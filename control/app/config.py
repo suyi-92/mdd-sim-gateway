@@ -62,7 +62,11 @@ DEFAULTS = {
         # configured value, else an implementation value). We rekey the CHILD (ESP) SA every
         # `minutes` from its establishment. 0 disables proactive rekey (passive only — the SA
         # is only refreshed if the ePDG initiates a rekey). Default 30 min.
-        "rekey": {"minutes": 30},
+        # `ike_minutes` is the same local policy for the IKE SA itself. The engine only rekeys
+        # the IKE SA as initiator, so this must fire before the carrier's own session clock:
+        # giffgaff/O2 UK silently invalidates a SWu session at ~2h50m (issue #33), EE at ~12h.
+        # 150 min preempts every observed clock; 0 disables proactive IKE rekey.
+        "rekey": {"minutes": 30, "ike_minutes": 150},
         # Outbound ring timeout (s): how long Asterisk lets an outgoing call ring before it
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
@@ -122,6 +126,7 @@ DEFAULTS = {
             "bot_token": "",
             "chat_id": "",
             "proxy_mode": "direct",
+            "proxy_profile_id": "",
             "proxy_url": "",
             "proxy_country": "",
             "message_templates": {},
@@ -142,6 +147,16 @@ DEFAULTS = {
                        "keepalive_result": True, "balance_low": True,
                        "software_update": True},
         },
+        "feishu": {
+            "enabled": False,
+            "url": "",
+            "secret": "",
+            "message_templates": {},
+            "events": {"incoming_sms": True, "incoming_call": True,
+                       "missed_call": True, "voicemail_received": True,
+                       "keepalive_result": True, "balance_low": True,
+                       "software_update": True},
+        },
         "security": {
             "https_only": True,
             "trusted_proxies": [],
@@ -156,6 +171,7 @@ DEFAULTS = {
         "updates": {
             "proxy_mode": "auto",
             "proxy_profile_id": "",
+            "proxy_country": "",
             # Automatic and notify-only are mutually exclusive. New installations track stable
             # releases explicitly classified as main automatically; every automatic install
             # still requires an exact
@@ -283,7 +299,7 @@ def load() -> dict:
                                     **(data.get("settings", {}).get("debug", {}))}
         # notification channels: merge one level deep (like tls/retry) so a saved config that
         # predates these keys — or omits the nested `events` map — still gets full defaults.
-        for key in ("webhook", "telegram", "pushplus"):
+        for key in ("webhook", "telegram", "pushplus", "feishu"):
             saved = data.get("settings", {}).get(key, {}) or {}
             merged = {**DEFAULTS["settings"][key], **saved}
             merged["events"] = {**DEFAULTS["settings"][key]["events"],
@@ -367,17 +383,39 @@ def load() -> dict:
         proxy["schema_version"] = 2
         proxy["profiles"] = profiles
         proxy["exits"] = exits
-        # Import legacy updater proxy definitions into the shared library. Old proxy-only
-        # policies become Auto so upgraded systems also get direct-first fallback; a library
-        # choice made by a current client remains pinned.
+        # A subscription names a collection of nodes, not one deterministic HTTP route.  Older
+        # builds nevertheless allowed Telegram and the updater to select it from the shared
+        # library, then silently reused the first ready country exit backed by that subscription.
+        # Preserve that effective route by making the country explicit on load.  Prefer an
+        # enabled exit, while retaining the first assigned exit as a fallback for configurations
+        # whose country routing is temporarily disabled.
+        def subscription_country(profile_id: str) -> str:
+            assigned = [(str(country).lower(), exit_cfg)
+                        for country, exit_cfg in exits.items()
+                        if re.fullmatch(r"[a-zA-Z]{2}", str(country))
+                        and isinstance(exit_cfg, dict)
+                        and exit_cfg.get("profile_id") == profile_id]
+            return next((country for country, exit_cfg in assigned if exit_cfg.get("enabled")),
+                        assigned[0][0] if assigned else "")
+
+        telegram = out["settings"]["telegram"]
+        telegram_profile_id = str(telegram.get("proxy_profile_id") or "")
+        if str(telegram.get("proxy_mode") or "direct").lower() == "library" \
+                and (profiles.get(telegram_profile_id) or {}).get("type") == "subscription":
+            country = subscription_country(telegram_profile_id)
+            if country:
+                telegram.update(proxy_mode="country", proxy_profile_id="", proxy_country=country)
+        # Import legacy updater proxy definitions into the shared library without changing the
+        # route the operator selected. Manual SOCKS settings become a private library entry;
+        # an existing country selection remains pinned to that country.
         updates = out["settings"].get("updates") or {}
         update_mode = str(updates.get("proxy_mode") or "auto").lower()
         update_profile_id = ""
+        update_country = ""
         if update_mode == "country":
             country = str(updates.get("proxy_country") or "").strip().lower()
-            candidate = exits.get(country) if isinstance(exits.get(country), dict) else {}
-            if candidate.get("enabled") and candidate.get("profile_id") in profiles:
-                update_profile_id = str(candidate["profile_id"])
+            if re.fullmatch(r"[a-z]{2}", country) and isinstance(exits.get(country), dict):
+                update_country = country
         elif update_mode == "manual":
             raw = str(updates.get("proxy_url") or "").strip()
             parsed = urllib.parse.urlsplit(raw)
@@ -390,8 +428,15 @@ def load() -> dict:
                     "password": urllib.parse.unquote(parsed.password or ""),
                 })
         elif update_mode == "library" and str(updates.get("proxy_profile_id") or "") in profiles:
-            update_profile_id = str(updates["proxy_profile_id"])
-        normalized_update_mode = "library" if update_mode == "library" and update_profile_id \
+            selected_profile_id = str(updates["proxy_profile_id"])
+            if (profiles.get(selected_profile_id) or {}).get("type") == "subscription":
+                update_country = subscription_country(selected_profile_id)
+                if update_country:
+                    update_mode = "country"
+            else:
+                update_profile_id = selected_profile_id
+        normalized_update_mode = "country" if update_mode == "country" and update_country \
+            else "library" if update_mode in {"library", "manual"} and update_profile_id \
             else (update_mode if update_mode in {"auto", "direct"} else "auto")
         raw_updates = data.get("settings", {}).get("updates", {}) or {}
         update_mode = str(raw_updates.get("update_mode") or "").lower()
@@ -413,6 +458,7 @@ def load() -> dict:
         out["settings"]["updates"] = {
             "proxy_mode": normalized_update_mode,
             "proxy_profile_id": update_profile_id if normalized_update_mode == "library" else "",
+            "proxy_country": update_country if normalized_update_mode == "country" else "",
             "update_mode": update_mode,
             "version_scope": version_scope,
         }
@@ -812,12 +858,12 @@ def imeisv_from_imei(imei: str, imeisv: str = "", svn: str = "00") -> str:
     return base14 + svn2
 
 
-def _clamp_rekey(v) -> int:
+def _clamp_rekey(v, default: int = 30) -> int:
     """0 disables proactive rekey; otherwise clamp to 1..1440 minutes."""
     try:
         m = int(v)
     except (TypeError, ValueError):
-        return 30
+        return default
     if m <= 0:
         return 0
     return max(1, min(1440, m))
@@ -1053,6 +1099,13 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # (off) or a sane 1..1440 window so a typo can't set an absurd sub-minute rekey storm.
         "rekey_minutes": _clamp_rekey(inst.get("rekey_minutes",
                                                (settings.get("rekey", {}) or {}).get("minutes", 30))),
+        # Proactive IKE-SA rekey period in minutes (0 = disabled). Same override order. The
+        # engine refuses the responder role for an IKE rekey, so a period longer than the
+        # carrier's own session clock means periodic teardowns (giffgaff/O2: ~2h50m, #33).
+        "ike_rekey_minutes": _clamp_rekey(
+            inst.get("ike_rekey_minutes",
+                     (settings.get("rekey", {}) or {}).get("ike_minutes", 150)),
+            default=150),
         # Accept an ePDG-initiated ESP rekey in place rather than refusing it and rebuilding the
         # tunnel. Per-line, and off unless asked for: the responder-side key direction it relies
         # on can only be proven against a carrier that actually initiates a rekey.

@@ -47,11 +47,11 @@ class ProductBoundaryTests(unittest.TestCase):
         with temp, paths:
             config.save({
                 "settings": {key: {"events": {"activation_reminder": True}}
-                             for key in ("webhook", "telegram", "pushplus")},
+                             for key in ("webhook", "telegram", "pushplus", "feishu")},
                 "instances": {},
             })
             settings = config.load()["settings"]
-            for key in ("webhook", "telegram", "pushplus"):
+            for key in ("webhook", "telegram", "pushplus", "feishu"):
                 self.assertNotIn("activation_reminder", settings[key]["events"])
                 self.assertTrue(settings[key]["events"]["software_update"])
 

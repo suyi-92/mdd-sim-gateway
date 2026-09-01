@@ -903,10 +903,15 @@ class swu():
         # shared response handler credits an error notify against the right rekey driver.
         self._create_child_kind = None
 
-        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Some ePDGs
-        # (EE) rekey the IKE SA themselves at a fixed age (~12 h observed); we do not implement
-        # the responder side of that (state_epdg_create_sa refuses it and the ePDG then deletes
-        # the SA => ~1 min outage). Rekeying FIRST keeps us the exchange initiator, so the SA
+        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Carriers
+        # bound the IKE SA / SWu session by a local clock we cannot see: EE rekeys it at
+        # ~12 h, and giffgaff/O2 UK silently invalidates the session at ~2h50m without any
+        # IKE message at all (issue #33) — IMS then rejects re-REGISTER until a fresh
+        # session exists. We do not implement the responder side of an ePDG-initiated rekey
+        # (state_epdg_create_sa refuses it and the ePDG then deletes the SA => ~1 min
+        # outage), so this period must stay comfortably below the carrier's clock; render.py
+        # supplies it from settings (default 150 min). Rekeying FIRST keeps us the exchange
+        # initiator, so the SA
         # roles, key-selection and header-flag assumptions baked into this file stay valid. The
         # machinery (state_ue_create_sa + the IKE branch of state_epdg_create_sa_response:
         # SKEYSEED' = prf(SK_d, g^ir | Ni | Nr), old-SA answer paths, DELETE old) predates this
@@ -5403,7 +5408,8 @@ class swu():
         IKE rekey (state_ue_create_sa). Staying the initiator keeps every role assumption in this
         file valid AND resets the ePDG's own rekey clock — the whole point, since we refuse the
         responder role and an ePDG-initiated rekey therefore ends in a teardown (EE does this at
-        ~12 h SA age; keep SWU_IKE_REKEY_MINUTES comfortably below that).
+        ~12 h SA age; giffgaff/O2 UK instead ages the session out silently at ~2h50m — keep
+        SWU_IKE_REKEY_MINUTES comfortably below the shortest carrier clock in use).
 
         An explicit rejection keeps the established IKE SA (retry in ike_rekey_retry_interval).
         An unanswered request is retransmitted verbatim; exhausting the retransmissions leaves the
