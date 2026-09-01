@@ -142,7 +142,10 @@ cleanup() { rm -rf -- "$stage"; }
 trap cleanup EXIT HUP INT TERM
 
 say "downloading the vmware source branch as the current user"
-git -c advice.detachedHead=false clone --filter=blob:none --single-branch --branch vmware \
+# install.sh uses this checkout as a local Git transport for the root-owned managed checkout.
+# Keep every object reachable from vmware locally: upload-pack deliberately cannot lazy-fetch a
+# missing promisor object while it is serving another repository.
+git -c advice.detachedHead=false clone --single-branch --branch vmware \
   "$MDD_REPOSITORY_URL" "$stage/repository"
 actual_remote=$(git -C "$stage/repository" remote get-url origin)
 [[ "$actual_remote" == "$MDD_REPOSITORY_URL" ]] || die "unexpected repository remote: $actual_remote"

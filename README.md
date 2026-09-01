@@ -6,11 +6,54 @@
 
 <p align="center">
   <a href="README.en.md">English</a> ·
-  <a href="#一键安装">一键安装</a> ·
+  <a href="#先安装后接设备推荐">快速开始</a> ·
   <a href="docs/INSTALL.md">完整安装说明</a> ·
   <a href="docs/TROUBLESHOOTING.md">故障排查</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
+
+## 先安装、后接设备（推荐）
+
+**设备不是基础安装的前提。** `--require-scr-prime` 和 `--require-cellular` 只是“本次安装
+必须通过对应硬件验收”的门禁，不是功能开关。不加它们不会关闭任何功能，也不需要以后重装
+系统。
+
+设备还没直通给 VM 时，先执行：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install
+```
+
+此时缺少 SCR Prime 或 Quectel 只会打印警告并继续，普通 `install` 不会等待硬件。Control、
+WebUI、pcscd、ModemManager、NetworkManager 和 Engine 仍会完成安装。
+
+以后把两台设备接入客户机后，只需完成下面这些步骤：
+
+1. 在 VMware Workstation 中把 SCR Prime 和**整个 Quectel USB 复合设备**连接到客户机，并在
+   SCR Prime 中插入 SIM；不能只传 Windows COM 口。
+2. 重新执行下面的硬件验收命令：
+
+   ```bash
+   bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
+   ```
+
+   重复安装是幂等的；同一提交会复用已经验证的本地构建和 Docker 缓存。SCR Prime 会先尝试
+   发行版原生驱动，必要时自动安装仅含补丁 03 的 CCID，并要求验证 ATR 和真实拔插恢复；
+   Quectel 最多等待约 90 秒，直到 `mmcli -L` 能看到 modem。
+3. 按 SCR Prime 验收过程的提示拔下、重新连接设备，然后运行：
+
+   ```bash
+   sudo mddctl doctor
+   ```
+
+4. 打开 `https://<VM 的 DHCP 保留地址>:8443`：把 SCR Prime 建成 **PC/SC、VoWiFi-only**
+   线路；把 Quectel 建成 **modem、4G + VoWiFi** 线路，并填写该 SIM 的 APN/4G 设置，使
+   NetworkManager 建立 GSM profile、bearer 和 IP。
+
+只后插其中一台设备时，只加对应的 `--require-scr-prime` 或 `--require-cellular` 即可。Quectel
+通常能被 ModemManager 热发现，但仍需在 WebUI 建线；SCR Prime 则应重新运行验收命令，因为
+只有看到真实 `04d9:c001` 后，安装器才能判断是否需要 CCID 补丁。若客户机已启用防火墙，可在
+硬件验收命令中再加 `--configure-firewall`，或按安装器打印的精确端口手工放行。
 
 `vmware` 分支面向 Windows x86_64 宿主机上的 VMware Workstation。Control 与 WebUI
 在 Linux 客户机中由 systemd 原生运行；只有每条 SIM 的 Engine 使用 rootful Docker。
@@ -47,16 +90,11 @@ VoWiFi 认证、通话和可用的短信功能由该路径完成。4G 数据来�
 6. Windows 的 VMware USB Arbitration Service 必须运行。设备连接到 VM 后，Windows 不应
    再占用对应驱动。
 
-## 一键安装
+## 安装过程与参数
 
-在客户机的普通用户终端执行；不要给 `wget` 或整个下载管道加 `sudo`：
-
-```bash
-bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
-```
-
-入口脚本先以当前用户下载 `vmware` 分支，再集中进行一次 `sudo` 权限确认，并从本地文件
-启动 root 安装器。它不会直接以 root 执行网络取得的标准输入。
+上面的命令都应在客户机的普通用户终端执行；不要给 `wget` 或整个下载管道加 `sudo`。入口
+脚本先以当前用户完整下载 `vmware` 单分支源码，再集中进行一次 `sudo` 权限确认，并从本地
+文件启动 root 安装器。它不会直接以 root 执行网络取得的标准输入。
 
 安装会执行完整 Engine 源码构建。Asterisk、pjproject、pcsc-lite 和 Python 依赖的首次无缓存
 构建可能需要几十分钟，具体取决于 CPU、内存、Docker Hub/GitHub 连接和软件源速度。

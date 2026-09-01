@@ -6,10 +6,50 @@
 
 <p align="center">
   <a href="README.md">中文</a> ·
-  <a href="#one-command-install">Install</a> ·
+  <a href="#install-first-attach-hardware-later">Quick start</a> ·
   <a href="docs/INSTALL.md">Detailed guide</a> ·
   <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a>
 </p>
+
+## Install first, attach hardware later
+
+**Hardware is not required for the base installation.** `--require-scr-prime` and
+`--require-cellular` are acceptance gates for that installer run, not feature switches. Omitting
+them does not disable either device and does not require reinstalling the guest later.
+
+When neither device is passed through yet, run:
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install
+```
+
+Missing SCR Prime and Quectel devices produce warnings and the ordinary `install` does not wait for
+hardware. Control, WebUI, pcscd, ModemManager, NetworkManager, and Engine are still installed.
+
+After attaching both devices to the guest:
+
+1. Pass SCR Prime and the **complete Quectel USB composite device** through in VMware Workstation,
+   and insert a SIM in SCR Prime. Passing only Windows COM ports is insufficient.
+2. Rerun the idempotent installer with both hardware gates:
+
+   ```bash
+   bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
+   ```
+
+   The same commit reuses its verified local build and Docker cache. SCR Prime is checked against
+   the distribution driver first; when required, CCID with patch 03 only is installed automatically,
+   followed by ATR and physical unplug/replug validation. The cellular gate waits up to about 90
+   seconds for `mmcli -L` to expose a modem.
+3. Follow the SCR Prime unplug/replug prompts, then run `sudo mddctl doctor`.
+4. Open `https://<reserved-VM-address>:8443`. Create SCR Prime as a **PC/SC, VoWiFi-only** line.
+   Create Quectel as a **modem, 4G + VoWiFi** line and enter the SIM's APN/4G settings so
+   NetworkManager can create its GSM profile, bearer, and IP.
+
+When attaching only one device, rerun with only its corresponding `--require-scr-prime` or
+`--require-cellular` gate. Quectel is normally hot-detected but still needs a WebUI line. SCR Prime
+should be revalidated because its real `04d9:c001` presence is the evidence needed to decide whether
+the CCID patch is required. If the guest firewall is active, add `--configure-firewall` to that
+acceptance run or apply the exact printed ports manually.
 
 The `vmware` branch targets VMware Workstation on an x86_64 Windows host. Control and WebUI run
 natively in the guest under systemd; Docker is rootful and is used only for per-SIM Engine
@@ -45,17 +85,12 @@ Before starting the guest:
 6. Keep VMware USB Arbitration Service running on Windows. Once connected to the guest, the
    devices must no longer be held by Windows drivers.
 
-## One-command install
+## Installer behavior and options
 
-Run as an ordinary user inside the guest. Do not pipe the download into `sudo`:
-
-```bash
-bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
-```
-
-The bootstrap downloads the reviewed `vmware` checkout as the current user, asks for sudo once,
-and invokes a local installer file. The first clean Engine build compiles Asterisk, pjproject,
-pcsc-lite, and Python dependencies and may take tens of minutes.
+Run the commands above as an ordinary user inside the guest; do not pipe the download into `sudo`.
+The bootstrap downloads a complete single-branch `vmware` checkout as the current user, asks for
+sudo once, and invokes a local installer file. The first clean Engine build compiles Asterisk,
+pjproject, pcsc-lite, and Python dependencies and may take tens of minutes.
 
 Supported bootstrap options:
 

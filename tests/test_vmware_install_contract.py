@@ -32,6 +32,13 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertNotIn("curl | sudo", BOOTSTRAP)
         self.assertNotIn("wget | sudo", BOOTSTRAP)
 
+    def test_bootstrap_checkout_is_complete_for_the_local_git_transport(self):
+        self.assertIn("clone --single-branch --branch vmware", BOOTSTRAP)
+        self.assertNotIn("--filter=blob:none", BOOTSTRAP)
+        checkout = shell_function(INSTALL, "install_source_checkout")
+        self.assertIn("remote.origin.promisor", checkout)
+        self.assertIn("provide a complete vmware checkout", checkout)
+
     def test_public_bootstrap_options_are_explicit(self):
         for value in ("install|update|doctor", "--install-dir", "--data-dir", "--ref",
                       "--require-scr-prime", "--require-cellular", "--no-start",

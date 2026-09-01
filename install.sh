@@ -302,6 +302,8 @@ install_source_checkout() {
   source_dir=$(realpath "$source_dir")
   git -C "$source_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "--source is not a Git checkout"
   [[ $(git -C "$source_dir" remote get-url origin) == "$ORIGIN_URL" ]] || die "source remote does not match $ORIGIN_URL"
+  [[ $(git -C "$source_dir" config --bool --get remote.origin.promisor 2>/dev/null || true) != true ]] || \
+    die "--source is a partial clone; provide a complete vmware checkout for managed installation"
   [[ -z $(git -C "$source_dir" status --porcelain --untracked-files=normal) ]] || die "source checkout is dirty"
   local source_sha incoming current
   source_sha=$(git -C "$source_dir" rev-parse HEAD)
