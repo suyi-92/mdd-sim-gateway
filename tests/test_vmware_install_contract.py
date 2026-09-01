@@ -133,6 +133,41 @@ printf '%s\\n' fingerprint-ok
         prepare = shell_function(INSTALL, "prepare_build")
         self.assertIn("docker build --pull --no-cache", prepare)
 
+    def test_staged_venv_is_relocated_before_the_ready_marker(self):
+        prepare = shell_function(INSTALL, "prepare_build")
+        moved = prepare.index('mv "$temp" "$build_root"')
+        relocated = prepare.index(
+            'relocate_venv "$build_root/venv" "$temp/venv" "$build_root/venv"')
+        ready = prepare.index('touch "$build_root/READY"')
+        verified = prepare.index(
+            'verify_prepared_build "$source_dir" "$build_root" "$sha"', ready)
+        self.assertLess(moved, relocated)
+        self.assertLess(relocated, ready)
+        self.assertLess(ready, verified)
+        self.assertIn('rm -f "$build_root/READY"', prepare)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "venv relocation contract runs in a supported Linux guest")
+    def test_relocated_venv_console_scripts_remain_executable(self):
+        helper = shell_function(INSTALL, "relocate_venv")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "build.tmp.123"
+            final = root / "build"
+            subprocess.run([shutil.which("python3") or "python3", "-m", "venv",
+                            str(staging / "venv")], check=True)
+            staging.rename(final)
+            script = helper + '\n}\nrelocate_venv "$1" "$2" "$3"'
+            subprocess.run(
+                ["bash", "-euc", script, "relocate-venv", str(final / "venv"),
+                 str(staging / "venv"), str(final / "venv")],
+                check=True, text=True, capture_output=True)
+            subprocess.run([str(final / "venv/bin/pip"), "check"], check=True,
+                           text=True, capture_output=True)
+            for path in (final / "venv/bin/pip", final / "venv/bin/activate",
+                         final / "venv/pyvenv.cfg"):
+                self.assertNotIn(str(staging / "venv"), path.read_text(encoding="utf-8"))
+
     def test_scr_prime_uses_native_probe_then_patch_three_only(self):
         gate = shell_function(INSTALL, "scr_prime_gate")
         patched = shell_function(INSTALL, "install_scr_prime_ccid")

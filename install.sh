@@ -667,6 +667,42 @@ engine_fingerprint() {
   env PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" "$kind"
 }
 
+relocate_venv() {
+  local root=$1 old_prefix=$2 new_prefix=$3
+  [[ -d "$root/bin" && -f "$root/pyvenv.cfg" ]] || die "Control venv is incomplete before relocation"
+  python3 - "$root" "$old_prefix" "$new_prefix" <<'PY'
+import os
+import sys
+
+root, old_prefix, new_prefix = sys.argv[1:]
+old = os.fsencode(old_prefix)
+new = os.fsencode(new_prefix)
+paths = [os.path.join(root, "pyvenv.cfg")]
+paths.extend(
+    entry.path for entry in os.scandir(os.path.join(root, "bin"))
+    if entry.is_file(follow_symlinks=False)
+)
+changed = 0
+for path in paths:
+    with open(path, "rb") as stream:
+        content = stream.read()
+    if old not in content:
+        continue
+    with open(path, "wb") as stream:
+        stream.write(content.replace(old, new))
+    changed += 1
+if changed == 0:
+    raise SystemExit("Control venv did not contain its staging prefix")
+for path in paths:
+    with open(path, "rb") as stream:
+        if old in stream.read():
+            raise SystemExit(f"Control venv still references its staging path: {path}")
+with open(os.path.join(root, "bin", "pip"), "rb") as stream:
+    if not stream.readline().startswith(b"#!" + new + b"/bin/python"):
+        raise SystemExit("Control venv pip shebang was not relocated")
+PY
+}
+
 verify_prepared_build() {
   local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image
   [[ -f "$root/READY" && -f "$root/webui/index.html" && -x "$root/venv/bin/python" && \
@@ -684,7 +720,10 @@ verify_prepared_build() {
      "https://github.com/suyi-92/mdd-sim-gateway" ]] || return 1
   [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}') == "$runtime_fp" ]] || return 1
   [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}') == "$base_fp" ]] || return 1
-  "$root/venv/bin/pip" check >/dev/null 2>&1 || return 1
+  "$root/venv/bin/pip" check >/dev/null 2>&1 || {
+    warn "build verification failed: Control venv console scripts or dependencies are invalid"
+    return 1
+  }
   python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
     "$(docker image inspect "$image" --format '{{.Id}}')" \
     "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" <<'PY'
@@ -787,11 +826,15 @@ with open(path, "w", encoding="utf-8") as stream:
     stream.write("\n")
 os.chmod(path, 0o644)
 PY
-  touch "$temp/READY"
   install -d -m 0755 "$(dirname "$build_root")"
   rm -rf -- "$build_root"
   mv "$temp" "$build_root"
-  verify_prepared_build "$source_dir" "$build_root" "$sha" || die "prepared build identity verification failed"
+  relocate_venv "$build_root/venv" "$temp/venv" "$build_root/venv"
+  touch "$build_root/READY"
+  if ! verify_prepared_build "$source_dir" "$build_root" "$sha"; then
+    rm -f "$build_root/READY"
+    die "prepared build identity verification failed"
+  fi
   info "verified local build: $build_root"
 }
 
