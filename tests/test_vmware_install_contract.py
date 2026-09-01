@@ -95,6 +95,37 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('-f "$source_dir/engine/Dockerfile" "$source_dir/engine"', prepare)
         self.assertTrue((ROOT / "engine/.dockerignore").exists())
 
+    def test_fingerprint_helper_does_not_reassign_the_readonly_version(self):
+        helper = shell_function(INSTALL, "engine_fingerprint")
+        self.assertIn('env PCSC_VERSION="$PCSC_VERSION"', helper)
+        self.assertNotIn('$(PCSC_VERSION="$PCSC_VERSION"', INSTALL)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "readonly fingerprint contract runs in a supported Linux guest")
+    def test_fingerprint_helper_accepts_a_readonly_pcsc_version(self):
+        helper = shell_function(INSTALL, "engine_fingerprint")
+        with tempfile.TemporaryDirectory() as directory:
+            script_path = Path(directory) / "tools" / "engine-fingerprint.sh"
+            script_path.parent.mkdir()
+            script_path.write_text(
+                """#!/bin/sh
+[ "$PCSC_VERSION" = 2.3.3 ] || exit 66
+[ "$1" = runtime ] || exit 67
+printf '%s\\n' fingerprint-ok
+""", encoding="utf-8")
+            script_path.chmod(0o755)
+            script = helper + '\n}\nreadonly PCSC_VERSION=2.3.3\nengine_fingerprint "$1" runtime'
+            result = subprocess.run(
+                ["bash", "-euc", script, "fingerprint-helper", directory],
+                check=True, text=True, capture_output=True)
+            self.assertEqual(result.stdout.strip(), "fingerprint-ok")
+
+    def test_initial_install_uses_cache_unless_no_cache_is_explicit(self):
+        install_action = INSTALL[INSTALL.index('case "$action" in'):]
+        self.assertNotIn('[[ -f "$build_root/READY" ]] || no_cache=1', install_action)
+        prepare = shell_function(INSTALL, "prepare_build")
+        self.assertIn("docker build --pull --no-cache", prepare)
+
     def test_scr_prime_uses_native_probe_then_patch_three_only(self):
         gate = shell_function(INSTALL, "scr_prime_gate")
         patched = shell_function(INSTALL, "install_scr_prime_ccid")

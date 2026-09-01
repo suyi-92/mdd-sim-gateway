@@ -660,14 +660,19 @@ cellular_gate() {
   info "ModemManager detected a cellular modem"
 }
 
+engine_fingerprint() {
+  local source=$1 kind=$2
+  env PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" "$kind"
+}
+
 verify_prepared_build() {
   local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image
   [[ -f "$root/READY" && -f "$root/webui/index.html" && -x "$root/venv/bin/python" && \
      -f "$root/manifest.json" ]] || return 1
   [[ $(git -C "$source" rev-parse HEAD 2>/dev/null) == "$expected_sha" ]] || return 1
   expected_version=$(tr -d '\r\n' < "$source/VERSION")
-  runtime_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" runtime) || return 1
-  base_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" base) || return 1
+  runtime_fp=$(engine_fingerprint "$source" runtime) || return 1
+  base_fp=$(engine_fingerprint "$source" base) || return 1
   image="mdd-sim-gateway/engine:$expected_sha"
   docker image inspect "$image" >/dev/null 2>&1 || return 1
   [[ $(docker image inspect "$image" --format '{{.Architecture}}') == amd64 ]] || return 1
@@ -734,8 +739,8 @@ prepare_build() {
       cp -a /src/src /src/public /work/; cd /work; npm ci; npm run build; cp -a dist/. /out/'
   [[ -f "$temp/webui/index.html" ]] || die "WebUI build did not produce index.html"
 
-  runtime_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source_dir/tools/engine-fingerprint.sh" runtime)
-  base_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source_dir/tools/engine-fingerprint.sh" base)
+  runtime_fp=$(engine_fingerprint "$source_dir" runtime)
+  base_fp=$(engine_fingerprint "$source_dir" base)
   version=$(tr -d '\r\n' < "$source_dir/VERSION")
   info "building Engine image for commit $sha"
   local build_args=(docker build --pull --label "org.opencontainers.image.revision=$sha" \
@@ -1039,7 +1044,6 @@ case "$action" in
     scr_prime_gate
     cellular_gate
     build_root="$cache_dir/builds/$sha"
-    [[ -f "$build_root/READY" ]] || no_cache=1
     prepare_build
     activate_build
     configure_firewall_rules
