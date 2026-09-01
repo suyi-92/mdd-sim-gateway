@@ -981,7 +981,10 @@ configure_firewall_rules() {
   local rules
   rules=$(firewall_rule_specs) || die "could not calculate exact firewall ports"
   firewall_ports
-  ((configure_firewall)) || return
+  if ((configure_firewall == 0)); then
+    info "firewall changes were not requested; printed required ports only"
+    return 0
+  fi
   if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
     touch "$state_dir/firewall-created"
     chmod 0600 "$state_dir/firewall-created"
@@ -1093,7 +1096,12 @@ case "$action" in
     activate_build
     configure_firewall_rules
     if ((no_start == 0)); then
-      systemctl restart mdd-sim-gateway-orchestrator.service mdd-sim-gateway-control.service
+      info "starting Control and orchestrator services"
+      if ! systemctl restart mdd-sim-gateway-orchestrator.service mdd-sim-gateway-control.service; then
+        systemctl --no-pager --full status mdd-sim-gateway-control.service \
+          mdd-sim-gateway-orchestrator.service >&2 || true
+        die "could not start MDD systemd services"
+      fi
       health_check
     else
       info "services installed but not started (--no-start)"

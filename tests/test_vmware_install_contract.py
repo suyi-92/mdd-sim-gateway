@@ -248,6 +248,27 @@ cellular_gate
         self.assertIn("firewall-nft-created", firewall)
         self.assertIn("is not recorded as MDD-owned", firewall)
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "firewall return contract runs in a supported Linux guest")
+    def test_print_only_firewall_path_returns_success(self):
+        firewall = shell_function(INSTALL, "configure_firewall_rules")
+        script = firewall + """
+}
+configure_firewall=0
+firewall_rule_specs() { printf '8443/tcp|MDD Control\\n'; }
+firewall_ports() { :; }
+info() { :; }
+die() { exit 98; }
+configure_firewall_rules
+"""
+        subprocess.run(["bash", "-euc", script], check=True)
+
+    def test_install_reports_and_diagnoses_systemd_start(self):
+        install_action = INSTALL[INSTALL.index('case "$action" in'):]
+        self.assertIn('info "starting Control and orchestrator services"', install_action)
+        self.assertIn("systemctl --no-pager --full status", install_action)
+        self.assertIn('die "could not start MDD systemd services"', install_action)
+
     def test_no_cloud_build_or_precompiled_project_asset_is_tracked(self):
         self.assertFalse(any((ROOT / ".github/workflows").glob("*.yml")))
         self.assertFalse((ROOT / "webui/release-dist.SHA256SUMS").exists())
