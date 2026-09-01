@@ -416,9 +416,16 @@ ensure_cmake() {
   printf '%s' "$home/bin/cmake"
 }
 
+lpac_binary_valid() {
+  local binary=$1 drivers
+  [[ -x "$binary" ]] || return 1
+  drivers=$(LPAC_APDU=stdio LPAC_HTTP=stdio "$binary" driver list 2>/dev/null) || return 1
+  grep -Fq '"pcsc"' <<<"$drivers" && grep -Fq '"curl"' <<<"$drivers"
+}
+
 ensure_lpac() {
   local destination="$data_dir/lpac" source="$cache_dir/sources/lpac-$LPAC_VERSION" cmake_bin build temp candidate
-  [[ -x "$destination/lpac" ]] && return
+  lpac_binary_valid "$destination/lpac" && return
   info "building lpac $LPAC_VERSION from pinned source"
   install -d -m 0755 "$(dirname "$source")"
   if [[ ! -d "$source/.git" ]]; then git clone --filter=blob:none --branch "v$LPAC_VERSION" --single-branch https://github.com/estkme-group/lpac.git "$source"; fi
@@ -443,7 +450,7 @@ ensure_lpac() {
   rm -rf -- "$destination"
   mv "$destination.tmp" "$destination"
   rm -rf -- "$temp"
-  "$destination/lpac" driver apdu list >/dev/null
+  lpac_binary_valid "$destination/lpac" || die "lpac binary is missing the required PC/SC or curl driver"
 }
 
 pcsc_scan_capture() {

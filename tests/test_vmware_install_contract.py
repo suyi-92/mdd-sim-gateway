@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -104,6 +105,34 @@ class InstallerContractTests(unittest.TestCase):
         self.assertNotIn("02_hsic_malformed_atr.patch", INSTALL)
         self.assertIn("apt-mark hold libccid", patched)
         self.assertIn("scr-prime-driver.json", patched)
+
+    def test_lpac_build_gate_does_not_require_a_pcsc_reader(self):
+        validator = shell_function(INSTALL, "lpac_binary_valid")
+        ensure = shell_function(INSTALL, "ensure_lpac")
+        self.assertIn("LPAC_APDU=stdio LPAC_HTTP=stdio", validator)
+        self.assertIn('"$binary" driver list', validator)
+        self.assertIn("'\"pcsc\"'", validator)
+        self.assertIn("'\"curl\"'", validator)
+        self.assertIn('lpac_binary_valid "$destination/lpac" && return', ensure)
+        self.assertNotIn("driver apdu list", INSTALL)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "lpac validation contract runs in a supported Linux guest")
+    def test_lpac_validator_forces_hardware_free_stdio_drivers(self):
+        validator = shell_function(INSTALL, "lpac_binary_valid")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "lpac"
+            binary.write_text(
+                """#!/bin/sh
+[ "$LPAC_APDU" = stdio ] && [ "$LPAC_HTTP" = stdio ] || exit 64
+[ "$1" = driver ] && [ "$2" = list ] || exit 65
+printf '%s\\n' '{"LPAC_APDU":["pcsc","stdio"],"LPAC_HTTP":["curl","stdio"]}'
+""", encoding="utf-8")
+            binary.chmod(0o755)
+            script = validator + '\n}\nlpac_binary_valid "$1"'
+            subprocess.run(
+                ["bash", "-c", script,
+                 "lpac-validator", str(binary)], check=True)
 
     def test_networkmanager_policy_preserves_the_management_interface(self):
         self.assertIn("address-before.json", INSTALL)
