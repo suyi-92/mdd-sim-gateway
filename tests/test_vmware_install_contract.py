@@ -269,6 +269,20 @@ configure_firewall_rules
         self.assertIn("systemctl --no-pager --full status", install_action)
         self.assertIn('die "could not start MDD systemd services"', install_action)
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "HTTPS startup retry contract runs in a supported Linux guest")
+    def test_install_https_health_retries_connection_refusal(self):
+        helper = shell_function(INSTALL, "https_health_ready")
+        script = helper + """
+}
+attempts=0
+curl() { attempts=$((attempts + 1)); ((attempts >= 3)); }
+sleep() { :; }
+https_health_ready
+[[ $attempts -eq 3 ]]
+"""
+        subprocess.run(["bash", "-euc", script], check=True)
+
     def test_no_cloud_build_or_precompiled_project_asset_is_tracked(self):
         self.assertFalse(any((ROOT / ".github/workflows").glob("*.yml")))
         self.assertFalse((ROOT / "webui/release-dist.SHA256SUMS").exists())
@@ -308,6 +322,16 @@ class MddctlContractTests(unittest.TestCase):
             self.assertIn(f"trap '{cleanup} $?' EXIT", source)
             self.assertIn("trap 'exit 130' INT", source)
             self.assertIn("trap 'exit 143' TERM", source)
+
+    def test_mutating_health_checks_wait_but_doctor_stays_a_snapshot(self):
+        health = shell_function(MDDCTL, "health_check")
+        doctor = shell_function(MDDCTL, "cmd_doctor")
+        wait = shell_function(MDDCTL, "https_healthy_wait")
+        self.assertIn("https_healthy_wait", health)
+        self.assertIn("SECONDS + 30", wait)
+        self.assertIn("sleep 1", wait)
+        self.assertIn("https_healthy && https=1", doctor)
+        self.assertNotIn("https_healthy_wait", doctor)
 
     def test_driver_restore_and_reprobe_preserve_evidence_on_failure(self):
         restore = shell_function(MDDCTL, "driver_restore_internal")

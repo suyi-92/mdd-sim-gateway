@@ -1022,10 +1022,23 @@ configure_firewall_rules() {
   fi
 }
 
+https_health_ready() {
+  local deadline=$((SECONDS + 30))
+  while ((SECONDS < deadline)); do
+    if curl --fail --silent --insecure --connect-timeout 2 --max-time 4 \
+        https://127.0.0.1:8443/api/auth/status >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 health_check() {
   systemctl is-active --quiet mdd-sim-gateway-control.service || die "Control service is not active"
   systemctl is-active --quiet mdd-sim-gateway-orchestrator.service || die "orchestrator service is not active"
-  curl --fail --silent --show-error --insecure --max-time 20 https://127.0.0.1:8443/api/auth/status >/dev/null || die "HTTPS health check failed"
+  https_health_ready || \
+    die "HTTPS health check did not become ready within 30 seconds; inspect the Control journal"
   docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null || die "stable Engine image is missing"
   docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh "$ENGINE_STABLE_IMAGE" -c 'test -c /dev/net/tun' >/dev/null
   if [[ -f "$state_dir/managed.env" ]]; then
