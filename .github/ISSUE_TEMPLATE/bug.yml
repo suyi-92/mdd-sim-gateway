@@ -5,19 +5,19 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Never include a PIN, IMSI, ICCID, EID, phone number, proxy URL or token. A read-only Codex workflow may analyze this public report and post a clearly marked draft response; a maintainer makes the final decision.
+      value: Never include a PIN, IMSI, ICCID, EID, IMEI, phone number, proxy URL, token, message content, or an unreviewed backup. Run mddctl doctor --json for a redacted starting point.
   - type: input
     id: version
     attributes:
       label: Version
-      placeholder: 1.0.0
+      placeholder: 1.7.0-vmware.1
     validations:
       required: true
   - type: dropdown
     id: hardware
     attributes:
       label: Hardware path
-      options: [Cellular modem, PC/SC reader, eUICC reader, Other]
+      options: [SCR Prime 04d9:c001, Quectel-class cellular modem, Other PC/SC reader, eUICC reader, Other]
     validations:
       required: true
   - type: textarea

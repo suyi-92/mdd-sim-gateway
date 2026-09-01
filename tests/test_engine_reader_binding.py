@@ -12,6 +12,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _to_bytes(value):
+    if isinstance(value, str):
+        return [int(value[index:index + 2], 16) for index in range(0, len(value), 2)]
+    return list(value)
+
+
 def _iccid_apdu_bytes(iccid):
     """Encode an ICCID the way EF.ICCID carries it: BCD with swapped nibbles, 'f'-padded."""
     padded = iccid if len(iccid) % 2 == 0 else iccid + "f"
@@ -39,7 +45,8 @@ class _Connection:
     def transmit(self, apdu):
         if self.iccid is None:
             raise RuntimeError("card does not answer")
-        if str(apdu).lower().startswith("00b0"):
+        command = "".join(f"{value:02x}" for value in _to_bytes(apdu))
+        if command.startswith("00b0"):
             return _iccid_apdu_bytes(self.iccid), 0x90, 0x00
         return [], 0x90, 0x00
 
@@ -63,7 +70,7 @@ def _load_engine_module(filename, module_name):
     system = types.ModuleType("smartcard.System")
     system.readers = lambda: []
     util = types.ModuleType("smartcard.util")
-    util.toBytes = lambda value: value
+    util.toBytes = _to_bytes
     util.toHexString = lambda value: ""
     exceptions = types.ModuleType("smartcard.Exceptions")
     exceptions.NoCardException = type("NoCardException", (Exception,), {})
@@ -87,6 +94,47 @@ def _load_engine_module(filename, module_name):
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(module)
     return module
+
+
+class _UsimSelectionConnection:
+    """Real-card shaped EF_DIR: legacy continuation, 6C retry, CSIM first, nested USIM."""
+    CSIM_AID = list(bytes.fromhex("A0000003431002"))
+    USIM_AID = list(bytes.fromhex("A0000000871002FF86FFFF89FFFFFFFF"))
+
+    def __init__(self):
+        self.commands = []
+        self.selected_aid = None
+        self.records = {
+            1: self._record(self.CSIM_AID, b"CSIM"),
+            2: self._record(self.USIM_AID, b"USIM"),
+        }
+
+    @staticmethod
+    def _record(aid, label):
+        body = [0x50, len(label), *label, 0x4F, len(aid), *aid]
+        return [0x61, len(body), *body]
+
+    def transmit(self, apdu):
+        command = _to_bytes(apdu)
+        self.commands.append(command)
+        if command == [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00]:
+            return [], 0x90, 0x00
+        if command == [0x00, 0xA4, 0x00, 0x04, 0x02, 0x2F, 0x00, 0x00]:
+            return [], 0x9F, 0x02
+        if command[:4] == [0x00, 0xC0, 0x00, 0x00]:
+            return [0x62, 0x00], 0x90, 0x00
+        if command[:2] == [0x00, 0xB2]:
+            record = self.records.get(command[2])
+            if record is None:
+                return [], 0x6A, 0x83
+            if command[-1] == 0:
+                return [], 0x6C, len(record)
+            return record, 0x90, 0x00
+        if command[:4] == [0x00, 0xA4, 0x04, 0x04]:
+            length = command[4]
+            self.selected_aid = command[5:5 + length]
+            return [], 0x61, 0x02
+        raise AssertionError(f"unexpected APDU: {command}")
 
 
 class EngineReaderBindingTests(unittest.TestCase):
@@ -161,6 +209,19 @@ class EngineReaderBindingTests(unittest.TestCase):
             reader, connection, _iccid = self.pin_keeper.find_reader("missing reader")
         self.assertIsNone(reader)
         self.assertIsNone(connection)
+
+    def test_every_engine_role_uses_the_real_card_compatible_usim_selector(self):
+        for selector in (self.pin_keeper.select_adf_usim, self.ami_usim.select_adf_usim):
+            connection = _UsimSelectionConnection()
+            self.assertTrue(selector(connection))
+            self.assertEqual(connection.selected_aid, connection.USIM_AID)
+            # Le=0 was corrected with the exact card-supplied record length.
+            self.assertTrue(any(command[:4] == [0x00, 0xB2, 0x01, 0x04] and
+                                command[-1] == len(connection.records[1])
+                                for command in connection.commands))
+
+        swu = (ROOT / "engine" / "swu_ike.py").read_text(encoding="utf-8")
+        self.assertIn("return _shared_select_adf_usim(conn)", swu)
 
 
 class ForeignCardRefusalTests(unittest.TestCase):

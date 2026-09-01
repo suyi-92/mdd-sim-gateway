@@ -93,6 +93,29 @@ def _hx(s: str):
     return [int(s[i:i + 2], 16) for i in range(0, len(s), 2)]
 
 
+def _transmit(conn, command, depth: int = 0):
+    """Send one APDU and normalize the continuation forms used by real UICCs.
+
+    pyscard exposes the raw status word.  Cards legitimately use either 61xx or the
+    SIM-era 9Fxx to request GET RESPONSE, and 6Cxx to correct an expected response
+    length.  Handling those forms in one bounded helper keeps identity discovery
+    consistent with the Engine and with native PC/SC implementations.
+    """
+    if depth > 8:
+        raise RuntimeError("too many APDU continuations")
+    command = list(command)
+    data, s1, s2 = conn.transmit(command)
+    if s1 == 0x6C and len(command) >= 5:
+        retry = list(command)
+        retry[-1] = s2
+        return _transmit(conn, retry, depth + 1)
+    if s1 in (0x61, 0x9F):
+        more, final_s1, final_s2 = _transmit(
+            conn, [0x00, 0xC0, 0x00, 0x00, s2], depth + 1)
+        return list(data) + list(more), final_s1, final_s2
+    return list(data), s1, s2
+
+
 def swap_nibbles(s: str) -> str:
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
@@ -115,45 +138,45 @@ USIM_AID_PREFIX = "A0000000871002"
 
 
 def _usim_aid_from_dir(conn) -> Optional[tuple[int, str]]:
-    """Scan EF_DIR records for the USIM application's AID. Prefers the 3GPP USIM AID;
-    falls back to the first application found. Returns (aid_len, aid_hex) or None."""
-    d, s1, s2 = conn.transmit(_hx("00a40004022f0000"))
-    if s1 != 0x61:
+    """Scan EF_DIR for the 3GPP USIM AID without assuming a record size/layout."""
+    _fcp, s1, s2 = _transmit(conn, _hx("00a40004022f0000"))
+    if (s1, s2) != (0x90, 0x00):
         return None
-    fcp, s1, s2 = conn.transmit(_hx("00C00000") + [s2])
-    if s1 != 0x90 or len(fcp) < 8:
-        return None
-    rec_len = fcp[7]
-    first = None
-    for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(_hx("00b2") + [rec, 0x04, rec_len])
-        # record template: 61 <len> 4F <aidlen> <AID...> [50 <len> label]
-        if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
+    for rec in range(1, 33):
+        # Le=0 lets the card provide its record length (directly or via 6Cxx).
+        data, s1, s2 = _transmit(conn, [0x00, 0xB2, rec, 0x04, 0x00])
+        if (s1, s2) in {(0x6A, 0x83), (0x94, 0x02)}:
             break
-        aid_len = d[3]
-        aid = "".join(f"{b:02X}" for b in d[4:4 + aid_len])
-        if len(aid) < aid_len * 2:
-            break
+        if (s1, s2) != (0x90, 0x00):
+            continue
+        aid_data = _find_tlv(data, 0x4F)
+        if not aid_data:
+            continue
+        aid_len = len(aid_data)
+        aid = "".join(f"{value:02X}" for value in aid_data)
         if aid.startswith(USIM_AID_PREFIX):
             return aid_len, aid
-        if first is None:
-            first = (aid_len, aid)
-    return first
+    return None
 
 
 def _select_adf_usim(conn) -> bool:
-    conn.transmit(_hx("00a40004023f0000"))
+    _data, s1, s2 = _transmit(conn, _hx("00a4000c023f00"))
+    if (s1, s2) != (0x90, 0x00):
+        return False
     got = _usim_aid_from_dir(conn)
     if not got:
         return False
     aid_len, aid = got
-    d, s1, s2 = conn.transmit(_hx("00a40404") + [aid_len] + _hx(aid))
-    return s1 == 0x61
+    _data, s1, s2 = _transmit(
+        conn, _hx("00a40404") + [aid_len] + _hx(aid) + [0x00])
+    return (s1, s2) == (0x90, 0x00)
 
 
 def _read_binary(conn, fid: str, length: int):
-    conn.transmit(_hx(f"00a4000402{fid}00"))
-    d, s1, s2 = conn.transmit(_hx(f"00b00000{length:02x}"))
+    _selected, s1, s2 = _transmit(conn, _hx(f"00a4000402{fid}00"))
+    if (s1, s2) != (0x90, 0x00):
+        return [], s1, s2
+    d, s1, s2 = _transmit(conn, _hx(f"00b00000{length:02x}"))
     return d, s1, s2
 
 
@@ -177,12 +200,22 @@ def _tlvs(data):
         i += length
 
 
+def _find_tlv(data, wanted: int) -> Optional[list[int]]:
+    """Find one value inside the simple nested templates used by EF_DIR/FCP."""
+    for tag, value in _tlvs(list(data)):
+        if tag == wanted:
+            return list(value)
+        if tag in (0x61, 0x62, 0x6F, 0xA5):
+            nested = _find_tlv(value, wanted)
+            if nested is not None:
+                return nested
+    return None
+
+
 def _read_transparent(conn, fid: str, max_length: int = 255) -> Optional[list[int]]:
     """Read one optional transparent EF under the selected ADF.USIM."""
-    selected, s1, s2 = conn.transmit(_hx(f"00a4000402{fid}00"))
-    if s1 == 0x61:
-        selected, s1, s2 = conn.transmit(_hx("00c00000") + [s2])
-    if s1 != 0x90:
+    selected, s1, s2 = _transmit(conn, _hx(f"00a4000402{fid}00"))
+    if (s1, s2) != (0x90, 0x00):
         return None
     body = selected
     if len(selected) >= 2 and selected[0] == 0x62:
@@ -195,9 +228,7 @@ def _read_transparent(conn, fid: str, max_length: int = 255) -> Optional[list[in
     if not size:
         return None
     size = min(size, max_length)
-    data, s1, s2 = conn.transmit(_hx("00b00000") + [size])
-    if s1 == 0x6C and s2:
-        data, s1, s2 = conn.transmit(_hx("00b00000") + [min(s2, max_length)])
+    data, s1, s2 = _transmit(conn, _hx("00b00000") + [size])
     return list(data) if s1 == 0x90 else None
 
 
@@ -278,10 +309,9 @@ def _read_smsc(conn) -> Optional[str]:
     and CHV1 verified (same as IMSI). Record layout (3GPP TS 31.102 4.2.27):
     [alpha(Y)][PI(1)][TP-DA(12)][TP-SC/SMSC(12)][PID][DCS][VP], Y = rec_len - 28.
     SMSC field = [len, TON/NPI, BCD digits...]."""
-    d, s1, s2 = conn.transmit(_hx("00a40004026f4200"))
-    if s1 != 0x61:
+    fcp, s1, s2 = _transmit(conn, _hx("00a40004026f4200"))
+    if (s1, s2) != (0x90, 0x00):
         return None
-    fcp, s1, s2 = conn.transmit(_hx("00c00000") + [s2])
     # FCP is an outer template: 0x62 <len> <nested TLVs>. Descend into it, then find the
     # File-Descriptor tag 0x82 whose bytes 3-4 hold the record length.
     body = fcp
@@ -297,14 +327,14 @@ def _read_smsc(conn) -> Optional[str]:
     if rec_len < 28:
         return None
     y = rec_len - 28
-    d, s1, s2 = conn.transmit(_hx("00b20104") + [rec_len])  # READ RECORD 1
+    d, s1, s2 = _transmit(conn, _hx("00b20104") + [rec_len])  # READ RECORD 1
     if s1 != 0x90 or len(d) < rec_len:
         return None
     return _decode_ton_bcd(d[y + 13:y + 25])
 
 
 def _pin_tries(conn) -> Optional[int]:
-    d, s1, s2 = conn.transmit(_hx("0020000100"))
+    d, s1, s2 = _transmit(conn, _hx("0020000100"))
     if s1 == 0x63:
         return s2 & 0x0F
     if (s1, s2) == (0x69, 0x83):
@@ -359,7 +389,7 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
     try:
         with _Tx(conn):
             # ICCID (EF 2FE2 under MF) - no PIN needed
-            conn.transmit(_hx("00a40004023f0000"))
+            _transmit(conn, _hx("00a4000c023f00"))
             d, s1, s2 = _read_binary(conn, "2fe2", 10)
             if s1 == 0x90:
                 info.iccid = dec_iccid("".join(f"{b:02x}" for b in d))
@@ -374,12 +404,11 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             # Optionally verify PIN in this same connection so IMSI becomes readable.
             if pin and tries is not None and tries >= MIN_TRIES:
                 body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
-                d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
+                d, s1, s2 = _transmit(conn, _hx("00200001") + [0x08] + body)
                 if (s1, s2) != (0x90, 0x00):
                     info.error = "wrong PIN" if s1 == 0x63 else f"pin sw={s1:02x}{s2:02x}"
             # IMSI (needs PIN normally; may fail if not verified)
-            conn.transmit(_hx("00a40004026f0700"))
-            d, s1, s2 = conn.transmit(_hx("00b0000009"))
+            d, s1, s2 = _read_binary(conn, "6f07", 9)
             if s1 == 0x90:
                 imsi = dec_imsi("".join(f"{b:02x}" for b in d))
                 if imsi:
@@ -394,8 +423,7 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             elif (s1, s2) == (0x69, 0x82):
                 info.pin_enabled = True     # security status not satisfied = PIN required
             # EF_AD (6FAD) for MNC length
-            conn.transmit(_hx("00a40004026fad00"))
-            d, s1, s2 = conn.transmit(_hx("00b0000004"))
+            d, s1, s2 = _read_binary(conn, "6fad", 4)
             if s1 == 0x90 and len(d) >= 4:
                 info.mnc_len = d[3]
                 if info.imsi:
@@ -466,7 +494,7 @@ def verify_pin(pin: str, reader_index: int = 0) -> dict:
             if tries is not None and tries < MIN_TRIES:
                 return {"ok": False, "error": f"refusing: only {tries} tries left", "tries": tries}
             body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
-            d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
+            d, s1, s2 = _transmit(conn, _hx("00200001") + [0x08] + body)
             if (s1, s2) == (0x90, 0x00):
                 return {"ok": True, "tries": 3}
             if s1 == 0x63:
@@ -494,7 +522,7 @@ def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
                 return {"ok": False, "error": f"refusing: only {tries} tries left"}
             ob = [ord(c) for c in old] + [0xFF] * (8 - len(old))
             nb = [ord(c) for c in new] + [0xFF] * (8 - len(new))
-            d, s1, s2 = conn.transmit(_hx("00240001") + [0x10] + ob + nb)  # CHANGE CHV1
+            d, s1, s2 = _transmit(conn, _hx("00240001") + [0x10] + ob + nb)  # CHANGE CHV1
             if (s1, s2) == (0x90, 0x00):
                 return {"ok": True}
             if s1 == 0x63:
@@ -522,7 +550,7 @@ def set_pin_enabled(pin: str, enabled: bool, reader_index: int = 0) -> dict:
                 return {"ok": False, "error": f"refusing: only {tries} tries left"}
             body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
             # ENABLE (0x28) / DISABLE (0x26) CHV1: 00 26/28 00 01 08 <pin padded FF>
-            d, s1, s2 = conn.transmit(_hx(f"00{ins}0001") + [0x08] + body)
+            d, s1, s2 = _transmit(conn, _hx(f"00{ins}0001") + [0x08] + body)
             if (s1, s2) == (0x90, 0x00):
                 return {"ok": True}
             if s1 == 0x63:

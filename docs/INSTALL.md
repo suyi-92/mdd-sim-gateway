@@ -1,97 +1,369 @@
-# 安装与升级
+# VMware 安装、更新与迁移
 
-## 支持环境
+本文只描述 `vmware` 分支。它不支持 WSL/usbipd、ARM64、Docker Control、GitHub Release
+资产或云端编译。
 
-- 推荐 ARM64 Debian、Ubuntu 或 Armbian，systemd 可用。
-- Docker、USB、内核 TUN、pcscd；蜂窝模块还需要 ModemManager/NetworkManager。
-- 已实机验证的三体电子 SCR Prime（`04d9:c001`）提供标准 CCID 接口，但尚未进入 libccid 1.6.2 的设备表。连接该型号时执行 `sudo ./install.sh patchprime`，安装程序会从校验过的固定版本源码构建驱动并加入设备匹配；完成后支持热插拔。
-- 根文件系统至少 4 GiB 可用空间；建议使用 16 GB 或更大的系统盘，并在升级前保留约 6 GiB，
-  供新镜像、当前镜像和一代回滚镜像在切换期间共存。虚拟机扩展虚拟硬盘后还必须扩展根分区
-  与文件系统，以 `df -h /` 为准，不能以控制台显示的虚拟硬盘容量为准。正式源码包的全新安装
-  和一键升级都会按主机架构下载 CI 在原生
-  ARM64/amd64 runner 构建的 Engine，并按校验和、架构、版本与源码指纹核验；设备不再为
-  Engine 编译 Asterisk。Docker 控制面模式还会下载相同架构的 Control 镜像，原生控制面
-  模式只下载 Engine。另一种架构的资产不会下载，导入后的压缩包会立即删除。同一 Engine
-  以多架构清单发布到 GHCR，供手工安装与独立核验。
-- 手工执行全新 Engine 构建时，固定 commit 从项目维护的 GitHub sysmocom 镜像获取；
-  镜像只保存构建所需的上游分支，原始项目与许可归属不变。离线迁移仍可使用已经审核的
-  `MDD_ENGINE_BASE_IMAGE`，不得关闭 TLS 验证或改用未审核源码。
+## 1. 固定部署模型
 
-## 安装
-
-```bash
-sudo ./install.sh install                 # 原生控制面 + Docker 引擎
-sudo ./install.sh install --mode docker   # 控制面也运行在 Docker
+```text
+Windows x86_64 + VMware Workstation
+└─ x86_64 Linux 客户机（桥接网络）
+   ├─ systemd: mdd-sim-gateway-control
+   ├─ systemd: mdd-sim-gateway-orchestrator
+   ├─ rootful Docker: 每条 SIM 一个 Engine
+   ├─ USB: SCR Prime 04d9:c001
+   └─ USB: Quectel 类复合蜂窝模块
 ```
 
-从 GitHub Release 下载的正式源码包包含 CI 生成的镜像校验清单，安装程序会默认取得本机架构
-的预构建资产。开发 checkout 没有该清单，仍从源码构建；正式源码包也可显式设置
-`MDD_BUILD_IMAGES=1` 进行审核用源码构建。Release 资产下载或身份校验失败时安装会停止，不会
-悄悄退回一次耗时且占用大量临时空间的编译。
+支持的客户机版本只有：
 
-可用环境变量：`MDD_PORT`、`MDD_DATA_DIR`、`MDD_BIND`、`MDD_ADVERTISE_ADDR`、`MDD_SINGBOX_VERSION`、`MDD_XRAY_VERSION`、`MDD_LPAC_VERSION`。安装程序会校验 sing-box 与 Xray-core 归档的 SHA-256；Xray-core 仅用于 Reality/XHTTP 节点的本机回环兼容层。更换固定依赖版本时必须同步审核并更新 SHA-256。离线迁移或显式执行源码构建时，可设置 `MDD_ENGINE_BASE_IMAGE`，从本机已审核的兼容引擎镜像创建只覆盖 MDD 运行脚本与模板的镜像；已经在可信构建机完成 `npm ci && npm run build` 时，也可设置 `MDD_REUSE_WEBUI=1` 复用随源码传入的 `webui/dist`。正式源码包的全新在线安装不需要设置这两项，安装程序会默认使用经校验的预构建镜像。必须执行全量 Engine 构建、但安装网络无法访问默认 GitHub mirror 时，可将 `PJPROJECT_REPOSITORY` 和 `ASTERISK_REPOSITORY` 显式指向另一条经过审核且包含相同固定 commit 的 HTTPS Git 仓库；未设置时继续使用 Dockerfile 中的项目 mirror。不得关闭 TLS 验证或改用未经审核的源码。
+- Ubuntu 24.04
+- Ubuntu 26.04
+- Debian 12
+- Debian 13
 
-`MDD_DATA_DIR` 在首次安装后会写入系统状态；后续执行 `status`、`reload` 和 `uninstall` 时不必再次填写，避免自定义数据目录被误判为新安装。
+其他发行版、架构、容器客户机和非 systemd init 会明确停止。
 
-如果系统 Docker 已经可以连接，安装脚本只复用它，不升级版本、不修改 daemon 配置，也不
-操作其他项目的容器、镜像或卷。MDD 容器带有归属标签；发现同名外部容器、8443 端口冲突或
-rootless Docker 时会停止并给出错误。切换到正式预构建镜像后会执行一次保守的
-`docker builder prune`（不带 `--all`），清理由旧版现场编译留下且 Docker 已判定为 dangling
-的构建缓存；它不删除任何镜像、容器或卷。由于旧版使用 Docker 的共享默认 builder，历史缓存
-没有项目标签，Docker 无法进一步只按 MDD 归属筛选。蜂窝与 TUN/PCSC 引擎需要系统级 Docker
-daemon，因此不支持 rootless 模式。
+## 2. 创建 VM
 
-“系统设置 → 维护”会分别显示 Docker 镜像和构建缓存的实际可回收空间。“清理构建缓存”只执行
-Docker 的保守 dangling-only 清理；“清理旧版与回滚镜像”是显式放弃一键回滚的操作，只删除
-未被任何容器使用的 MDD 历史镜像，并保留当前 Engine/Control 与可信 Engine 基础镜像。两项
-操作都不会删除容器、卷或其他项目镜像。
+建议值：
 
-版本检查始终使用 GitHub Release API，不读取或发送 GitHub Token。配置的仓库不可访问或尚未发布 Release 时，界面会显示尚无可用发布版本。
+- 4 vCPU；
+- 8 GiB RAM；
+- 64 GiB 动态磁盘；
+- 一张桥接网卡；
+- USB 3.1 控制器。
 
-安装完成后，在受信的局域网或 VPN 中立即打开 `https://主机地址:8443`，创建至少 10 字符的管理员密码。首次设置完成前，任何能访问该端口的客户端都可申领初始管理员。配置自有证书时，证书和私钥应只允许 root 读取。运行数据目录默认为 `0700`，凭据文件为 `0600`。
+硬门禁：RAM 少于 4 GiB、根文件系统可用空间少于 12 GiB或根文件系统总容量少于
+20 GiB 时停止。RAM 少于 8 GiB或可用空间少于 25 GiB 时警告。
 
-## 更新
-
-系统设置可在“自动更新”和“提示更新”中二选一，并分别选择全部版本或主版本。`update-policy.json` 为两类用户保存独立目标：`channels.all` 始终指向获准推送的最新正式 Release，`channels.main` 指向当前获准推送的主版本，即使其后已经发布补丁，落后的主版本设备仍能按 tag 找到并安装该版本。新安装默认自动更新主版本；每个通道仍须匹配目标版本并到达自己的 `not_before` 时间，单纯发布 Release 不会触发安装。提示模式默认提示全部版本，左下角版本号出现红点后，由管理员查看说明并确认“立即升级”。更新时控制面把请求写入编排器目录，主机上的 `mdd-sim-gateway-orchestrator` 以独立的临时 systemd 单元（`mdd-sim-gateway-update`）运行 `host/mdd_update.py` —— 下载对应 `vX.Y.Z` Release 资产、校验 SHA-256 和版本，并比较新源码与本机 Engine 指纹。Engine 输入发生变化时，更新器通过同一条直连或代理回退线路下载该版本与主机架构匹配的 Engine 资产，校验后导入 Docker，再核对架构、版本和两类指纹；输入未变化时不会重复下载。备份与覆盖源码后，安装器保存旧 Engine 的 `:previous` 回滚标签，启用新镜像并只重建旧镜像上的线路，控制面重新扫描在位 SIM 使线路自愈。Docker 控制面模式还会取得同架构、已校验的 Control 镜像并执行 `docker load`。`data/`、`.env`、`.git` 和虚拟环境均保留。日志见 `journalctl -u mdd-sim-gateway-update`、数据目录下 `update/reload.log` 与 `update/engine-image.log`。
-
-“系统设置 → 备份与更新”默认使用“自动”联网：先直连 GitHub，连接失败、超时或被限流时，再按代理库顺序尝试可用条目；检查成功的线路会继续用于更新下载。也可选择“仅直连”或指定一个代理库条目。SOCKS5 条目可直接使用；订阅、具体节点和导入的 outbound 需已分配给一个已启用且就绪的国家出口。代理凭据只保存一份，并只通过主机权限为 `0600` 的配置/临时文件传递，不写入 systemd 命令行或升级状态。
-控制面不依赖浏览器登录，每 6 小时检查一次 Release。提示更新模式会通过已启用的 Webhook、Telegram 或 PushPlus 通道发送一次去重通知；“全部版本”检查 GitHub 最新 Release，“仅主版本”检查策略中独立配置的主版本 tag，不从版本号位数推断。
-正式 Release 归档包内含 CI 预构建的 `webui/dist`，一键升级校验整个归档后直接复用，因此不需要在树莓派上下载 Node 镜像或编译前端。GitHub `main` 与其 Release 是唯一支持的更新通道。
-
-`v1.4.1` 的升级器早于多架构 Release 资产，完成源码校验后会调用新版本安装器并要求保留旧
-Engine。为允许用户直接跨级，正式源码包额外携带镜像校验清单；新安装器会读取旧升级任务
-尚未删除的私有线路文件，以相同的直连和代理候选下载、校验并导入与主机架构、实际安装模式
-匹配的 Engine 与 Control。从 v1.5.3 起 ARM64 与 amd64 都会取得各自的预构建镜像。接力只在
-旧升级任务的私有网络文件仍存在时触发，不改变日常手工执行 `--no-engines` 的含义；校验清单
-作为正式包元数据保留，供重复安装继续使用预构建资产。
-
-已经安装的 **amd64 + Docker 控制面 v1.4.x** 还有一个旧升级器自身无法由目标版本修补的
-前置问题：它会在覆盖新源码之前固定下载 ARM64 Control 资产并中止。此类设备升级到 v1.5.3
-前需执行一次以下引导，让旧升级器跳过这一步；这不会停止或迁移当前 Docker 控制面：
+扩大 VMware 虚拟磁盘后，还要在客户机内扩展分区、LVM（如有）和文件系统：
 
 ```bash
-MDD_DATA_DIR=$(sudo sed -n '1p' /etc/mdd-sim-gateway/data-dir)
-test -n "$MDD_DATA_DIR" && test -d "$MDD_DATA_DIR"
-sudo cp -p "$MDD_DATA_DIR/install-mode" "$MDD_DATA_DIR/install-mode.pre-v1.5.3"
-printf 'local\n' | sudo tee "$MDD_DATA_DIR/install-mode" >/dev/null
+lsblk -f
+findmnt /
+df -hT /
 ```
 
-随后从 WebUI 正常执行更新。v1.5.3 安装器会从仍在运行的 Control 容器识别真实 Docker 模式，
-下载 amd64 Engine 与 Control，并在服务成功恢复后把 `install-mode` 自动写回 `docker`。若更新
-在新源码接管前失败，可用
-`sudo cp "$MDD_DATA_DIR/install-mode.pre-v1.5.3" "$MDD_DATA_DIR/install-mode"` 恢复标记后排查。
-ARM64 Docker、原生控制面以及已进入 v1.5.x 的安装不需要这一步，也不需要先安装其他桥接版本。
+目标设备名必须来自当前 `lsblk`；不要照抄别人的 `/dev/sda3`。安装器以 `df` 看到的根
+文件系统为准。
 
-也可以随时在主机上手动更新：备份并用受信任来源更新源码后执行：
+## 3. 桥接网络与 DHCP 保留
+
+1. Workstation 中选择 Bridged，不使用 NAT。
+2. 记录 VM 网卡 MAC。
+3. 在路由器中为该 MAC 创建 DHCP 地址保留。
+4. 客户机启动后记录：
+
+   ```bash
+   ip -4 route show default
+   ip -4 route get 1.1.1.1
+   ip -br address
+   ```
+
+安装器在安装 NetworkManager 前也会记录默认网卡、网关、源地址和 JSON 快照：
+
+```text
+/etc/mdd-sim-gateway/network/
+```
+
+如果主网卡原本不由 NetworkManager 管理，安装器写入
+`/etc/NetworkManager/conf.d/90-mdd-cellular-only.conf`，只让 NetworkManager 管理 GSM
+设备。如果主网卡本来就由 NetworkManager 管理，则保留原管理方式。安装后默认网卡、网关
+或源地址变化会移除 MDD 策略、恢复原后端状态并停止，不继续部署一个可能失联的网关。
+
+## 4. USB 直通
+
+在 Workstation 图形界面中完成：
+
+- 连接三体电子 SCR Prime `04d9:c001` 到客户机；
+- 连接**整个** Quectel USB 复合设备到客户机；
+- 为这两个具体设备启用随 VM 连接；
+- 不启用“所有新 USB 自动连接”；
+- 确认 Windows VMware USB Arbitration Service 正常；
+- 确认连接到 VM 后 Windows 不再占用设备。
+
+只透传某个 Windows COM 口不能提供 USB 控制、QMI/MBIM、WWAN 和全部 tty 接口。
+
+客户机中的预安装检查：
 
 ```bash
-sudo ./install.sh reload --engines
+lsusb -d 04d9:c001
+lsusb
+lsusb -t
 ```
 
-该方式保留数据并从固定源码重建依赖与引擎；正式一键升级优先使用 CI 分发镜像。
+## 5. 一键安装
 
-正式发布前请逐项完成 [发布检查清单](RELEASE_CHECKLIST.md)。推送与 `VERSION` 一致的 `vX.Y.Z` 标签后，Release 工作流会运行全套测试，并生成带 SHA-256 校验文件的源码包。
+以普通用户执行：
 
-## 卸载
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
+```
 
-`sudo ./install.sh uninstall` 保留数据；`--purge` 会删除运行数据与虚拟环境，无法恢复。卸载只移除确认属于 MDD 的容器；Docker 本身及其他项目不受影响。
+安全边界：
+
+1. 流式 bootstrap 不接受 root 身份；
+2. 先集中执行一次 `sudo -v`；
+3. Git 源码由普通用户克隆到 `mktemp` 目录；
+4. 核对 remote 精确等于 `https://github.com/suyi-92/mdd-sim-gateway.git`；
+5. root 只执行已下载到本地的 `install.sh`。
+
+### 参数
+
+| 参数 | 作用 |
+|---|---|
+| `install` | 全新安装或幂等重复安装 |
+| `update` | 转发到已安装的 `mddctl update` |
+| `doctor` | 转发到已安装的 `mddctl doctor` |
+| `--install-dir PATH` | 受管源码，默认 `/opt/mdd-sim-gateway` |
+| `--data-dir PATH` | 运行数据，默认 `/var/lib/mdd-sim-gateway` |
+| `--ref vmware` | 安装当前远端分支 |
+| `--ref <40 位 commit>` | 安装精确提交；提交必须可获取 |
+| `--require-scr-prime` | SCR Prime 全链路任一门禁失败即停止 |
+| `--require-cellular` | `mmcli -L` 无 modem 即停止 |
+| `--configure-firewall` | 明确授权写入精确 MDD 规则 |
+| `--no-start` | 构建并安装 unit，但不启动服务 |
+| `--dry-run` | 只显示参数和预检意图 |
+| `--yes` | 接受普通确认；不跳过硬门禁 |
+| `--no-cache` | 仅 update 使用，强制 Engine 无缓存构建 |
+| `--json` | 仅 doctor 使用，输出脱敏 JSON |
+
+路径必须是绝对非根路径，不能包含换行或空白。
+
+## 6. 安装阶段
+
+### 6.1 预检
+
+- `uname -m == x86_64`；
+- systemd 是 PID 1；
+- `/dev/net/tun` 是字符设备；
+- 8443/TCP 未被非 MDD 进程占用；
+- rootful Docker；
+- RAM、根文件系统和空间达到门槛；
+- 虚拟化类型不是 VMware 时警告。
+
+### 6.2 发行版软件包
+
+使用 apt 安装发行版版本的：
+
+```text
+docker.io
+modemmanager
+network-manager
+pcscd / pcsc-tools / libccid
+python3 / python3-venv / build-essential
+Git / curl / wget / jq
+PCSC、USB、OpenSSL、libcurl、autotools、Meson、Ninja 编译依赖
+```
+
+安装器不会写 `/etc/docker/daemon.json`，不会切换 Docker 数据目录，不会删除非 MDD 容器、
+镜像或卷。rootless Docker 会停止，因为 Engine 需要 TUN、NET_ADMIN 和主机 PC/SC socket。
+
+ModemManager drop-in 使用 `--debug` 开启受保护的 command interface，启动后立即通过 D-Bus
+把运行日志降回 INFO：
+
+```text
+/etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
+```
+
+### 6.3 固定依赖
+
+安装器按固定版本和 SHA-256 获取 sing-box、Xray-core、CCID、vsmartcard、lpac 和必要时的
+CMake。Engine Dockerfile还会按固定提交取得 Asterisk 与 pjproject。首次安装需要网络，不是
+离线安装；固定版本和摘要用于阻止上游文件被静默替换。
+
+### 6.4 SCR Prime
+
+流程：
+
+1. `lsusb -d 04d9:c001`；
+2. 启动 pcscd；
+3. 有超时的 `pcsc_scan -n`；
+4. 能列出 SCR Prime：记录 `native`；
+5. USB 可见、PC/SC 不可见：下载 CCID 1.6.2，验证 SHA-256，只应用
+   `03_scr_prime_reader.patch`，在临时 DESTDIR 构建；
+6. 备份原 `ifd-ccid.bundle`，原子替换并记录 root-only JSON 元数据；
+7. 只有确实替换发行版 bundle 时才 `apt-mark hold libccid`；
+8. 发布 `orchestrator/pcsc-maintenance` 后重启 pcscd；
+9. 再次确认 reader 和 ATR；
+10. 按终端提示拔出、确认 USB 消失、重新连接并确认 PC/SC 自动恢复。
+
+补丁元数据：
+
+```text
+/etc/mdd-sim-gateway/scr-prime-driver.json
+/etc/mdd-sim-gateway/driver-backups/<UTC 时间>/
+/etc/mdd-sim-gateway/scr-prime-mode
+```
+
+元数据包含设备 ID、CCID 版本、唯一补丁、usbdropdir、包版本、备份路径和安装前后哈希，
+不包含 SIM 身份。
+
+### 6.5 Quectel
+
+验收顺序：
+
+```bash
+lsusb
+lsusb -t
+ls -l /dev/ttyUSB* /dev/cdc-wdm* /dev/wwan* 2>/dev/null
+mmcli -L
+mmcli -m <对象>
+nmcli device status
+```
+
+`--require-cellular` 最多等待约 90 秒让 ModemManager 完成探测。必须看到 `/Modem/` 对象。
+后续在 WebUI 中建立第二条 SIM 线路并打开 4G，NetworkManager 才按线路配置建立 GSM profile
+和 bearer。
+
+### 6.6 本地构建与原子切换
+
+- Control：临时 venv，按 `control/requirements.txt` 安装；
+- WebUI：固定到 amd64 manifest digest 的 `node:22.14.0-bookworm-slim` 容器中
+  `npm ci && npm run build`；
+- Engine：`mdd-sim-gateway/engine:<40 位提交>`；
+- 构建目录：`/var/cache/mdd-sim-gateway/builds/<提交>/`；
+- 激活：原子切换 `/opt/mdd-sim-gateway/.venv` 和 `webui/dist` symlink，再把已验证 Engine
+  标为 `mdd-sim-gateway/engine:latest`。
+
+Engine 门禁：
+
+- Architecture 为 amd64；
+- OCI source revision 等于当前提交；
+- OCI product version 等于仓库 `VERSION`，镜像 ID/大小与构建 manifest 一致；
+- runtime/base fingerprint 与当前源码一致；
+- Asterisk 可执行并有合理模块数量；
+- `jinja2`、`requests`、`pyscard`、`cryptography` 可导入；
+- Control venv 通过 `pip check`，正式 WebUI 树哈希与构建 manifest 一致；
+- 最小容器在 `/dev/net/tun + NET_ADMIN` 下可创建并删除 TUN。
+
+## 7. 目录和服务
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/mdd-sim-gateway` | 受管 Git 工作树 |
+| `/var/lib/mdd-sim-gateway` | 数据库、配置、证书、日志、线路状态、凭据 |
+| `/var/backups/mdd-sim-gateway` | 默认备份位置 |
+| `/etc/mdd-sim-gateway` | root-only 机器状态、网络和驱动元数据 |
+| `/var/cache/mdd-sim-gateway` | 本地构建、源码依赖缓存、临时 update worktree |
+| `/usr/local/sbin/mddctl` | 唯一管理入口 |
+
+systemd units：
+
+```text
+mdd-sim-gateway-control.service
+mdd-sim-gateway-orchestrator.service
+```
+
+安装后：
+
+```bash
+sudo mddctl status
+sudo mddctl doctor
+sudo mddctl doctor --json
+```
+
+然后在受信 LAN/VPN 打开 `https://<DHCP 保留地址>:8443` 并创建至少 10 字符的管理员密码。
+
+## 8. 防火墙
+
+默认前两条自动分配线路：
+
+```text
+8443/tcp
+8089/tcp, 8099/tcp
+10000-10011/udp
+12000-12011/udp
+```
+
+未指定 `--configure-firewall` 时不写防火墙。安装器会读取已有线路，并用与自动建线相同的
+TCP/UDP 占用探测预测不足两条时的端口块；如果 UFW 已启用，授权后只添加这份精确清单。
+如果是自定义 nftables，安装器把 MDD 规则保存在 `/etc/mdd-sim-gateway/mdd-sim-gateway.nft`
+并明确提示把它接入发行版持久化策略；管理员仍应复核自己的 chain/priority 语义。
+
+线路使用手工 SIP base 或自动分配器跳过冲突端口时，端口会变化；以 WebUI 中保存的实际
+port block 和 `mddctl doctor` 为准，再调整规则。
+
+## 9. 更新
+
+```bash
+sudo mddctl update
+sudo mddctl update --no-cache
+```
+
+预检：
+
+- 受管目录是 Git 工作树；
+- origin URL 精确匹配；
+- 当前分支是 `vmware`；
+- 没有 staged、unstaged、未忽略 untracked、冲突或进行中的 Git 操作。
+
+然后：
+
+1. `fetch origin vmware`；
+2. 当前 HEAD 等于远端：只重探测 SCR Prime 原生驱动并结束；
+3. 当前 HEAD 必须是远端祖先，否则停止；
+4. 在临时 worktree 执行 Bash 语法、Python compile、单元测试和全部本地构建；
+5. 重探测发行版 SCR Prime 驱动；
+6. 创建更新前数据备份并保留旧 Engine tag；
+7. 停止 Control、orchestrator 和全部带 MDD Engine 标签的运行容器；
+8. `merge --ff-only origin/vmware`；
+9. 激活已验证产物并启动；
+10. 检查 HTTPS、systemd、Docker/TUN 和必需硬件。
+
+任何激活/健康失败都会在确认工作树仍干净后：
+
+- 把受管 checkout 回到旧提交；
+- 激活旧 venv/WebUI；
+- 恢复旧 Engine tag；
+- 恢复更新前数据快照；
+- 启动并验证旧版本。
+
+成功后保留一代旧提交身份、Engine 和数据备份。构建缓存不会被更新命令自动批量删除。
+
+## 10. 备份、恢复和整机迁移
+
+```bash
+sudo mddctl backup
+sudo mddctl backup --output /mnt/encrypted/mdd-data.tar.gz
+sudo mddctl restore --input /mnt/encrypted/mdd-data.tar.gz
+```
+
+备份：停止服务和 Engine，SQLite WAL checkpoint + integrity check，拒绝符号链接/特殊文件，排除 cache/update/tmp，
+生成 tar.gz、`.sha256` 和 manifest，然后恢复原运行状态。
+
+恢复：要求归档与同名 `.sha256`；拒绝绝对路径、`..`、symlink、hardlink、设备节点、错误
+manifest 和损坏 SQLite；现有数据先移动到 `.pre-restore-<时间>`，新数据从临时目录原子替换。
+健康失败会把失败数据另存并恢复旧数据。
+
+备份含明文凭据，只能放在受控加密介质。跨电脑首选停止 MDD、关闭 VM 后复制/导出整个
+VM，因为 USB 自动连接、VM MAC、DHCP 保留和防火墙属于机器状态，不在数据归档内。
+
+## 11. 卸载
+
+```bash
+sudo mddctl uninstall
+sudo mddctl uninstall --purge
+```
+
+普通卸载保留数据与备份。`--purge` 要求输入 `PURGE`，删除源码、缓存、运行数据和备份。
+卸载只删除带 MDD 标签的 Engine 容器/镜像和 MDD 自有 unit/规则；不卸载 Docker，不处理
+其他项目。若 MDD 修改过 SCR Prime 驱动，会先按元数据和哈希安全恢复发行版 libccid。
+
+## 12. 四发行版验收矩阵
+
+每个系统必须分别记录：
+
+| 门禁 | Ubuntu 24.04 | Ubuntu 26.04 | Debian 12 | Debian 13 |
+|---|---:|---:|---:|---:|
+| 全新一键安装 | 待实机 | 待实机 | 待实机 | 待实机 |
+| 重复安装 | 待实机 | 待实机 | 待实机 | 待实机 |
+| 无更新 / 快进 update | 待实机 | 待实机 | 待实机 | 待实机 |
+| 构建/健康失败回滚 | 待实机 | 待实机 | 待实机 | 待实机 |
+| 桥接地址与默认路由不变 | 待实机 | 待实机 | 待实机 | 待实机 |
+| SCR USB / PCSC / ATR / 热插拔 | 待实机 | 待实机 | 待实机 | 待实机 |
+| Quectel modem / bearer / IP | 待实机 | 待实机 | 待实机 | 待实机 |
+| 两线路并发 IMS/通话/音频 | 待实机 | 待实机 | 待实机 | 待实机 |
+
+只有真实完成后才能把对应“待实机”改为“通过”。

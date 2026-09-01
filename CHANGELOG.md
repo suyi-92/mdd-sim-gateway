@@ -4,6 +4,43 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Added the VMware source-build deployment path for x86_64 Ubuntu 24.04/26.04 and Debian 12/13,
+  with an ordinary-user streaming bootstrap, native systemd Control/WebUI, commit-specific Engine
+  builds, `mddctl` lifecycle/update/doctor/backup/restore commands, bridged-network protection, and
+  explicit four-VM acceptance gates.
+- Added SCR Prime `04d9:c001` evidence-led setup: use distribution libccid when it already works;
+  otherwise build CCID 1.6.2 with only patch 03, record hashes/backups/package hold, validate ATR
+  and hotplug, and provide a metadata-checked driver restore path.
+- Added configurable `max_sim_lines` with a default of 13 and a validated 1–32 range shared by
+  settings, provisioning, API and every Engine start path.
+
+### Changed
+
+- Based the VMware product on upstream v1.7.0 while retaining Feishu, IKE-SA rekey, native-reader
+  recovery, Xray error reporting and notification routing. Migrated the platform-neutral UICC,
+  identity, SMSC, egress, Fake-IP, CMLink UK, port-probing and shutdown fixes from the Windows fork.
+- Ordinary PC/SC readers can omit IMEI, and an unavailable SMSC disables only outbound VoWiFi SMS.
+  Country exits now distinguish saved assignments from running nodes and persist a changed route
+  before performing its bounded UDP test.
+
+### Removed
+
+- Removed all GitHub Actions, Issue-analysis automation, GitHub Release checks/installation,
+  updater APIs/polling/events/settings, Docker Control, release manifests and precompiled-project
+  handoff logic. The WebUI now directs updates and transactional backups to `mddctl`.
+- Removed WSL/usbipd/PowerShell paths and portable/LFS delivery assumptions from the VMware
+  installation model.
+
+### Fixed
+
+- Fixed UICC `61xx`/`9Fxx` continuation and `6Cxx` length correction, nested EF_DIR handling and
+  strict shared USIM AID selection across PIN, IKE and SIP paths.
+- Fixed stale-disabled eSIM activation, Fake-IP ePDG pinning and browser SDP filtering, real
+  TCP/UDP port conflict probing, failed `Created` container cleanup, and interruptible fast service
+  shutdown.
+
 ## [1.7.0] - 2026-09-01
 
 ### Added

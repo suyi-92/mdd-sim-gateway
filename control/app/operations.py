@@ -1,8 +1,4 @@
-"""Safe local administration helpers for the unified WebUI.
-
-Backups stay on the gateway (they contain credentials). Support bundles are downloadable but
-strictly redacted and contain only configuration shape, status and bounded log tails.
-"""
+"""Safe diagnostics and bounded maintenance helpers for the unified WebUI."""
 from __future__ import annotations
 
 import io
@@ -11,7 +7,6 @@ import os
 from collections import deque
 from pathlib import Path
 import re
-import tarfile
 import time
 import zipfile
 
@@ -166,11 +161,9 @@ SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
 # still measured and pruned below; this budget keeps that fallback exceptional.
 SUPPORT_BUNDLE_CONTENT_BYTES = 8 * 1024 * 1024
 
-_MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
+_MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/engine:",)
 _CURRENT_IMAGE_TAGS = {
     "mdd-sim-gateway/engine:latest",
-    "mdd-sim-gateway/control:latest",
-    "mdd-sim-gateway/engine-base:trusted",
 }
 
 
@@ -284,46 +277,6 @@ def call_event_evidence(text: str) -> str:
             safe["ts"] = int(record["ts"])
         out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True))
     return "\n".join(out)
-
-
-def create_local_backup(system_name: str = "gateway") -> dict:
-    """Create a root-local recovery archive. It is intentionally not returned over HTTP."""
-    root = Path(cfg.DATA_DIR).resolve()
-    target_dir = root / "backups"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = target_dir / f"{_safe_name(system_name)}-{stamp}.tar.gz"
-    with tarfile.open(target, "w:gz") as archive:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or target_dir in path.parents:
-                continue
-            archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
-    os.chmod(target, 0o600)
-    return {"ok": True, "name": target.name, "created_at": int(time.time()),
-            "size": target.stat().st_size, "location": "gateway-local"}
-
-
-def list_local_backups() -> list[dict]:
-    root = Path(cfg.DATA_DIR) / "backups"
-    result = []
-    for path in sorted(root.glob("*.tar.gz"), reverse=True) if root.exists() else []:
-        stat = path.stat()
-        result.append({"name": path.name, "created_at": int(stat.st_mtime),
-                       "size": stat.st_size, "location": "gateway-local"})
-    return result[:50]
-
-
-def delete_local_backup(name: str) -> dict:
-    """Delete one named local backup without allowing paths outside the backup directory."""
-    name = str(name or "")
-    if (Path(name).name != name or not re.fullmatch(r"[A-Za-z0-9_.-]+\.tar\.gz", name)):
-        raise ValueError("invalid backup name")
-    root = (Path(cfg.DATA_DIR) / "backups").resolve()
-    target = root / name
-    if not target.is_file():
-        raise FileNotFoundError(name)
-    target.unlink()
-    return {"ok": True, "name": name}
 
 
 SERVICE_RESTART_SCOPES = ("control", "services", "host")

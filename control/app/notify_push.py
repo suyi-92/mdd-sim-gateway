@@ -72,9 +72,6 @@ EV_MISSED_CALL = "missed_call"
 # Somebody left a message. Announced separately from the missed call itself because the
 # action it invites is different: there is now something to listen to.
 EV_VOICEMAIL = "voicemail_received"
-# A new MDD Sim Gateway Release is available. This is a gateway-level event and therefore
-# carries no SIM identity; update settings decide whether patch-only releases are announced.
-EV_SOFTWARE_UPDATE = "software_update"
 
 _TIMEOUT = 8  # seconds; keep short so a dead endpoint never piles up threads
 _TOKEN = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
@@ -170,7 +167,6 @@ def _events_enabled(chan: dict) -> dict:
         EV_BALANCE_LOW: ev.get(EV_BALANCE_LOW, True),
         EV_MISSED_CALL: ev.get(EV_MISSED_CALL, True),
         EV_VOICEMAIL: ev.get(EV_VOICEMAIL, True),
-        EV_SOFTWARE_UPDATE: ev.get(EV_SOFTWARE_UPDATE, True),
     }
 
 
@@ -193,8 +189,7 @@ def build_payload(event: str, instance: dict, source: str, text: str | None) -> 
         "from": source or "",                             # the event's source number
         "text": text if event in (EV_INCOMING_SMS, EV_HOST_ALERT, EV_NUMBER_CHANGED,
                                   EV_LINE_UNRECOVERABLE, EV_KEEPALIVE_RESULT,
-                                  EV_BALANCE_LOW, EV_VOICEMAIL,
-                                  EV_SOFTWARE_UPDATE) else None,
+                                  EV_BALANCE_LOW, EV_VOICEMAIL) else None,
     }
 
 
@@ -205,8 +200,7 @@ BRAND = "MDD"
 
 
 def _titled(text: str) -> str:
-    """Prefix once. The software-update title already carries the product name, so a blind
-    prefix would render it as "MDD · MDD Sim Gateway …"."""
+    """Prefix a notification title exactly once."""
     return text if text.startswith(BRAND) else f"{BRAND} · {text}"
 
 
@@ -236,9 +230,6 @@ def _default_notification_message(payload: dict) -> dict:
             lines.append(f"本机号码: {own}")
         lines.append(f"来源号码: {sender}")
         return {"title": _titled(f"未接来电 · {sim}"), "content": "\n".join(lines)}
-    if event == EV_SOFTWARE_UPDATE:
-        return {"title": _titled(f"MDD Sim Gateway 新版本 · v{sender}"),
-                "content": payload.get("text") or ""}
     title = _titled(f"VoWiFi {'短信' if event == EV_INCOMING_SMS else '来电'} · {sim}")
     lines = [f"SIM: {sim}"]
     if own:
@@ -278,7 +269,7 @@ _MAX_MESSAGE_TEMPLATE_LENGTH = 4000
 NOTIFICATION_EVENTS = {
     EV_INCOMING_SMS, EV_INCOMING_CALL, EV_HOST_ALERT, EV_NUMBER_CHANGED,
     EV_LINE_UNRECOVERABLE, EV_KEEPALIVE_RESULT, EV_BALANCE_LOW, EV_MISSED_CALL,
-    EV_VOICEMAIL, EV_SOFTWARE_UPDATE,
+    EV_VOICEMAIL,
 }
 
 
@@ -554,9 +545,6 @@ def _default_telegram_text(payload: dict) -> str:
         return "\n".join([_telegram_headline("📵", "Missed call"),
                           f"SIM: {name}" + (f" ({msisdn})" if msisdn else ""),
                           f"From: {payload.get('from') or 'unknown'}"])
-    if ev == EV_SOFTWARE_UPDATE:
-        return "\n".join([_telegram_headline("🆕", f"Sim Gateway 新版本 · v{payload.get('from') or ''}"),
-                           "", payload.get("text") or ""])
     head = _telegram_headline("📩" if ev == EV_INCOMING_SMS else "📞",
                               "Incoming SMS" if ev == EV_INCOMING_SMS else "Incoming call")
     name = payload.get("sim_name") or payload.get("iccid") or payload.get("instance")

@@ -47,8 +47,8 @@ class AutoProvisionTests(unittest.TestCase):
 
     @patch.object(main.cfg, "upsert_instance")
     @patch.object(main, "_hardware_imei_for_card")
-    def test_incomplete_draft_stays_stopped(self, hardware_imei, upsert):
-        hardware_imei.return_value = ("", "reader-test", "reader")
+    def test_modem_draft_without_hardware_imei_stays_stopped(self, hardware_imei, upsert):
+        hardware_imei.return_value = ("", "modem-test", "modem")
 
         result = main._auto_promote_card_draft(self.draft, self.card, [self.card])
 
@@ -56,6 +56,25 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertFalse(result["enabled"])
         self.assertIn("IMEI", result["auto_provision_missing"])
         upsert.assert_not_called()
+
+    @patch.object(main.egress, "publish")
+    @patch.object(main.cfg, "upsert_instance")
+    @patch.object(main, "_hardware_imei_for_card")
+    def test_native_reader_without_imei_or_smsc_still_promotes_for_vowifi(
+            self, hardware_imei, upsert, _publish):
+        hardware_imei.return_value = ("", "reader-test", "reader")
+        draft = {**self.draft, "smsc": ""}
+        card = {**self.card, "hardware_kind": "reader", "hardware_id": "reader-test",
+                "virtual_slots": [], "smsc": ""}
+        upsert.side_effect = lambda value, **kwargs: value
+
+        result = main._auto_promote_card_draft(draft, card, [card])
+
+        self.assertEqual(result["provisioning_state"], "ready")
+        self.assertEqual(result["imei"], "")
+        self.assertEqual(result["imeisv"], "")
+        self.assertEqual(result["smsc"], "")
+        self.assertNotIn("auto_provision_missing", result)
 
     @patch.object(main.cfg, "upsert_instance")
     @patch.object(main, "_hardware_imei_for_card")
@@ -67,6 +86,60 @@ class AutoProvisionTests(unittest.TestCase):
 
         self.assertIn("SIM PIN", result["auto_provision_missing"])
         upsert.assert_not_called()
+
+    def test_ui_missing_keys_cover_every_field_that_blocks_a_draft(self):
+        missing = main._draft_provisioning_missing(
+            {"provisioning_state": "draft"}, {"pin_enabled": True}, "")
+        self.assertEqual(missing, ["imsi", "mcc_mnc", "imei", "pin"])
+        self.assertEqual(main._draft_provisioning_missing(
+            {**self.draft, "pin": "0000"}, self.card, "490154203237518"), [])
+        self.assertEqual(main._draft_provisioning_missing(
+            {"provisioning_state": "draft"}, {"pin_enabled": False}, "", "reader"),
+            ["imsi", "mcc_mnc"])
+
+    def test_non_blocking_reader_warnings_are_reported_separately(self):
+        warnings = main._provisioning_warnings(
+            {"smsc": ""}, {"smsc": ""}, "", "reader")
+        self.assertEqual(warnings, ["outbound_sms_disabled", "device_identity_omitted"])
+
+    def test_start_on_identityless_reader_clears_a_stale_modem_identity(self):
+        inst = {"id": "2", "iccid": "test-card", "imei": "490154203237518",
+                "imeisv": "4901542032375100", "imei_source_device_id": "old-modem"}
+        card = {"present": True, "iccid": "test-card", "hardware_kind": "reader"}
+        cleared = {**inst, "imei": "", "imeisv": "",
+                   "imei_source_device_id": "reader-test"}
+        with patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main, "_hardware_imei_for_card",
+                             return_value=("", "reader-test", "reader")), \
+                patch.object(main.cfg, "upsert_instance", return_value=cleared) as upsert:
+            result = main._apply_current_hardware_imei(inst)
+
+        self.assertEqual(result["imei"], "")
+        upsert.assert_called_once_with({
+            "id": "2", "imei": "", "imeisv": "",
+            "imei_source_device_id": "reader-test",
+        })
+
+    def test_country_api_requests_and_releases_an_idle_test_runtime(self):
+        settings = {"proxy": {"enabled": True,
+                              "exits": {"gb": {"enabled": True}}}}
+        live = {"updated_at": 1000, "exits": {"gb": {
+            "ready": True, "proxy_host": "127.0.0.1", "proxy_port": 1080,
+            "node": "Example node", "interface": "mdd-gb",
+        }}}
+        with patch.object(main.cfg, "get_settings", return_value=settings), \
+                patch.object(main.egress, "publish") as publish, \
+                patch.object(main.egress, "request_test",
+                             return_value=("request-token", 1000.25)) as request, \
+                patch.object(main.egress, "status", side_effect=[
+                    {"updated_at": 999, "exits": {}}, live]), \
+                patch.object(main.egress, "test_udp_proxy", return_value=42), \
+                patch.object(main.egress, "finish_test", return_value=True) as finish:
+            result = asyncio.run(main._test_egress_country("gb"))
+        self.assertEqual(result["latency_ms"], 42)
+        publish.assert_called_once()
+        request.assert_called_once_with("gb")
+        finish.assert_called_once_with("gb", "request-token")
 
     @patch.object(main.cfg, "upsert_instance")
     @patch.object(main, "_hardware_imei_for_card")
@@ -88,6 +161,18 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertTrue(first["user_eq_phone"])
         self.assertIn("country=GB", first["pani"])
         self.assertNotIn("ffffffffffff", first["pani"])
+
+    def test_cmlink_profile_formats_telephone_requests_for_ee_mvno_ims(self):
+        profile = config.carrier_sip_defaults(
+            "234", "33", "test-cmlink-card", {"spn": "CMLink"})
+
+        self.assertEqual(profile["access_type"], "wlan1")
+        self.assertTrue(profile["user_eq_phone"])
+        self.assertIn("country=GB", profile["pani"])
+        self.assertNotIn("ffffffffffff", profile["pani"])
+
+    def test_generic_ee_profile_does_not_inherit_mvno_sip_flags(self):
+        self.assertEqual(config.carrier_sip_defaults("234", "33", "test-ee-card"), {})
 
     def test_unknown_carrier_does_not_invent_sip_identity(self):
         self.assertEqual(config.carrier_sip_defaults("001", "01", "test-card"), {})
@@ -243,6 +328,71 @@ class HotplugDraftPromotionTests(unittest.IsolatedAsyncioTestCase):
         promote.assert_called_once_with(draft, card, [card])
         start.assert_not_called()
         self.assertNotIn("2", main.hub.hotplug_starts)
+
+
+class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_native_reader_provision_does_not_require_imei_or_smsc(self):
+        card = main.sim.CardInfo(
+            reader="Reader", reader_index=0, reader_port="1-1", present=True,
+            iccid="test-card", imsi="001010000000001", mcc="001", mnc="01",
+            pin_enabled=False, pin_tries=3, smsc=None,
+        )
+        live = {"name": "Reader", "index": 0, "reader_port": "1-1",
+                "present": True, "iccid": "test-card", "hardware_kind": "reader"}
+        with patch.object(main, "_resolve_reader_index", return_value=0), \
+                patch.object(main.sim, "list_readers", return_value=["Reader"]), \
+                patch.object(main.sim, "read_card", return_value=card), \
+                patch.object(main.hub, "reader_lock", return_value=asyncio.Lock()), \
+                patch.object(main.hub, "cards_list", return_value=[live]), \
+                patch.object(main, "_hardware_imei_for_card",
+                             return_value=("", "reader-test", "reader")), \
+                patch.object(main.cfg, "merge_carrier_sip_defaults",
+                             return_value={"webrtc": {"enable": False}}), \
+                patch.object(main.cfg, "list_instances", return_value=[]), \
+                patch.object(main.cfg, "load", return_value={"instances": {}}), \
+                patch.object(main.cfg, "alloc_ports_auto", return_value={"sip": 5060}), \
+                patch.object(main.cfg, "upsert_instance",
+                             side_effect=lambda value: value) as upsert, \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(main.hub, "reset_health"), \
+                patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main, "_refresh_card_matches"), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            result = await main.api_provision({"reader_index": 0, "webrtc": False})
+
+        saved = upsert.call_args.args[0]
+        self.assertEqual(saved["imei"], "")
+        self.assertEqual(saved["imeisv"], "")
+        self.assertEqual(saved["smsc"], "")
+        self.assertTrue(result["ok"])
+        start.assert_called_once()
+
+    async def test_native_reader_identity_can_be_cleared_without_blocking_vowifi(self):
+        device = {"id": "reader-test", "device_type": "reader", "name": "Reader",
+                  "stable_path": "1-1", "instance_id": "2"}
+        inst = {"id": "2", "imei": "490154203237518", "imeisv": "4901542032375100"}
+        cleared = {**inst, "imei": "", "imeisv": "",
+                   "imei_source_device_id": "reader-test"}
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(main.device_state, "set_hardware",
+                             return_value={"imei": ""}) as set_hardware, \
+                patch.object(main.cfg, "get_instance", return_value=inst), \
+                patch.object(main.cfg, "upsert_instance", return_value=cleared) as upsert, \
+                patch.object(main.engine, "is_running", return_value=False), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            result = await main.api_device_hardware("reader-test", {"imei": ""})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["imei_masked"], "")
+        set_hardware.assert_called_once_with("reader-test", {
+            "device_type": "reader", "name": "Reader",
+            "stable_path": "1-1", "imei": "",
+        })
+        upsert.assert_called_once_with({
+            "id": "2", "imei": "", "imei_source_device_id": "reader-test",
+            "imeisv": "",
+        })
 
 
 class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):

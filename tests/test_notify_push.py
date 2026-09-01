@@ -330,7 +330,7 @@ class BrandPrefixTests(unittest.TestCase):
 
     EVENTS = ("incoming_sms", "incoming_call", "missed_call", "voicemail_received",
               "host_alert", "number_changed", "line_unrecoverable", "keepalive_result",
-              "balance_low", "software_update")
+              "balance_low")
 
     def _payload(self, event):
         return notify_push.build_payload(
@@ -346,16 +346,6 @@ class BrandPrefixTests(unittest.TestCase):
         for event in self.EVENTS:
             first = notify_push._telegram_text(self._payload(event)).splitlines()[0]
             self.assertIn(notify_push.BRAND, first, f"{event}: {first}")
-
-    def test_the_brand_is_not_repeated_when_the_text_already_carries_it(self):
-        # The software-update wording names the product, so a blind prefix would read
-        # "MDD · MDD Sim Gateway 新版本".
-        title = notify_push.build_notification_message(
-            self._payload("software_update"))["title"]
-        self.assertEqual(title.count(notify_push.BRAND), 1, title)
-        first = notify_push._telegram_text(
-            self._payload("software_update")).splitlines()[0]
-        self.assertEqual(first.count(notify_push.BRAND), 1, first)
 
     def test_the_icon_stays_leftmost_in_telegram(self):
         # It is what makes the event type scannable in a chat list.

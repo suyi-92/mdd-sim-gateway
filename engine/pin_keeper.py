@@ -101,47 +101,93 @@ def dec_imsi(ef_hex):
     return swapped[1:]
 
 
-# 3GPP USIM AID prefix. EF_DIR record 1 is NOT always the USIM (China Telecom cards
-# list CSIM first), so scan the records and pick the USIM by AID.
+# This module is also the single Engine-side USIM selector used by ami_usim and swu_ike. Keep
+# card-vendor APDU quirks here so PIN keeping, SIP AKA and IKE AKA cannot drift apart again.
 USIM_AID_PREFIX = "A0000000871002"
 
 
+def _transmit(conn, command, depth=0):
+    """Send an APDU and normalize 61xx/9Fxx continuations plus 6Cxx length retries."""
+    if depth > 8:
+        raise RuntimeError("too many APDU continuations")
+    command = list(command)
+    data, s1, s2 = conn.transmit(command)
+    if s1 == 0x6C and len(command) >= 5:
+        retry = list(command)
+        retry[-1] = s2
+        return _transmit(conn, retry, depth + 1)
+    if s1 in (0x61, 0x9F):
+        more, final_s1, final_s2 = _transmit(
+            conn, [0x00, 0xC0, 0x00, 0x00, s2], depth + 1)
+        return list(data) + list(more), final_s1, final_s2
+    return list(data), s1, s2
+
+
+def _tlvs(data):
+    """Yield bounded BER-TLV values from the simple EF_DIR templates used by UICCs."""
+    data = list(data)
+    offset = 0
+    while offset + 1 < len(data):
+        tag = data[offset]
+        offset += 1
+        length = data[offset]
+        offset += 1
+        if length & 0x80:
+            count = length & 0x7F
+            if count == 0 or offset + count > len(data):
+                return
+            length = int.from_bytes(bytes(data[offset:offset + count]), "big")
+            offset += count
+        if offset + length > len(data):
+            return
+        yield tag, data[offset:offset + length]
+        offset += length
+
+
+def _find_tlv(data, wanted):
+    for tag, value in _tlvs(data):
+        if tag == wanted:
+            return list(value)
+        if tag in (0x61, 0x62, 0x6F, 0xA5):
+            nested = _find_tlv(value, wanted)
+            if nested is not None:
+                return nested
+    return None
+
+
 def _usim_aid_from_dir(conn):
-    """Scan EF_DIR records for the USIM AID; prefer 3GPP USIM, fall back to the first
-    application. Returns (aid_len, aid_hex) or None."""
-    d, s1, s2 = conn.transmit(toBytes("00a40004022f0000"))  # SELECT EF.DIR
-    if s1 != 0x61:
+    """Scan EF_DIR for the 3GPP USIM AID without assuming record order or layout."""
+    _fcp, s1, s2 = _transmit(conn, toBytes("00a40004022f0000"))
+    if (s1, s2) != (0x90, 0x00):
         return None
-    fcp, s1, s2 = conn.transmit(toBytes("00C00000") + [s2])
-    if s1 != 0x90 or len(fcp) < 8:
-        return None
-    rec_len = fcp[7]
-    first = None
-    for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(toBytes("00b2") + [rec, 0x04, rec_len])
-        # record template: 61 <len> 4F <aidlen> <AID...> [50 <len> label]
-        if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
+    for rec in range(1, 33):
+        data, s1, s2 = _transmit(conn, [0x00, 0xB2, rec, 0x04, 0x00])
+        if (s1, s2) in ((0x6A, 0x83), (0x94, 0x02)):
             break
-        aid_len = d[3]
-        aid = "".join("%02X" % b for b in d[4:4 + aid_len])
-        if len(aid) < aid_len * 2:
-            break
+        if (s1, s2) != (0x90, 0x00):
+            continue
+        aid_data = _find_tlv(data, 0x4F)
+        if not aid_data:
+            continue
+        aid_len = len(aid_data)
+        aid = "".join("%02X" % value for value in aid_data)
         if aid.startswith(USIM_AID_PREFIX):
             return aid_len, aid
-        if first is None:
-            first = (aid_len, aid)
-    return first
+    return None
 
 
 def select_adf_usim(conn):
     """SELECT MF -> EF.DIR -> USIM AID -> ADF.USIM. Returns True on success."""
-    conn.transmit(toBytes("00a40004023f0000"))          # SELECT MF
+    _data, s1, s2 = _transmit(conn, toBytes("00a4000c023f00"))
+    if (s1, s2) != (0x90, 0x00):
+        return False
     got = _usim_aid_from_dir(conn)
     if not got:
         return False
     aid_len, aid = got
-    d, s1, s2 = conn.transmit(toBytes("00a40404") + [aid_len] + toBytes(aid))
-    return s1 == 0x61
+    _data, s1, s2 = _transmit(
+        conn, toBytes("00a40404") + [aid_len] + toBytes(aid) + [0x00])
+    return (s1, s2) == (0x90, 0x00)
 
 
 def read_imsi(conn):

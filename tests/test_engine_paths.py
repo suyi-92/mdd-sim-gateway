@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,16 @@ from unittest.mock import patch
 
 
 class EnginePathTests(unittest.TestCase):
+    def test_native_control_uses_the_same_runtime_and_host_data_path(self):
+        engine = self.engine_module()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "DATA_DIR", temporary):
+            runtime, host = engine._instance_paths("sim1")
+            expected = os.path.join(temporary, "instances", "sim1")
+            self.assertEqual(runtime, expected)
+            self.assertEqual(host, expected)
+            self.assertTrue(os.path.isdir(os.path.join(expected, "run")))
+            self.assertTrue(os.path.isdir(os.path.join(expected, "logs")))
+
     @staticmethod
     def engine_module():
         fake_docker = SimpleNamespace(
@@ -19,22 +30,6 @@ class EnginePathTests(unittest.TestCase):
         with patch.dict(sys.modules, {"docker": fake_docker}):
             sys.modules.pop("control.app.engine", None)
             return importlib.import_module("control.app.engine")
-
-    def test_docker_tls_path_maps_to_native_data_directory(self):
-        engine = self.engine_module()
-        with tempfile.TemporaryDirectory() as temp:
-            expected = Path(temp) / "certs" / "gateway.pem"
-            expected.parent.mkdir()
-            expected.write_text("certificate")
-            with patch.object(engine, "DATA_DIR", temp):
-                self.assertEqual(engine._runtime_data_path("/data/certs/gateway.pem"),
-                                 str(expected))
-
-    def test_missing_tls_path_remains_unchanged(self):
-        engine = self.engine_module()
-        with tempfile.TemporaryDirectory() as temp, patch.object(engine, "DATA_DIR", temp):
-            self.assertEqual(engine._runtime_data_path("/data/certs/missing.pem"),
-                             "/data/certs/missing.pem")
 
     def test_normal_docker_calls_reuse_one_client(self):
         engine = self.engine_module()
@@ -54,9 +49,10 @@ class EnginePathTests(unittest.TestCase):
             def get(self, name):
                 raise engine.docker.errors.NotFound(name)
 
-            def run(self, image, **kwargs):
+            def create(self, image, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""))
+                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""),
+                                       start=lambda: None)
 
         client = SimpleNamespace(containers=_Containers())
         inst = {"id": "sim1", "ports": {"sip_udp": 5060, "sip_tls": 5061, "webrtc": 8089,
@@ -87,9 +83,10 @@ class EnginePathTests(unittest.TestCase):
             def get(self, name):
                 raise engine.docker.errors.NotFound(name)
 
-            def run(self, image, **kwargs):
+            def create(self, image, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""))
+                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""),
+                                       start=lambda: None)
 
         client = SimpleNamespace(containers=_Containers())
         inst = {"id": "sim1", "ports": {"sip_udp": 5060, "sip_tls": 5061,
@@ -107,6 +104,75 @@ class EnginePathTests(unittest.TestCase):
         self.assertEqual(len([key for key in bindings if key.endswith("/udp")]), 12)
         self.assertIn("10011/udp", bindings)
         self.assertNotIn("10012/udp", bindings)
+
+    def test_proxied_engine_pins_epdg_to_the_real_routed_address(self):
+        engine = self.engine_module()
+        captured = {}
+
+        class _Containers:
+            def get(self, name):
+                raise engine.docker.errors.NotFound(name)
+
+            def create(self, image, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""),
+                                       start=lambda: None)
+
+        client = SimpleNamespace(containers=_Containers())
+        epdg = "epdg.epc.mnc033.mcc234.pub.3gppnetwork.org"
+        inst = {"id": "sim1", "mcc": "234", "mnc": "33",
+                "ports": {"webrtc": 8089, "rtp_start": 10000, "rtp_span": 12}}
+        routed = {"ready": True, "mode": "manual",
+                  "addresses": ["31.94.76.9", "31.94.76.1"]}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "_client", lambda: client), \
+                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
+                patch.object(engine, "_clear_runtime_state", lambda base: None), \
+                patch.object(engine.egress, "ensure_line", return_value=routed), \
+                patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
+            engine.start(inst, {"proxy": {"enabled": True}})
+
+        self.assertEqual(captured["extra_hosts"][epdg], "31.94.76.1")
+        self.assertEqual(captured["extra_hosts"]["host.docker.internal"], "host-gateway")
+
+    def test_failed_docker_start_removes_only_its_created_container(self):
+        engine = self.engine_module()
+        removed = []
+
+        class _FailedContainer:
+            id = "failed-id"
+            name = "mdd-sim-gateway-engine-sim1"
+            attrs = {"State": {"Status": "created", "Running": False}}
+
+            def start(self):
+                raise RuntimeError("host UDP port is already in use")
+
+            def reload(self):
+                return None
+
+            def remove(self, force=False):
+                removed.append(force)
+
+        class _Containers:
+            def get(self, name):
+                raise engine.docker.errors.NotFound(name)
+
+            def create(self, image, **kwargs):
+                return _FailedContainer()
+
+        client = SimpleNamespace(containers=_Containers())
+        inst = {"id": "sim1", "ports": {"webrtc": 8089, "rtp_start": 10000,
+                                          "rtp_span": 12}}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "_client", lambda: client), \
+                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
+                patch.object(engine, "_clear_runtime_state", lambda base: None), \
+                patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                engine.start(inst, {})
+
+        self.assertEqual(removed, [True])
 
     def test_engine_recreation_clears_stale_runtime_observations(self):
         engine = self.engine_module()

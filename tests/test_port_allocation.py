@@ -38,6 +38,25 @@ class PortAllocationTests(unittest.TestCase):
             rendered = config.render_instance_json(legacy, config.DEFAULTS["settings"])
             self.assertEqual(rendered["rtp_end"], rendered["rtp_start"] + 59)
 
+    @staticmethod
+    def _windows_mirrored_port_probe(port, *, tcp=True, udp=True):
+        return not (udp and port in {10010, 10011})
+
+    def test_auto_allocator_skips_a_live_rtp_udp_conflict(self):
+        with patch.object(config, "_host_port_free",
+                          side_effect=self._windows_mirrored_port_probe):
+            block = config.alloc_ports_auto({"instances": {}})
+
+        self.assertEqual(block["sip_udp"], 5070)
+        self.assertEqual(block["rtp_start"], 12000)
+        self.assertEqual(block["rtp_span"], 12)
+
+    def test_manual_port_selection_rejects_a_live_rtp_udp_conflict(self):
+        with patch.object(config, "_host_port_free",
+                          side_effect=self._windows_mirrored_port_probe):
+            with self.assertRaisesRegex(ValueError, r"port 10010 \(RTP/UDP\).+already in use"):
+                config.ports_from_sip_base({"instances": {}}, 5060)
+
 
 if __name__ == "__main__":
     unittest.main()

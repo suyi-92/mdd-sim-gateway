@@ -70,7 +70,8 @@ dedicated_bearer_up=yes
 100rel=peer_supported
 moh_passthrough=yes
 direct_media=no
-smsc_uri=sip:{{ smsc }}@{{ realm }}
+{% if smsc %}smsc_uri=sip:{{ smsc }}@{{ realm }}
+{% endif %}
 sdp_owner={{ sdp_owner }}
 sdp_session={{ sdp_session }}
 

@@ -1,13 +1,120 @@
-# 架构说明
+# VMware 架构
 
-MDD 用“物理设备”作为用户可见边界。每个蜂窝模块拥有独立 ModemManager 对象、数据 bearer、SIM 桥和 VoWiFi 实例；普通读卡器没有射频能力，因此不会显示可用的 4G 开关。
+## 运行边界
 
-控制面运行 FastAPI 与 React，保存期望状态并展示实际状态。宿主机 orchestrator 管理 USB 拓扑、模块 SIM 桥、ModemManager/NetworkManager 及 sing-box TUN。模块 SIM 桥通过 ModemManager 的命令接口传递 APDU；安装程序会启用该接口，并立即把运行日志级别降回 INFO。每张已配置 SIM 对应一个隔离 Docker 引擎，内部运行修改后的 SWu IKEv2/IPsec 客户端和 sysmocom Asterisk。
+```text
+Windows / VMware Workstation
+│
+├─ Bridged vNIC ── router DHCP reservation
+├─ USB passthrough: SCR Prime 04d9:c001
+└─ USB passthrough: complete Quectel composite device
+   │
+   ▼
+x86_64 Linux guest
+├─ pcscd + libccid
+│  ├─ SCR Prime physical PC/SC reader
+│  └─ vsmartcard VPCD slots for the modem SIM
+├─ ModemManager + NetworkManager
+│  └─ Quectel modem, registration, GSM profile, bearer and IP
+├─ mdd-sim-gateway-control.service
+│  ├─ FastAPI / HTTPS / WebUI
+│  ├─ persistent configuration and SQLite
+│  └─ Docker API for managed Engine containers
+├─ mdd-sim-gateway-orchestrator.service
+│  ├─ hardware discovery and VPCD bridges
+│  ├─ sing-box/Xray country exits
+│  └─ desired/observed state reconciliation
+└─ rootful Docker
+   ├─ Engine line 1: SCR Prime SIM, VoWiFi-only
+   └─ Engine line 2: Quectel SIM, VoWiFi plus separate 4G bearer
+```
 
-插入身份可读的新 SIM 时，控制面会按 ICCID 自动创建一条停止状态的线路草稿并绑定稳定读卡器端口；MCC 可直接确定国家出口。只有读卡器无法提供的必填信息（例如外接 PC/SC 读卡器没有硬件 IMEI）需要用户补充，完成后同一草稿转为正式线路并启动，不会覆盖其他 SIM 线路。
+Control 永远在客户机本机运行，不存在 Docker Control 分支。Engine 需要独立网络命名空间、
+TUN、NET_ADMIN、Asterisk 和每线路端口，因此继续使用容器。
 
-4G、飞行模式与 VoWiFi 是三个独立状态。4G 开关只建立或断开该模块的 NetworkManager 移动数据承载；飞行模式通过 ModemManager 单独关闭或开启模块射频；VoWiFi 独立启停。关闭 4G 不再停止 ModemManager，也不会隐式进入飞行模式。一个能力失败不会伪造另一个能力失败。每个物理模块映射到独立 ModemManager 对象和 NetworkManager 连接，状态与流量按模块读取；普通读卡器只显示 VoWiFi，不显示 4G 或飞行模式。
+## 数据与构建
 
-每张模块 UICC 最多使用逻辑通道 1–3，三条通道分别保留给 PIN 保活、SWu/EAP-AKA 和 IMS/Asterisk；这是每张物理 SIM 的独立上限，不是多模块共享的全局池。桥接器在元数据中发布容量、实际通道号、用途和分配状态。启动时若只分配了部分通道或收到重复通道，会先释放本轮已经打开的通道，再发布明确错误并退出，由编排器按正常恢复流程重试。状态机以飞行模式、4G 数据和 VoWiFi 三个布尔输入形成八种组合，并通过纯函数表驱动测试约束有效射频、数据承载和 SIM 桥目标。
+```text
+/opt/mdd-sim-gateway                  managed Git checkout
+/var/lib/mdd-sim-gateway              runtime and secrets
+/var/backups/mdd-sim-gateway          root-only data backups
+/etc/mdd-sim-gateway                  machine/network/driver metadata
+/var/cache/mdd-sim-gateway/builds     locally verified builds by commit SHA
+```
 
-国家出口以 SIM MCC 或线路覆盖值选择。配置分为可复用的代理库与国家绑定：订阅节点按名称关键词进入选择池，具体节点和 SOCKS5 则直接绑定。sing-box 继续拥有每国 TUN、路由和选择器；VLESS Reality/XHTTP 由仅监听回环地址的 Xray-core SOCKS 端点承载，再作为 sing-box 的上游。所有路径都进行运行时 UDP 验证。没有健康出口时仅阻止对应 VoWiFi 线路启动，4G 数据保持独立。
+WebUI 和 venv 通过 symlink 指向一个通过门禁的提交构建目录；Engine 使用
+`mdd-sim-gateway/engine:<commit>`，验证后再更新 `:latest`。新构建不会先覆盖运行版本。
+
+## 设备模型
+
+物理设备和 SIM 线路分离：
+
+- SCR Prime 是 `reader`，没有 IMEI 和蜂窝射频也合法。DEVICE_IDENTITY 可省略；若运营商
+  强制要求，线路会由运营商拒绝而不是由本地固定假 IMEI。
+- Quectel 是 `modem`，硬件 IMEI、蜂窝能力和 SIM 逻辑通道来自 ModemManager/AT 路径。
+- `max_sim_lines` 是唯一容量来源，默认 13、范围 1–32。API、自动建线和 Engine 启动均调用
+  同一配置；降低上限不删除已有记录。
+
+UICC 选择器统一处理 APDU `61xx`、`9Fxx` 和 `6Cxx`，支持嵌套 EF_DIR，并严格选择 USIM
+AID。PIN keeper、IKE/EAP-AKA 和 SIP/IMS-AKA 共用该选择逻辑，避免三条路径对同一张卡得出
+不同 applet。
+
+## 网络
+
+桥接 vNIC 是管理平面默认路由。NetworkManager 只新增或保留蜂窝管理，不接管原本由其他
+backend 管理的桥接网卡。蜂窝 bearer 是设备能力，不应替换管理默认路由。
+
+每条 Engine 使用独立的 WebRTC 与小范围 RTP block。分配器同时探测 TCP 和 UDP 真实占用，
+避免 Docker 创建后才发现冲突。国家出口按 SIM 国家建立独立 TUN，UDP 健康失败时该线路
+fail-closed，不退回错误国家的默认网络。
+
+宿主解析器返回 Fake-IP 时，orchestrator 在已选出口内解析真实 ePDG 地址，并把该地址固定到
+对应 Engine。WebUI 软电话同时过滤 SDP 中的 Fake-IP candidate。
+
+## SCR Prime 驱动决策
+
+```text
+USB absent ── require flag? ── stop / warn
+USB present
+  └─ pcsc_scan sees SCR Prime ── native, no hold
+     └─ not seen ── CCID 1.6.2 + patch 03 only
+                    ├─ backup + metadata + hash
+                    ├─ maintenance marker
+                    ├─ conditional libccid hold
+                    └─ reader + ATR + hotplug gates
+```
+
+`mddctl driver restore` 是带证据的逆操作，不是无条件包重装。系统/项目更新会临时重探测
+当前发行版 libccid；原生支持出现后自动回归发行版文件。
+
+## 更新事务
+
+```text
+validate managed checkout
+  → fetch origin/vmware
+  → require fast-forward
+  → temporary worktree
+  → static tests + new venv/WebUI/Engine build
+  → data backup
+  → stop Control/orchestrator/managed Engines
+  → ff-only source switch + atomic artifact activation
+  → health gates
+       success: keep one previous generation
+       failure: old commit + artifacts + image + data, then revalidate
+```
+
+没有 GitHub Release API、网页更新按钮、后台轮询、`software_update` 通知或自动合并策略。
+
+## 备份事务
+
+备份停止写入方，确认 Engine 全停，执行 SQLite WAL checkpoint 和 integrity check，再把数据、
+secret-free manifest 与外部 SHA-256 一起生成。恢复在临时目录验证所有归档成员，拒绝路径穿越
+和链接/设备节点，保留 `.pre-restore-*` 后才原子替换；健康失败逆转数据切换。
+
+## 权限与隐私
+
+- Control 和 orchestrator 以 root + `UMask=0077` 运行，因为它们需要 PC/SC、Docker 和网络；
+- 数据、驱动元数据和备份默认为 root-only；
+- Docker 操作只针对 `io.mdd-sim-gateway.managed=true` 的 Engine；
+- `doctor --json` 不读取或输出 SIM 身份、硬件 IMEI、号码、消息或凭据；
+- 机器 USB/网络/防火墙状态不进入数据备份。

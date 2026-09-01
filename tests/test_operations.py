@@ -17,7 +17,7 @@ except ImportError:      # the Docker SDK is a manager runtime dependency this d
 
 
 class OperationsTests(unittest.TestCase):
-    def test_old_image_cleanup_keeps_live_current_and_trusted_images(self):
+    def test_old_image_cleanup_keeps_only_current_and_live_images(self):
         def image(image_id, tags, managed=True):
             value = Mock(id=image_id, tags=tags)
             value.attrs = {"Config": {"Labels": {
@@ -41,10 +41,11 @@ class OperationsTests(unittest.TestCase):
         with patch.object(operations.docker, "from_env", return_value=client):
             result = operations.prune_old_mdd_images()
 
-        self.assertEqual(result, {"ok": True, "removed_images": 1,
+        self.assertEqual(result, {"ok": True, "removed_images": 2,
                                   "space_reclaimed_bytes": 4_000})
-        client.images.remove.assert_called_once_with(
-            "rollback", force=True, noprune=False)
+        self.assertEqual(
+            [call.args[0] for call in client.images.remove.call_args_list],
+            ["base", "rollback"])
         client.containers.list.assert_called_once_with(all=True)
         client.close.assert_called_once_with()
 
@@ -162,31 +163,6 @@ class OperationsTests(unittest.TestCase):
             errors="replace")
         self.assertNotIn("_data, _sw1, _sw2 = res", source)
         self.assertIn("unexpected response type=%s", source)
-
-    def test_local_backup_is_not_exposed_as_file_contents(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
-            Path(temp, "config.yaml").write_text("settings: {}\ninstances: {}\n")
-            result = operations.create_local_backup("Test Gateway")
-            self.assertEqual(result["location"], "gateway-local")
-            self.assertNotIn("path", result)
-            self.assertTrue(Path(temp, "backups", result["name"]).is_file())
-
-    def test_local_backup_can_be_deleted_by_its_listed_name(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
-            Path(temp, "config.yaml").write_text("settings: {}\ninstances: {}\n")
-            created = operations.create_local_backup("Test Gateway")
-            result = operations.delete_local_backup(created["name"])
-            self.assertTrue(result["ok"])
-            self.assertFalse(Path(temp, "backups", created["name"]).exists())
-
-    def test_local_backup_delete_rejects_paths_and_non_backups(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
-            outside = Path(temp, "keep.txt")
-            outside.write_text("keep")
-            for name in ("../keep.txt", "/tmp/keep.txt", "not-a-backup.txt"):
-                with self.assertRaises(ValueError):
-                    operations.delete_local_backup(name)
-            self.assertEqual(outside.read_text(), "keep")
 
     def test_support_bundle_contains_only_redacted_documents(self):
         settings_value = {

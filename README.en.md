@@ -2,176 +2,163 @@
   <img src="assets/logo-lockup.svg" width="520" alt="MDD Sim Gateway">
 </p>
 
-<p align="center"><strong>Turn physical SIMs and eSIMs into a self-hosted gateway for VoWiFi, calls, SMS and isolated network egress.</strong></p>
+<p align="center"><strong>Run two locally built SIM communication lines in a VMware Linux guest.</strong></p>
 
 <p align="center">
   <a href="README.md">中文</a> ·
-  <a href="#quick-install">Quick install</a> ·
-  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
-  <a href="docs/INSTALL.md">Installation</a> ·
-  <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">Discussions</a>
+  <a href="#one-command-install">Install</a> ·
+  <a href="docs/INSTALL.md">Detailed guide</a> ·
+  <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a>
 </p>
 
-MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ubuntu and Armbian ARM64 hosts. It brings cellular modems, USB smart-card readers, IMS, EAP-AKA, eSIM, ModemManager and sing-box into one bilingual Web console.
+The `vmware` branch targets VMware Workstation on an x86_64 Windows host. Control and WebUI run
+natively in the guest under systemd; Docker is rootful and is used only for per-SIM Engine
+containers. The project does not use GitHub Actions, GitHub Release updates, prebuilt project
+archives, or Git LFS delivery assets. Installation and updates build the checkout locally.
 
-| Real SIM authentication | Calls and SMS | Multi-modem control | Isolated country exits |
-|---|---|---|---|
-| Perform EAP-AKA and IMS-AKA inside a physical SIM/eSIM without reading Ki/OP/OPc | Browser softphone, SMS, call history and incoming notifications | Manage cellular modems, PC/SC readers and eUICCs in one console | Route each SIM's ePDG through its own country TUN and fail closed when UDP checks fail |
+## Supported topology
 
-## Interface tour
+| Item | Scope |
+|---|---|
+| Guest OS | Ubuntu 24.04/26.04, Debian 12/13, x86_64 only |
+| Network | VMware bridged NIC, router DHCP reservation by VM MAC |
+| Reader line | Santi Electronics SCR Prime `04d9:c001`, one SIM, VoWiFi-only |
+| Modem line | One Quectel-class USB composite modem, another SIM, 4G + VoWiFi |
+| Control | Python venv + systemd, HTTPS on 8443/TCP |
+| Engine | One rootful-Docker container per active SIM |
+| Capacity | `max_sim_lines` defaults to 13 and accepts 1–32 |
 
-![MDD Sim Gateway English interface tour (fictional demo data)](assets/product-tour.gif)
+SCR Prime is a PC/SC reader and has no cellular radio or 4G switch. Cellular service comes from
+the separate Quectel-class modem.
 
-<p align="center">Overview → device management → browser calling → messages → balance & keeping → system updates · All identities and content shown are fictional demo data</p>
+## VMware prerequisites
 
-## Quick install
+Before starting the guest:
 
-Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stable network connection.
+1. Use a bridged NIC and reserve the VM NIC MAC address in the router's DHCP server.
+2. Allocate 4 vCPUs, 8 GiB RAM, and a 64 GiB dynamic disk. Grow the guest partition and root
+   filesystem as well as the virtual disk; `df -h /` is authoritative.
+3. Enable a USB 3.1 controller.
+4. Connect SCR Prime and the complete Quectel USB composite device to the guest from Workstation's
+   removable-device menu. Passing only Windows COM ports is insufficient.
+5. Enable automatic connection only for those two exact devices, not every new USB device.
+6. Keep VMware USB Arbitration Service running on Windows. Once connected to the guest, the
+   devices must no longer be held by Windows drivers.
 
-Storage requirements: keep at least **4 GiB free on the root filesystem** before installation.
-A **16 GB or larger** system disk is recommended, with about **6 GiB free** before an upgrade so
-the new image and one rollback generation can coexist. Development checkouts and explicit source
-builds create substantially more temporary build cache and are unsuitable for space-constrained
-devices. Enlarging a VM's virtual disk alone is not enough: grow its root partition and filesystem,
-then use `df -h /` as the authoritative capacity.
+## One-command install
 
-```bash
-git clone https://github.com/MddIdd/mdd-sim-gateway.git
-cd mdd-sim-gateway
-sudo ./install.sh install
-```
-
-When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades.
-
-> This software directly controls cellular radios, SIMs, network routes and IMS. Carrier support for Wi-Fi Calling still depends on the plan, region, device identity and network policy.
-
-## Architecture
-
-![MDD Sim Gateway architecture](docs/architecture.svg)
-
-## Full screenshots
-
-<details>
-<summary>View the Overview, Devices, Calls, Messages, Balance & keeping, and System updates screens</summary>
-
-![MDD Sim Gateway English overview (fictional demo data)](screenshots/overview-redacted.en.png)
-
-![MDD Sim Gateway English devices page (fictional demo data)](screenshots/devices-redacted.en.png)
-
-![MDD Sim Gateway English calls page (fictional demo data)](screenshots/calls-redacted.en.png)
-
-![MDD Sim Gateway English messages page (fictional demo data)](screenshots/messages-redacted.en.png)
-
-![MDD Sim Gateway English balance and number keeping page (fictional demo data)](screenshots/keepalive-redacted.en.png)
-
-![MDD Sim Gateway English system updates page (fictional demo data)](screenshots/settings-redacted.en.png)
-
-</details>
-
-## Capabilities
-
-- Detect supported ModemManager cellular modules and ordinary PC/SC readers automatically.
-- Control 4G data, radio flight mode and VoWiFi independently for each physical modem.
-- Show balance, plan expiry, network presence and keeping results on one page. Prepaid lines can
-  schedule a real chargeable SMS, while plan lines can watch the renewal balance and warn when low.
-- Perform EAP-AKA and IMS-AKA in the physical SIM/eSIM without reading or storing Ki/OP/OPc.
-- Show each modem UICC's three logical-channel allocations, roles and explicit failures.
-- Provide an authenticated browser softphone, SMS, call history, missed-call notifications and
-  per-line local voicemail. Recordings remain on the gateway and are never attached to notifications
-  or support bundles; standalone SIP clients are not accepted.
-- Maintain reusable subscriptions, individual nodes and SOCKS5 proxies, then assign one to each
-  country. sing-box owns the isolated TUNs; Xray-core carries Reality/XHTTP nodes. VoWiFi fails
-  closed unless the selected exit passes a runtime UDP check.
-- Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
-- Check releases every six hours in the background. Choose automatic installation or notify-only,
-  scoped to main releases or every release. Unattended installation still requires the exact version
-  and earliest rollout time to be approved separately in `update-policy.json`. All-version
-  devices follow the approved latest Release, while main-only devices follow an independently
-  configured main Release even after newer patches have been published.
-- Telegram is notification-only and does not accept remote control commands.
-- Manage eUICC profiles through a pinned local lpac build, including dual-SE readers.
-- Offer HTTPS, first-run administrator setup, persistent 12-hour or 30-day sessions, CSRF protection,
-  login throttling, local backups, audit records, redacted support bundles and release checks.
-
-| Hardware | 4G data | Wi-Fi Calling | SIM access |
-|---|---:|---:|---|
-| ModemManager-compatible cellular module | Yes | Yes | Modem APDU/logical-channel bridge |
-| DJI/Quectel EC25-class module | Yes | Yes | Automatically provisioned virtual slots |
-| USB PC/SC reader | No | Yes | Direct PC/SC |
-| Santi Electronics SCR Prime (`04d9:c001`) | No | Yes | Direct PC/SC; install with the `patchprime` driver patch |
-| eUICC/eSIM reader | No | Yes | PC/SC and lpac |
-
-The Santi Electronics SCR Prime has been verified on physical hardware. Support in this table
-describes the implemented path; it does not guarantee that every SIM, firmware build or carrier
-will permit the service.
-
-## What the installer does
-
-The installer reuses a working system Docker daemon, or installs the distribution package when
-Docker is absent. It provisions pcscd, ModemManager/NetworkManager, checksummed sing-box and
-Xray-core, a pinned
-lpac source build, the Web console and the per-SIM VoWiFi engine. It does not prune Docker or
-modify unrelated containers.
-
-Common commands:
+Run as an ordinary user inside the guest. Do not pipe the download into `sudo`:
 
 ```bash
-sudo ./install.sh status
-sudo ./install.sh logs
-sudo ./install.sh reload
-sudo ./install.sh build-lpac
-sudo ./install.sh uninstall
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
 ```
 
-See [installation](docs/INSTALL.md), [architecture](docs/ARCHITECTURE.md),
-[troubleshooting](docs/TROUBLESHOOTING.md) and [security](SECURITY.md) for details.
+The bootstrap downloads the reviewed `vmware` checkout as the current user, asks for sudo once,
+and invokes a local installer file. The first clean Engine build compiles Asterisk, pjproject,
+pcsc-lite, and Python dependencies and may take tens of minutes.
 
-## Responsible use
+Supported bootstrap options:
 
-> **Compliance warning:** This software is only for use by the verified subscriber of a number where the carrier expressly permits that use. Do not use it for fraud, bulk or nuisance calling, marketing, verification-code collection, renting numbers or lines, call forwarding for others, concealing the controller's location, or providing telecommunications services to third parties. Users must follow local law, subscriber identity rules, and carrier terms. This project grants no telecom licence or carrier authorisation. MDD Sim Gateway stores and runs at most **five SIM lines** and provides neither standalone SIP accounts nor Telegram commands for calls, SMS, or hangup. Technical restrictions do not make any particular use lawful.
+```text
+install | update | doctor
+--install-dir PATH
+--data-dir PATH
+--ref vmware|<40-character commit>
+--require-scr-prime
+--require-cellular
+--configure-firewall
+--no-start
+--dry-run
+--yes
+```
 
-## Community and feedback
+Defaults are `/opt/mdd-sim-gateway` for source, `/var/lib/mdd-sim-gateway` for data,
+`/var/backups/mdd-sim-gateway` for backups, and `/etc/mdd-sim-gateway` for root-owned machine
+metadata. `--yes` never bypasses checksum, Git, network, hardware, or health gates.
 
-- Installation, hardware and carrier compatibility: [GitHub Discussions](https://github.com/MddIdd/mdd-sim-gateway/discussions)
-- Reproducible defects and concrete feature requests: [GitHub Issues](https://github.com/MddIdd/mdd-sim-gateway/issues/new/choose)
-- Code and documentation contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
+## SCR Prime driver handling
 
-If the project is useful to you, save it on GitHub and share a redacted hardware or carrier compatibility result.
+The installer follows evidence rather than guessing from the distribution version:
 
-## Country exits
+1. `lsusb -d 04d9:c001` must prove VMware USB passthrough.
+2. A bounded `pcsc_scan` checks the distribution libccid first. Native support is kept unchanged.
+3. If USB sees the device but PC/SC does not, CCID 1.6.2 is downloaded with a fixed SHA-256 and
+   **only** `03_scr_prime_reader.patch` is applied. HSIC patches 01 and 02 are never used.
+4. The replaced bundle, package version, hashes, patch set, and backup path are recorded. `libccid`
+   is held only when the distribution bundle was actually replaced.
+5. PC/SC, ATR, and physical unplug/replug recovery must pass.
 
-Add one or more subscriptions, individual nodes or SOCKS5 servers to the proxy library, then assign
-one to each country. Subscription exits retain name filtering and automatic/manual node selection;
-individual nodes and SOCKS5 entries are used directly. Reality/XHTTP share links use a loopback-only
-Xray-core bridge. The eye control is off by default, masking subscription URLs, node links and
-SOCKS5 details. A separate UDP probe is mandatory because IKEv2/ESP NAT traversal depends on UDP
-500/4500. Only that SIM's ePDG routes enter the country's dedicated TUN.
+Use `sudo mddctl driver status` to inspect it and `sudo mddctl driver restore` to restore only a
+driver that MDD metadata and hashes prove MDD changed. Every project update probes whether the
+current distribution driver has acquired native SCR Prime support.
 
-## Security and privacy
+## Management
 
-- Administrator passwords use salted scrypt hashes. Session cookies are HttpOnly, Secure and
-  SameSite=Strict; state-changing requests require a CSRF token.
-- Engine callbacks use a random per-install token.
-- Runtime data directories are owner-only and credential-bearing files are written as mode 0600.
-- Support bundles redact identities, URLs, notification credentials, activation codes and
-  cryptographic material. Review every bundle before sharing it.
-- The product has no analytics or telemetry. Network requests occur only for configured
-  carrier/IMS operation, subscriptions, notifications, eSIM provisioning, dependency installation
-  and periodic release/promotion checks.
-- Do not expose Docker, ModemManager, pcscd, SIP, AMI or the management port directly to the
-  public Internet. Prefer a trusted LAN or VPN and a trusted TLS certificate.
+```text
+mddctl status
+mddctl doctor [--json]
+mddctl start|stop|restart|logs
+mddctl update [--no-cache]
+mddctl backup [--output PATH]
+mddctl restore --input PATH
+mddctl driver status|restore
+mddctl uninstall [--purge]
+```
 
-## License and acknowledgements
+`mddctl update` fetches only `origin/vmware`. It requires the exact managed remote, the `vmware`
+branch, a clean tree, no Git operation in progress, and a fast-forward relationship. It builds
+and tests the new commit in a temporary worktree before stopping the running version. Activation
+or health failure restores the previous commit, venv, WebUI, Engine image, and data snapshot.
+It never merges, rebases, force-pushes, or calls a GitHub Release API.
 
-MDD Sim Gateway is released under **GPL-3.0-only**. Build-time derivative patches that must remain
-under an upstream license are identified separately. The project is a derivative of
-[pagecat/vowifi_gateway](https://github.com/pagecat/vowifi_gateway) (MIT), which contributes the
-VoWiFi engine and the overall control-plane/engine/WebUI architecture; MDD Sim Gateway adds 4G
-cellular data and SMS, per-country network egress routing, unified device management and automatic
-provisioning, failover and a test suite. It further derives from or interoperates with SWu-IKEv2,
-sysmocom Asterisk and pjproject, phcoder/asterisk-docker, mitshell/card, sing-box, lpac, PCSC,
-CCID, pyscard and frankmorgner/vsmartcard. See [NOTICE](NOTICE) and
+`mddctl backup` stops MDD, confirms managed Engines are stopped, checkpoints and integrity-checks
+SQLite, then produces a root-only tar.gz, SHA-256 sidecar, and secret-free manifest. Restore rejects
+checksum failures, unsafe archive paths, links/devices, invalid manifests, and corrupt SQLite.
+
+> Backup archives contain plaintext credentials. Store them only on BitLocker, encrypted removable
+> media, or another access-controlled encrypted location. For whole-machine migration, stop MDD,
+> shut down the guest, and export or copy the VMware VM instead.
+
+`doctor --json` reports version and boolean health only; it must never print IMSI, ICCID, IMEI,
+credentials, phone numbers, or message text.
+
+## Ports and firewall
+
+The allocator probes real TCP and UDP occupancy. The first two default line blocks require:
+
+```text
+8443/tcp              Control/WebUI
+8089/tcp, 8099/tcp    WebRTC/WSS
+10000-10011/udp       line 1 RTP/RTCP
+12000-12011/udp       line 2 RTP/RTCP
+```
+
+The installer does not broadly rewrite UFW or nftables. The values above are the conflict-free
+defaults; installation predicts the exact two blocks from saved lines and live TCP/UDP occupancy.
+It prints that list without changing rules unless `--configure-firewall` is explicitly supplied.
+
+## Verification boundary
+
+Repository tests can verify source behavior and installer contracts. The following remain physical
+acceptance gates and must be run separately on fresh VMs for all four distributions: clean and
+repeat install, no-op and real fast-forward update, failed-build rollback, unchanged bridged route
+and DHCP address, SCR Prime USB/PCSC/ATR/hotplug, Quectel tty/WWAN/ModemManager/NetworkManager bearer,
+concurrent registration, inbound/outbound calls, browser two-way audio, supported SMS, guest reboot,
+and Windows-host reboot recovery. Do not infer those results from source tests.
+
+See [the detailed installation guide](docs/INSTALL.md),
+[troubleshooting](docs/TROUBLESHOOTING.md), and [architecture](docs/ARCHITECTURE.md).
+
+## Security and responsible use
+
+- Use only for a verified subscriber where local law, the carrier, and the plan permit it. Do not
+  use it for fraud, nuisance calling, verification-code collection, line rental, or telecom service
+  for third parties.
+- AKA keys remain inside the SIM/eSIM; the project does not read or store Ki/OP/OPc.
+- Lowering `max_sim_lines` retains existing records but prevents out-of-limit lines from starting.
+- Open `https://<reserved-VM-address>:8443` on a trusted LAN/VPN and create the administrator
+  immediately after installation.
+
+The project is GPL-3.0-only. The CCID patch is an LGPL-2.1-or-later derivative of CCID; see
+[patches/ccid/README.md](patches/ccid/README.md), [NOTICE](NOTICE), and
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
-
-This is an independent project and is not endorsed by carriers, hardware vendors or upstream
-projects.

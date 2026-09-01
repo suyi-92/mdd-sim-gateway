@@ -9,9 +9,9 @@
 # address, and requests the IPv6 P-CSCF. A supervisor restarts it on exit; because every fresh
 # start re-runs EAP-AKA WITH the PIN verify, the tunnel self-heals after a rekey/reauth teardown.
 #
-# PC/SC: this container is a pcscd CLIENT — it talks to the HOST pcscd via the bind-mounted
-# /run/pcscd socket. The pcsc-lite client library is pinned to the same version as the host
-# pcscd (see Dockerfile PCSC_VERSION) so the client/server protocol always matches.
+# PC/SC: this container is a pcscd client — it talks to the guest's distribution pcscd via the
+# bind-mounted /run/pcscd socket. The image pins its own client library and uses pcsc-lite's
+# stable socket protocol; it does not replace the guest daemon.
 set -u
 
 export MDD_RUNDIR="${MDD_RUNDIR:-/run/mdd-sim-gateway}"
@@ -34,7 +34,6 @@ export SWU_ACCEPT_EPDG_ESP_REKEY
 # in its own connection for EAP-AKA, so both auth paths work on PIN-enabled SIMs.
 log "starting pin_keeper (reader=${PIN_USIM_READER:-$USIM_READER})..."
 USIM_READER="${PIN_USIM_READER:-$USIM_READER}" python3 -u /usr/local/bin/pin_keeper.py &
-KEEPER_PID=$!
 
 wait_pin() {
     for _ in $(seq 1 30); do
@@ -81,7 +80,6 @@ rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
     sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 60 ] && backoff=60
   done
 ) &
-SWU_PID=$!
 
 # --- 4. Wait for the tunnel, then (re)render pjsip with the discovered P-CSCF ------
 log "waiting for SWu tunnel to establish..."

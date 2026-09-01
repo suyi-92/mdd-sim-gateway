@@ -11,6 +11,7 @@ import argparse
 import base64
 import collections
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -18,8 +19,10 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -291,6 +294,15 @@ UDP_PROXY_TYPES = {"ss", "shadowsocks", "trojan", "vless", "vmess", "hysteria2",
 # IKE SA. Addresses are therefore retained well beyond one DNS answer.
 EPDG_ADDRESS_TTL = float(os.environ.get("MDD_EPDG_ADDRESS_TTL", "21600"))
 EPDG_ADDRESS_MAX = int(os.environ.get("MDD_EPDG_ADDRESS_MAX", "64"))
+# Clash-style Fake-IP DNS answers are routing tokens, not Internet destinations. A proxy-aware
+# host resolver can make even an explicit query
+# to 1.1.1.1 return one of these addresses. Resolve through the already selected country exit
+# when that happens; otherwise the fake address is handed to the outbound node and IKE can only
+# retransmit forever.
+EPDG_FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
+EPDG_DOH_HOST = os.environ.get("MDD_EPDG_DOH_HOST", "cloudflare-dns.com")
+EPDG_DOH_TIMEOUT = float(os.environ.get("MDD_EPDG_DOH_TIMEOUT", "8"))
+EPDG_DOH_CACHE_TTL = float(os.environ.get("MDD_EPDG_DOH_CACHE_TTL", "60"))
 # How long a node that just failed a line is kept out of the candidate pool.
 EXIT_RESELECT_COOLDOWN = float(os.environ.get("MDD_EXIT_RESELECT_COOLDOWN", "900"))
 EXIT_RESELECT_MAX_AGE = float(os.environ.get("MDD_EXIT_RESELECT_MAX_AGE", "600"))
@@ -304,6 +316,7 @@ EXIT_PREFERRED_PROBE_ATTEMPTS = int(os.environ.get("MDD_EXIT_PREFERRED_PROBE_ATT
 # a QUIC outbound must complete a fresh handshake and loses to TCP candidates that are slower
 # in steady state. Wait for the process to settle before believing any measurement.
 EXIT_RANK_WARMUP_SECONDS = float(os.environ.get("MDD_EXIT_RANK_WARMUP", "25"))
+EXIT_TEST_MAX_AGE_SECONDS = 90.0
 # A full reconcile shells out to mmcli and ip about fifteen times. At the base interval that
 # was the largest source of process creation on the box, and almost all of it re-derived a
 # state that had not changed. When a cycle finds nothing to do the loop backs off, while still
@@ -324,12 +337,7 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
-# Grace between publishing "launching" and expecting systemd to report the updater unit as
-# active, so a loop pass that races a launch cannot retire the run it just started.
-UPDATE_LAUNCH_GRACE_SECONDS = 90.0
 COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
-# The control plane's container in docker installs; install.sh owns the same name.
-CONTROL_CONTAINER = "mdd-sim-gateway-control"
 COUNTRY_PROXY_PORT_BASE = int(os.environ.get("MDD_COUNTRY_PROXY_PORT_BASE", "22000"))
 
 
@@ -339,6 +347,112 @@ def country_proxy_port(country: str) -> int:
     if not re.fullmatch(r"[a-z]{2}", code):
         raise ValueError("country must be a two-letter ISO code")
     return COUNTRY_PROXY_PORT_BASE + (ord(code[0]) - 97) * 26 + ord(code[1]) - 97
+
+
+def _recv_exact(stream: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.recv(remaining)
+        if not chunk:
+            raise RuntimeError("SOCKS5 proxy closed the DNS connection")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _socks5_connect(proxy_host: str, proxy_port: int, target_host: str,
+                    target_port: int, timeout: float) -> socket.socket:
+    """Open one unauthenticated SOCKS5 CONNECT stream without resolving the target locally."""
+    stream = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
+    stream.settimeout(timeout)
+    try:
+        stream.sendall(b"\x05\x01\x00")
+        if _recv_exact(stream, 2) != b"\x05\x00":
+            raise RuntimeError("country exit rejected the DNS SOCKS5 negotiation")
+        encoded = str(target_host).encode("idna")
+        if not encoded or len(encoded) > 255:
+            raise RuntimeError("DoH hostname is invalid")
+        stream.sendall(b"\x05\x01\x00\x03" + bytes([len(encoded)]) + encoded
+                       + int(target_port).to_bytes(2, "big"))
+        head = _recv_exact(stream, 4)
+        if head[0] != 5 or head[1] != 0:
+            code = head[1] if len(head) > 1 else -1
+            raise RuntimeError(f"country exit rejected the DNS connection (code {code})")
+        atyp = head[3]
+        if atyp == 1:
+            _recv_exact(stream, 4)
+        elif atyp == 3:
+            _recv_exact(stream, _recv_exact(stream, 1)[0])
+        elif atyp == 4:
+            _recv_exact(stream, 16)
+        else:
+            raise RuntimeError("country exit returned an invalid SOCKS5 address")
+        _recv_exact(stream, 2)
+        return stream
+    except Exception:
+        stream.close()
+        raise
+
+
+def _parse_doh_ipv4(document: dict) -> tuple[list[str], float]:
+    try:
+        status = int(document.get("Status", -1))
+    except (TypeError, ValueError):
+        status = -1
+    if status != 0:
+        raise RuntimeError(f"proxy DoH resolver returned DNS status {status}")
+    addresses, ttls = set(), []
+    for answer in document.get("Answer") or []:
+        if not isinstance(answer, dict) or answer.get("type") != 1:
+            continue
+        try:
+            address = ipaddress.IPv4Address(str(answer.get("data") or ""))
+        except ipaddress.AddressValueError:
+            continue
+        if not address.is_global:
+            continue
+        addresses.add(str(address))
+        try:
+            ttls.append(float(answer.get("TTL")))
+        except (TypeError, ValueError):
+            pass
+    if not addresses:
+        raise RuntimeError("proxy DoH resolver returned no public IPv4 ePDG address")
+    ttl = min(ttls) if ttls else EPDG_DOH_CACHE_TTL
+    return sorted(addresses), max(15.0, min(ttl, 300.0))
+
+
+def resolve_ipv4_via_socks_doh(host: str, proxy_host: str, proxy_port: int,
+                                timeout: float = EPDG_DOH_TIMEOUT) -> tuple[list[str], float]:
+    """Resolve an ePDG over HTTPS inside its country exit, bypassing host Fake-IP DNS."""
+    query = urllib.parse.urlencode({"name": str(host), "type": "A"})
+    request = (f"GET /dns-query?{query} HTTP/1.1\r\n"
+               f"Host: {EPDG_DOH_HOST}\r\n"
+               "Accept: application/dns-json\r\n"
+               "User-Agent: mdd-sim-gateway\r\n"
+               "Connection: close\r\n\r\n").encode("ascii")
+    try:
+        with _socks5_connect(proxy_host, proxy_port, EPDG_DOH_HOST, 443, timeout) as stream:
+            context = ssl.create_default_context()
+            with context.wrap_socket(stream, server_hostname=EPDG_DOH_HOST) as tls:
+                tls.sendall(request)
+                response = http.client.HTTPResponse(tls, method="GET")
+                response.begin()
+                if response.status != 200:
+                    raise RuntimeError(f"proxy DoH resolver returned HTTP {response.status}")
+                body = response.read(131073)
+                response.close()
+        if len(body) > 131072:
+            raise RuntimeError("proxy DoH response is too large")
+        document = json.loads(body.decode("utf-8"))
+    except RuntimeError:
+        raise
+    except (OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"proxy DoH lookup failed: {exc}") from exc
+    if not isinstance(document, dict):
+        raise RuntimeError("proxy DoH resolver returned an invalid document")
+    return _parse_doh_ipv4(document)
 
 
 def node_keyword_matches(name: str, keyword: str) -> bool:
@@ -526,6 +640,7 @@ class Orchestrator:
         self.device_status_path = self.root / "devices-status.json"
         self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
+        self.exit_test_request_dir = self.root / "exit-test-requests"
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -537,6 +652,10 @@ class Orchestrator:
             prior_exits = {}
         # "<country>:<epdg host>" -> {address: time it may stop being routed}
         self.epdg_seen: dict[str, dict[str, float]] = {}
+        # "<host>:<local country SOCKS endpoint>" -> (expiry, real A records). Only populated
+        # when the inherited host resolver returns a Clash-style Fake-IP.
+        self.epdg_proxy_dns: dict[str, tuple[float, list[str]]] = {}
+        self.epdg_fake_dns_reported: set[str] = set()
         # Last node change per country, so the UI can say why the exit is not the pinned one.
         self.exit_last_change: dict[str, dict] = {
             str(country): dict(state["last_change"])
@@ -614,6 +733,9 @@ class Orchestrator:
         try: self.last_reader_config = self.reader_config_path.read_text(encoding="utf-8")
         except OSError: self.last_reader_config = ""
         self.stop = False
+        # Keep idle reconciliation low-frequency while allowing SIGTERM to wake shutdown
+        # immediately instead of inheriting the whole polling interval.
+        self._stop_event = threading.Event()
         # What the previous cycle concluded, for deciding whether this one changed anything.
         self._last_conclusion = ""
         # ---------------------------------------------------------- support diagnostics
@@ -755,161 +877,13 @@ class Orchestrator:
     def service_active(name: str) -> bool:
         return run(["systemctl", "is-active", "--quiet", name]).returncode == 0
 
-    # ------------------------------------------------------------------ self-update
-    def process_update_request(self):
-        """Launch the detached self-updater when the control plane requests one.
-
-        The updater must outlive this process (``install.sh reload`` restarts the
-        orchestrator and the control plane), so it runs as a transient systemd unit from a
-        staged copy of ``host/mdd_update.py`` — the checkout under ``self.repo`` is replaced
-        while it runs.  The request file is consumed before launching so a restart loop can
-        never spawn a second updater for the same request.
-        """
-        request_path = self.root / "update-request.json"
-        request = read_json(request_path)
-        if not request:
-            return
-        try:
-            request_path.unlink()
-        except OSError:
-            pass
-        status_path = self.root / "update-status.json"
-        version = str(request.get("version") or "")
-        repository = str(request.get("repository") or "")
-        network = request.get("network") or {}
-        raw_asset_sizes = request.get("asset_sizes") or {}
-        asset_sizes = {}
-        if isinstance(raw_asset_sizes, dict):
-            for name, size in raw_asset_sizes.items():
-                try:
-                    parsed_size = int(size)
-                except (TypeError, ValueError):
-                    continue
-                if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", str(name)) \
-                        and 0 < parsed_size < 20 * 1024 * 1024 * 1024:
-                    asset_sizes[str(name)] = parsed_size
-
-        def fail(reason: str):
-            atomic_json(status_path, {"state": "failed", "phase": "launch", "error": reason,
-                                      "target": version, "updated_at": int(time.time())})
-
-        if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version) \
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-            fail("invalid update request")
-            return
-        desired = read_json(self.desired_path)
-        proxy = desired.get("proxy") or {}
-        live = read_json(self.status_path).get("exits") or {}
-
-        def resolve_route(selection: dict) -> dict:
-            mode = str(selection.get("proxy_mode") or "direct").lower()
-            if mode == "direct":
-                return {"proxy_url": "", "route": "direct", "route_name": ""}
-            if mode == "country":
-                country = str(selection.get("proxy_country") or "").strip().lower()
-                exit_cfg = (proxy.get("exits") or {}).get(country) or {}
-                state = live.get(country) or {}
-                try:
-                    proxy_port = int(state.get("proxy_port") or 0)
-                except (TypeError, ValueError):
-                    proxy_port = 0
-                proxy_host = str(state.get("proxy_host") or "").strip()
-                if (not re.fullmatch(r"[a-z]{2}", country) or not exit_cfg.get("enabled")
-                        or not state.get("ready") or proxy_host != COUNTRY_PROXY_LISTEN
-                        or not 1 <= proxy_port <= 65535):
-                    raise ValueError("selected update country exit is not ready")
-                return {"proxy_url": f"socks5h://{proxy_host}:{proxy_port}",
-                        "route": "country", "route_name": country.upper()}
-            if mode != "library":
-                raise ValueError("invalid update proxy mode")
-            profile_id = str(selection.get("proxy_profile_id") or "").strip()
-            profile = (proxy.get("profiles") or {}).get(profile_id) or {}
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) or not profile:
-                raise ValueError("selected update proxy is not in the proxy library")
-            route_name = str(profile.get("name") or profile_id).strip()[:120]
-            if profile.get("type") == "socks5":
-                host = str(profile.get("server") or "").strip()
-                try:
-                    port = int(profile.get("port") or 1080)
-                except (TypeError, ValueError):
-                    port = 0
-                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
-                    raise ValueError("selected SOCKS5 update proxy is invalid")
-                username = urllib.parse.quote(str(profile.get("username") or ""), safe="")
-                password = urllib.parse.quote(str(profile.get("password") or ""), safe="")
-                auth = f"{username}:{password}@" if username or password else ""
-                proxy_url = f"socks5h://{auth}{host}:{port}"
-            else:
-                exits = proxy.get("exits") or {}
-                state = next((live.get(country) or {} for country, exit_cfg in exits.items()
-                              if isinstance(exit_cfg, dict) and exit_cfg.get("enabled")
-                              and exit_cfg.get("profile_id") == profile_id
-                              and (live.get(country) or {}).get("ready")), {})
-                try:
-                    proxy_port = int(state.get("proxy_port") or 0)
-                except (TypeError, ValueError):
-                    proxy_port = 0
-                proxy_host = str(state.get("proxy_host") or "").strip()
-                if proxy_host != COUNTRY_PROXY_LISTEN or not 1 <= proxy_port <= 65535:
-                    raise ValueError("selected update proxy has no ready country exit")
-                proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
-            return {"proxy_url": proxy_url, "route": "library", "route_name": route_name}
-
-        requested_routes = request.get("networks")
-        selections = requested_routes if isinstance(requested_routes, list) else [network]
-        routes, route_error = [], ""
-        for selection in selections:
-            if not isinstance(selection, dict):
-                continue
-            try:
-                resolved = resolve_route(selection)
-            except ValueError as exc:
-                route_error = str(exc)
-                continue
-            if not any(item["proxy_url"] == resolved["proxy_url"] for item in routes):
-                routes.append(resolved)
-        if not routes:
-            fail(route_error or "no usable update download route")
-            return
-        if self.dry_run:
-            fail("dry-run orchestrator does not apply updates")
-            return
-        if self.service_active("mdd-sim-gateway-update.service"):
-            return  # an update is already running; drop the duplicate request
-        runner = self.data / "update" / "runner.py"
-        try:
-            runner.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copy2(self.repo / "host" / "mdd_update.py", runner)
-            network_path = runner.parent / "network.json"
-            # Proxy credentials stay in a root-only file and never appear in systemd's command
-            # line, unit metadata, progress status or journal output.
-            atomic_json(network_path, {"proxy_url": routes[0]["proxy_url"],
-                                      "route": routes[0]["route"],
-                                      "route_name": routes[0]["route_name"],
-                                      "routes": routes,
-                                      "asset_sizes": asset_sizes})
-        except OSError as exc:
-            fail(f"could not stage the updater: {exc}")
-            return
-        run(["systemctl", "reset-failed", "mdd-sim-gateway-update.service"])
-        atomic_json(status_path, {"state": "running", "phase": "launching", "target": version,
-                                  "updated_at": int(time.time())})
-        result = run(["systemd-run", "--unit", "mdd-sim-gateway-update", "--collect",
-                      "--description", "MDD Sim Gateway self-update",
-                      sys.executable, str(runner), "--repo", str(self.repo),
-                      "--data", str(self.data), "--version", version,
-                      "--repository", repository, "--network-config", str(network_path)])
-        if result.returncode != 0:
-            fail(f"systemd-run failed: {(result.stderr or result.stdout or '').strip()}")
-
     def process_service_restart_request(self):
         """Restart the gateway's own services, or the host, when the control plane asks.
 
         The control plane is unprivileged and is itself restarted in every scope, so it can
         only state the intent.  ``control`` is safe to run inline — it does not touch this
         process, so the SIM bridges and engine containers stay up — while ``services``
-        restarts this very process and has to outlive it in a transient unit, the way
-        self-updates do.
+        restarts this very process and therefore has to outlive it in a transient unit.
         """
         request_path = self.root / "service-restart-request.json"
         request = read_json(request_path)
@@ -935,11 +909,7 @@ class Orchestrator:
         publish("running")
         self.log(f"restarting on request: scope={scope}")
         if scope == "control":
-            mode = (self.data / "install-mode").read_text(encoding="utf-8").strip().lower() \
-                if (self.data / "install-mode").is_file() else "local"
-            command = ["docker", "restart", CONTROL_CONTAINER] if mode == "docker" \
-                else ["systemctl", "restart", "mdd-sim-gateway-control"]
-            result = run(command)
+            result = run(["systemctl", "restart", "mdd-sim-gateway-control"])
             if result.returncode:
                 publish("failed", error_code="restart.error.failed",
                         error=(result.stderr or result.stdout or "").strip()[:400])
@@ -967,42 +937,13 @@ class Orchestrator:
 
         ``services`` restarts this process and ``host`` takes the machine down, so neither can
         publish a result — this process running again *is* the result. Without this the
-        document stays "running" forever, which is the very thing this release removes from
-        the update path.
+        document stays "running" forever.
         """
         status_path = self.root / "service-restart-status.json"
         status = read_json(status_path)
         if status.get("state") == "running" and status.get("scope") in {"services", "host"}:
             atomic_json(status_path, {**status, "state": "success",
                                       "updated_at": int(time.time())})
-
-    def reap_abandoned_update(self):
-        """Retire a progress document whose updater no longer exists.
-
-        An updater killed mid-flight — the host rebooted or lost power, the transient unit was
-        stopped, the process was OOM-killed — cannot record its own death, so the document it
-        was publishing to stays "running" and the WebUI resumes into that dead progress view on
-        every visit until someone deletes the file over SSH.  systemd knows what the document
-        cannot say: with no request waiting to be launched and no updater unit left, the run is
-        over.  The failure keeps the stage and asset it died on, which is the useful part.
-        """
-        if self.dry_run:
-            return
-        status_path = self.root / "update-status.json"
-        status = read_json(status_path)
-        if status.get("state") != "running":
-            return
-        if (self.root / "update-request.json").is_file():
-            return  # queued for process_update_request(); no unit is expected yet
-        if time.time() - int(status.get("updated_at") or 0) < UPDATE_LAUNCH_GRACE_SECONDS:
-            return
-        if self.service_active("mdd-sim-gateway-update.service"):
-            return
-        # Only the code is published: the WebUI renders it in the operator's language, and an
-        # `error` string beside it would just repeat the same sentence in English.
-        atomic_json(status_path, {**status, "state": "failed", "updated_at": int(time.time()),
-                                  "error_code": "update.error.abandoned"})
-        self.log(f"retired an abandoned update at phase {status.get('phase') or 'unknown'}")
 
     def publish_device_status(self, desired_devices: dict, assignments: dict,
                               *, transitioning=False, error="", disruption=None,
@@ -1352,10 +1293,9 @@ class Orchestrator:
                                  vowifi_required: bool) -> None:
         """Publish the host-side view the control plane cannot observe for itself.
 
-        The control plane runs in a container without systemd or the host USB tree, so
-        every fact here would otherwise reach a maintainer only by asking the operator to
-        run commands. Fields are drawn from state this cycle already computed; nothing is
-        collected merely to fill the file.
+        Keep host probing in this privileged service instead of the Web process. Fields are
+        drawn from state this cycle already computed; nothing is collected merely to fill
+        the file.
         """
         now = int(time.time())
 
@@ -1718,6 +1658,55 @@ class Orchestrator:
             return True
         return any(bool(line.get("enabled", True))
                    for line in (desired.get("lines") or []) if isinstance(line, dict))
+
+    def active_exit_tests(self, now: float | None = None) -> set[str]:
+        """Return valid, unexpired country-scoped test requests.
+
+        These files are written by the control plane only when an operator presses Test UDP.
+        They are bounded by both their declared expiry and a hard maximum age, so a crashed
+        request can never turn an otherwise idle proxy into a permanent background service.
+        """
+        now = time.time() if now is None else float(now)
+        active = set()
+        for path in self.exit_test_request_dir.glob("*.json"):
+            country = path.stem.lower()
+            request = read_json(path)
+            try:
+                requested_at = float(request.get("requested_at") or 0)
+                expires_at = float(request.get("expires_at") or 0)
+            except (TypeError, ValueError):
+                requested_at = expires_at = 0
+            valid = (bool(re.fullmatch(r"[a-z]{2}", country))
+                     and str(request.get("country") or "").lower() == country
+                     and bool(request.get("token"))
+                     and requested_at <= now + 5
+                     and now < expires_at
+                     and now - requested_at <= EXIT_TEST_MAX_AGE_SECONDS)
+            if valid:
+                active.add(country)
+            elif not self.dry_run:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return active
+
+    @staticmethod
+    def proxy_reconcile_desired(desired: dict, line_required: bool,
+                                test_countries: set[str]) -> dict:
+        """Scope an idle-host test to its requested countries, or disable proxy runtime."""
+        if line_required:
+            return desired
+        scoped = dict(desired)
+        proxy = dict(desired.get("proxy") or {})
+        if test_countries:
+            exits = proxy.get("exits") or {}
+            proxy["exits"] = {country: value for country, value in exits.items()
+                              if str(country).lower() in test_countries}
+        else:
+            proxy = {"enabled": False}
+        scoped["proxy"] = proxy
+        return scoped
 
     def desired_devices(self, discovered: list[dict]) -> tuple[dict, bool]:
         """Load per-device state, creating safe defaults once when necessary."""
@@ -2469,14 +2458,43 @@ class Orchestrator:
             raise RuntimeError("Xray exited during startup")
         self.last_xray_fingerprint = fingerprint
 
-    @staticmethod
-    def resolve(host: str) -> list[str]:
+    def resolve(self, host: str, proxy_host: str = "", proxy_port: int = 0) -> list[str]:
         result = set()
-        for family, _, _, _, address in socket.getaddrinfo(host, 0, type=socket.SOCK_DGRAM):
-            ip = address[0]
-            if family == socket.AF_INET:
-                result.add(ip)
-        return sorted(result)
+        system_error = None
+        try:
+            for family, _, _, _, address in socket.getaddrinfo(host, 0,
+                                                               type=socket.SOCK_DGRAM):
+                ip = address[0]
+                if family == socket.AF_INET:
+                    result.add(ip)
+        except socket.gaierror as exc:
+            system_error = exc
+        fake = {value for value in result if any(
+            ipaddress.IPv4Address(value) in network for network in EPDG_FAKE_IP_NETWORKS)}
+        if result and not fake:
+            return sorted(result)
+        if not proxy_host or not int(proxy_port or 0):
+            if system_error:
+                raise RuntimeError(f"ePDG DNS lookup failed: {system_error}") from system_error
+            return sorted(result)
+
+        key = f"{host}:{proxy_host}:{int(proxy_port)}"
+        now = time.time()
+        cached = self.epdg_proxy_dns.get(key)
+        if cached and cached[0] > now:
+            return list(cached[1])
+        try:
+            addresses, ttl = resolve_ipv4_via_socks_doh(
+                host, proxy_host, int(proxy_port), EPDG_DOH_TIMEOUT)
+        except RuntimeError as exc:
+            prefix = "ePDG DNS returned a Fake-IP" if fake else "ePDG DNS lookup failed"
+            raise RuntimeError(f"{prefix}; proxy resolution failed: {exc}") from exc
+        self.epdg_proxy_dns[key] = (now + max(15.0, ttl), list(addresses))
+        if fake and key not in self.epdg_fake_dns_reported:
+            self.log(f"ePDG DNS for {host} returned a Fake-IP; using real addresses resolved "
+                     "inside the selected country exit")
+            self.epdg_fake_dns_reported.add(key)
+        return list(addresses)
 
     def retained_epdg_addresses(self, key: str, resolved: list[str]) -> list[str]:
         """Every ePDG address that must stay routed, not just the one DNS just returned.
@@ -2566,7 +2584,8 @@ class Orchestrator:
                     state = {"ready": True, "mode": "disabled"}
                 elif exit_state.get("ready") and exit_state.get("mode") != "direct":
                     try:
-                        resolved = self.resolve(host)
+                        resolved = self.resolve(host, str(exit_state.get("proxy_host") or ""),
+                                                int(exit_state.get("proxy_port") or 0))
                         if not resolved: raise RuntimeError("ePDG DNS returned no IPv4 address")
                         addresses = self.retained_epdg_addresses(f"{country}:{host}", resolved)
                         iface = exit_state["interface"]
@@ -2951,8 +2970,6 @@ class Orchestrator:
         # be completed by the process that comes back.
         self.settle_service_restart()
         while not self.stop:
-            self.process_update_request()
-            self.reap_abandoned_update()
             self.process_service_restart_request()
             self.process_bridge_restart_requests()
             self.retire_obsolete_services()
@@ -2988,7 +3005,9 @@ class Orchestrator:
             # the next boot does not start-then-stop-then-reset the modems all over again.
             mm_stood_down = (not self._serial_mode
                              and plan["cellular_backend_required"] and not cellular_required)
-            vowifi_required = self.country_egress_required(desired, plan)
+            line_egress_required = self.country_egress_required(desired, plan)
+            test_countries = self.active_exit_tests()
+            vowifi_required = line_egress_required or bool(test_countries)
             mm_active = self.service_active("ModemManager.service")
             previous = mm_active
             if self.applied_cellular_backend is None:
@@ -3021,10 +3040,8 @@ class Orchestrator:
             self.apply_device_radios(discovered, active_desired,
                                      through_modemmanager=cellular_required)
             # Country egress only exists to carry VoWiFi IKE/ePDG traffic.
-            proxy_desired = desired
-            if not vowifi_required:
-                proxy_desired = dict(desired)
-                proxy_desired["proxy"] = {"enabled": False}
+            proxy_desired = self.proxy_reconcile_desired(
+                desired, line_egress_required, test_countries)
             self.reconcile_proxy(proxy_desired)
             # If any modem needs cellular, ModemManager owns every modem tty. Consequently every
             # enabled VoWiFi bridge (including VoWiFi-only devices) must use its serialized AT
@@ -3049,7 +3066,7 @@ class Orchestrator:
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
-                     self.bridge_restart_request_dir):
+                     self.bridge_restart_request_dir, self.exit_test_request_dir):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:
@@ -3083,7 +3100,8 @@ class Orchestrator:
             remaining = deadline - time.time()
             if remaining <= 0:
                 return
-            time.sleep(min(self.interval, max(0.1, remaining)))
+            if self._stop_event.wait(min(self.interval, max(0.1, remaining))):
+                return
             if self._input_mtimes() != watched:
                 return
 
@@ -3095,6 +3113,7 @@ class Orchestrator:
         readers disappear first and removes an otherwise healthy VoWiFi engine container.
         """
         self.stop = True
+        self._stop_event.set()
         if self.bridges:
             self.root.mkdir(parents=True, exist_ok=True)
             (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")

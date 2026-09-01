@@ -239,8 +239,12 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   }
 
   const missing = targetDevice?.provisioning?.missing || []
-  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)') }
+  const missingLabels = {
+    imsi: 'IMSI', mcc_mnc: 'MCC / MNC', imei: t('Hardware IMEI'),
+    smsc: t('SMS centre (SMSC)'), pin: t('SIM PIN'),
+  }
   const imeiReady = String(targetDevice?.imei || '').replace(/[^0-9]/g, '').length === 15
+  const nativeReader = targetDevice?.device_type === 'reader'
   const existingLine = instances.some(line => String(line.id) === String(form.id))
 
   return (
@@ -333,6 +337,9 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               onChange={(e) => upd({ smsc: e.target.value })}
               placeholder={smscMode === 'auto' ? t('detect card / verify PIN to read from SIM') : '+1...'}
               style={smscMode === 'auto' ? { opacity: .7 } : undefined} />
+            {!String(form.smsc || '').trim() && <div className="u-field-warning">
+              {t('Optional for VoWiFi calls. Outbound VoWiFi SMS stays disabled until an SMSC is available.')}
+            </div>}
           </Field>
           {!creating && <Field label={t('Reader match')}><input className="mono" value={form.reader} onChange={(e) => upd({ reader: e.target.value })} placeholder="imsi:302..." /></Field>}
           <Field label="APN"><input className="mono" value={form.apn ?? 'ims'} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" /></Field>
@@ -358,7 +365,9 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         </div>
         <p className="u-note">{imeiReady
           ? t('The IMEI is inherited from this device’s Hardware settings.')
-          : t('Set a 15-digit IMEI on the Hardware tab before starting VoWiFi.')}</p>
+          : nativeReader
+            ? t('A smart-card reader has no hardware IMEI. MDD will omit DEVICE_IDENTITY; configure one only if it truthfully belongs to the equipment and your carrier requires it.')
+            : t('Set a 15-digit IMEI on the Hardware tab before starting VoWiFi.')}</p>
         <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
           {t('IDr help')}
         </div>

@@ -1,157 +1,307 @@
-# 故障排查
+# VMware 故障排查
 
-- 虚拟机已扩容、但诊断页仍显示磁盘接近 100%：虚拟磁盘容量、分区和文件系统是三层，
-  管理平台只放大第一层不会自动扩展后两层。先用 `lsblk -f`、`findmnt /` 和 `df -hT /`
-  确认根分区及文件系统；普通 ext4 分区可用 `growpart` 扩分区后再用 `resize2fs`，
-  XFS 用 `xfs_growfs /`，LVM 则需先 `pvresize` 再 `lvextend -r`。目标设备名必须以
-  `lsblk` 的实际结果为准，不要盲目复制 `/dev/sda` 或分区号。扩容完成前反复重试镜像
-  构建只会继续填满旧文件系统。
-
-- 4G 不在线：检查“设备 → 详情”的 ModemManager 对象、注册、APN 和 bearer；运行设备诊断。
-- VoWiFi 停在部分连接：检查国家出口 UDP 验证、ePDG、SIM 是否开通 Wi‑Fi Calling、PIN 剩余次数及引擎日志。
-- 服务更新后 VoWiFi 突然停止：确认引擎容器仍存在，并检查控制面日志中是否把虚拟读卡器维护误判为 `card removed`。当前版本会在编排器退出信号到达时立即发布维护标记，并保留 45 秒重建窗口；旧版本应先恢复读卡桥再重新启动线路。
-- 能振铃但没声音：确认 `MDD_ADVERTISE_ADDR` 是软电话可达的主机地址，并检查 RTP 端口与浏览器麦克风权限。
-- 读卡器未出现：先用 `lsusb` 确认 USB 层，再运行 `pcsc_scan` 检查 PC/SC 层。SCR Prime（`04d9:c001`）需执行一次 `sudo ./install.sh patchprime` 加入 libccid 设备表；之后支持热插拔。读卡器没有 4G 开关属于正常设计。
-- SIM 逻辑通道分配失败：查看“设备 → 硬件”中的已分配数量、通道用途和明确错误。系统会自动释放本轮部分分配；若持续失败，先重启对应线路，确认仍失败后再安排模块复位，不要只按底层 QMI 错误码猜测原因。
-- Telegram 失败：选择手动 HTTP/SOCKS 代理或已就绪的国家出口，并使用“测试”。
-- Telegram 机器人不响应指令：先确认“通知 → Telegram → 聊天指令”已开启，且发送者的数字 ID
-  在授权列表里（向 `@userinfobot` 索取自己的 ID；群聊需填群 ID，且群 ID 为负数）。指令走与推送
-  相同的代理设置，推送“测试”通过即说明链路可用。停机期间积压的指令会被丢弃而不是延迟执行，
-  因此重启后需要重新发送。号码必须写完整 E.164（如 `+447700900123`），运营商会拒绝或误路由
-  只有国内格式的号码。
-- 更新显示“尚无公开发布版本”：仓库仍为私有或尚未发布正式 Release 时属于正常情况；版本查询不需要 GitHub 认证。
-- 升级在下载阶段超时或被远端断开：保持默认“自动”，系统会先直连，再尝试代理库中的可用
-  条目；也可固定选择一个代理库条目后先点击“检查更新”验证链路。检查成功的线路会继续用于
-  源码包、Engine 和控制镜像下载。
-- 升级停在 `engine_image`：检查界面显示的下载线路与数据目录下
-  `update/engine-image.log`。Engine 使用与其他 Release 资产相同的直连或代理回退，不要求
-  Docker daemon 直接访问 GHCR；旧 Engine 在新镜像通过校验和及完整身份检查前不会被替换。
-- 手工 Engine 构建在克隆 pjproject 或 Asterisk 时失败：确认主机能访问项目维护的两个
-  GitHub sysmocom 镜像。它们固定保存本项目使用的上游 commit；不得关闭证书验证或改用
-  未审核镜像。
-
-
-## 虚拟化环境部署（PVE / QEMU）
-
-本节来自一次完整的现场排障（issue #1），配方均经实机验证。
-
-### 网络前置：Docker Hub 不可达
-
-国内网络环境下引擎镜像的基础层（`fedora`、`node`）常无法从 `registry-1.docker.io` 拉取，
-表现为安装/升级时 `dial tcp ... i/o timeout`。给 Docker 配置镜像加速后重试：
+先运行：
 
 ```bash
-sudo tee /etc/docker/daemon.json <<'EOF'
-{ "registry-mirrors": ["https://docker.m.daocloud.io"] }
-EOF
-sudo systemctl restart docker
+sudo mddctl status
+sudo mddctl doctor
+sudo mddctl logs
 ```
 
-加速地址时效性强，哪个可用因网络而异，任选一个能用的填入即可。
+需要提交机器可读结果时使用：
 
-### 虚拟机（QEMU/PVE）单模块
+```bash
+sudo mddctl doctor --json
+```
 
-- 用完整虚拟机而不是 LXC 时，模块的 QMI 网口在客户机内核中创建，ModemManager 可完整工作（4G + VoWiFi）。
-- USB 直通**按物理端口映射**（不要按厂商/设备 ID —— 两个同型模块的 ID 完全相同，按 ID 映射行为不确定），并**取消勾选「使用 USB3」**（这类模块是 USB2 设备，挂到模拟 xHCI 上控制传输可能失败，症状为设置 DTR 报 `Errno 71 Protocol error`、AT 无响应）。
+JSON 不包含 IMSI、ICCID、IMEI、号码、凭据或消息正文。分享其他日志前仍需人工复核。
 
-### 虚拟机双模块（多模块）
+## 1. 一键命令在下载或 sudo 前失败
 
-两个模块共享一个模拟 USB 控制器时可能同时静默失效。已验证的完整配方：
+- 必须以普通用户运行，不能先 `sudo bash`。
+- 需要 `sudo`；最小系统若没有 Git，bootstrap 会在一次权限确认后通过 apt 安装 Git。
+- `--ref` 只接受 `vmware` 或精确 40 位十六进制提交。
+- 自定义源码/数据路径必须是无空白的绝对非根路径。
 
-1. **宿主机拉黑模块驱动**，防止宿主机与直通抢设备（历史上多次「模块全哑」由此而来）：
+只看动作：
 
-   ```bash
-   printf 'blacklist option\nblacklist qmi_wwan\n' > /etc/modprobe.d/mdd-passthrough-blacklist.conf
-   modprobe -r option qmi_wwan
-   ```
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --dry-run --require-scr-prime --require-cellular
+```
 
-2. **一模块一个独立模拟控制器**（PVE 网页界面做不到，需命令行；VM 需关机）：
+## 2. 系统或资源预检停止
 
-   ```bash
-   qm set <vmid> --delete usb0 --delete usb1
-   qm set <vmid> --args '-device qemu-xhci,id=x1 -device qemu-xhci,id=x2 -device usb-host,hostbus=3,hostport=3,bus=x1.0 -device usb-host,hostbus=3,hostport=4,bus=x2.0'
-   ```
+支持范围只包含 x86_64 的 Ubuntu 24.04/26.04 和 Debian 12/13。检查：
 
-   `hostbus`/`hostport` 按宿主机 `lsusb -t` 里模块实际所在的总线和端口填写。注意：`--args`
-   定义的 USB 设备不会显示在 PVE 网页硬件列表中；回退用 `qm set <vmid> --delete args`。
+```bash
+uname -m
+. /etc/os-release; printf '%s %s\n' "$ID" "$VERSION_ID"
+ps -p 1 -o comm=
+free -h
+df -hT /
+test -c /dev/net/tun && echo TUN_OK
+ss -ltnp | grep ':8443'
+```
 
-   两个模块更换到其他物理 USB 接口后，可在 **PVE 宿主机**用仓库脚本重新发现并绑定：
+虚拟硬盘显示 64 GiB、`df` 仍很小时，只扩大了 VMware 的磁盘层，没有扩分区/文件系统。
+使用 `lsblk -f` 与 `findmnt /` 确定真实布局后再扩容；不要猜设备名。
 
-   ```bash
-   # 只预览，不修改
-   bash tools/pve-bind-ec25-modems.sh 104
+## 3. 安装 NetworkManager 后地址或 SSH 变化
 
-   # 确认后应用；若 VM 原本运行，会正常关机、更新绑定并重新启动
-   bash tools/pve-bind-ec25-modems.sh --apply 104
-   ```
+安装器会停止并报告 before/after 地址。证据位于：
 
-   脚本只在恰好发现两块 `2c7c:0125` 时工作，并拒绝覆盖未知的 QEMU `args`、已有
-   `usbN` 配置，以及已由其他 VM 配置或持有的相同物理 USB 口。它依据 sysfs 的
-   `busnum + devpath` 绑定，不使用每次插拔都会变化的 `Device` 编号。脚本需要在换口后
-   手动执行；不会因 USB 瞬断自动关闭生产 VM。
+```text
+/etc/mdd-sim-gateway/network/default-interface
+/etc/mdd-sim-gateway/network/default-gateway
+/etc/mdd-sim-gateway/network/default-source
+/etc/mdd-sim-gateway/network/address-before.json
+/etc/mdd-sim-gateway/network/routes-before.json
+/etc/mdd-sim-gateway/network/backend-before
+```
 
-3. 可选：调高宿主机 usbfs 缓冲上限（无害保险）：内核参数 `usbcore.usbfs_memory_mb=1000`。
+检查：
 
-验证：客户机 `lsusb -t` 中两个模块应挂在**两个不同的 xhci** 下、各 5 个接口；`mmcli -L` 应列出两个 Modem 对象。
+```bash
+ip -4 route show default
+ip -4 route get 1.1.1.1
+nmcli device status
+networkctl status
+```
 
-### LXC 容器
+若主网卡本来不由 NetworkManager 管理，确认以下策略仍存在且只允许 GSM：
 
-- LXC 内看不到模块的 QMI 网口（网络接口属于宿主机命名空间），ModemManager 无法创建 modem 对象，**4G 不可用**。
-- 自 v1.3.9 起这是受支持的纯 VoWiFi 路径：编排服务读到 ModemManager 的拒绝记录后立即降级为直连串口，并停掉 ModemManager；SIM 访问与 VoWiFi 正常。
-- LXC 的 USB 为宿主内核直驱，多模块无虚拟化层限制。
+```bash
+sudo cat /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf
+```
 
-### 直通排障纪律
+不要为了让蜂窝上网而把桥接主网卡改成静态 IP；继续使用路由器 DHCP 保留。
 
-- **每一步观测都必须从已知状态出发**：先关 VM（`qm status` 确认 `stopped`），设备冷复位（物理重插或重启宿主机），再测。带电测试得到的现象几乎都是上一步的残影。
-- VM 带直通运行期间，宿主机上**不要** `modprobe option` 或访问那些串口 —— 宿主机驱动与 QEMU 抢同一设备会把它推入「接口被两个系统瓜分」的分裂态，两侧同时失灵。
-- 宿主机侧快速自检（VM 关机状态下）：`modprobe option` 后 8 个 `ttyUSB` 应齐全，`echo 'ATI' | socat - /dev/ttyUSB2,crnl` 应返回模块固件信息；测完 `modprobe -r option` 再启 VM。
+## 4. SCR Prime：Windows 看得到，VM 看不到
 
-## 线路认证失败（SW=9862 / 读卡器绑定错位）
+这是 VMware 直通层问题，尚未进入 Linux 驱动：
 
-一条线反复 `reg_rejected` 并每几分钟重建容器，`usim_status.json` 是
-`AUTH_FAIL / sw=9862`，而 SWu 隧道却是 `CONNECTED` —— 这不是运营商拒绝，
-是这条线打开了**另一条线的 SIM**。`9862` 是 AKA 的 MAC 校验失败，运营商用它
-回应"这张卡算出的响应不对"，和"这个用户被拒"在报文层面无法区分。
-
-自 v1.3.13 起引擎会自己拆穿这种情况：pin_keeper、ami_usim 和 swu_ike 在动卡之前
-先读一次免 PIN 的 EF.ICCID，与线路自己的 ICCID 比对，不符就拒绝并把两个 ICCID
-一起写进状态文件（`WRONG_CARD`），控制面也不再把它算作出口节点的过错。
-
-排查顺序：
-
-1. 看状态文件是否已经直接给出答案：
-
-   ```bash
-   cat data/instances/<id>/run/pin_status.json
-   cat data/instances/<id>/run/usim_status.json
-   ```
-
-2. 若引擎版本较旧、只报 `9862`，手动比对配置与运行时：
+1. Windows 服务中确认 VMware USB Arbitration Service 正常；
+2. Workstation → VM → Removable Devices 中把 SCR Prime 连接到 guest；
+3. 不要让 Windows 智能卡服务/厂商软件继续占用设备；
+4. 客户机执行：
 
    ```bash
-   # 线路被绑到哪个 reader
-   python3 -c "import json;d=json.load(open('data/instances/<id>/instance.json'));print(d['pin_reader'])"
-   # 引擎实际打开了哪个
-   python3 -c "import json;print(json.load(open('data/instances/<id>/run/pin_status.json'))['reader'])"
+   lsusb -d 04d9:c001
    ```
 
-   两者不一致 = 容器内解析错位。**先查引擎镜像是不是旧的**——`git pull` 只更新控制面
-   的 Python，不会更新镜像：
+未出现 `04d9:c001` 时，不要重装 libccid；驱动无法修复未直通的 USB。
 
-   ```bash
-   docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedAt}}' | grep engine
-   git log -1 --date=short --format='%ad %s' -- engine/
-   ```
+## 5. SCR Prime：lsusb 可见，pcsc_scan 不可见
 
-   镜像早于 `engine/` 的最后一次提交,就用 overlay 重建（只 COPY 运行时脚本，
-   几十秒，不重编 Asterisk）。`RUNTIME_FP`/`BASE_FP` 必须带上，否则下次
-   `install.sh reload` 会因标签为空而触发一次全量重建：
+逐层检查：
 
-   ```bash
-   ./install.sh reload --engines
-   ```
+```bash
+sudo systemctl status pcscd --no-pager
+sudo journalctl -u pcscd -n 100 --no-pager
+timeout 15 pcsc_scan -n
+sudo mddctl driver status
+```
 
-3. 换完镜像**每条线都要重建**。恰好绑在 reader 索引 0 上的那条线在旧镜像下
-   "看起来正常"，其实是回退撞对的，不换同样不可信。
+安装器只有在这组证据成立时才构建 CCID，并且只应用
+`patches/ccid/03_scr_prime_reader.patch`。检查元数据：
 
-提交问题前下载“诊断 → 脱敏支持包”，并再次确认其中没有个人信息。
+```bash
+sudo jq . /etc/mdd-sim-gateway/scr-prime-driver.json
+apt-mark showhold | grep '^libccid$'
+```
+
+不要对 SCR Prime 使用 HSIC 的 `01_hsic_slot_status.patch`、
+`02_hsic_malformed_atr.patch` 或旧 `patchall` 逻辑。
+
+若要回到发行版驱动：
+
+```bash
+sudo mddctl driver restore
+```
+
+恢复命令拒绝以下情况：没有 MDD 元数据、备份路径越界、当前 bundle 不存在，或当前哈希与
+MDD 安装后哈希不一致。遇到拒绝先保留现场，不要手工覆盖后再伪造元数据。
+
+## 6. SCR Prime reader 可见但没有 ATR
+
+- 确认 SIM 插入方向和接触；
+- `pcsc_scan` 应列出 reader，插卡后才出现 ATR；
+- 观察 pcscd 日志中 power-on/communication 错误；
+- 将 SCR Prime 从 VM 断开再重新连接，确认无需重启客户机即可恢复。
+
+`--require-scr-prime` 会要求真实拔插。`--yes` 不能跳过这项。
+
+## 7. Quectel 在 Windows 中有 COM 口，客户机没有 modem
+
+只传 COM 口不等于传完整复合 USB。客户机验收：
+
+```bash
+lsusb
+lsusb -t
+ls -l /dev/ttyUSB* /dev/cdc-wdm* /dev/wwan* 2>/dev/null
+sudo systemctl status ModemManager --no-pager
+mmcli -L
+sudo journalctl -u ModemManager -n 150 --no-pager
+```
+
+应看到多个 tty 和可能的 QMI/MBIM/WWAN 接口，再看到 `/Modem/<n>`。若 Windows 仍占用
+某一接口，在 Workstation 中断开并重新连接**整个设备**。
+
+ModemManager unit 应包含 MDD drop-in：
+
+```bash
+systemctl cat ModemManager.service
+```
+
+它以 `--debug` 开启 command interface，随即 `SetLogging INFO`；持续 DEBUG 日志说明
+ExecStartPost 失败，检查 `busctl` 与 D-Bus 服务名。
+
+## 8. ModemManager 有对象，但 4G 没有 bearer/IP
+
+```bash
+mmcli -m <n>
+mmcli -m <n> --simple-status
+nmcli device status
+nmcli connection show
+ip -br address
+ip route
+```
+
+检查 SIM 锁定、注册、APN、信号、QMI/MBIM 端口和 NetworkManager GSM profile。不要通过
+修改桥接默认路由“修复”蜂窝 bearer；管理流量仍应走桥接网卡，蜂窝数据是对应设备能力。
+
+## 9. WebUI 8443 无法访问
+
+```bash
+sudo systemctl status mdd-sim-gateway-control --no-pager
+sudo journalctl -u mdd-sim-gateway-control -n 150 --no-pager
+curl -k -v https://127.0.0.1:8443/api/auth/status
+ss -ltnp | grep ':8443'
+```
+
+VM 内可访问、局域网不可访问时检查桥接地址与精确防火墙端口。默认前两条线路：
+
+```text
+8443/tcp
+8089/tcp, 8099/tcp
+10000-10011/udp
+12000-12011/udp
+```
+
+使用手工端口或自动分配器因冲突跳号时，以实际线路配置为准。
+
+## 10. 本地 Engine 构建失败
+
+首次无缓存构建会下载 Fedora base、Asterisk/pjproject 固定提交和其他依赖。检查：
+
+```bash
+docker info
+docker pull fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+df -h /
+free -h
+```
+
+安装器不会自动改 `/etc/docker/daemon.json`。如所在网络需要企业镜像或代理，由管理员按组织
+策略配置 Docker 后重试；不要关闭 TLS 校验或把固定源码提交改成未知镜像。
+
+强制完整重建：
+
+```bash
+sudo mddctl update --no-cache
+```
+
+## 11. update 拒绝 dirty、分叉或 remote
+
+```bash
+sudo git -C /opt/mdd-sim-gateway status --short --branch
+sudo git -C /opt/mdd-sim-gateway remote -v
+sudo git -C /opt/mdd-sim-gateway rev-parse --git-path MERGE_HEAD
+```
+
+受管工作树不允许 staged、unstaged 或未忽略 untracked。不要用 `mddctl update` 覆盖手工
+改动。remote 必须精确为 `https://github.com/suyi-92/mdd-sim-gateway.git`，分支必须为
+`vmware`。分叉时工具不会 merge/rebase/reset/force；先在开发仓库处理并推送可快进历史。
+
+## 12. update 构建通过但启动失败
+
+工具应自动回滚并输出失败。检查：
+
+```bash
+sudo cat /etc/mdd-sim-gateway/active-commit
+sudo cat /etc/mdd-sim-gateway/previous-commit 2>/dev/null
+sudo mddctl status
+sudo mddctl doctor
+sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator -n 200 --no-pager
+ls -l /var/backups/mdd-sim-gateway/pre-update-*
+```
+
+不要在自动回滚中途手工把源码切到新提交，否则会产生“新源码 + 旧服务”的混合状态。
+
+## 13. backup 或 restore 被拒绝
+
+- backup 输出不能在运行数据目录内部；
+- backup 不覆盖已有归档或摘要；请换新路径，并且运行数据树不能含 symlink/设备节点；
+- 必须有归档和同名 `.sha256`；
+- manifest 必须为 `format=1`、`kind=mdd-sim-gateway-data`；
+- 归档不能含绝对路径、`..`、symlink、hardlink 或设备节点；
+- 所有 SQLite 必须通过 integrity check。
+
+检查摘要：
+
+```bash
+sha256sum -c /path/to/backup.tar.gz.sha256
+```
+
+恢复失败后，旧数据应仍在 `.pre-restore-<时间>`；不要删除它，先运行 doctor 和查看 unit
+日志。备份含明文凭据，只能放到受控加密介质。
+
+## 14. VoWiFi、通话和短信
+
+VoWiFi 链路：
+
+```text
+SIM/PCSC → UICC 选择与 AKA → 国家出口 UDP → ePDG/IKE → IMS/SIP → Asterisk/WebRTC
+```
+
+按层检查，不要只凭最后一条错误猜原因：
+
+- SIM 的 MCC/MNC、SPN/GID 和运营商品牌；
+- SWu/IKE 状态与重传；
+- IMS Registration；
+- Asterisk/AMI；
+- `call_result` 中的 `DIALSTATUS` 与 Q.850。
+
+Q.850 127 是未明确映射的互通失败，不能据此声称“本地未发送”或“运营商确定不支持”。
+失败后的 `Return without Gosub` 通常是挂断处理噪声，不是 INVITE 未发出的证据。
+
+CMLink UK 的 `10086` 是其官方短号，保持原样拨打；不要改写成 `+4410086`。判断短号时按
+SIM 品牌自己的规则，不只看底层宿主网络。
+
+普通 PC/SC reader 没有 IMEI 时允许注册，Engine 会省略 DEVICE_IDENTITY；若运营商强制
+要求，WebUI 会提示风险。读不到 SMSC 时 VoWiFi 通话仍可启动，只禁用主动 VoWiFi 短信。
+
+## 15. Fake-IP 或浏览器只有单向音频
+
+国家出口启用时，host orchestrator 会在出口内部解析 ePDG 并把真实公网地址固定到对应
+Engine；如果日志仍显示 Fake-IP，检查 sing-box/Xray 出口状态和 DNS 解析证据。
+
+浏览器 SDP 会过滤 Fake-IP ICE candidate。双向音频仍失败时检查：
+
+- 浏览器麦克风授权；
+- WSS 8089/8099；
+- 对应 RTP UDP 小范围；
+- VM 桥接地址是否与 Control 的 advertise address 一致；
+- 是否有 VPN/安全软件改写浏览器路由。
+
+## 16. 重启恢复
+
+分别测试：
+
+1. `sudo reboot` 客户机；
+2. 正常关闭客户机后重启 Windows 宿主机；
+3. 打开 VM，观察两台 USB 是否按设备规则重新连接；
+4. 运行 `mddctl doctor`；
+5. 确认两条线路自动恢复。
+
+USB 未自动连接属于 VMware 配置，不要通过放宽成“所有新 USB 自动连接”规避；只修复两个
+确定设备的连接规则。

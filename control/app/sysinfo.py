@@ -239,7 +239,7 @@ def _docker_storage() -> dict:
         except Exception:
             pass
 
-    repositories = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
+    repositories = ("mdd-sim-gateway/engine:",)
     image_bytes, image_ids = 0, set()
     for item in report.get("Images") or []:
         image_id = str(item.get("Id") or item.get("ID") or "")
@@ -269,9 +269,7 @@ def _docker_storage() -> dict:
     all_image_ids = {str(item.get("Id") or item.get("ID") or "")
                      for item in image_items if item.get("Id") or item.get("ID")}
     all_images_are_mdd = bool(all_image_ids) and all_image_ids == image_ids
-    current_tags = {"mdd-sim-gateway/engine:latest",
-                    "mdd-sim-gateway/control:latest",
-                    "mdd-sim-gateway/engine-base:trusted"}
+    current_tags = {"mdd-sim-gateway/engine:latest"}
     old_image_count, protected_unused = 0, False
     for item in image_items:
         image_id = str(item.get("Id") or item.get("ID") or "")

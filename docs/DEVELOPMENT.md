@@ -1,152 +1,101 @@
-# 开发与协作规范
+# VMware 分支开发规范
 
-面向在本仓库工作的 AI 代理与人类贡献者。约定本身不区分二者——区别只在于 AI 更容易在
-「看起来对」的地方出错，所以第 6 节单独列了几条纪律。
+`vmware` 是部署分支。它以同步后的上游版本为基线，并使用
+`<上游版本>-vmware.<修订>`，例如 `1.7.0-vmware.1`。同步下一上游版本时先做普通 merge，
+再按代码块移植本分支修复；不重置分支、不把 Windows/WSL 提交整体 cherry-pick 进来。
 
-产品说明见 `README.md`、`docs/ARCHITECTURE.md`、`docs/INSTALL.md`；发布流程的权威版本在
-`docs/RELEASE_CHECKLIST.md`，本文不重复，只说明与日常开发衔接的部分。
+## 产品边界
 
----
+- 客户机：x86_64 Ubuntu 24.04/26.04、Debian 12/13；
+- Control/WebUI：本机 venv + systemd；
+- Engine：rootful Docker；
+- 更新：干净受管 checkout 到 `origin/vmware` 的 `--ff-only`；
+- 构建：客户机本地源码构建；
+- 无 GitHub Actions、Release API、网页更新、预编译项目资产、Docker Control、WSL/usbipd；
+- SCR Prime 自动路径只能应用 `03_scr_prime_reader.patch`；
+- `max_sim_lines` 默认 13、范围 1–32，并由所有入口共用。
 
-## 1. 仓库与分支
+## 开发前检查
 
-**一个工作副本作为主线。** 同一台机器上存在多个 clone 时，必须明确哪一个是主线，其余只做
-归档或部署。两个副本各自推进同名分支时，一边提到的 commit 在另一边解析不出来，而这看起来
-像是对方记错了 commit id，不像是副本的问题——排查的代价远高于一开始就统一副本。
-
-开始工作前先确认落点：
-
-```
-git rev-parse --show-toplevel     # 我在哪个副本
-git branch --show-current         # 我在哪个分支
-git log --oneline -3              # 它的基线是什么
-```
-
-**分支命名**（沿用仓库既有习惯）：
-
-| 前缀 | 用途 |
-|---|---|
-| `feat/<主题>` | 新功能。跨版本的集成分支用 `feat/vX.Y.Z-preview` |
-| `fix/<主题>` | 缺陷修复 |
-| `release/<版本>` | 发布集成 |
-| `deploy/<环境>` | 部署副本专用，**不用于开发** |
-| `archive/<说明>-<日期>` | 冻结留档 |
-
-**不在 `main` 上直接开发。** 功能分支从 `main` 分出，能快进就快进，避免无意义的合并提交。
-分支落后于主线时先同步再继续，不要在旧基线上堆积。
-
-## 2. 提交
-
-**类型与范围**，与仓库现状一致：`fix` / `feat` / `docs` / `ci` / `refactor` / `chore` /
-`tools` / `release`。范围取子系统名：`webui`、`engine`、`install`、`update`、`pcsc`、
-`modem`、`bridge`、`esim`、`softphone`、`notify`、`keepalive`、`voicemail`、`diagnostics`。
-
-**提交信息写「为什么」，不写「改了什么」。** 改了什么 diff 已经说清楚了；半年后需要的是
-当时的判断依据。用完整的句子成段写，不要罗列条目。一条好的提交信息通常包含：
-
-- 原来的行为在什么情况下是错的，以及它为什么看起来是对的；
-- 为什么选了这个方案而不是更直觉的那个（尤其当更直觉的那个有坑）；
-- 顺带修掉的问题，单独成段。
-
-**一个功能一个提交**，代码、测试、i18n、`CHANGELOG.md` 条目放在同一个提交里。本仓库单个
-功能提交通常在 500–1500 行量级。改动交织到无法干净拆分时，宁可少拆也不要提交无法独立通过
-测试的中间态；确需拆分，用「保存最终态 → 回退基线 → 分层重放 → 逐字节校验回到最终态」，
-并在每一层跑一次测试。
-
-
-## 3. 提交前必须通过的检查
-
-**每一次提交前都跑，不是每一批改动跑一次。** 上一次扫描覆盖不到它之后新写的代码——
-在 `git add` 与 `git commit` 之间引入的标识符，正好落在两次扫描的缝里。
-
-```
-python -m unittest discover -s tests          # 全套，不是只跑相关的
-python -m py_compile control/app/*.py engine/*.py host/*.py
-sh -n install.sh engine/entrypoint.sh
-sh tools/check-subscriber-identifiers.sh      # 退出码必须为 0
-cd webui && npm run build                     # 触及 WebUI 时
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+git status --short
+git log --oneline -5
 ```
 
-**订阅者标识符红线**：真实 IMSI、ICCID、IMEI、手机号一律不得进入仓库，测试数据用保留段
-（`001-01` 测试 PLMN、`+44 7700 900xxx`、NANP `555`、零填充体）。这条扫描进 CI 之前被手工
-跳过了连续 15 个版本，不要重演。
+不要在受管部署目录中开发；`mddctl update` 会拒绝任何非忽略变化。开发使用独立 checkout 或
+worktree，再推送 `vmware`。
 
-**i18n 重复键**会让 WebUI 构建直接失败。新增翻译前先确认 key 不存在——语义不同就换 key，
-不要复用（例如 `Method` 已用于「请求方法」，保号方式必须另起 `Keeping method`）。
+## 变更原则
 
-## 4. CHANGELOG
+- 保留上游 Feishu、IKE SA rekey、原生 reader recovery、Xray 错误反馈和通知路由；
+- 修改 UICC 时同时验证 PIN、IKE 和 SIP 三条路径；
+- 修改线路上限时同时验证 API、自动建线和所有 Engine 启动入口；
+- 修改端口时同时探测 TCP 与 UDP，并覆盖 `Created` 容器清理；
+- 不把运行数据、`.venv`、`node_modules`、`webui/dist`、build cache 或备份加入 Git；
+- 不添加 Engine/Control/WebUI tar 包或 Git LFS 资产；
+- 不把 IMSI、ICCID、IMEI、号码、凭据、私有 URL 或消息正文写入测试和文档。
 
-遵循 Keep a Changelog：改动进 `## [Unreleased]` 下的 `Added` / `Changed` / `Fixed` /
-`Removed`。**写给使用者，不是写给开发者**——说明原来什么是坏的、为什么值得在意、现在是什么
-行为。发布时把 `Unreleased` 改成版本号与日期。
+## 本地门禁
 
-## 5. 发布
+在支持的 Linux 客户机中执行：
 
-完整流程见 `docs/RELEASE_CHECKLIST.md`，**必须逐条执行**，其中两点最容易被跳过：
+```bash
+bash -n bootstrap.sh install.sh scripts/mddctl engine/entrypoint.sh
+python3 -m compileall -q control engine host tests
+python3 -m unittest discover -s tests -p 'test_*.py'
+sh tools/check-subscriber-identifiers.sh
+cd webui
+npm ci
+npm run build
+```
 
-**Release 说明是 `.github/release-notes/vX.Y.Z.md` 中的简短中英双语正文**，中文在前、
-英文在后，内容一致。按「重要更新说明 → 本次小版本更新 → 当前大版本更新」组织；每条按
-「症状 → 原因 → 现在的行为」写一到三句，让使用者据此判断该不该升级。发布工作流直接用
-这个文件创建 Release，缺失时会失败，避免先显示自动生成的开发提交列表。本版未重建引擎
-镜像时在结尾注明。
+Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行一次 amd64 无缓存构建，并验证：
 
-**`update-policy.json` 是分通道的**，位于仓库根目录，由控制面从 `main` 分支的 raw URL 读取：
+- source revision、version、Architecture；
+- runtime/base fingerprint；
+- Asterisk 和模块数量；
+- Engine Python 依赖；
+- `/dev/net/tun + NET_ADMIN` 最小容器。
 
-- `release`：记录当前最新 Release 并标记 `main`（含功能变化）或 `patch`（仅修复），供旧版
-  客户端分类；它不代表允许自动安装。
-- `channels.all`：选择“全部版本”的当前目标，必须等于最新正式 Release。
-- `channels.main`：选择“仅主版本”的独立目标，可以是在最新补丁之前发布的主版本。
-- 两个通道分别携带 UTC `not_before`。完成观察和实机验证、确实决定推送时才填写；发现回归时
-  清空对应通道即可阻止尚未开始的设备安装。
-- `auto_update` 在 v1.5.4 过渡期继续镜像 `channels.all`，供尚未升级到双通道逻辑的设备读取。
+只修改 Markdown 或忽略规则时不要求 Engine 构建。
 
-通道留空是安全默认值：该范围不自动安装。
+## 安装器测试
 
-## 6. AI 特有的纪律
+`tests/test_vmware_install_contract.py` 固定以下边界：
 
-**先验证再断言。** 不确定的事就去查，查不到就说查不到，不要用推测填空。一个意料之外的
-读数不等于故障：先弄清它是怎么来的，再决定要不要报警——正常但你不知情的操作，和真正的
-异常，在数据上往往长得一样。
+- 普通用户下载、一次 sudo、本地 root 脚本；
+- 四发行版与 x86_64；
+- native Control / Docker Engine；
+- 临时构建与原子切换；
+- SCR Prime 原生优先和补丁 03 only；
+- NetworkManager 默认路由保护；
+- Git 精确 remote、clean、fast-forward-only；
+- backup/restore 校验和与路径安全；
+- doctor JSON 不含用户身份字段；
+- 仓库无 workflows、Release manifest 和 LFS。
 
-**分不清进程内状态和持久状态。** 独立进程读不到运行中服务的内存状态（如 PC/SC 卡表），
-在那里得到的空结果不是证据。设计依赖此类状态的判断时，要考虑服务刚重启、状态尚未建立的
-那段窗口，并给出跨进程可验证的兜底信号。
+脚本行为测试应通过 fake command PATH 或临时目录覆盖包管理器、systemctl、Git、Docker、
+lsusb、pcsc_scan、mmcli 和网络输出。测试不得真实修改开发机 systemd、驱动或防火墙。
 
-**如实报告。** 测试失败就贴输出，跳过的步骤要说，部分完成不要说成完成。发现自己之前说错了，
-直接改正并继续，不必反复致歉。
+## 四 VM 和硬件验收
 
-**改动真实设备前先确认。** 部署、重启线路、启用会改变来电行为的功能，都要先说明影响再动手；
-已获授权的操作范围不自动延伸到下一次。
+源码测试不代表硬件通过。发布前按 `docs/INSTALL.md` 的矩阵逐台执行：
 
-**产品边界写在代码里，不要绕过。** 线路上限、禁止外部 SIP 账号、通知单向不可远程控制——
-这些由 `tests/test_product_boundaries.py` 强制，触碰前先读它。
+- fresh/repeat install；
+- no-op/fast-forward/failed update rollback；
+- 默认路由、SSH 地址、DHCP 保留；
+- SCR USB/PCSC/ATR/hotplug；
+- Quectel tty/WWAN/modem/bearer；
+- 两线路 IMS、呼入呼出、双向音频、短信；
+- VM reboot 与 Windows host reboot。
 
-## 7. 与仓库外部资料的边界
+结果和发行版镜像、内核、libccid、ModemManager、NetworkManager、Docker 版本一起记录。未执行
+项目保持“待实机”，不得写成通过。
 
-主机地址、账号、真实路径与凭据**不属于本仓库**，也不得复制进来。仓库内文档只描述可公开的
-架构与流程。本地设计草稿、UI 原型等如需留在工作目录，用 `.git/info/exclude` 排除——它是
-本地文件，不会被提交，也不会影响其他副本。
+## 提交与交付
 
-## 8. Issue 自动分析
-
-公开 Issue 的自动分析由 `.github/workflows/issue-triage.yml` 执行。仓库 Secrets 必须提供
-`API_KEY`、不带末尾斜杠且以 `/v1` 结尾的 `BASE_URL`，以及 Responses API 返回的实际
-`MODEL` 名称。密钥只交给 Codex Action 的受保护本地代理；Codex 自身使用 `:read-only`
-权限配置，不能联网或写工作区。发布评论的 Job 与模型 Job 分离，只接受经过本地脚本验证、
-限长并映射到固定标签白名单的 JSON。
-
-Issue 标题、正文和评论全部视为不可信数据：进入模型前会移除明显的 Token、长数字和 URL，
-模型提示词也不得遵循其中的命令。自动流程只能更新一条带隐藏标记的分析评论和 `ai-*`
-标签；它不删除人工标签、不关闭 Issue、不修改代码、不创建 PR，也不执行部署。`MddIdd` 是
-人工确认者，模型输出不能替代其判断。
-
-分析评论只保留能推动处理的内容：简短结论、最多三条已确认事实、最多两个带仓库依据的高概率
-原因、真正阻碍下一步的信息和具体动作。它不得复述 Issue、罗列通用可能性或重复询问正文和截图
-已经提供的信息；需要运行日志才能区分原因时，置信度不得标为高。工作流还会提供同一作者近期的
-公开 Issue 摘要用于判断续报或重复问题，但只有症状实质相同时才允许关联。
-
-为限制公开仓库的额度滥用，新 Issue 只自动分析一次；编辑正文和普通评论都不会调用模型。
-只有 `MddIdd` 精确发送 `/ai-triage` 或从 Actions 手动运行工作流才能重新分析，每个 Issue
-包含失败在内最多尝试三次。成功分析和失败通知使用不同的隐藏标记，失败不得覆盖最后一次
-成功结果。仓库侧限制不能阻止批量创建新 Issue，因此生产环境还必须为这把独立 API Key
-配置服务端额度或速率上限。
+本仓库在 Server 超级项目中是独立子模块。先在 `vmware` 分支提交并推送子项目，确认提交在
+团队可访问的 origin 后，再在父项目提交 gitlink。提交信息遵守父项目 `AGENTS.md` 的
+`【苏忆】` 署名规则。永不强推。

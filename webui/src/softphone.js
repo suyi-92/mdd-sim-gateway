@@ -1,5 +1,6 @@
 // Browser softphone: JsSIP UA over WSS to the engine's Asterisk WebRTC transport.
 import JsSIP from 'jssip'
+import { rewriteLocalSdpForMediaHost } from './media-sdp.js'
 
 // Surface JsSIP internals in the console to aid troubleshooting (registration, ICE, etc.)
 try { JsSIP.debug.enable('JsSIP:*') } catch {}
@@ -19,6 +20,7 @@ export class Softphone {
     this._rec = null
     this._recCtx = null
     this._recChunks = []
+    this.mediaHost = ''
   }
 
   emit(type, data) { try { this.onEvent(type, data) } catch {} }
@@ -78,9 +80,10 @@ export class Softphone {
     })
   }
 
-  // prov: { username, password, ws_port, host, realm }
+  // prov: { username, password, ws_port, host, realm, media_host }
   start(prov, host) {
     if (this.ua) this.stop()
+    this.mediaHost = prov.media_host || ''
     const wsUrl = `wss://${host}:${prov.ws_port}/ws`
     const socket = new JsSIP.WebSocketInterface(wsUrl)
     const domain = prov.domain || host
@@ -120,6 +123,14 @@ export class Softphone {
     if (session.__vowifiBound) return
     session.__vowifiBound = true
     const dir = session.direction  // 'incoming' | 'outgoing'
+    // JsSIP exposes the final gathered local offer/answer before it is placed on the wire.
+    // Chrome may otherwise advertise Mihomo's 198.18.0.1 adapter as m=/c= even though the
+    // Asterisk container can reach only the real LAN adapter.  Rewrite both directions here:
+    // outgoing calls create a local offer; incoming calls create a local answer.
+    session.on('sdp', (event) => {
+      if (event?.originator !== 'local' || !event.sdp) return
+      event.sdp = rewriteLocalSdpForMediaHost(event.sdp, this.mediaHost)
+    })
     if (dir === 'incoming') {
       const from = (session.remote_identity && session.remote_identity.uri && session.remote_identity.uri.user) || 'Unknown'
       this.emit('incoming', { from })

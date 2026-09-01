@@ -23,6 +23,11 @@ from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.scard import SCardBeginTransaction, SCardEndTransaction, SCARD_LEAVE_CARD
 
+try:                                # installed scripts live together in /usr/local/bin
+    from pin_keeper import select_adf_usim as _shared_select_adf_usim
+except ImportError:                 # source-tree imports use the namespace package
+    from engine.pin_keeper import select_adf_usim as _shared_select_adf_usim
+
 RUNDIR = os.environ.get("MDD_RUNDIR", "/run/mdd-sim-gateway")
 USIM_PIN = os.environ.get("USIM_PIN", "")
 
@@ -171,53 +176,18 @@ def dec_imsi(ef):
     return swapped[1:]
 
 
-# 3GPP USIM AID prefix. EF_DIR record 1 is NOT always the USIM (China Telecom cards
-# list CSIM first), so scan the records and pick the USIM by AID.
-USIM_AID_PREFIX = "A0000000871002"
-
-
-def _usim_aid_from_dir(connection):
-    """Scan EF_DIR records for the USIM AID; prefer 3GPP USIM, fall back to the first
-    application. EF.DIR must be selectable from the current DF. Returns (len, hex) or None."""
-    data, sw1, sw2 = connection.transmit(toBytes("00a40004022f0000"))  # SELECT EF.DIR
-    if sw1 != 0x61:
-        return None
-    fcp, sw1, sw2 = connection.transmit(toBytes("00C00000") + [sw2])
-    if sw1 != 0x90 or len(fcp) < 8:
-        return None
-    record_length = fcp[7]
-    first = None
-    for rec in range(1, 11):
-        data, sw1, sw2 = connection.transmit(toBytes("00b2") + [rec, 0x04, record_length])
-        if sw1 != 0x90 or len(data) < 5 or data[0] != 0x61 or data[2] != 0x4F:
-            break
-        aid_length = data[3]
-        aid = "".join("%02X" % b for b in data[4:4 + aid_length])
-        if len(aid) < aid_length * 2:
-            break
-        if aid.startswith(USIM_AID_PREFIX):
-            return aid_length, aid
-        if first is None:
-            first = (aid_length, aid)
-    return first
-
-
 def make_connection_index(reader_index):
     r = readers()
     if reader_index >= len(r):
         return None
     connection = r[reader_index].createConnection()
     connection.connect()
-    connection.transmit(toBytes("00a40004023f0000"))
-    got = _usim_aid_from_dir(connection)
-    if got is None:
-        print("Failed to find USIM AID in EF.DIR")
-        return None
-    aid_length, aid = got
-    print(f"Using aid={aid}")
-    data, sw1, sw2 = connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
-    if sw1 != 0x61:
+    if not _shared_select_adf_usim(connection):
         print("Failed to select AID")
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
         return None
     return connection
 
@@ -368,23 +338,11 @@ def make_connection_name(reader_name):
 
 
 def make_reselect_adf(connection):
-    connection.transmit(toBytes("00a40004023f0000"))
-    got = _usim_aid_from_dir(connection)
-    if got is None:
-        return
-    aid_length, aid = got
-    connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
+    _shared_select_adf_usim(connection)
 
 
 def select_adf_usim(connection):
-    """SELECT MF -> EF.DIR -> USIM AID -> ADF.USIM. Returns True on success."""
-    connection.transmit(toBytes("00a40004023f0000"))
-    got = _usim_aid_from_dir(connection)
-    if got is None:
-        return False
-    aid_length, aid = got
-    data, sw1, sw2 = connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
-    return sw1 == 0x61
+    return _shared_select_adf_usim(connection)
 
 
 def open_usim(reader_spec):

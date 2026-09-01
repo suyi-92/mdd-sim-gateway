@@ -3,3 +3,5 @@
 # `patch -p1`).
 *.sh    text eol=lf
 *.patch text eol=lf
+scripts/mddctl text eol=lf
+scripts/*.py   text eol=lf

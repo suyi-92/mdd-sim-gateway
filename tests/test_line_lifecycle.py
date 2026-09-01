@@ -50,7 +50,6 @@ class DeletedCardSuppressionTests(unittest.TestCase):
     def test_lifecycle_records_are_bounded_and_reject_free_text(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp), \
                 patch.object(engine, "LIFECYCLE_RECORDS", 3):
             Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
             for index in range(5):
@@ -75,8 +74,7 @@ class DeletedCardSuppressionTests(unittest.TestCase):
         # Issue #33: a reg_rejected freeze reached the support bundle without the SIP code
         # that caused it, because every log holding it had already rotated.
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp):
+                patch.object(engine, "DATA_DIR", temp):
             Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
             engine.record_lifecycle(
                 "line-1", "recovery_scheduled", reason_code="reg_rejected",
@@ -95,8 +93,7 @@ class DeletedCardSuppressionTests(unittest.TestCase):
 
     def test_lifecycle_never_recreates_a_deleted_instance_directory(self):
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp):
+                patch.object(engine, "DATA_DIR", temp):
             engine.record_lifecycle(
                 "deleted", "recovery_cancelled", reason_code="line_deleted")
             self.assertFalse(Path(temp, "instances", "deleted").exists())

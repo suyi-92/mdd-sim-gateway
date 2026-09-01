@@ -1115,6 +1115,7 @@ def vpcd_modem_bridge_slot_choices():
     import argparse
     from host import vpcd_modem_bridge
     parser = argparse.ArgumentParser()
-    source = Path(vpcd_modem_bridge.__file__).read_text()
+    # The source contains Unicode punctuation; Windows' legacy locale is not necessarily UTF-8.
+    source = Path(vpcd_modem_bridge.__file__).read_text(encoding="utf-8")
     match = re.search(r'"--slots".*choices=\(([^)]*)\)', source)
     return tuple(int(value) for value in match.group(1).split(","))

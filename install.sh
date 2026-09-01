@@ -1,935 +1,828 @@
-#!/bin/sh
-# install.sh — one-click installer / lifecycle manager for MDD Sim Gateway.
-#
-# Deploys the whole system on any Docker-capable Linux with a PC/SC reader, in one of two
-# DEPLOY MODES:
-#
-#   local   (DEFAULT) — control plane runs NATIVELY on the host (Python venv + systemd unit);
-#                       Docker is used only as the ENGINE layer (per-SIM engine containers).
-#                       The WebUI is still compiled with a throwaway Node container, so the
-#                       host needs no Node/JS toolchain.
-#   docker            — control plane AND engine both run in containers (control plane in a
-#                       privileged container with the host Docker + pcscd sockets bind-mounted).
-#
-# In BOTH modes:
-#   - Docker + host pcscd are installed and running
-#   - pcsc-lite is version-LOCKED (PCSC_VERSION) across the host + every container image so the
-#     PC/SC client/server protocol always matches (distro defaults differ -> "Failed to
-#     establish context")
-#   - official releases import the verified native Engine image; development checkouts build it
-#     from source with all bug-fix patches baked in (engine/patches/*)
-#
-# Usage:
-#   sudo ./install.sh install [--mode local|docker]   # full install (default mode: local)
-#   sudo ./install.sh reload  [--mode local|docker] [--no-cache] [--engines|--no-engines]
-#   sudo ./install.sh build-lpac [--lpac-src PATH] [--dest DIR]   # local eSIM LPA (lpac)
-#   sudo ./install.sh enable-autostart | disable-autostart
-#   sudo ./install.sh uninstall [--purge]             # --purge also deletes ./data (+ venv)
-#   ./install.sh status | logs
-#
-# The chosen mode is remembered (persisted under the data dir), so reload/status/logs/uninstall
-# don't need --mode again. An explicit --mode or the MDD_MODE env var always overrides.
-#
-# Config via env (or a .env file next to this script):
-#   MDD_MODE            deploy mode: local | docker                (default local)
-#   MDD_PORT            host port to publish/serve the WebUI on    (default 8443)
-#   MDD_DATA_DIR        runtime data dir                           (default <repo>/data)
-#   MDD_ADVERTISE_ADDR  host LAN IP for SIP/WebRTC media           (default: auto-detect)
-#   MDD_BIND            control bind addr                          (default 0.0.0.0)
-#   MDD_ENGINE_BASE_IMAGE optional trusted local engine image for an offline overlay migration
-#   MDD_ENGINE_DISTRIBUTION_IMAGE optional already-pulled, release-matched Engine image
-#   PJPROJECT_REPOSITORY optional reviewed pjproject Git repository override for a full build
-#   ASTERISK_REPOSITORY optional reviewed Asterisk Git repository override for a full build
-#   MDD_REUSE_WEBUI     set to 1 to reuse a prebuilt, reviewed webui/dist in an offline install
-#   MDD_REUSE_CONTROL_IMAGE set to 1 to reuse a checksummed Release control image (docker mode)
-#   MDD_BUILD_IMAGES    set to 1 to build images from source instead of using Release assets
-#   PCSC_VERSION           pinned pcsc-lite version                   (default 2.3.3)
-#   LPAC_SRC               optional path to lpac source (for build-lpac)
-#   CMAKE_FETCH_VER        Kitware cmake version if system is too old (default 3.31.12)
-set -eu
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# VMware-only installer. Control/WebUI run locally under systemd; Docker is used only for Engine.
+set -Eeuo pipefail
+umask 077
 
-# ------------------------------------------------------------------ paths & config
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-REPO_DIR="$SELF_DIR"
-[ -f "$REPO_DIR/.env" ] && . "$REPO_DIR/.env"
+readonly ORIGIN_URL="https://github.com/suyi-92/mdd-sim-gateway.git"
+readonly ENGINE_STABLE_IMAGE="mdd-sim-gateway/engine:latest"
+readonly NODE_BUILD_IMAGE="node:22.14.0-bookworm-slim@sha256:745403dc46b5ab4c998502b07a12cbf020cf2c30645427a68ec0718f02d647de"
+readonly PCSC_VERSION="2.3.3"
+readonly CCID_VERSION="1.6.2"
+readonly CCID_SHA256="6d5e6a6884090831ed155ee75cbc03aed252bd8158d94f507a94f05ebaba296c"
+readonly VPCD_VERSION="0.8"
+readonly VPCD_SHA256="b428c399d5f014a350db0e8e5947ce69392429cc1aebdf3830af3c7f8078b18f"
+readonly VPCD_SLOTS="4"
+readonly SINGBOX_VERSION="1.13.15"
+readonly SINGBOX_SHA256_AMD64="a3a3ff223b23c3f4731d0a17cb0ef94c97ce257c70721a5b07dc7ca079203c9f"
+readonly XRAY_VERSION="26.3.27"
+readonly XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+readonly LPAC_VERSION="2.3.0"
+readonly LPAC_COMMIT="c2fcf5e4b21c712d54e35a11da2ad9ad134fb821"
+readonly CMAKE_VERSION="3.31.12"
+readonly CMAKE_SHA256_AMD64="0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c"
 
-MDD_PORT="${MDD_PORT:-8443}"
-DATA_DIR_STATE="/etc/mdd-sim-gateway/data-dir"
-if [ -n "${MDD_DATA_DIR+x}" ]; then
-  MDD_DATA_DIR=$MDD_DATA_DIR
-elif [ -r "$DATA_DIR_STATE" ]; then
-  MDD_DATA_DIR=$(sed -n '1p' "$DATA_DIR_STATE")
-  case "$MDD_DATA_DIR" in /*) ;; *) MDD_DATA_DIR="$REPO_DIR/data" ;; esac
-else
-  MDD_DATA_DIR="$REPO_DIR/data"
-fi
-MDD_BIND="${MDD_BIND:-0.0.0.0}"
-MDD_ADVERTISE_ADDR="${MDD_ADVERTISE_ADDR:-}"
-
-CONTROL_IMAGE="mdd-sim-gateway/control"
-ENGINE_IMAGE="mdd-sim-gateway/engine"
-ENGINE_HANDOFF_MANIFEST="$REPO_DIR/engine/release-image.SHA256SUMS"
-CONTROL_NAME="mdd-sim-gateway-control"
-ENGINE_PREFIX="mdd-sim-gateway-engine-"
-MDD_DOCKER_LABEL="io.mdd-sim-gateway.managed"
-WEBUI_BUILD_IMAGE="node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
-
-# Native (local-mode) control plane bits.
-VENV_DIR="$REPO_DIR/control/.venv"
-WEBUI_DIST="$REPO_DIR/webui/dist"
-SYSTEMD_UNIT="/etc/systemd/system/mdd-sim-gateway-control.service"
-ORCHESTRATOR_UNIT="/etc/systemd/system/mdd-sim-gateway-orchestrator.service"
-# Where the selected deploy mode is remembered between invocations.
-MODE_STATE="$MDD_DATA_DIR/install-mode"
-
-# pcsc-lite version pinned across host + both container images so the PC/SC client/server
-# protocol always matches (distro defaults differ -> "Failed to establish context").
-PCSC_VERSION="${PCSC_VERSION:-2.3.3}"
-PCSC_SHA256="00b667aa71504ed1d39a48ad377de048c70dbe47229e8c48a3239ab62979c70f"
-# Set by ensure_pcscd: 1 if we source-built pcsc-lite on the host (headers already in /usr),
-# 0 if the distro package already matched the pin (need the distro -dev pkg for pyscard headers).
-PCSC_SOURCE_BUILT=0
-# CCID USB driver version, built from source ON THE HOST with local fixes (patches/ccid/*).
-# NOT installed by default — run `sudo ./install.sh patch` to build + install it. Needed only
-# for the HSIC CCID-Reader (1d99:0016): its firmware always answers "no ICC present" to
-# GetSlotStatus even while a card is inserted and powered, so stock libccid never powers
-# the card. NotifySlotChange only sets a pending flag; IFDHICCPresence tick probes
-# via IccPowerOn/ATR (debounced) and restores prior power state.
-# Keep this >= 1.6.2: that release added 1d99:0016 to the supported-reader table, so the
-# built driver recognizes the VID/PID out of the box (older/distro libccid < 1.6.2 would
-# additionally need the device whitelisted by hand in the bundle's Info.plist).
-CCID_VERSION="${CCID_VERSION:-1.6.2}"
-CCID_SHA256="6d5e6a6884090831ed155ee75cbc03aed252bd8158d94f507a94f05ebaba296c"
-
-# Virtual smart-card driver, built from source because the packaged one is compiled for two
-# slots. A module's SIM is exposed as one virtual reader per logical channel, and this gateway
-# uses three (PIN keeper, SWu tunnel, IMS), so on the distro build the third channel has no
-# socket behind it: its bridge thread dials a port pcscd never listens on and the channel is
-# simply unavailable. The count is a compile-time constant (--enable-vpcdslots, upstream
-# default 2), so a rebuild is the only way to raise it. Same upstream release Debian packages
-# as 3.3+dfsg, so this changes the slot count and nothing else.
-VPCD_VERSION="${VPCD_VERSION:-0.8}"
-VPCD_SHA256="b428c399d5f014a350db0e8e5947ce69392429cc1aebdf3830af3c7f8078b18f"
-VPCD_SLOTS="${VPCD_SLOTS:-4}"
-
-# Host-side runtime dependencies. Versions and hashes are pinned so an upstream replacement
-# cannot silently change what this root installer executes. Override only for a reviewed release.
-SINGBOX_VERSION="${MDD_SINGBOX_VERSION:-1.13.15}"
-SINGBOX_SHA256_AMD64="a3a3ff223b23c3f4731d0a17cb0ef94c97ce257c70721a5b07dc7ca079203c9f"
-SINGBOX_SHA256_ARM64="f0810bbb5722ae36635687c421019defcc8b328d31a0b3c287901f331747ca93"
-# 26.3.27 is the newest release Xray marks stable; everything after it is a prerelease.
-# REALITY moves with Xray, so an operator whose server runs a prerelease may need to match
-# it here. Overriding the version alone would only fail the checksum of the pinned one, so
-# the digests are overridable together with it — a reviewed override, never a silent one.
-XRAY_VERSION="${MDD_XRAY_VERSION:-26.3.27}"
-XRAY_SHA256_AMD64="${MDD_XRAY_SHA256_AMD64:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}"
-XRAY_SHA256_ARM64="${MDD_XRAY_SHA256_ARM64:-4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c}"
-LPAC_VERSION="${MDD_LPAC_VERSION:-2.3.0}"
-LPAC_COMMIT="c2fcf5e4b21c712d54e35a11da2ad9ad134fb821"
-CMAKE_SHA256_AMD64="0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c"
-CMAKE_SHA256_ARM64="83f8fd91d2038a56556e1400390fcfe42f79602940c494f6c6f1cdae7f9e7f40"
-
-# ------------------------------------------------------------------ pretty output
-if [ -t 1 ]; then B=$(printf '\033[1m'); G=$(printf '\033[32m'); Y=$(printf '\033[33m'); R=$(printf '\033[31m'); N=$(printf '\033[0m'); else B=; G=; Y=; R=; N=; fi
-info() { printf '%s==>%s %s\n' "$G$B" "$N" "$*"; }
-warn() { printf '%s!!%s %s\n'  "$Y$B" "$N" "$*"; }
-err()  { printf '%sxx%s %s\n'  "$R$B" "$N" "$*" >&2; }
-die()  { err "$@"; exit 1; }
-
-# ------------------------------------------------------------------ helpers
-need_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    die "this command needs root — re-run with: sudo $0 $CMD"
-  fi
-}
-
+info() { printf '==> %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-sha256_file() {
-  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
-  elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
-  else die "SHA-256 tool not found (install coreutils)"
+usage() {
+  cat <<'EOF'
+Internal VMware installer. Use bootstrap.sh for normal installation.
+
+  install.sh install --source PATH [--install-dir PATH] [--data-dir PATH]
+                     [--ref vmware|COMMIT] [--require-scr-prime]
+                     [--require-cellular] [--configure-firewall]
+                     [--no-start] [--yes]
+
+Internal commands used by mddctl:
+  install.sh prepare  --source PATH --build-root PATH [--no-cache]
+  install.sh verify   --source PATH --build-root PATH --sha COMMIT
+  install.sh activate --source PATH --build-root PATH --sha COMMIT
+  install.sh health   --source PATH
+EOF
+}
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die "this installer must be invoked through sudo"
+
+action=${1:-}
+[[ -n "$action" ]] || { usage; exit 2; }
+shift
+case "$action" in install|prepare|verify|activate|health) ;; -h|--help|help) usage; exit 0 ;; *) die "unknown action: $action" ;; esac
+
+source_dir=""
+install_dir=/opt/mdd-sim-gateway
+data_dir=/var/lib/mdd-sim-gateway
+backup_dir=/var/backups/mdd-sim-gateway
+state_dir=/etc/mdd-sim-gateway
+cache_dir=/var/cache/mdd-sim-gateway
+build_root=""
+sha=""
+ref=vmware
+require_scr_prime=0
+require_cellular=0
+configure_firewall=0
+no_start=0
+assume_yes=0
+no_cache=0
+
+while (($#)); do
+  case "$1" in
+    --source) (($# >= 2)) || die "--source requires PATH"; source_dir=$2; shift 2 ;;
+    --install-dir) (($# >= 2)) || die "--install-dir requires PATH"; install_dir=$2; shift 2 ;;
+    --data-dir) (($# >= 2)) || die "--data-dir requires PATH"; data_dir=$2; shift 2 ;;
+    --build-root) (($# >= 2)) || die "--build-root requires PATH"; build_root=$2; shift 2 ;;
+    --sha) (($# >= 2)) || die "--sha requires COMMIT"; sha=$2; shift 2 ;;
+    --ref) (($# >= 2)) || die "--ref requires a value"; ref=$2; shift 2 ;;
+    --require-scr-prime) require_scr_prime=1; shift ;;
+    --require-cellular) require_cellular=1; shift ;;
+    --configure-firewall) configure_firewall=1; shift ;;
+    --no-start) no_start=1; shift ;;
+    --yes|-y) assume_yes=1; shift ;;
+    --no-cache) no_cache=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+validate_path() {
+  local value=$1 label=$2
+  [[ "$value" == /* && "$value" != / ]] || die "$label must be an absolute non-root path"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *[[:space:]]* ]] || \
+    die "$label may not contain whitespace"
+}
+validate_path "$install_dir" "install directory"
+validate_path "$data_dir" "data directory"
+[[ -z "$source_dir" ]] || validate_path "$source_dir" "source directory"
+[[ -z "$build_root" ]] || validate_path "$build_root" "build root"
+[[ -z "$sha" || "$sha" =~ ^[0-9a-f]{40}$ ]] || die "--sha must be an exact lowercase commit id"
+
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+download_verified() {
+  local url=$1 destination=$2 expected=$3 actual
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --output "$destination" "$url"
+  actual=$(sha256_file "$destination")
+  [[ "$actual" == "$expected" ]] || die "checksum mismatch for $url (expected $expected, got $actual)"
+}
+
+load_managed_paths() {
+  local env_file=/etc/mdd-sim-gateway/managed.env
+  [[ -r "$env_file" ]] || return 0
+  # The file is root-owned and written by this installer; reject anything except simple values.
+  local line key value
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Z_]+)=([^[:space:]]+)$ ]] || continue
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    case "$key" in
+      INSTALL_DIR) install_dir=$value ;;
+      DATA_DIR) data_dir=$value ;;
+      BACKUP_DIR) backup_dir=$value ;;
+      STATE_DIR) state_dir=$value ;;
+      CACHE_DIR) cache_dir=$value ;;
+    esac
+  done < "$env_file"
+}
+[[ "$action" == install ]] || load_managed_paths
+
+validate_managed_layout() {
+  local label value first second i j
+  for label in install_dir data_dir backup_dir state_dir cache_dir; do
+    value=${!label}
+    validate_path "$value" "$label"
+    printf -v "$label" '%s' "$(realpath -m "$value")"
+  done
+  local paths=("$install_dir" "$data_dir" "$backup_dir" "$state_dir" "$cache_dir")
+  for ((i = 0; i < ${#paths[@]}; i++)); do
+    for ((j = i + 1; j < ${#paths[@]}; j++)); do
+      first=${paths[$i]}; second=${paths[$j]}
+      case "$first" in "$second"|"$second"/*) die "managed directories may not overlap: $first and $second" ;; esac
+      case "$second" in "$first"|"$first"/*) die "managed directories may not overlap: $first and $second" ;; esac
+    done
+  done
+}
+validate_managed_layout
+
+detect_distro() {
+  [[ -r /etc/os-release ]] || die "/etc/os-release is missing"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}:${VERSION_ID:-}" in
+    ubuntu:24.04|ubuntu:26.04|debian:12|debian:13) distro_key="${ID}-${VERSION_ID}" ;;
+    *) die "unsupported system: ${PRETTY_NAME:-${ID:-unknown} ${VERSION_ID:-}}; supported: Ubuntu 24.04/26.04 and Debian 12/13" ;;
+  esac
+}
+
+preflight_host() {
+  [[ $(uname -m) == x86_64 ]] || die "only x86_64 guests are supported"
+  [[ $(ps -p 1 -o comm= | tr -d ' ') == systemd ]] || die "systemd must be PID 1"
+  [[ -c /dev/net/tun ]] || die "/dev/net/tun is unavailable; enable the TUN device before installing"
+
+  local mem_kib free_bytes root_bytes
+  mem_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  ((mem_kib >= 4 * 1024 * 1024)) || die "at least 4 GiB RAM is required"
+  ((mem_kib >= 8 * 1024 * 1024)) || warn "less than 8 GiB RAM; the source Engine build may be slow or fail"
+  free_bytes=$(df -PB1 / | awk 'NR==2 {print $4}')
+  root_bytes=$(df -PB1 / | awk 'NR==2 {print $2}')
+  ((free_bytes >= 12 * 1024 * 1024 * 1024)) || die "at least 12 GiB free disk space is required"
+  ((free_bytes >= 25 * 1024 * 1024 * 1024)) || warn "less than 25 GiB free disk; 64 GiB dynamic disk is recommended"
+  ((root_bytes >= 20 * 1024 * 1024 * 1024)) || die "the root filesystem is smaller than 20 GiB; expand it before installing"
+
+  local virt
+  virt=$(systemd-detect-virt 2>/dev/null || true)
+  [[ "$virt" == vmware ]] || warn "guest is reported as '${virt:-physical}', not VMware"
+
+  if systemctl is-active --quiet mdd-sim-gateway-control.service 2>/dev/null; then
+    : # an idempotent reinstall owns its listener
+  elif ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:|\])8443$'; then
+    die "TCP port 8443 is already in use"
   fi
 }
 
-download_verified() {
-  url=$1 destination=$2 expected=$3
-  have curl || pkg_install curl ca-certificates
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --output "$destination" "$url"
-  actual=$(sha256_file "$destination")
-  [ "$actual" = "$expected" ] || die "checksum mismatch for $url (expected $expected, got $actual)"
+network_value() {
+  local kind=$1
+  case "$kind" in
+    dev) ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' ;;
+    gateway) ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' ;;
+    source) ip -4 route get 1.1.1.1 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' ;;
+  esac
 }
 
-host_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) printf '%s' amd64 ;;
-    aarch64|arm64) printf '%s' arm64 ;;
-    *) die "unsupported CPU architecture: $(uname -m)" ;;
-  esac
+prepare_network_guard() {
+  install -d -m 0700 "$state_dir/network"
+  network_dev_before=$(network_value dev)
+  network_gateway_before=$(network_value gateway)
+  network_source_before=$(network_value source)
+  [[ -n "$network_dev_before" && -n "$network_source_before" ]] || die "could not identify the bridged default route and SSH address"
+  printf '%s\n' "$network_dev_before" > "$state_dir/network/default-interface"
+  printf '%s\n' "$network_gateway_before" > "$state_dir/network/default-gateway"
+  printf '%s\n' "$network_source_before" > "$state_dir/network/default-source"
+  ip -j address show dev "$network_dev_before" > "$state_dir/network/address-before.json"
+  ip -j route show default > "$state_dir/network/routes-before.json"
+  networkmanager_was_active=0
+  systemctl is-active --quiet NetworkManager.service 2>/dev/null && networkmanager_was_active=1
+  networkd_was_active=0
+  systemctl is-active --quiet systemd-networkd.service 2>/dev/null && networkd_was_active=1
+  networking_was_active=0
+  systemctl is-active --quiet networking.service 2>/dev/null && networking_was_active=1
+  primary_was_nm_managed=0
+  if have nmcli && nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -Eq "^${network_dev_before}:(connected|connecting)"; then
+    primary_was_nm_managed=1
+  fi
+  printf 'networkmanager_was_active=%s\nnetworkd_was_active=%s\nnetworking_was_active=%s\nprimary_was_nm_managed=%s\n' \
+    "$networkmanager_was_active" "$networkd_was_active" "$networking_was_active" \
+    "$primary_was_nm_managed" > "$state_dir/network/backend-before"
+
+  # A newly installed NetworkManager must not claim the bridged management NIC. If it already
+  # manages that NIC, preserve that arrangement and merely add cellular management.
+  install -d -m 0755 /etc/NetworkManager/conf.d
+  rm -f "$state_dir/network/policy-existed" "$state_dir/network/90-mdd-cellular-only.conf.before"
+  if [[ -f /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf ]]; then
+    cp -a /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf \
+      "$state_dir/network/90-mdd-cellular-only.conf.before"
+    touch "$state_dir/network/policy-existed"
+  fi
+  if ((primary_was_nm_managed == 0)); then
+    cat > /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf <<'EOF'
+[device-mdd-cellular]
+match-device=type:gsm
+managed=1
+
+[device-mdd-noncellular]
+match-device=except:type:gsm
+managed=0
+EOF
+  else
+    rm -f /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf
+  fi
+}
+
+restore_network_guard() {
+  if [[ -f "$state_dir/network/policy-existed" ]]; then
+    cp -a "$state_dir/network/90-mdd-cellular-only.conf.before" \
+      /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf || \
+      warn "could not restore the previous NetworkManager policy file"
+  else
+    rm -f /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf
+  fi
+  if ((networkmanager_was_active)); then systemctl restart NetworkManager.service >/dev/null 2>&1 || true
+  else systemctl disable --now NetworkManager.service >/dev/null 2>&1 || true
+  fi
+  if ((networkd_was_active)); then systemctl restart systemd-networkd.service >/dev/null 2>&1 || true; fi
+  if ((networking_was_active)); then systemctl restart networking.service >/dev/null 2>&1 || true; fi
+}
+
+verify_network_guard() {
+  local dev_after gateway_after source_after
+  dev_after=$(network_value dev); gateway_after=$(network_value gateway); source_after=$(network_value source)
+  if [[ "$dev_after" != "$network_dev_before" || "$gateway_after" != "$network_gateway_before" || "$source_after" != "$network_source_before" ]]; then
+    warn "network changed during package installation; rolling back the MDD NetworkManager policy"
+    restore_network_guard
+    network_guard_armed=0
+    die "default route or SSH address changed (before ${network_source_before}/${network_dev_before}, after ${source_after:-none}/${dev_after:-none})"
+  fi
+  info "bridged management address preserved: $source_after via $dev_after"
+}
+
+install_packages() {
+  info "installing ${distro_key} packages"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y \
+    ca-certificates curl wget git jq openssl coreutils util-linux iproute2 usbutils \
+    docker.io modemmanager network-manager dbus pcscd pcsc-tools libccid \
+    python3 python3-dev python3-venv python3-pip build-essential pkg-config swig \
+    libpcsclite-dev libcurl4-openssl-dev libssl-dev libffi-dev \
+    autoconf automake libtool help2man flex meson ninja-build patch perl \
+    libusb-1.0-0-dev zlib1g-dev unzip cmake nftables
+  systemctl enable --now docker.service ModemManager.service NetworkManager.service
+  systemctl enable --now pcscd.socket >/dev/null 2>&1 || systemctl start pcscd.service
+  docker info >/dev/null
+  if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -qi rootless; then
+    die "rootless Docker is not supported; install the distro rootful docker.io daemon"
+  fi
+}
+
+install_modemmanager_dropin() {
+  local binary
+  binary=$(command -v ModemManager)
+  install -d -m 0755 /etc/systemd/system/ModemManager.service.d
+  cat > /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=$binary --debug
+ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1 org.freedesktop.ModemManager1 SetLogging s INFO
+EOF
+  systemctl daemon-reload
+  systemctl restart ModemManager.service
+}
+
+install_source_checkout() {
+  [[ -n "$source_dir" ]] || die "install requires --source"
+  source_dir=$(realpath "$source_dir")
+  git -C "$source_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "--source is not a Git checkout"
+  [[ $(git -C "$source_dir" remote get-url origin) == "$ORIGIN_URL" ]] || die "source remote does not match $ORIGIN_URL"
+  [[ -z $(git -C "$source_dir" status --porcelain --untracked-files=normal) ]] || die "source checkout is dirty"
+  local source_sha incoming current
+  source_sha=$(git -C "$source_dir" rev-parse HEAD)
+  [[ "$ref" == vmware || "$ref" =~ ^[0-9a-fA-F]{40}$ ]] || die "invalid --ref"
+  if [[ "$ref" == vmware ]]; then
+    [[ $(git -C "$source_dir" branch --show-current) == vmware ]] || die "vmware installs require a vmware source branch"
+    [[ $(git -C "$source_dir" rev-parse --verify origin/vmware) == "$source_sha" ]] || \
+      die "vmware source HEAD does not exactly match origin/vmware"
+  else
+    [[ "$source_sha" == "${ref,,}" ]] || die "source HEAD does not match the requested exact commit"
+  fi
+
+  install -d -m 0755 "$(dirname "$install_dir")"
+  if [[ ! -e "$install_dir" ]]; then
+    incoming="${install_dir}.incoming.$$"
+    [[ "$incoming" == "$(dirname "$install_dir")/"* ]] || die "unsafe incoming checkout path"
+    rm -rf -- "$incoming"
+    # Clone the reviewed Git tree instead of copying the directory wholesale: ignored .env,
+    # venv, build output or runtime data in a manually supplied source checkout must not leak
+    # into the root-owned managed installation.
+    git clone --no-hardlinks --no-checkout "$source_dir" "$incoming"
+    git -C "$incoming" remote set-url origin "$ORIGIN_URL"
+    git -C "$incoming" switch -C vmware "$source_sha"
+    chown -R root:root "$incoming"
+    mv -- "$incoming" "$install_dir"
+  else
+    git -C "$install_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$install_dir is not a Git checkout"
+    [[ $(git -C "$install_dir" remote get-url origin) == "$ORIGIN_URL" ]] || die "managed checkout remote mismatch"
+    [[ $(git -C "$install_dir" branch --show-current) == vmware ]] || die "managed checkout is not on vmware"
+    [[ -z $(git -C "$install_dir" status --porcelain --untracked-files=normal) ]] || die "managed checkout is dirty"
+    current=$(git -C "$install_dir" rev-parse HEAD)
+    git -C "$install_dir" fetch --no-tags "$source_dir" "$source_sha"
+    git -C "$install_dir" merge-base --is-ancestor "$current" "$source_sha" || die "existing checkout and requested source diverged"
+    git -C "$install_dir" merge --ff-only "$source_sha"
+  fi
+  source_dir=$install_dir
+  sha=$(git -C "$source_dir" rev-parse HEAD)
 }
 
 ensure_singbox() {
-  arch=$(host_arch)
-  if have sing-box && sing-box version 2>/dev/null | grep -q "$SINGBOX_VERSION"; then
-    info "sing-box $SINGBOX_VERSION already installed"
-    return
-  fi
-  case "$arch" in
-    amd64) digest=$SINGBOX_SHA256_AMD64 ;;
-    arm64) digest=$SINGBOX_SHA256_ARM64 ;;
-  esac
-  archive="sing-box-${SINGBOX_VERSION}-linux-${arch}.tar.gz"
-  temporary=$(mktemp -d /tmp/mdd-singbox.XXXXXX)
-  trap 'rm -rf "$temporary"' EXIT HUP INT TERM
-  info "installing sing-box $SINGBOX_VERSION ($arch)…"
-  download_verified "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive}" "$temporary/$archive" "$digest"
-  tar xzf "$temporary/$archive" -C "$temporary"
-  install -m 0755 "$temporary/sing-box-${SINGBOX_VERSION}-linux-${arch}/sing-box" /usr/local/bin/sing-box
-  rm -rf "$temporary"
-  trap - EXIT HUP INT TERM
-  sing-box version | head -n1
+  if have sing-box && sing-box version 2>/dev/null | grep -q "$SINGBOX_VERSION"; then return; fi
+  local temp archive="sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+  temp=$(mktemp -d /tmp/mdd-singbox.XXXXXX)
+  download_verified "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive}" "$temp/$archive" "$SINGBOX_SHA256_AMD64"
+  tar xzf "$temp/$archive" -C "$temp"
+  install -m 0755 "$temp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+  rm -rf -- "$temp"
 }
 
 ensure_xray() {
-  arch=$(host_arch)
-  if have xray && xray version 2>/dev/null | grep -q "$XRAY_VERSION"; then
-    info "Xray-core $XRAY_VERSION already installed"
-    return
+  if have xray && xray version 2>/dev/null | grep -q "$XRAY_VERSION"; then return; fi
+  local temp asset=Xray-linux-64.zip
+  temp=$(mktemp -d /tmp/mdd-xray.XXXXXX)
+  download_verified "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${asset}" "$temp/$asset" "$XRAY_SHA256_AMD64"
+  unzip -q "$temp/$asset" -d "$temp/xray"
+  install -m 0755 "$temp/xray/xray" /usr/local/bin/xray
+  rm -rf -- "$temp"
+}
+
+pcsc_dropdir() {
+  local value
+  value=$(pkg-config libpcsclite --variable=usbdropdir 2>/dev/null || true)
+  printf '%s' "${value:-/usr/lib/pcsc/drivers}"
+}
+
+publish_pcsc_maintenance() {
+  install -d -m 0700 "$data_dir/orchestrator"
+  : > "$data_dir/orchestrator/pcsc-maintenance"
+  chmod 0600 "$data_dir/orchestrator/pcsc-maintenance"
+}
+
+ensure_vpcd() {
+  local drop serial marker temp source
+  drop=$(pcsc_dropdir); serial="$drop/serial"; marker="$serial/.mdd-vpcd-slots-$VPCD_SLOTS"
+  [[ -f "$marker" ]] && return
+  info "building vsmartcard VPCD with $VPCD_SLOTS logical slots"
+  temp=$(mktemp -d /tmp/mdd-vpcd.XXXXXX)
+  download_verified "https://github.com/frankmorgner/vsmartcard/archive/refs/tags/virtualsmartcard-${VPCD_VERSION}.tar.gz" "$temp/source.tar.gz" "$VPCD_SHA256"
+  tar xf "$temp/source.tar.gz" -C "$temp"
+  source="$temp/vsmartcard-virtualsmartcard-${VPCD_VERSION}/virtualsmartcard"
+  (cd "$source" && autoreconf -vif . >/dev/null && \
+    ./configure --enable-serialconfdir=/etc/reader.conf.d --enable-serialdropdir="$serial" \
+      --enable-vpcdslots="$VPCD_SLOTS" --disable-dependency-tracking >/dev/null && \
+    make -C src/vpcd >/dev/null && make -C src/ifd-vpcd >/dev/null && \
+    make -C src/ifd-vpcd install >/dev/null)
+  ldconfig
+  rm -rf -- "$temp"
+  install -d -m 0755 "$serial"
+  rm -f "$serial/.mdd-vpcd-slots-"* 2>/dev/null || true
+  touch "$marker"
+  if [[ -f /etc/reader.conf.d/vpcd ]]; then mv -f /etc/reader.conf.d/vpcd /etc/reader.conf.d/.vpcd.mdd-disabled; fi
+  publish_pcsc_maintenance
+  systemctl restart pcscd.service
+}
+
+ensure_cmake() {
+  local version major minor home temp
+  version=$(cmake --version 2>/dev/null | awk 'NR==1 {print $3}')
+  major=${version%%.*}; minor=${version#*.}; minor=${minor%%.*}
+  if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] && ((major > 3 || (major == 3 && minor >= 31))); then
+    command -v cmake; return
   fi
-  case "$arch" in
-    amd64) asset="Xray-linux-64.zip"; digest=$XRAY_SHA256_AMD64 ;;
-    arm64) asset="Xray-linux-arm64-v8a.zip"; digest=$XRAY_SHA256_ARM64 ;;
-  esac
-  have unzip || pkg_install unzip
-  temporary=$(mktemp -d /tmp/mdd-xray.XXXXXX)
-  trap 'rm -rf "$temporary"' EXIT HUP INT TERM
-  info "installing Xray-core $XRAY_VERSION ($arch)…"
-  download_verified "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${asset}" "$temporary/$asset" "$digest"
-  unzip -q "$temporary/$asset" -d "$temporary/xray"
-  install -m 0755 "$temporary/xray/xray" /usr/local/bin/xray
-  rm -rf "$temporary"
-  trap - EXIT HUP INT TERM
-  xray version | head -n1
-}
-
-ensure_cellular_tools() {
-  if have apt-get; then pkg_install modemmanager network-manager dbus
-  elif have dnf || have yum; then pkg_install ModemManager NetworkManager dbus
-  elif have pacman; then pkg_install modemmanager networkmanager dbus
+  home="$cache_dir/tools/cmake-$CMAKE_VERSION"
+  if [[ ! -x "$home/bin/cmake" ]]; then
+    temp=$(mktemp -d /tmp/mdd-cmake.XXXXXX)
+    download_verified "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" "$temp/cmake.tgz" "$CMAKE_SHA256_AMD64"
+    tar xzf "$temp/cmake.tgz" -C "$temp"
+    install -d -m 0755 "$(dirname "$home")"
+    mv "$temp/cmake-${CMAKE_VERSION}-linux-x86_64" "$home"
+    rm -rf -- "$temp"
   fi
-  have mmcli || die "ModemManager command mmcli is unavailable"
-  have nmcli || die "NetworkManager command nmcli is unavailable"
-  ensure_modemmanager_command_interface
+  printf '%s' "$home/bin/cmake"
 }
 
-# The module SIM bridge sends APDUs through ModemManager's guarded AT command API.  Upstream
-# exposes that API only when started with --debug; immediately lower its runtime logging back to
-# INFO so this does not produce debug-volume logs.  The drop-in is MDD-owned and installed only
-# when systemd manages ModemManager.
-ensure_modemmanager_command_interface() {
-  have systemctl || return 0
-  modemmanager_bin=$(command -v ModemManager 2>/dev/null || true)
-  [ -n "$modemmanager_bin" ] || die "ModemManager executable is unavailable"
-  dropin_dir=/etc/systemd/system/ModemManager.service.d
-  dropin_file=$dropin_dir/90-mdd-command-interface.conf
-  temporary=$(mktemp /tmp/mdd-modemmanager.XXXXXX)
-  cat >"$temporary" <<EOF
-[Service]
-ExecStart=
-ExecStart=$modemmanager_bin --debug
-ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1 org.freedesktop.ModemManager1 SetLogging s INFO
-EOF
-  if [ ! -f "$dropin_file" ] || ! cmp -s "$temporary" "$dropin_file"; then
-    install -d -m 0755 "$dropin_dir"
-    install -m 0644 "$temporary" "$dropin_file"
-    systemctl daemon-reload
-    if systemctl is-active ModemManager.service >/dev/null 2>&1; then
-      info "enabling ModemManager command interface for the module SIM bridge…"
-      systemctl restart ModemManager.service
-    fi
-  fi
-  rm -f "$temporary"
-}
-
-# Best-effort primary LAN IPv4 of THIS host (the address SIP/WebRTC clients must reach).
-detect_lan_ip() {
-  ip=""
-  if have ip; then
-    ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
-  fi
-  if [ -z "$ip" ] && have hostname; then
-    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -n1)
-  fi
-  printf '%s' "$ip"
-}
-
-# Detect the host package manager and install the given packages.
-pkg_install() {
-  if   have apt-get; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-  elif have dnf;     then dnf install -y "$@"
-  elif have yum;     then yum install -y "$@"
-  elif have pacman;  then pacman -Sy --noconfirm "$@"
-  elif have zypper;  then zypper install -y "$@"
-  elif have apk;     then apk add --no-cache "$@"
-  else die "no supported package manager found (apt/dnf/yum/pacman/zypper/apk)"
-  fi
-}
-
-svc_enable_start() {
-  # Enable+start a system service across init systems (best-effort).
-  if have systemctl; then systemctl enable --now "$1" 2>/dev/null || systemctl start "$1" 2>/dev/null || true
-  elif have rc-update; then rc-update add "$1" default 2>/dev/null || true; rc-service "$1" start 2>/dev/null || true
-  elif have service; then service "$1" start 2>/dev/null || true
-  fi
-}
-
-# Ensure pcscd is running AND set to start on boot. pcscd ships differently across distros:
-# some socket-activate it (pcscd.socket starts the daemon on first client), some don't enable
-# it at all (seen on Armbian) — so a plain `systemctl enable --now pcscd` may leave it stopped
-# and not persistent. We enable both the socket and the service, start the daemon now, and
-# verify it actually came up (falling back to a manual daemon launch if the units don't exist).
-enable_pcscd_autostart() {
-  if have systemctl; then
-    # Enable the socket (on-boot autostart, incl. socket-activated setups) and the service.
-    systemctl enable pcscd.socket 2>/dev/null || true
-    systemctl enable pcscd.service 2>/dev/null || systemctl enable pcscd 2>/dev/null || true
-    # Start now: the socket triggers the daemon on first use; also start the service directly
-    # for distros where the service isn't socket-activated.
-    systemctl start pcscd.socket 2>/dev/null || true
-    systemctl start pcscd.service 2>/dev/null || systemctl start pcscd 2>/dev/null || true
-    # Verify. If neither the daemon nor its socket is present, force the service up once.
-    if ! systemctl is-active --quiet pcscd 2>/dev/null && [ ! -S /run/pcscd/pcscd.comm ]; then
-      systemctl restart pcscd.service 2>/dev/null || systemctl restart pcscd 2>/dev/null || true
-    fi
-  else
-    svc_enable_start pcscd
-  fi
-  # Last-resort: if systemd units are absent/broken but the binary exists, launch it detached so
-  # the reader is usable this session (autostart on non-systemd hosts is best-effort).
-  if [ ! -S /run/pcscd/pcscd.comm ] && have pcscd && ! pgrep -x pcscd >/dev/null 2>&1; then
-    mkdir -p /run/pcscd
-    pcscd 2>/dev/null || true   # daemonizes by default; harmless if a unit already owns it
-  fi
-}
-
-data_dir_abs() { CDPATH= cd -- "$MDD_DATA_DIR" 2>/dev/null && pwd -P || printf '%s' "$MDD_DATA_DIR"; }
-
-# ------------------------------------------------------------------ deploy-mode state
-persist_mode() {
-  mkdir -p "$MDD_DATA_DIR"
-  install -d -m 0755 "$(dirname -- "$DATA_DIR_STATE")"
-  printf '%s\n' "$(data_dir_abs)" > "$DATA_DIR_STATE"
-  chmod 0644 "$DATA_DIR_STATE"
-  printf '%s\n' "$1" > "$MODE_STATE" 2>/dev/null || true
-}
-
-# Detect an EXISTING installation from real artifacts (not just the state file), and which
-# plane it uses. Prints: local | docker | none.
-#   local  = native systemd unit present
-#   docker = control container present
-detect_installed_mode() {
-  if [ -f "$SYSTEMD_UNIT" ]; then echo local; return; fi
-  if have docker && docker container inspect "$CONTROL_NAME" >/dev/null 2>&1; then echo docker; return; fi
-  echo none
-}
-
-# Resolve the deploy mode. For lifecycle commands (start/stop/status/…): prefer what's actually
-# installed, so controls act on the real plane regardless of the state file. Precedence:
-#   --mode arg > MDD_MODE env > detected-from-artifacts > persisted state > default(local).
-resolve_mode() {
-  m="${MODE_ARG:-}"
-  [ -z "$m" ] && m="${MDD_MODE:-}"
-  if [ -z "$m" ]; then d=$(detect_installed_mode); [ "$d" != none ] && m="$d"; fi
-  [ -z "$m" ] && [ -f "$MODE_STATE" ] && m=$(cat "$MODE_STATE" 2>/dev/null || true)
-  [ -z "$m" ] && m="local"
-  case "$m" in
-    local|docker) ;;
-    *) die "invalid deploy mode '$m' (use: local | docker)";;
-  esac
-  MODE="$m"
-}
-
-# True (0) if the control plane is currently running.
-control_running() {
-  if [ "${MODE:-}" = local ]; then
-    have systemctl && systemctl is-active --quiet mdd-sim-gateway-control
-  else
-    [ "$(docker inspect -f '{{.State.Running}}' "$CONTROL_NAME" 2>/dev/null)" = true ]
-  fi
-}
-
-# ------------------------------------------------------------------ prerequisites
-ensure_docker() {
-  if have docker && docker info >/dev/null 2>&1; then
-    info "Docker present ($(docker --version | awk '{print $3}' | tr -d ,))"
-    return
-  fi
-  if ! have docker; then
-    info "installing Docker from the host distribution…"
-    if have apt-get; then pkg_install docker.io
-    elif have dnf || have yum; then pkg_install docker
-    elif have pacman; then pkg_install docker
-    elif have zypper; then pkg_install docker
-    elif have apk; then pkg_install docker
-    else die "install Docker from your operating-system vendor, then re-run"
-    fi
-  fi
-  svc_enable_start docker
-  docker info >/dev/null 2>&1 || die "Docker installed but the daemon is not running"
-  info "Docker ready"
-}
-
-docker_container_owned() {
-  name=$1
-  label=$(docker inspect -f "{{ index .Config.Labels \"$MDD_DOCKER_LABEL\" }}" "$name" 2>/dev/null || true)
-  image=$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || true)
-  [ "$label" = true ] || case "$image" in mdd-sim-gateway/*) return 0;; *) return 1;; esac
-}
-
-engine_names() {
-  docker ps -a --format '{{.Names}}' 2>/dev/null | while IFS= read -r name; do
-    case "$name" in
-      "$ENGINE_PREFIX"*) docker_container_owned "$name" && printf '%s\n' "$name";;
-    esac
+ensure_lpac() {
+  local destination="$data_dir/lpac" source="$cache_dir/sources/lpac-$LPAC_VERSION" cmake_bin build temp candidate
+  [[ -x "$destination/lpac" ]] && return
+  info "building lpac $LPAC_VERSION from pinned source"
+  install -d -m 0755 "$(dirname "$source")"
+  if [[ ! -d "$source/.git" ]]; then git clone --filter=blob:none --branch "v$LPAC_VERSION" --single-branch https://github.com/estkme-group/lpac.git "$source"; fi
+  [[ $(git -C "$source" rev-parse HEAD) == "$LPAC_COMMIT" ]] || die "lpac source commit mismatch"
+  for candidate in "$source_dir"/patches/lpac/*.patch; do
+    [[ -f "$candidate" ]] || continue
+    if patch -p1 -d "$source" -N --dry-run < "$candidate" >/dev/null 2>&1; then patch -p1 -d "$source" -N < "$candidate"; fi
   done
+  cmake_bin=$(ensure_cmake); build="$source/build-mdd"; temp=$(mktemp -d /tmp/mdd-lpac.XXXXXX)
+  rm -rf -- "$build"
+  "$cmake_bin" -S "$source" -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+    -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_HTTP_CURL=ON -DLPAC_WITH_APDU_AT=OFF \
+    -DLPAC_WITH_APDU_QMI=OFF -DLPAC_WITH_APDU_QMI_QRTR=OFF -DLPAC_WITH_APDU_UQMI=OFF \
+    -DLPAC_WITH_APDU_MBIM=OFF -DLPAC_WITH_APDU_GBINDER=OFF
+  "$cmake_bin" --build "$build" --parallel "$(nproc)"
+  DESTDIR="$temp" "$cmake_bin" --install "$build"
+  candidate=$(find "$temp" -type f -name lpac -perm /111 -print -quit)
+  [[ -n "$candidate" ]] || die "lpac binary was not produced"
+  rm -rf -- "$destination.tmp"
+  install -d -m 0700 "$destination.tmp"
+  install -m 0755 "$candidate" "$destination.tmp/lpac"
+  rm -rf -- "$destination"
+  mv "$destination.tmp" "$destination"
+  rm -rf -- "$temp"
+  "$destination/lpac" driver apdu list >/dev/null
 }
 
-docker_preflight() {
-  case "$MDD_PORT" in ''|*[!0-9]*) die "MDD_PORT must be a number between 1 and 65535";; esac
-  [ "$MDD_PORT" -ge 1 ] && [ "$MDD_PORT" -le 65535 ] || die "MDD_PORT must be between 1 and 65535"
+pcsc_scan_capture() {
+  LC_ALL=C timeout "${1:-10}" pcsc_scan -n 2>&1 || true
+}
+scr_prime_pcsc_visible() { pcsc_scan_capture 8 | grep -Eiq 'SCR[[:space:]_-]*Prime'; }
 
-  security=$(docker info --format '{{json .SecurityOptions}}' 2>/dev/null || true)
-  printf '%s' "$security" | grep -qi rootless && \
-    die "rootless Docker is not supported: engine containers need privileged TUN and host PC/SC access"
+tree_hash() {
+  local root=$1
+  python3 - "$root" <<'PY'
+import hashlib, os, stat, sys
+root = os.path.realpath(sys.argv[1])
+if not os.path.isdir(root):
+    raise SystemExit(f"tree is missing: {root}")
+digest = hashlib.sha256()
+items = []
+for base, directories, files in os.walk(root, followlinks=False):
+    directories.sort(); files.sort()
+    items.extend(os.path.join(base, name) for name in directories)
+    items.extend(os.path.join(base, name) for name in files)
+for path in sorted(items):
+    metadata = os.lstat(path)
+    relative = os.path.relpath(path, root).replace(os.sep, "/")
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"tree contains a symbolic link: {relative}")
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = "d"; size = 0
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "f"; size = metadata.st_size
+    else:
+        raise SystemExit(f"tree contains an unsupported path: {relative}")
+    digest.update(f"{kind}\0{relative}\0{stat.S_IMODE(metadata.st_mode):o}\0{size}\0".encode())
+    if kind == "f":
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
 
-  if docker inspect "$CONTROL_NAME" >/dev/null 2>&1 && ! docker_container_owned "$CONTROL_NAME"; then
-    die "container name '$CONTROL_NAME' is already used by another project"
-  fi
-  for name in $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
-    case "$name" in
-      "$ENGINE_PREFIX"*) docker_container_owned "$name" || \
-        die "container name '$name' looks like MDD but is owned by another project";;
-    esac
-  done
+install_scr_prime_ccid() {
+  (
+  local drop bundle backup timestamp temp source stage built package_version before_hash after_hash metadata
+  local package_owned=0 hold_was_present=0 hold_added=0 replaced=0 completed=0
+  drop=$(pcsc_dropdir); bundle="$drop/ifd-ccid.bundle"; timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  backup="$state_dir/driver-backups/$timestamp"; metadata="$state_dir/scr-prime-driver.json"
+  package_version=$(dpkg-query -W -f='${Version}' libccid 2>/dev/null || true)
+  apt-mark showhold 2>/dev/null | grep -qx libccid && hold_was_present=1
 
-  publishers=$(docker ps --filter "publish=$MDD_PORT" --format '{{.Names}}' 2>/dev/null || true)
-  for name in $publishers; do
-    [ "$name" = "$CONTROL_NAME" ] && docker_container_owned "$name" && continue
-    die "TCP port $MDD_PORT is already published by Docker container '$name'"
-  done
-  if [ -z "$publishers" ] && have ss && ss -ltnH 2>/dev/null | awk '{print $4}' | \
-      grep -Eq "(^|:)$MDD_PORT$"; then
-    if ! { have systemctl && systemctl is-active --quiet mdd-sim-gateway-control; }; then
-      die "TCP port $MDD_PORT is already in use by a non-MDD process"
+  info "system libccid does not expose SCR Prime; building CCID $CCID_VERSION with patch 03 only"
+  temp=$(mktemp -d /tmp/mdd-ccid.XXXXXX); stage="$temp/stage"
+  driver_install_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    if ((completed == 0 && replaced)); then
+      rm -rf -- "$bundle"
+      if [[ -d "$backup/ifd-ccid.bundle" ]]; then cp -a -- "$backup/ifd-ccid.bundle" "$bundle"; fi
+      ((hold_added == 0)) || apt-mark unhold libccid >/dev/null 2>&1 || true
+      systemctl restart pcscd.service >/dev/null 2>&1 || true
+      rm -rf -- "$backup"
     fi
-  fi
-  info "existing Docker daemon passed ownership, port and privilege checks; daemon configuration was left unchanged"
-}
-
-managed_control_exists() {
-  docker inspect "$CONTROL_NAME" >/dev/null 2>&1 || return 1
-  docker_container_owned "$CONTROL_NAME" || die "refusing to operate on foreign container '$CONTROL_NAME'"
-}
-
-ensure_pcscd() {
-  # We PIN pcsc-lite to $PCSC_VERSION everywhere (host pcscd + container client libs) so the
-  # PC/SC client/server protocol always matches — distro-default versions differ and cause
-  # "Failed to establish context" between a client and the host daemon.  In BOTH deploy modes
-  # the reader is owned by the HOST pcscd; engine containers (and, in docker mode, the control
-  # container) are pcscd clients over the shared /run/pcscd socket.
-  installed_ver=""
-  if have pcscd; then installed_ver=$(pcscd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); fi
-
-  if [ "$installed_ver" = "$PCSC_VERSION" ]; then
-    info "host pcscd already at pinned version $PCSC_VERSION"
-    PCSC_SOURCE_BUILT=0
-  else
-    # Install the CCID USB driver from the distro (its IFDHandler ABI is stable across pcscd
-    # 2.x, so the distro driver works with our source-built pcscd), plus build deps.
-    info "host pcscd is '${installed_ver:-none}', pinning to $PCSC_VERSION (building from source)…"
-    if   have apt-get; then
-      pkg_install libccid libudev-dev libsystemd-dev meson ninja-build flex pkg-config gcc wget ca-certificates
-      # Debian 13 split systemd.pc out of the systemd package into systemd-dev, and that
-      # file is what meson's dependency('systemd') resolves. Without it the pcsc-lite build
-      # stops at "Dependency systemd found: NO". Older releases have no such package and
-      # ship the file with systemd itself, so its absence must not fail the install.
-      apt-get install -y systemd-dev >/dev/null 2>&1 || true
-    elif have dnf || have yum; then pkg_install ccid systemd-devel meson ninja-build flex pkgconf-pkg-config gcc perl-podlators wget
-    elif have pacman;  then pkg_install ccid meson ninja flex pkgconf gcc wget
-    elif have zypper;  then pkg_install pcsc-ccid systemd-devel meson ninja flex pkg-config gcc wget
-    else pkg_install ccid meson ninja flex gcc wget
-    fi
-    _build_pcsclite_host
-    PCSC_SOURCE_BUILT=1
-  fi
-  enable_pcscd_autostart
-  # pcscd may be socket-activated (daemon starts on first client), so the socket can be absent
-  # until a reader is used — that's fine. If it IS present, confirm; else just note it.
-  if [ -S /run/pcscd/pcscd.comm ] || { have systemctl && systemctl is-active --quiet pcscd 2>/dev/null; }; then
-    info "host pcscd running + set to start on boot"
-  else
-    warn "pcscd not active yet — it is enabled for boot and will start on first reader use"
-  fi
-}
-
-# Build + install the CCID USB driver $CCID_VERSION from source with a chosen SET of the
-# fixes under patches/ccid/* applied. Args: $1 = short set label (used for the idempotency
-# marker + logs), remaining args = patch filenames (under patches/ccid/) to apply in order.
-# Patch sets (see the `patch*` subcommands):
-#   01_hsic_slot_status.patch   HSIC 1d99:0016 broken GetSlotStatus — firmware always reports
-#                               "no ICC present". NotifySlotChange sets pending; IFDHICCPresence
-#                               tick probes via IccPowerOn/ATR (debounced). Base fix; safe for all cards.
-#   02_hsic_malformed_atr.patch HSIC firmware drops the final TCK byte from the ATR; this
-#                               patch synthesizes it at power-on (ISO 7816-3 XOR) and falls back
-#                               to relaxed validation if repair fails. Fixes SCardConnect 607
-#                               for (U)SIMs that work on other readers.
-#   03_scr_prime_reader.patch   Adds SCR Prime 04d9:c001 to the supported-reader table. The
-#                               device exposes a standard CCID interface but is absent upstream.
-# The build installs into the pcsc-lite usbdropdir, replacing the distro libccid bundle files.
-# Idempotent via a per-set marker file (switching sets rebuilds); on apt systems the distro
-# libccid package is held so an upgrade can't clobber the patched driver.
-# OPT-IN: not part of `install` — run `sudo ./install.sh patch | patch2 | patchall`.
-ensure_ccid_host() {
-  set_label="$1"; shift
-  ccid_patches="$*"
-  drivers_dir=$(pkg-config libpcsclite --variable usbdropdir 2>/dev/null || true)
-  [ -n "$drivers_dir" ] || drivers_dir=/usr/lib/pcsc/drivers
-  ccid_marker="$drivers_dir/ifd-ccid.bundle/Contents/.mdd-ccid-${CCID_VERSION}-${set_label}"
-  if [ -f "$ccid_marker" ]; then
-    info "patched CCID driver $CCID_VERSION (set: $set_label) already installed ($drivers_dir)"
-    return
-  fi
-  info "building CCID driver $CCID_VERSION from source — patch set '$set_label' ($ccid_patches)…"
-  if   have apt-get; then
-    pkg_install meson ninja-build flex gcc pkg-config perl patch wget ca-certificates libusb-1.0-0-dev zlib1g-dev
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install libpcsclite-dev
-  elif have dnf || have yum; then
-    pkg_install meson ninja-build flex gcc pkgconf-pkg-config perl patch wget libusb1-devel zlib-devel
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
-  elif have pacman;  then
-    pkg_install meson ninja flex gcc pkgconf perl patch wget libusb zlib
-  elif have zypper;  then
-    pkg_install meson ninja flex gcc pkg-config perl patch wget libusb-1_0-devel zlib-devel
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
-  elif have apk;     then
-    pkg_install meson ninja flex gcc pkgconfig perl patch wget musl-dev libusb-dev zlib-dev
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-dev
-  fi
-  tmp=$(mktemp -d)
-  download_verified "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz" "$tmp/ccid.tar.gz" "$CCID_SHA256"
-  ( cd "$tmp" \
-    && tar xf ccid.tar.gz && cd "CCID-${CCID_VERSION}" \
-    && for p in $ccid_patches; do echo "applying $p"; patch -p1 < "$REPO_DIR/patches/ccid/$p" || exit 1; done \
-    && meson setup builddir \
-    && ninja -C builddir && ninja -C builddir install \
-  ) || die "failed to build CCID driver $CCID_VERSION from source"
-  rm -rf "$tmp"
-  # drop any other-set markers so `status`/idempotency reflect the set just installed
-  rm -f "$drivers_dir/ifd-ccid.bundle/Contents/.mdd-ccid-${CCID_VERSION}-"* 2>/dev/null || true
-  touch "$ccid_marker" 2>/dev/null || true
-  # keep a distro libccid upgrade from clobbering the patched bundle files
-  if have apt-mark; then apt-mark hold libccid >/dev/null 2>&1 || true; fi
-  # Reload the driver if pcscd is already running. Publish the same maintenance marker used
-  # by the host orchestrator first, so the control-plane card monitor does not mistake this
-  # planned enumeration gap for a physical unplug and stop healthy VoWiFi engines.
-  if have systemctl; then
-    install -d -m 0700 "$MDD_DATA_DIR/orchestrator"
-    : > "$MDD_DATA_DIR/orchestrator/pcsc-maintenance"
-    chmod 0600 "$MDD_DATA_DIR/orchestrator/pcsc-maintenance" 2>/dev/null || true
-    systemctl restart pcscd 2>/dev/null || true
-  fi
-  info "patched CCID driver $CCID_VERSION (set: $set_label) installed to $drivers_dir"
-}
-
-_build_pcsclite_host() {
-  # Build + install pcsc-lite $PCSC_VERSION to /usr on the host (client lib + headers + daemon),
-  # and install a systemd unit so it runs as the reader daemon. Idempotent.
-  tmp=$(mktemp -d)
-  download_verified "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}.tar.gz" "$tmp/pcsc.tar.gz" "$PCSC_SHA256"
-  ( cd "$tmp" \
-    && tar xf pcsc.tar.gz && cd "PCSC-${PCSC_VERSION}" \
-    && meson setup builddir --prefix=/usr -Dpolkit=false \
-    && ninja -C builddir && ninja -C builddir install \
-  ) || die "failed to build pcsc-lite $PCSC_VERSION from source"
-  ldconfig 2>/dev/null || true
-  rm -rf "$tmp"
-  # Ensure a systemd unit + socket exist (meson installs them under /usr/lib/systemd/system).
-  if have systemctl; then systemctl daemon-reload 2>/dev/null || true; fi
-  info "host pcscd built + installed at $PCSC_VERSION"
-}
-
-# ------------------------------------------------------------------ image builds
-# Build the engine image ONLY if it is missing, or if forced ($1 non-empty / --no-cache).
-# The engine image is large and slow to build (~10-15 min: compiles Asterisk + pcsc-lite + the
-# Python SWu tunnel deps), and it bakes every bug-fix patch under engine/patches/* via the
-# Dockerfile — so an unforced reinstall reuses the existing patched image instead of rebuilding it.
-# Files the overlay can refresh on its own, versus the ones that decide what the base contains.
-# Splitting them is what lets an update ship an engine fix without a 15-minute Asterisk rebuild.
-ENGINE_BASE_TAG="mdd-sim-gateway/engine-base:trusted"
-
-engine_fingerprint() {
-  PCSC_VERSION="$PCSC_VERSION" sh "$REPO_DIR/tools/engine-fingerprint.sh" "$1"
-}
-
-engine_image_label() {
-  docker image inspect "$1" --format "{{index .Config.Labels \"$2\"}}" 2>/dev/null || true
-}
-
-# Decide how to produce the engine image, and say why. An unforced reload used to reuse whatever
-# image was already there, so an engine-side fix shipped in a release never reached the box that
-# self-updated — silently, because the control plane did update. The image now carries
-# fingerprints of what went into it: only Asterisk-level inputs (Dockerfile, patches, pcsc
-# version) cost a full rebuild, while a changed script is a seconds-long overlay that needs no
-# registry at all. Forcing still overrides everything.
-ensure_engine_image() {
-  force="${1:-}"
-  # Whether this call replaced the image. A running container keeps the image it started
-  # from, so an upgrade that rebuilds the image but leaves the containers alone silently
-  # ships nothing: the lines go on serving the old dialplan. The caller uses this to decide
-  # whether the containers have to be re-created, instead of asking the operator to know.
-  ENGINE_IMAGE_CHANGED=0
-  runtime_fp=$(engine_fingerprint runtime)
-  base_fp=$(engine_fingerprint base)
-  have_image=0
-  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 && have_image=1
-
-  if [ -n "${MDD_ENGINE_DISTRIBUTION_IMAGE:-}" ]; then
-    distributed="$MDD_ENGINE_DISTRIBUTION_IMAGE"
-    docker image inspect "$distributed" >/dev/null 2>&1 || \
-      die "distributed engine image not found: $distributed"
-    expected_version=$(tr -d '\n' < "$REPO_DIR/VERSION")
-    expected_arch=$(uname -m)
-    [ "$expected_arch" = aarch64 ] && expected_arch=arm64
-    [ "$expected_arch" = x86_64 ] && expected_arch=amd64
-    identity=$(docker image inspect "$distributed" --format \
-      '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}|{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}' 2>/dev/null || true)
-    expected="$expected_arch|$expected_version|$runtime_fp|$base_fp"
-    [ "$identity" = "$expected" ] || \
-      die "distributed engine image identity mismatch: ${identity:-unreadable}"
-    if [ "$have_image" = 1 ]; then
-      docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" || \
-        die "could not preserve the current engine image"
-    fi
-    docker tag "$distributed" "$ENGINE_IMAGE" || die "could not activate distributed engine image"
-    docker tag "$distributed" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
-    ENGINE_IMAGE_CHANGED=1
-    info "using verified distributed engine image $distributed"
-    return
-  fi
-
-  if [ "$have_image" = 1 ] && [ -z "$force" ] && [ -z "$NOCACHE_FLAG" ]; then
-    image_runtime=$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)
-    image_base=$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.base-fp)
-    if [ "$image_base" = "$base_fp" ] && [ "$image_runtime" = "$runtime_fp" ]; then
-      info "engine image $ENGINE_IMAGE matches this checkout — reusing"
-      return
-    fi
-    if [ -n "$image_base" ] && [ "$image_base" = "$base_fp" ]; then
-      # Only runtime-owned files moved: refresh them onto the image already installed.
-      info "engine scripts changed — refreshing them onto the existing image (no rebuild)"
-      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
-        ENGINE_IMAGE_CHANGED=1; return
-      fi
-      warn "overlay refresh failed; falling back to a full engine rebuild"
-    elif [ -z "$image_base" ]; then
-      # Built before fingerprints existed: adopt it as the base and stamp it, rather than
-      # forcing every existing install through a rebuild it may not be able to complete.
-      info "engine image predates fingerprinting — refreshing scripts onto it and stamping it"
-      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
-        ENGINE_IMAGE_CHANGED=1; return
-      fi
-      warn "overlay refresh failed; falling back to a full engine rebuild"
-    else
-      info "engine base inputs changed (Dockerfile/patches/pcsc) — full rebuild required"
-    fi
-  fi
-
-  if [ -n "${MDD_ENGINE_BASE_IMAGE:-}" ]; then
-    docker image inspect "$MDD_ENGINE_BASE_IMAGE" >/dev/null 2>&1 || \
-      die "trusted local engine base image not found: $MDD_ENGINE_BASE_IMAGE"
-    info "building offline engine overlay from trusted local image $MDD_ENGINE_BASE_IMAGE"
-    engine_overlay_build "$MDD_ENGINE_BASE_IMAGE" "$runtime_fp" "$base_fp" || \
-      die "offline engine overlay build failed"
-    ENGINE_IMAGE_CHANGED=1
-  else
-    info "building engine image ($ENGINE_IMAGE) from source — long; compiles Asterisk+pcsc-lite+Python SWu tunnel deps and bakes engine/patches/*…"
-    # The reviewed GitHub mirrors remain the Dockerfile defaults. Some installation networks can
-    # reach the reviewed upstream sysmocom repositories but not GitHub, so preserve an explicit
-    # override instead of trapping a forced full build behind one hard-coded route. Build the
-    # argument vector incrementally so repository URLs remain one quoted argument.
-    set -- docker build
-    [ -n "$NOCACHE_FLAG" ] && set -- "$@" "$NOCACHE_FLAG"
-    set -- "$@" --build-arg "PCSC_VERSION=$PCSC_VERSION" \
-      --build-arg "RUNTIME_FP=$runtime_fp" --build-arg "BASE_FP=$base_fp" \
-      --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")"
-    [ -n "${PJPROJECT_REPOSITORY:-}" ] && \
-      set -- "$@" --build-arg "PJPROJECT_REPOSITORY=$PJPROJECT_REPOSITORY"
-    [ -n "${ASTERISK_REPOSITORY:-}" ] && \
-      set -- "$@" --build-arg "ASTERISK_REPOSITORY=$ASTERISK_REPOSITORY"
-    "$@" -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
-    # Keep the full build as the base every future overlay starts from, so repeated updates
-    # stack one layer on a known-good image instead of a layer per update.
-    docker tag "$ENGINE_IMAGE" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
-    ENGINE_IMAGE_CHANGED=1
-  fi
-  info "engine image built"
-}
-
-# v1.4.1's updater deliberately invokes the newly applied installer with --no-engines because
-# distributed Engine images did not exist yet. A release-only checksum manifest lets the new
-# installer recognise that one transition, reuse the old updater's still-live route list, and
-# import the matching Release asset instead of silently leaving the old Engine behind.
-engine_matches_checkout() {
-  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || return 1
-  runtime_fp=$(engine_fingerprint runtime)
-  base_fp=$(engine_fingerprint base)
-  [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)" = "$runtime_fp" ] && \
-    [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.base-fp)" = "$base_fp" ]
-}
-
-control_image_matches_checkout() {
-  docker image inspect "$CONTROL_IMAGE" >/dev/null 2>&1 || return 1
-  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
-  identity=$(docker image inspect "$CONTROL_IMAGE" --format \
-    '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}' \
-    2>/dev/null || true)
-  [ "$identity" = "$(host_arch)|$version" ]
-}
-
-handoff_release_images() {
-  have python3 || die "python3 is required to import the Release image assets"
-  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
-  repository=${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}
-  network_file="$MDD_DATA_DIR/update/network.json"
-  if [ -f "$network_file" ]; then
-    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
-      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
-      --repository "$repository" --network-config "$network_file" \
-      --install-images --install-mode "$MODE") || \
-      die "could not import the Release image assets"
-  else
-    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
-      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
-      --repository "$repository" --install-images --install-mode "$MODE") || \
-      die "could not import the Release image assets"
-  fi
-  [ -n "$distributed" ] || die "Release image handoff returned no Engine image"
-  MDD_ENGINE_DISTRIBUTION_IMAGE=$distributed
-  MDD_PRUNE_BUILD_CACHE=1
-  export MDD_ENGINE_DISTRIBUTION_IMAGE MDD_PRUNE_BUILD_CACHE
-  if [ "$MODE" = docker ]; then
-    MDD_REUSE_CONTROL_IMAGE=1
-    export MDD_REUSE_CONTROL_IMAGE
-  fi
-  info "old updater handed off to verified $(host_arch) Release images"
-}
-
-# An official source archive contains a CI-generated image checksum manifest. A development
-# checkout does not, so it keeps the normal source-build behavior. This makes fresh installs use
-# the same architecture-checked Release assets as one-click updates without trusting a floating
-# registry tag or silently falling back to a lengthy build after a verification failure.
-prepare_release_images() {
-  [ "${MDD_BUILD_IMAGES:-0}" != 1 ] || {
-    info "building images from source (MDD_BUILD_IMAGES=1)"
-    return
+    rm -rf -- "$temp" "$bundle.mdd-new"
+    ((completed)) || rm -f "$data_dir/orchestrator/pcsc-maintenance"
+    exit "$code"
   }
-  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return
-  have python3 || die "python3 is required to import Release image assets"
-  MDD_REUSE_WEBUI=1
-  MDD_PRUNE_BUILD_CACHE=1
-  export MDD_REUSE_WEBUI MDD_PRUNE_BUILD_CACHE
-  if engine_matches_checkout; then
-    if [ "$MODE" = local ]; then
-      info "installed Engine already matches the official release — reusing images"
+  trap 'driver_install_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  download_verified "https://github.com/LudovicRousseau/CCID/archive/refs/tags/${CCID_VERSION}.tar.gz" "$temp/source.tar.gz" "$CCID_SHA256"
+  tar xf "$temp/source.tar.gz" -C "$temp"; source="$temp/CCID-$CCID_VERSION"
+  patch -p1 -d "$source" < "$source_dir/patches/ccid/03_scr_prime_reader.patch"
+  meson setup "$source/builddir" "$source" --prefix=/usr
+  ninja -C "$source/builddir"
+  DESTDIR="$stage" ninja -C "$source/builddir" install
+  built=$(find "$stage" -type d -path '*/ifd-ccid.bundle' -print -quit)
+  [[ -n "$built" ]] || die "CCID build did not produce ifd-ccid.bundle"
+
+  install -d -m 0700 "$backup"
+  if [[ -d "$bundle" ]]; then
+    cp -a -- "$bundle" "$backup/ifd-ccid.bundle"
+    before_hash=$(tree_hash "$bundle")
+    if [[ -n "$package_version" ]] && dpkg-query -L libccid 2>/dev/null | grep -Fq "$bundle/"; then package_owned=1; fi
+  else
+    before_hash=missing
+  fi
+  install -d -m 0755 "$drop"
+  rm -rf -- "$bundle.mdd-new"; cp -a -- "$built" "$bundle.mdd-new"
+  rm -rf -- "$bundle"; mv "$bundle.mdd-new" "$bundle"; replaced=1
+  after_hash=$(tree_hash "$bundle")
+  systemctl restart pcscd.service
+  scr_prime_pcsc_visible || die "patched CCID was installed but does not expose SCR Prime"
+  if ((package_owned && hold_was_present == 0)); then
+    apt-mark hold libccid >/dev/null
+    hold_added=1
+  fi
+  python3 - "$metadata" "$drop" "$backup" "$package_version" "$before_hash" "$after_hash" \
+    "$package_owned" "$hold_was_present" "$hold_added" <<'PY'
+import json, os, sys, tempfile
+path, drop, backup, package_version, before_hash, after_hash = sys.argv[1:7]
+package_owned, hold_was_present, hold_added = (value == "1" for value in sys.argv[7:10])
+payload = {
+    "managed": True, "device": "04d9:c001", "ccid_version": "1.6.2",
+    "patches": ["03_scr_prime_reader.patch"], "dropdir": drop,
+    "backup_path": backup, "package_version": package_version,
+    "before_hash": before_hash, "installed_hash": after_hash,
+    "overwrote_package": package_owned, "hold_was_present": hold_was_present,
+    "libccid_held": hold_added,
+}
+fd, tmp = tempfile.mkstemp(prefix=".scr-prime-", dir=os.path.dirname(path))
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True, indent=2)
+    stream.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+  completed=1
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$temp"
+  )
+}
+
+scr_prime_gate() {
+  local present=0 output metadata="$state_dir/scr-prime-driver.json" drop expected actual
+  lsusb -d 04d9:c001 >/dev/null 2>&1 && present=1
+  if ((present == 0)); then
+    ((require_scr_prime == 0)) && { warn "SCR Prime 04d9:c001 is not passed through to the VM"; return; }
+    die "SCR Prime 04d9:c001 is not visible; connect the complete USB device to this VMware guest"
+  fi
+  publish_pcsc_maintenance
+  scr_gate_cleanup() { rm -f "$data_dir/orchestrator/pcsc-maintenance"; }
+  trap scr_gate_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  systemctl restart pcscd.service
+  if [[ -f "$metadata" ]]; then
+    read -r drop expected < <(python3 - "$metadata" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if (value.get("managed") is not True or value.get("device") != "04d9:c001" or
+        value.get("patches") != ["03_scr_prime_reader.patch"]):
+    raise SystemExit("invalid SCR Prime driver metadata")
+print(value.get("dropdir", ""), value.get("installed_hash", ""))
+PY
+)
+    [[ "$drop" == /* && "$expected" =~ ^[0-9a-f]{64}$ ]] || die "invalid SCR Prime driver metadata"
+    actual=$(tree_hash "$drop/ifd-ccid.bundle")
+    [[ "$actual" == "$expected" ]] || die "installed SCR Prime driver no longer matches its MDD metadata"
+    scr_prime_pcsc_visible || die "recorded patched driver is present, but pcsc_scan cannot see SCR Prime"
+    info "SCR Prime is using the verified CCID patch 03 installation"
+    printf 'patched\n' > "$state_dir/scr-prime-mode"
+  elif scr_prime_pcsc_visible; then
+    info "SCR Prime is supported by the native libccid package"
+    printf 'native\n' > "$state_dir/scr-prime-mode"
+  else
+    install_scr_prime_ccid
+    scr_prime_pcsc_visible || die "patched CCID installed, but pcsc_scan still does not list SCR Prime"
+    printf 'patched\n' > "$state_dir/scr-prime-mode"
+  fi
+
+  output=$(pcsc_scan_capture 45)
+  grep -Eiq 'SCR[[:space:]_-]*Prime' <<<"$output" || die "SCR Prime disappeared during PC/SC validation"
+  grep -Eiq 'ATR:[[:space:]]*[0-9A-F]' <<<"$output" || die "insert a SIM in SCR Prime so its ATR can be validated"
+  if ((require_scr_prime)); then
+    [[ -t 0 ]] || die "SCR Prime hot-plug acceptance needs an interactive terminal"
+    printf 'Unplug SCR Prime, then press Enter. The installer will verify disappearance: '
+    read -r _
+    local deadline=$((SECONDS + 60))
+    while lsusb -d 04d9:c001 >/dev/null 2>&1 && ((SECONDS < deadline)); do sleep 1; done
+    ! lsusb -d 04d9:c001 >/dev/null 2>&1 || die "SCR Prime did not disappear within 60 seconds"
+    printf 'Reconnect SCR Prime to this VM, then press Enter: '
+    read -r _
+    deadline=$((SECONDS + 90))
+    while ! lsusb -d 04d9:c001 >/dev/null 2>&1 && ((SECONDS < deadline)); do sleep 1; done
+    lsusb -d 04d9:c001 >/dev/null 2>&1 || die "SCR Prime did not reappear within 90 seconds"
+    deadline=$((SECONDS + 45))
+    while ! scr_prime_pcsc_visible && ((SECONDS < deadline)); do sleep 2; done
+    scr_prime_pcsc_visible || die "SCR Prime did not recover in PC/SC after hot-plug"
+  fi
+  scr_gate_cleanup
+  trap - EXIT HUP INT TERM
+}
+
+cellular_gate() {
+  local deadline=$((SECONDS + 90)) listing=""
+  while ((SECONDS < deadline)); do
+    listing=$(mmcli -L 2>/dev/null || true)
+    grep -q '/Modem/' <<<"$listing" && break
+    sleep 3
+  done
+  if ! grep -q '/Modem/' <<<"$listing"; then
+    ((require_cellular == 0)) && { warn "no Quectel-class modem is visible to ModemManager"; return; }
+    die "no cellular modem detected; pass the complete Quectel USB composite device to the guest"
+  fi
+  info "ModemManager detected a cellular modem"
+}
+
+verify_prepared_build() {
+  local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image
+  [[ -f "$root/READY" && -f "$root/webui/index.html" && -x "$root/venv/bin/python" && \
+     -f "$root/manifest.json" ]] || return 1
+  [[ $(git -C "$source" rev-parse HEAD 2>/dev/null) == "$expected_sha" ]] || return 1
+  expected_version=$(tr -d '\r\n' < "$source/VERSION")
+  runtime_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" runtime) || return 1
+  base_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source/tools/engine-fingerprint.sh" base) || return 1
+  image="mdd-sim-gateway/engine:$expected_sha"
+  docker image inspect "$image" >/dev/null 2>&1 || return 1
+  [[ $(docker image inspect "$image" --format '{{.Architecture}}') == amd64 ]] || return 1
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}') == "$expected_sha" ]] || return 1
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}') == "$expected_version" ]] || return 1
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}') == \
+     "https://github.com/suyi-92/mdd-sim-gateway" ]] || return 1
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}') == "$runtime_fp" ]] || return 1
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}') == "$base_fp" ]] || return 1
+  "$root/venv/bin/pip" check >/dev/null 2>&1 || return 1
+  python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
+    "$(docker image inspect "$image" --format '{{.Id}}')" \
+    "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" <<'PY'
+import json, sys
+path, sha, version, image, runtime_fp, base_fp, image_id, image_size, webui_hash = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as stream:
+        value = json.load(stream)
+except (OSError, ValueError):
+    raise SystemExit(1)
+expected = {
+    "source_commit": sha, "version": version, "image": image,
+    "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
+    "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
+    "image_id": image_id, "image_size": int(image_size), "webui_hash": webui_hash,
+}
+if any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit(1)
+if not str(value.get("asterisk", "")).startswith("Asterisk "):
+    raise SystemExit(1)
+if not isinstance(value.get("asterisk_modules"), int) or value["asterisk_modules"] <= 20:
+    raise SystemExit(1)
+PY
+}
+
+prepare_build() {
+  [[ -n "$source_dir" ]] || die "prepare requires --source"
+  source_dir=$(realpath "$source_dir")
+  sha=${sha:-$(git -C "$source_dir" rev-parse HEAD)}
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "invalid source commit"
+  build_root=${build_root:-$cache_dir/builds/$sha}
+  validate_path "$build_root" "build root"
+  if [[ -f "$build_root/READY" && $no_cache -eq 0 ]]; then
+    if verify_prepared_build "$source_dir" "$build_root" "$sha"; then
+      info "reusing locally verified build $sha"
       return
     fi
-    if control_image_matches_checkout; then
-      MDD_REUSE_CONTROL_IMAGE=1
-      export MDD_REUSE_CONTROL_IMAGE
-      info "installed Engine and Control already match the official release — reusing images"
-      return
-    fi
+    warn "cached build identity check failed; rebuilding $sha"
   fi
-  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
-  repository=${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}
-  network_file="$MDD_DATA_DIR/update/network.json"
-  info "downloading verified $(host_arch) Release images for a fresh install…"
-  if [ -f "$network_file" ]; then
-    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
-      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
-      --repository "$repository" --network-config "$network_file" \
-      --install-images --install-mode "$MODE") || \
-      die "could not import Release images; set MDD_BUILD_IMAGES=1 to build from source"
-  else
-    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
-      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
-      --repository "$repository" --install-images --install-mode "$MODE") || \
-      die "could not import Release images; set MDD_BUILD_IMAGES=1 to build from source"
-  fi
-  [ -n "$distributed" ] || die "Release image importer returned no Engine image"
-  MDD_ENGINE_DISTRIBUTION_IMAGE=$distributed
-  export MDD_ENGINE_DISTRIBUTION_IMAGE MDD_REUSE_WEBUI MDD_PRUNE_BUILD_CACHE
-  if [ "$MODE" = docker ]; then
-    MDD_REUSE_CONTROL_IMAGE=1
-    export MDD_REUSE_CONTROL_IMAGE
-  fi
-  info "using verified Release images for $(host_arch)"
+  local temp="${build_root}.tmp.$$" runtime_fp base_fp image="mdd-sim-gateway/engine:$sha" version module_count asterisk_version
+  local image_id image_size webui_hash
+  [[ "$temp" == "$(dirname "$build_root")/"* ]] || die "unsafe build staging path"
+  rm -rf -- "$temp"; install -d -m 0755 "$temp/venv" "$temp/webui"
+
+  info "building Control virtual environment"
+  python3 -m venv --clear "$temp/venv"
+  "$temp/venv/bin/pip" install --disable-pip-version-check --no-cache-dir -r "$source_dir/control/requirements.txt"
+  "$temp/venv/bin/pip" check
+
+  info "building WebUI in fixed Node container $NODE_BUILD_IMAGE"
+  docker run --rm --network bridge -v "$source_dir/webui:/src:ro" -v "$temp/webui:/out" \
+    "$NODE_BUILD_IMAGE" sh -euc '
+      mkdir /work; cp /src/package.json /src/package-lock.json /src/index.html /src/vite.config.js /work/;
+      cp -a /src/src /src/public /work/; cd /work; npm ci; npm run build; cp -a dist/. /out/'
+  [[ -f "$temp/webui/index.html" ]] || die "WebUI build did not produce index.html"
+
+  runtime_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source_dir/tools/engine-fingerprint.sh" runtime)
+  base_fp=$(PCSC_VERSION="$PCSC_VERSION" sh "$source_dir/tools/engine-fingerprint.sh" base)
+  version=$(tr -d '\r\n' < "$source_dir/VERSION")
+  info "building Engine image for commit $sha"
+  local build_args=(docker build --pull --label "org.opencontainers.image.revision=$sha" \
+    --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
+    --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
+    -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir")
+  ((no_cache)) && build_args=(docker build --pull --no-cache --label "org.opencontainers.image.revision=$sha" \
+    --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
+    --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
+    -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir")
+  "${build_args[@]}"
+  [[ $(docker image inspect "$image" --format '{{.Architecture}}') == amd64 ]] || die "Engine image architecture is not amd64"
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}') == "$runtime_fp" ]] || die "Engine runtime fingerprint mismatch"
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}') == "$base_fp" ]] || die "Engine base fingerprint mismatch"
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}') == "$sha" ]] || die "Engine source identity mismatch"
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}') == "$version" ]] || die "Engine product version mismatch"
+  [[ $(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}') == \
+     "https://github.com/suyi-92/mdd-sim-gateway" ]] || die "Engine source repository label mismatch"
+  asterisk_version=$(docker run --rm --entrypoint /usr/sbin/asterisk "$image" -V)
+  [[ "$asterisk_version" == Asterisk\ * ]] || die "Engine Asterisk version could not be verified"
+  module_count=$(docker run --rm --entrypoint /bin/sh "$image" -c "find /usr/lib64/asterisk/modules /usr/lib/asterisk/modules -type f -name '*.so' 2>/dev/null | wc -l")
+  ((module_count > 20)) || die "Engine Asterisk module count is unexpectedly low: $module_count"
+  docker run --rm --entrypoint python3 "$image" -c 'import jinja2, requests, smartcard, cryptography'
+  docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh "$image" -c \
+    'test -c /dev/net/tun; ip tuntap add dev mdd-build-test mode tun; ip link delete mdd-build-test'
+  image_id=$(docker image inspect "$image" --format '{{.Id}}')
+  image_size=$(docker image inspect "$image" --format '{{.Size}}')
+  webui_hash=$(tree_hash "$temp/webui")
+  python3 - "$temp/manifest.json" "$sha" "$version" "$image" "$runtime_fp" "$base_fp" \
+    "$asterisk_version" "$module_count" "$image_id" "$image_size" "$webui_hash" <<'PY'
+import datetime, json, os, sys
+path, sha, version, image, runtime_fp, base_fp, asterisk, modules, image_id, image_size, webui_hash = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump({"source_commit": sha, "version": version, "image": image,
+               "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
+               "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
+               "asterisk": asterisk.strip(), "asterisk_modules": int(modules),
+               "image_id": image_id, "image_size": int(image_size),
+               "webui_hash": webui_hash,
+               "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+              stream, sort_keys=True, indent=2)
+    stream.write("\n")
+os.chmod(path, 0o644)
+PY
+  touch "$temp/READY"
+  install -d -m 0755 "$(dirname "$build_root")"
+  rm -rf -- "$build_root"
+  mv "$temp" "$build_root"
+  verify_prepared_build "$source_dir" "$build_root" "$sha" || die "prepared build identity verification failed"
+  info "verified local build: $build_root"
 }
 
-# Overlay the runtime-owned files onto $1 and retag the result as the engine image. Needs no
-# network, so it works on a host that cannot reach a registry. The previous image is kept as
-# :previous for rollback; the base it was built from stays tagged for the next overlay.
-engine_overlay_build() {
-  overlay_base="$1"; overlay_runtime_fp="$2"; overlay_base_fp="$3"
-  # Prefer the recorded base over the running image, so overlays never stack on each other.
-  if docker image inspect "$ENGINE_BASE_TAG" >/dev/null 2>&1; then
-    overlay_base="$ENGINE_BASE_TAG"
-  else
-    docker tag "$overlay_base" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
-  fi
-  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 && \
-    docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" >/dev/null 2>&1
-  docker build --build-arg "BASE_IMAGE=$overlay_base" \
-    --build-arg "RUNTIME_FP=$overlay_runtime_fp" --build-arg "BASE_FP=$overlay_base_fp" \
-    --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")" \
-    -t "$ENGINE_IMAGE" -f "$REPO_DIR/engine/Dockerfile.overlay" "$REPO_DIR/engine"
+write_managed_state() {
+  install -d -m 0700 "$state_dir" "$data_dir" "$backup_dir" "$cache_dir"
+  cat > "$state_dir/managed.env" <<EOF
+INSTALL_DIR=$install_dir
+DATA_DIR=$data_dir
+BACKUP_DIR=$backup_dir
+STATE_DIR=$state_dir
+CACHE_DIR=$cache_dir
+ORIGIN_URL=$ORIGIN_URL
+BRANCH=vmware
+REQUIRE_SCR_PRIME=$require_scr_prime
+REQUIRE_CELLULAR=$require_cellular
+EOF
+  chmod 0600 "$state_dir/managed.env"
 }
 
-build_control_image() {
-  if [ "${MDD_REUSE_CONTROL_IMAGE:-0}" = 1 ]; then
-    docker image inspect "$CONTROL_IMAGE" >/dev/null 2>&1 || \
-      die "MDD_REUSE_CONTROL_IMAGE=1 but $CONTROL_IMAGE is not loaded"
-    expected=$(tr -d '\n' < "$REPO_DIR/VERSION")
-    actual=$(docker image inspect "$CONTROL_IMAGE" \
-      --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || true)
-    [ "$actual" = "$expected" ] || \
-      die "loaded control image version ${actual:-unknown} does not match $expected"
-    arch=$(docker image inspect "$CONTROL_IMAGE" --format '{{.Architecture}}' 2>/dev/null || true)
-    host_arch=$(uname -m)
-    case "$host_arch:$arch" in
-      aarch64:arm64|arm64:arm64|x86_64:amd64) ;;
-      *) die "loaded control image architecture ${arch:-unknown} does not match host $host_arch" ;;
-    esac
-    info "reusing verified Release control image $CONTROL_IMAGE ($actual, $arch)"
-    return
-  fi
-  info "building control image ($CONTROL_IMAGE) from source (WebUI + FastAPI)…"
-  # shellcheck disable=SC2086
-  docker build $NOCACHE_FLAG --build-arg "PCSC_VERSION=$PCSC_VERSION" \
-    --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")" \
-    -t "$CONTROL_IMAGE" -f "$REPO_DIR/control/Dockerfile" "$REPO_DIR"
-  info "control image built"
-}
+activate_build() {
+  [[ -n "$source_dir" ]] || source_dir=$install_dir
+  source_dir=$(realpath "$source_dir")
+  sha=${sha:-$(git -C "$source_dir" rev-parse HEAD)}
+  build_root=${build_root:-$cache_dir/builds/$sha}
+  verify_prepared_build "$source_dir" "$build_root" "$sha" || die "build is incomplete or does not match source $sha: $build_root"
+  local image="mdd-sim-gateway/engine:$sha" lan_ip
+  docker image inspect "$image" >/dev/null || die "verified Engine image is missing: $image"
+  docker tag "$image" "$ENGINE_STABLE_IMAGE"
+  ln -sfn "$build_root/venv" "$source_dir/.venv.new"; mv -Tf "$source_dir/.venv.new" "$source_dir/.venv"
+  ln -sfn "$build_root/webui" "$source_dir/webui/dist.new"; mv -Tf "$source_dir/webui/dist.new" "$source_dir/webui/dist"
+  lan_ip=$(network_value source)
 
-# Compile the React WebUI to webui/dist using a throwaway Node container — so LOCAL mode needs
-# no Node/JS toolchain on the host. Builds in an isolated dir inside the container (ignores any
-# host node_modules that might be built for another arch), then copies dist back to the host.
-build_webui_local() {
-  if [ "${MDD_REUSE_WEBUI:-0}" = 1 ]; then
-    [ -f "$WEBUI_DIST/index.html" ] || die "MDD_REUSE_WEBUI=1 but webui/dist/index.html is missing"
-    info "reusing reviewed prebuilt WebUI at $WEBUI_DIST"
-    return
-  fi
-  # v1.3.3 bootstrap: v1.3.2's updater downloads GitHub's tag archive, which cannot contain
-  # ignored CI artifacts. Reuse the already-installed dist only when every file matches the
-  # reviewed manifest committed with this release. Newer updaters install a checksummed Release
-  # asset and set MDD_REUSE_WEBUI=1 explicitly, so this is not a trust-on-first-use shortcut.
-  webui_manifest="$REPO_DIR/webui/release-dist.SHA256SUMS"
-  if [ -f "$webui_manifest" ] && [ -f "$WEBUI_DIST/index.html" ] && have sha256sum && \
-      (cd "$REPO_DIR/webui" && sha256sum -c "$(basename -- "$webui_manifest")" >/dev/null 2>&1); then
-    info "reusing WebUI verified by the release manifest at $WEBUI_DIST"
-    return
-  fi
-  info "building WebUI (webui/dist) via a pinned throwaway Node container (no host Node needed)…"
-  docker run --rm -v "$REPO_DIR/webui":/host-webui "$WEBUI_BUILD_IMAGE" sh -euc '
-    cp -a /host-webui /build && cd /build && rm -rf node_modules dist
-    npm ci
-    npm run build
-    rm -rf /host-webui/dist && cp -a /build/dist /host-webui/dist
-  '
-  [ -f "$WEBUI_DIST/index.html" ] || die "WebUI build produced no dist/index.html"
-  info "WebUI built at $WEBUI_DIST"
-}
-
-# ------------------------------------------------------------------ native (local) control plane
-# Install host packages the native control plane needs: python venv + the toolchain to build
-# pyscard (SWIG binding) against the pinned pcsc-lite, plus headers for cryptography if wheels
-# are unavailable. pcsc-lite headers come from our source build (if we did one) or the distro
-# -dev package (version already matches the pin, since ensure_pcscd aligned it).
-ensure_control_local_deps() {
-  info "installing native control-plane dependencies (python venv + pyscard build toolchain)…"
-  if   have apt-get; then
-    pkg_install python3 python3-venv python3-pip python3-dev swig gcc pkg-config libffi-dev libssl-dev
-    if [ "$PCSC_SOURCE_BUILT" = 0 ] && [ ! -f /usr/include/PCSC/pcsclite.h ]; then pkg_install libpcsclite-dev; fi
-  elif have dnf || have yum; then
-    pkg_install python3 python3-pip python3-devel swig gcc pkgconf-pkg-config libffi-devel openssl-devel
-    if [ "$PCSC_SOURCE_BUILT" = 0 ] && [ ! -f /usr/include/PCSC/pcsclite.h ]; then pkg_install pcsc-lite-devel; fi
-  elif have pacman;  then
-    pkg_install python python-pip swig gcc pkgconf libffi openssl
-    if [ "$PCSC_SOURCE_BUILT" = 0 ] && [ ! -f /usr/include/PCSC/pcsclite.h ]; then pkg_install pcsclite; fi
-  elif have zypper;  then
-    pkg_install python3 python3-pip python3-devel swig gcc pkg-config libffi-devel libopenssl-devel
-    if [ "$PCSC_SOURCE_BUILT" = 0 ] && [ ! -f /usr/include/PCSC/pcsclite.h ]; then pkg_install pcsc-lite-devel; fi
-  elif have apk;     then
-    pkg_install python3 python3-dev py3-pip swig gcc musl-dev pkgconfig libffi-dev openssl-dev
-    if [ "$PCSC_SOURCE_BUILT" = 0 ] && [ ! -f /usr/include/PCSC/pcsclite.h ]; then pkg_install pcsc-lite-dev; fi
-  fi
-}
-
-setup_venv() {
-  info "creating Python venv + installing control requirements ($VENV_DIR)…"
-  [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
-  # Most reloads do not change Python dependencies. Prove the pinned requirements are already
-  # present without consulting an index first: this keeps a release download proxy out of pip's
-  # vendored networking stack and lets a fully provisioned host reload offline. Only a genuinely
-  # missing or changed dependency needs the package index. Do not upgrade pip on every reload;
-  # replacing the installer itself creates needless network and compatibility risk.
-  if "$VENV_DIR/bin/python" -m pip install --quiet --no-index \
-      -r "$REPO_DIR/control/requirements.txt" >/dev/null 2>&1; then
-    info "control requirements already satisfied — reusing the installed packages"
-  else
-    "$VENV_DIR/bin/python" -m pip install --quiet wheel \
-      -r "$REPO_DIR/control/requirements.txt"
-  fi
-  info "venv ready"
-}
-
-# Write + (re)start the native control-plane systemd unit. Runs as root (needs the reader via
-# host pcscd + the Docker socket to manage engine containers). Because the control plane runs
-# ON the host, MDD_HOST_DATA == MDD_DATA (the real host path the manager hands to engine
-# bind-mounts). Engines reach it back over host.docker.internal:<port> (engine.start adds the
-# host-gateway extra_host), same as in docker mode.
-run_control_local() {
-  have systemctl || die "local mode needs systemd (systemctl not found). Re-run with --mode docker."
-  install -d -m 0700 "$MDD_DATA_DIR"
-  DATA_ABS=$(data_dir_abs)
-  LAN_IP="$MDD_ADVERTISE_ADDR"
-  [ -z "$LAN_IP" ] && LAN_IP=$(detect_lan_ip)
-  [ -z "$LAN_IP" ] && warn "could not auto-detect a LAN IP; set MDD_ADVERTISE_ADDR — SIP/WebRTC audio needs a routable host address"
-
-  info "installing systemd unit $SYSTEMD_UNIT (native control plane)"
-  cat > "$SYSTEMD_UNIT" <<EOF
+  cat > /etc/systemd/system/mdd-sim-gateway-control.service <<EOF
 [Unit]
-Description=MDD Sim Gateway control surface (native / manager + WebUI)
-After=network-online.target pcscd.service docker.service
+Description=MDD Sim Gateway native Control and WebUI
+After=network-online.target docker.service pcscd.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR/control
-Environment=MDD_DATA=$DATA_ABS
-Environment=MDD_HOST_DATA=$DATA_ABS
-Environment=MDD_REPO_DIR=$REPO_DIR
-Environment=MDD_VENV_DIR=$VENV_DIR
-Environment=MDD_WEBUI=$WEBUI_DIST
-Environment=MDD_HTTP_PORT=$MDD_PORT
-Environment=MDD_BIND=$MDD_BIND
-Environment=MDD_ADVERTISE_ADDR=$LAN_IP
-Environment=MDD_ENGINE_IMAGE=$ENGINE_IMAGE
-Environment=MDD_MANAGER_URL=https://host.docker.internal:$MDD_PORT
+WorkingDirectory=$source_dir/control
+Environment=MDD_DATA=$data_dir
+Environment=MDD_REPO_DIR=$source_dir
+Environment=MDD_VENV_DIR=$source_dir/.venv
+Environment=MDD_WEBUI=$source_dir/webui/dist
+Environment=MDD_HTTP_PORT=8443
+Environment=MDD_BIND=0.0.0.0
+Environment=MDD_ADVERTISE_ADDR=$lan_ip
+Environment=MDD_ENGINE_IMAGE=$ENGINE_STABLE_IMAGE
+Environment=MDD_MANAGER_URL=https://host.docker.internal:8443
 Environment=MDD_PCSCD_DIR=/run/pcscd
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$VENV_DIR/bin/python run.py
+ExecStart=$source_dir/.venv/bin/python run.py
 Restart=on-failure
 RestartSec=3
 User=root
@@ -938,155 +831,19 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable mdd-sim-gateway-control >/dev/null 2>&1 || true
-  systemctl restart mdd-sim-gateway-control
-  info "started native control plane on https://${LAN_IP:-<host>}:${MDD_PORT}"
-}
 
-remove_control_local() {
-  if have systemctl; then
-    systemctl disable --now mdd-sim-gateway-control >/dev/null 2>&1 || true
-  fi
-  if [ -f "$SYSTEMD_UNIT" ]; then
-    rm -f "$SYSTEMD_UNIT"
-    have systemctl && systemctl daemon-reload 2>/dev/null || true
-  fi
-}
-
-# The vsmartcard-vpcd package ships its own /etc/reader.conf.d/vpcd: a two-slot "Virtual PCD"
-# reader on vpcd's default port, present whether or not a modem is. pcscd cannot bind that port
-# for it AND for a modem reader, and directory order decides who wins, so on some hosts the modem
-# readers never appeared while two phantom devices did. Rename it out of the way — pcsc-lite skips
-# dot files — instead of deleting a package file, so it can be restored. The orchestrator repeats
-# this check on every pass, which also covers a later reinstall of the package.
-VPCD_PACKAGED_READER=/etc/reader.conf.d/vpcd
-VPCD_PACKAGED_READER_DISABLED=/etc/reader.conf.d/.vpcd.mdd-disabled
-disable_packaged_vpcd_reader() {
-  [ -f "$VPCD_PACKAGED_READER" ] || return 0
-  mv -f "$VPCD_PACKAGED_READER" "$VPCD_PACKAGED_READER_DISABLED"
-  info "disabled the packaged 'Virtual PCD' reader definition (collides with modem readers)"
-  systemctl restart pcscd.service >/dev/null 2>&1 || true
-}
-
-restore_packaged_vpcd_reader() {
-  [ -f "$VPCD_PACKAGED_READER_DISABLED" ] || return 0
-  [ -e "$VPCD_PACKAGED_READER" ] && { rm -f "$VPCD_PACKAGED_READER_DISABLED"; return 0; }
-  mv -f "$VPCD_PACKAGED_READER_DISABLED" "$VPCD_PACKAGED_READER"
-  systemctl restart pcscd.service >/dev/null 2>&1 || true
-}
-
-# Slot count of the installed libifdvpcd, read from the constant the build compiles in. Used to
-# decide whether a rebuild is needed and to tell the orchestrator what it may ask for; a driver
-# that cannot be inspected is reported as the upstream default rather than guessed upwards.
-installed_vpcd_slots() {
-  lib=$(find /usr/local/lib /usr/lib -name 'libifdvpcd.so*' -print -quit 2>/dev/null || true)
-  [ -n "$lib" ] || { printf '0'; return; }
-  marker=$(find /usr/local/lib /usr/lib -name ".mdd-vpcd-slots-*" -print -quit 2>/dev/null || true)
-  case "$marker" in *.mdd-vpcd-slots-*) printf '%s' "${marker##*-}"; return ;; esac
-  printf '2'
-}
-
-# Build + install libifdvpcd with enough slots for this gateway's logical channels. The packaged
-# driver is compiled for two and the count has no runtime override, so the third channel is
-# unreachable until the driver itself is replaced. Idempotent via a slot-tagged marker beside the
-# driver; a distro reinstall drops the marker and the next run rebuilds.
-ensure_vpcd_host() {
-  # Ask pcsc-lite where its drivers live rather than assuming, the way the CCID build does.
-  # Debian keeps this out of the multiarch tree today, but a distribution that does not would
-  # otherwise get a driver installed somewhere pcscd never looks — and the only symptom would
-  # be the two-slot behaviour this exists to fix, with the build reporting success.
-  drivers_dir=$(pkg-config libpcsclite --variable usbdropdir 2>/dev/null || true)
-  [ -n "$drivers_dir" ] && drivers_dir="$drivers_dir/serial"
-  # Fall back to wherever the packaged driver already sits, then to the historical path.
-  [ -d "$drivers_dir" ] || drivers_dir=$(dirname "$(find /usr/lib /usr/local/lib -name 'libifdvpcd.so*' -print -quit 2>/dev/null || true)" 2>/dev/null)
-  [ -n "$drivers_dir" ] && [ -d "$drivers_dir" ] || drivers_dir=/usr/lib/pcsc/drivers/serial
-  vpcd_marker="$drivers_dir/.mdd-vpcd-slots-${VPCD_SLOTS}"
-  if [ -f "$vpcd_marker" ]; then
-    info "virtual smart-card driver already provides $VPCD_SLOTS slots ($drivers_dir)"
-    return 0
-  fi
-  info "building the virtual smart-card driver from source for $VPCD_SLOTS slots…"
-  if   have apt-get; then
-    pkg_install autoconf automake libtool pkg-config gcc make wget ca-certificates help2man
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install libpcsclite-dev
-  elif have dnf || have yum; then
-    pkg_install autoconf automake libtool pkgconf-pkg-config gcc make wget help2man
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
-  elif have pacman;  then pkg_install autoconf automake libtool pkgconf gcc make wget help2man
-  elif have zypper;  then
-    pkg_install autoconf automake libtool pkg-config gcc make wget help2man
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
-  elif have apk;     then
-    pkg_install autoconf automake libtool pkgconfig gcc make wget musl-dev help2man
-    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-dev
-  fi
-  tmp=$(mktemp -d)
-  download_verified \
-    "https://github.com/frankmorgner/vsmartcard/archive/refs/tags/virtualsmartcard-${VPCD_VERSION}.tar.gz" \
-    "$tmp/vsmartcard.tar.gz" "$VPCD_SHA256"
-  # Only the driver and the library it links against are built. The rest of the tree is the
-  # Python virtual card, the Android relay and pcsc-relay — none of which this gateway uses,
-  # and each dragging in its own dependencies. src/vpcd must come first: src/ifd-vpcd links
-  # libvpcd.la and its makefile has no rule to build it.
-  ( cd "$tmp" \
-    && tar xf vsmartcard.tar.gz \
-    && cd "vsmartcard-virtualsmartcard-${VPCD_VERSION}/virtualsmartcard" \
-    && autoreconf -vif . >/dev/null 2>&1 \
-    && ./configure --enable-serialconfdir=/etc/reader.conf.d \
-                   --enable-serialdropdir="$drivers_dir" \
-                   --enable-vpcdslots="$VPCD_SLOTS" \
-                   --disable-dependency-tracking >/dev/null \
-    && make -C src/vpcd >/dev/null \
-    && make -C src/ifd-vpcd >/dev/null \
-    && make -C src/ifd-vpcd install >/dev/null \
-  ) || { rm -rf "$tmp"; warn "could not build the virtual smart-card driver; the packaged two-slot driver stays in place and a module's third logical channel will be unavailable"; return 1; }
-  rm -rf "$tmp"
-  # configure installs its own reader definition; this gateway writes per-modem ones instead.
-  disable_packaged_vpcd_reader
-  rm -f "$drivers_dir/.mdd-vpcd-slots-"* 2>/dev/null || true
-  touch "$vpcd_marker" 2>/dev/null || true
-  if have apt-mark; then apt-mark hold vsmartcard-vpcd >/dev/null 2>&1 || true; fi
-  if have systemctl; then
-    # Same maintenance marker the orchestrator publishes, so the control plane does not read
-    # this planned enumeration gap as readers being unplugged and stop healthy engines.
-    install -d -m 0700 "$MDD_DATA_DIR/orchestrator"
-    : > "$MDD_DATA_DIR/orchestrator/pcsc-maintenance"
-    chmod 0600 "$MDD_DATA_DIR/orchestrator/pcsc-maintenance" 2>/dev/null || true
-    systemctl restart pcscd 2>/dev/null || true
-  fi
-  info "virtual smart-card driver installed with $VPCD_SLOTS slots ($drivers_dir)"
-}
-
-# Country routes and USB modem serial ports live in the host namespace even when the manager is
-# containerized, so this small privileged service is installed in both deployment modes.
-run_orchestrator() {
-  have systemctl || { warn "systemd unavailable — country routing/modem auto-detection disabled"; return; }
-  DATA_ABS=$(data_dir_abs)
-  # Debian/Ubuntu/Armbian package name. Other distributions can provide libifdvpcd.so manually;
-  # native PC/SC readers continue to work when it is absent.
-  if [ ! -e /usr/local/lib/libifdvpcd.so ] && [ ! -e /usr/lib/libifdvpcd.so ] && have apt-get; then
-    pkg_install vsmartcard-vpcd
-  fi
-  VPCD_LIB=$(find /usr/local/lib /usr/lib -name libifdvpcd.so -print -quit 2>/dev/null || true)
-  [ -n "$VPCD_LIB" ] && info "virtual smart-card driver: $VPCD_LIB" \
-    || warn "libifdvpcd.so not found; native readers work, modem virtual slots will stay unavailable"
-  # The packaged driver only has two slots, one short of the logical channels a module needs.
-  [ -n "$VPCD_LIB" ] && ensure_vpcd_host
-  disable_packaged_vpcd_reader
-  have sing-box || die "sing-box installation failed"
-  have xray || die "Xray-core installation failed"
-  cat > "$ORCHESTRATOR_UNIT" <<EOF
+  cat > /etc/systemd/system/mdd-sim-gateway-orchestrator.service <<EOF
 [Unit]
 Description=MDD Sim Gateway host egress and modem orchestrator
-After=network-online.target pcscd.service
+After=network-online.target docker.service pcscd.service ModemManager.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR
+WorkingDirectory=$source_dir
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$VENV_DIR/bin/python $REPO_DIR/host/mdd_orchestrator.py --data $DATA_ABS --repo $REPO_DIR
+ExecStart=$source_dir/.venv/bin/python $source_dir/host/mdd_orchestrator.py --data $data_dir --repo $source_dir
 Restart=always
 RestartSec=3
 User=root
@@ -1095,861 +852,187 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+  install -m 0755 "$source_dir/scripts/mddctl" /usr/local/sbin/mddctl
   systemctl daemon-reload
-  systemctl enable mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-  systemctl restart mdd-sim-gateway-orchestrator
+  systemctl enable mdd-sim-gateway-control.service mdd-sim-gateway-orchestrator.service >/dev/null
+  printf '%s\n' "$sha" > "$state_dir/active-commit"
+  info "activated local build $sha"
 }
 
-remove_orchestrator() {
-  if have systemctl; then systemctl disable --now mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true; fi
-  rm -f "$ORCHESTRATOR_UNIT" /etc/reader.conf.d/mdd-sim-gateway-modems
-  # Nothing of ours is left to collide with it, so hand the packaged reader back.
-  restore_packaged_vpcd_reader
-  have systemctl && systemctl daemon-reload 2>/dev/null || true
-}
+firewall_rule_specs() {
+  local python="$source_dir/.venv/bin/python" rules
+  [[ -x "$python" ]] || die "Control venv is unavailable; cannot calculate exact firewall ports"
+  rules=$(PYTHONPATH="$source_dir" MDD_DATA="$data_dir" "$python" - <<'PY'
+from copy import deepcopy
+from control.app import config
 
-# ------------------------------------------------------------------ containerized control plane
-run_control() {
-  install -d -m 0700 "$MDD_DATA_DIR"
-  DATA_ABS=$(data_dir_abs)
-  LAN_IP="$MDD_ADVERTISE_ADDR"
-  [ -z "$LAN_IP" ] && LAN_IP=$(detect_lan_ip)
-  [ -z "$LAN_IP" ] && warn "could not auto-detect a LAN IP; set MDD_ADVERTISE_ADDR — SIP/WebRTC audio needs a routable host address"
+data = config.load()
 
-  if docker inspect "$CONTROL_NAME" >/dev/null 2>&1; then
-    docker_container_owned "$CONTROL_NAME" || die "refusing to replace foreign container '$CONTROL_NAME'"
-    docker rm -f "$CONTROL_NAME" >/dev/null
-  fi
-  info "starting control plane container ($CONTROL_NAME) on https://${LAN_IP:-<host>}:${MDD_PORT}"
-  docker run -d --name "$CONTROL_NAME" \
-    --label "$MDD_DOCKER_LABEL=true" \
-    --label "io.mdd-sim-gateway.component=control" \
-    --privileged \
-    --restart unless-stopped \
-    -p "${MDD_PORT}:8443" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /run/pcscd:/run/pcscd \
-    -v /run/dbus:/run/dbus:ro \
-    -v /usr/local/bin/sing-box:/usr/local/bin/sing-box:ro \
-    -v /usr/local/bin/xray:/usr/local/bin/xray:ro \
-    -v "${REPO_DIR}/host:/app/host:ro" \
-    -v "${DATA_ABS}:/data" \
-    -e MDD_DATA=/data \
-    -e MDD_HOST_DATA="${DATA_ABS}" \
-    -e MDD_HTTP_PORT=8443 \
-    -e MDD_BIND="${MDD_BIND}" \
-    -e MDD_ADVERTISE_ADDR="${LAN_IP}" \
-    -e MDD_MANAGER_URL="https://host.docker.internal:${MDD_PORT}" \
-    -e MDD_ENGINE_IMAGE="${ENGINE_IMAGE}" \
-    -e MDD_PCSCD_DIR=/run/pcscd \
-    -e MDD_SINGBOX_BIN=/usr/local/bin/sing-box \
-    -e MDD_XRAY_BIN=/usr/local/bin/xray \
-    "$CONTROL_IMAGE"
-}
+def order(item):
+    try:
+        index = int(item.get("index", 1_000_000))
+    except (TypeError, ValueError):
+        index = 1_000_000
+    return index, str(item.get("id") or "")
 
-# Re-scan present cards after old engine containers have been removed. Restart only the control
-# plane: restarting the orchestrator here would also rebuild pcscd while new engines start.
-restart_control_plane() {
-  if [ "$MODE" = local ]; then
-    have systemctl || return 1
-    systemctl restart mdd-sim-gateway-control || return 1
-  else
-    managed_control_exists || return 1
-    docker restart "$CONTROL_NAME" >/dev/null || return 1
-  fi
-}
+selected = []
+for instance in sorted(data.get("instances", {}).values(), key=order)[:2]:
+    if isinstance(instance.get("ports"), dict):
+        selected.append(instance["ports"])
 
-cleanup_release_artifacts() {
-  set -- python3 "$REPO_DIR/host/mdd_image_cleanup.py" \
-    --version "$(tr -d '\n' < "$REPO_DIR/VERSION")"
-  [ "${MDD_PRUNE_BUILD_CACHE:-0}" != 1 ] || set -- "$@" --prune-build-cache
-  if "$@"; then
-    if [ "${MDD_PRUNE_BUILD_CACHE:-0}" = 1 ]; then
-      info "removed superseded MDD images and dangling legacy build cache"
-    else
-      info "removed superseded MDD image tags and dangling images"
-    fi
-  else
-    warn "could not remove every superseded MDD image or cache record; services remain healthy"
-  fi
-}
+# On a fresh deployment predict the same collision-aware blocks that auto-provision will use.
+# Placeholders reserve each prediction before asking for the next one.
+working = deepcopy(data)
+while len(selected) < 2:
+    block = config.alloc_ports_auto(working)
+    selected.append(block)
+    placeholder = f"__firewall_prediction_{len(selected)}"
+    working.setdefault("instances", {})[placeholder] = {
+        "id": placeholder, "index": 1_000_000 + len(selected), "ports": block}
 
-# ------------------------------------------------------------------ subcommands
-cmd_install() {
-  need_root
-  rm -f "$REPO_DIR/EDITION"
-  resolve_mode
-  info "MDD Sim Gateway install — repo: $REPO_DIR  (mode: ${B}$MODE${N})"
-  # Development checkouts have no CI-generated asset manifest and therefore compile from source.
-  # Warn only on that path; official release archives import the matching native image instead.
-  ensure_docker
-  docker_preflight
-  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 \
-      && { [ ! -f "$ENGINE_HANDOFF_MANIFEST" ] || [ "${MDD_BUILD_IMAGES:-0}" = 1 ]; }; then
-    warn "the engine image builds from source (Asterisk + pcsc-lite + SWu tunnel deps). On low-power ARM"
-    warn "machines this can take 20-30 minutes — this is normal, please be patient. It runs only once;"
-    warn "later installs/reloads reuse the built image."
-  fi
-  ensure_pcscd
-  ensure_singbox
-  ensure_xray
-  ensure_cellular_tools
-  if [ ! -x "$MDD_DATA_DIR/lpac/lpac" ]; then
-    saved_args=$ARGS; ARGS=""; cmd_build_lpac; ARGS=$saved_args
-  else
-    info "lpac already installed at $MDD_DATA_DIR/lpac/lpac"
-  fi
-  prepare_release_images
-  ensure_engine_image
-  persist_mode "$MODE"
-  if [ "$MODE" = docker ]; then
-    setup_venv
-    build_control_image
-    run_control
-  else
-    build_webui_local
-    ensure_control_local_deps
-    setup_venv
-    run_control_local
-  fi
-  run_orchestrator
-  cleanup_release_artifacts
-  DATA_ABS=$(data_dir_abs)
-  LAN_IP="${MDD_ADVERTISE_ADDR:-$(detect_lan_ip)}"
-  printf '\n'
-  info "install complete (mode: $MODE)"
-  printf '   %sWebUI:%s   https://%s:%s\n' "$B" "$N" "${LAN_IP:-<host-ip>}" "$MDD_PORT"
-  printf '   %sData:%s    %s\n' "$B" "$N" "$DATA_ABS"
-  if [ "$MODE" = local ]; then
-    printf '   %sControl:%s native systemd service (mdd-sim-gateway-control); engines run in Docker\n' "$B" "$N"
-  else
-    printf '   %sControl:%s Docker container (%s); engines run in Docker\n' "$B" "$N" "$CONTROL_NAME"
-  fi
-  printf '   %sManage:%s  %s status | logs | reload | disable-autostart | uninstall\n' "$B" "$N" "$0"
-  printf '   Accept the self-signed cert in your browser, then provision your SIM in the dashboard.\n'
-}
-
-cmd_reload() {
-  need_root
-  rm -f "$REPO_DIR/EDITION"
-  resolve_mode
-  RECREATE_ENGINES=0
-  PRESERVE_ENGINES=0
-  for a in $ARGS; do
-    [ "$a" = "--engines" ] && RECREATE_ENGINES=1
-    [ "$a" = "--no-engines" ] && PRESERVE_ENGINES=1
-  done
-  [ "$RECREATE_ENGINES" = 1 ] && [ "$PRESERVE_ENGINES" = 1 ] && \
-    die "--engines and --no-engines cannot be used together"
-  [ "$PRESERVE_ENGINES" = 1 ] && [ -n "$NOCACHE_FLAG" ] && \
-    die "--no-cache and --no-engines cannot be used together"
-  info "reload (mode: $MODE)"
-  # Engine image: ensure_engine_image compares the checkout against the image's fingerprints and
-  # picks reuse / script-overlay / full rebuild by itself. --engines and --no-cache force the
-  # full rebuild, which is what you want after changing anything the base owns.
-  ensure_docker
-  docker_preflight
-  ensure_singbox
-  ensure_xray
-  ensure_cellular_tools
-  ENGINE_IMAGE_CHANGED=0
-  if [ "$PRESERVE_ENGINES" = 1 ] && [ -f "$ENGINE_HANDOFF_MANIFEST" ] \
-      && [ -f "$MDD_DATA_DIR/update/network.json" ]; then
-    if engine_matches_checkout \
-        && { [ "$MODE" = local ] || control_image_matches_checkout; }; then
-      info "installed release images already match the handoff — preserving them"
-    else
-      handoff_release_images
-      PRESERVE_ENGINES=0
-    fi
-  fi
-  if [ "$PRESERVE_ENGINES" = 1 ]; then
-    docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || \
-      die "--no-engines requires the existing engine image $ENGINE_IMAGE"
-    info "preserving the installed engine image (--no-engines)"
-  elif [ "$RECREATE_ENGINES" = 1 ] || [ -n "$NOCACHE_FLAG" ]; then
-    ensure_engine_image force
-  else
-    ensure_engine_image
-  fi
-  if [ "$MODE" = docker ]; then
-    setup_venv
-    build_control_image
-    run_control
-  else
-    build_webui_local
-    ensure_control_local_deps
-    setup_venv
-    run_control_local
-  fi
-  run_orchestrator
-  # A container keeps the image it was started from, so re-creating them is not optional once
-  # the image has changed — skipping it leaves every line running the previous engine while
-  # the control plane reports the new version. That mismatch is invisible from the UI and was
-  # reported as a broken feature rather than a stale image, so decide it from what actually
-  # happened instead of from a flag the operator has to know to pass. --no-engines still wins
-  # for an operator; only the release-only v1.4.1 handoff marker overrides it above.
-  if [ "$RECREATE_ENGINES" = 1 ] || [ "$ENGINE_IMAGE_CHANGED" = 1 ]; then
-    removed=0
-    for n in $(engine_names); do
-      docker rm -f "$n" >/dev/null 2>&1 && removed=$((removed + 1)) || true
-    done
-    # A disappearing container is reported as STOPPED and does not enter health recovery. A
-    # control-plane restart starts with an empty card table, so its first reader scan treats each
-    # present SIM as an insertion and starts the missing engine. Engines not removed remain alone.
-    if [ "$removed" -gt 0 ]; then
-      info "removed $removed engine container(s) built on the previous image"
-      if restart_control_plane; then
-        info "control plane restarted — present SIM lines are starting their new engines"
-      else
-        warn "could not restart the control plane; removed engines remain down until it restarts"
-        warn "run: $0 restart"
-      fi
-    fi
-  fi
-  # An amd64 Docker v1.4.x bootstrap temporarily writes "local" so its immutable old updater
-  # skips the ARM64-only Control asset. resolve_mode has already selected the real Docker
-  # installation from its live container; restore that authoritative mode only after reload.
-  persist_mode "$MODE"
-  # Run cleanup from the newly applied checkout, not from the updater's staged runner.  An
-  # upgrade launched on an older version keeps executing that old runner after apply_tree, while
-  # this installer is already the target version.  Keeping cleanup here makes the first upgrade
-  # into a fixed release reclaim old images too.  Failure is best-effort: a healthy reload must
-  # not be reported as failed only because optional disk cleanup could not run.
-  cleanup_release_artifacts
-  info "reload complete (data preserved)"
-}
-
-cmd_start() {
-  need_root
-  resolve_mode
-  if [ "$MODE" = local ]; then
-    have systemctl || die "local mode needs systemd"
-    systemctl start mdd-sim-gateway-control && info "control plane started (systemd)" || warn "could not start mdd-sim-gateway-control"
-  else
-    if managed_control_exists; then
-      docker start "$CONTROL_NAME" >/dev/null && info "control plane started (docker)"
-    else warn "control container not found"; fi
-  fi
-  have systemctl && systemctl start mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-}
-
-cmd_stop() {
-  need_root
-  resolve_mode
-  if [ "$MODE" = local ]; then
-    have systemctl || die "local mode needs systemd"
-    systemctl stop mdd-sim-gateway-control && info "control plane stopped (systemd)" || warn "could not stop mdd-sim-gateway-control"
-  else
-    if managed_control_exists; then
-      docker stop "$CONTROL_NAME" >/dev/null && info "control plane stopped (docker)"
-    else warn "control container not found"; fi
-  fi
-  have systemctl && systemctl stop mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-  info "note: engine containers keep running; the control plane just stops managing them until restarted"
-}
-
-cmd_restart() {
-  need_root
-  resolve_mode
-  if [ "$MODE" = local ]; then
-    have systemctl || die "local mode needs systemd"
-    systemctl restart mdd-sim-gateway-control && info "control plane restarted (systemd)" || warn "could not restart mdd-sim-gateway-control"
-  else
-    if managed_control_exists; then
-      docker restart "$CONTROL_NAME" >/dev/null && info "control plane restarted (docker)"
-    else warn "control container not found"; fi
-  fi
-  have systemctl && systemctl restart mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-}
-
-cmd_enable_autostart() {
-  need_root
-  resolve_mode
-  if [ "$MODE" = local ]; then
-    have systemctl && systemctl enable mdd-sim-gateway-control >/dev/null 2>&1 && info "control autostart ON (systemd)" || warn "systemd unit not found"
-  else
-    if managed_control_exists; then
-      docker update --restart unless-stopped "$CONTROL_NAME" >/dev/null && info "control autostart ON"
-    else warn "control container not found"; fi
-  fi
-  have systemctl && systemctl enable mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-  for n in $(engine_names); do docker update --restart unless-stopped "$n" >/dev/null 2>&1 || true; done
-}
-
-cmd_disable_autostart() {
-  need_root
-  resolve_mode
-  if [ "$MODE" = local ]; then
-    have systemctl && systemctl disable mdd-sim-gateway-control >/dev/null 2>&1 && info "control autostart OFF (systemd)" || warn "systemd unit not found"
-  else
-    if managed_control_exists; then
-      docker update --restart no "$CONTROL_NAME" >/dev/null && info "control autostart OFF"
-    else warn "control container not found"; fi
-  fi
-  have systemctl && systemctl disable mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true
-  for n in $(engine_names); do docker update --restart no "$n" >/dev/null 2>&1 || true; done
-  info "note: already-running components keep running until stopped or the host reboots"
-}
-
-cmd_uninstall() {
-  need_root
-  resolve_mode
-  PURGE=0
-  for a in $ARGS; do [ "$a" = "--purge" ] && PURGE=1; done
-  info "uninstalling (mode: $MODE)…"
-  # Tear down BOTH possible control planes so switching modes leaves nothing behind.
-  info "removing native control plane (if any)…"
-  remove_control_local
-  remove_orchestrator
-  if [ -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf ]; then
-    rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl try-restart ModemManager.service >/dev/null 2>&1 || true
-  fi
-  info "removing MDD containers…"
-  if managed_control_exists; then docker rm -f "$CONTROL_NAME" >/dev/null; fi
-  for n in $(engine_names); do docker rm -f "$n" >/dev/null 2>&1 || true; done
-  if [ "$PURGE" = 1 ]; then
-    # Full teardown: also drop images (incl. the slow, patched engine image) and data+venv.
-    info "removing MDD images…"
-    docker rmi -f "$CONTROL_IMAGE" "$ENGINE_IMAGE" >/dev/null 2>&1 || true
-    warn "purging data dir: $(data_dir_abs) and venv $VENV_DIR"
-    rm -rf "$MDD_DATA_DIR" "$VENV_DIR"
-    rm -f "$DATA_DIR_STATE"
-  else
-    # Keep the ~15-20 min patched engine image (and the control image) so a reinstall reuses
-    # them; only the running components are torn down. Data + venv are preserved too.
-    docker rmi -f "$CONTROL_IMAGE" >/dev/null 2>&1 || true
-    info "data kept at $(data_dir_abs); engine image + venv preserved (use --purge to delete all). Docker & pcscd left installed."
-  fi
-  info "uninstall complete"
-}
-
-cmd_status() {
-  resolve_mode
-  printf '%sVersion:%s %s\n' "$B" "$N" "$(cat "$REPO_DIR/VERSION" 2>/dev/null || echo unknown)"
-  printf '%sMode:%s    %s\n' "$B" "$N" "$MODE"
-  printf '%sControl:%s\n' "$B" "$N"
-  if [ "$MODE" = local ]; then
-    if have systemctl; then
-      systemctl is-active mdd-sim-gateway-control >/dev/null 2>&1 \
-        && printf '  mdd-sim-gateway-control  %s\n' "$(systemctl show -p ActiveState -p SubState --value mdd-sim-gateway-control 2>/dev/null | tr '\n' ' ')" \
-        || printf '  mdd-sim-gateway-control  (not running)\n'
-    fi
-  else
-    docker ps -a --filter "name=^${CONTROL_NAME}$" --format '  {{.Names}}  {{.Status}}  {{.Ports}}' 2>/dev/null || true
-  fi
-  printf '%sHost orchestrator:%s\n' "$B" "$N"
-  if have systemctl && systemctl is-active mdd-sim-gateway-orchestrator >/dev/null 2>&1; then
-    printf '  mdd-sim-gateway-orchestrator  %s\n' "$(systemctl show -p ActiveState -p SubState --value mdd-sim-gateway-orchestrator 2>/dev/null | tr '\n' ' ')"
-  else
-    printf '  mdd-sim-gateway-orchestrator  (not running)\n'
-  fi
-  printf '%sEngines:%s\n' "$B" "$N"
-  docker ps -a --filter "name=^${ENGINE_PREFIX}" --format '  {{.Names}}  {{.Status}}' 2>/dev/null || true
-  printf '%sDependencies:%s\n' "$B" "$N"
-  if have sing-box; then printf '  sing-box  %s\n' "$(sing-box version 2>/dev/null | head -1)"; else printf '  sing-box  (not installed)\n'; fi
-  if have xray; then printf '  Xray-core  %s\n' "$(xray version 2>/dev/null | head -1)"; else printf '  Xray-core  (not installed)\n'; fi
-  if have mmcli; then printf '  ModemManager  %s\n' "$(mmcli --version 2>/dev/null | head -1)"; else printf '  ModemManager  (not installed)\n'; fi
-  # Slot count decides whether a module's third logical channel exists at all, and the build
-  # that raises it only warns when it fails — so it has to be visible without reading a log.
-  vpcd_slots=$(installed_vpcd_slots)
-  case "$vpcd_slots" in
-    0) printf '  virtual reader driver  (not installed)\n' ;;
-    2) printf '  virtual reader driver  %s slots — run `%s vpcd` for a third logical channel\n' "$vpcd_slots" "$0" ;;
-    *) printf '  virtual reader driver  %s slots\n' "$vpcd_slots" ;;
-  esac
-  if [ -x "$MDD_DATA_DIR/lpac/lpac" ]; then printf '  lpac  installed\n'; else printf '  lpac  (not installed)\n'; fi
-}
-
-# One command whose output can be pasted into a bug report: everything needed to tell a card
-# path apart from a radio path, with SIM identities masked on the way out. Long digit runs are
-# ICCID/IMSI/IMEI/EID here, so only their last four characters survive.
-diag_redact() { sed -E 's/[0-9]{6,}([0-9]{4})/****\1/g'; }
-
-diag_section() { printf '\n%s== %s ==%s\n' "$B" "$1" "$N"; }
-
-diag_readers() {
-  if [ -x "$VENV_DIR/bin/python" ]; then
-    "$VENV_DIR/bin/python" - <<'PY' 2>/dev/null || true
-try:
-    from smartcard.System import readers
-    for index, reader in enumerate(readers()):
-        print("%d: %s" % (index, reader))
-except Exception as exc:  # noqa - a diagnostic must never fail the whole report
-    print("reader enumeration failed: %r" % (exc,))
+print("8443/tcp|MDD Control")
+for number, ports in enumerate(selected[:2], 1):
+    web = int(ports.get("webrtc", 8089 + (number - 1) * 10))
+    start = int(ports.get("rtp_start", 10000 + (number - 1) * 2000))
+    end = start + config.rtp_span(ports) - 1
+    print(f"{web}/tcp|MDD line {number} WebRTC")
+    print(f"{start}:{end}/udp|MDD line {number} RTP")
 PY
-  elif have pcsc_scan; then
-    pcsc_scan -r 2>/dev/null || true
-  else
-    printf '(no pyscard venv and no pcsc_scan — install pcsc-tools to list readers)\n'
-  fi
+) || die "could not calculate exact firewall ports"
+  printf '%s\n' "$rules"
 }
 
-cmd_diagnose() {
-  need_root
-  resolve_mode
-  DATA_ABS=$(data_dir_abs)
-  diag_section "Install"
-  printf 'version: %s (%s)\n' "$(cat "$REPO_DIR/VERSION" 2>/dev/null || echo unknown)" \
-    "$(git -C "$REPO_DIR" describe --always --dirty 2>/dev/null || echo 'no git')"
-  printf 'mode:    %s\ndata:    %s\n' "$MODE" "$DATA_ABS"
-  printf 'host:    %s\n' "$(uname -srm)"
-  if [ -r /etc/os-release ]; then
-    (. /etc/os-release; printf 'distro:  %s\n' "${PRETTY_NAME:-unknown}") || true
-  fi
-
-  diag_section "PC/SC reader definitions"
-  ls -la /etc/reader.conf.d/ 2>/dev/null || printf '(no /etc/reader.conf.d)\n'
-  [ -f "$VPCD_PACKAGED_READER" ] \
-    && printf '\n!! the packaged "Virtual PCD" definition is still active — it collides with modem readers\n' \
-    || printf '\npackaged "Virtual PCD" definition: not active (good)\n'
-  printf '\n--- /etc/reader.conf.d/mdd-sim-gateway-modems ---\n'
-  cat /etc/reader.conf.d/mdd-sim-gateway-modems 2>/dev/null || printf '(absent)\n'
-
-  diag_section "pcscd and live readers"
-  if have systemctl; then systemctl is-active pcscd.service 2>/dev/null || true; fi
-  diag_readers
-
-  diag_section "Modem SIM bridges"
-  pgrep -af vpcd_modem_bridge.py 2>/dev/null || printf '(no bridge process running)\n'
-  printf '\n--- listening virtual-reader sockets (pcscd) ---\n'
-  if have ss; then
-    ss -lntp 2>/dev/null | grep -i pcscd || printf '(none — pcscd bound no virtual reader port)\n'
-    printf '\n--- bridge connections ---\n'
-    ss -ntp 2>/dev/null | grep -i "vpcd_modem_bridge\|python" || printf '(none)\n'
-  else
-    printf '(ss unavailable)\n'
-  fi
-
-  diag_section "Orchestrator state (masked)"
-  for name in devices-desired.json devices-hardware.json devices-status.json; do
-    printf -- '--- %s ---\n' "$name"
-    if [ -f "$DATA_ABS/orchestrator/$name" ]; then
-      diag_redact < "$DATA_ABS/orchestrator/$name"
-    else
-      printf '(absent)\n'
-    fi
-    printf '\n'
-  done
-  for path in "$DATA_ABS"/modems/*.json; do
-    [ -f "$path" ] || continue
-    printf -- '--- modems/%s ---\n' "$(basename "$path")"
-    diag_redact < "$path"
-    printf '\n'
-  done
-
-  diag_section "Bridge process logs (masked)"
-  # Since 1.3.10 bridge stdout/stderr land in per-modem files rather than the journal, so
-  # the activity trail survives journald rotation and reaches the support bundle.
-  for bridge_log in "$MDD_DATA_DIR"/orchestrator/bridge-*.log; do
-    [ -f "$bridge_log" ] || continue
-    printf -- '--- %s ---\n' "$(basename "$bridge_log")"
-    tail -40 "$bridge_log" | diag_redact
-  done
-
-  diag_section "Orchestrator log (card path, masked)"
-  if have journalctl; then
-    # -A6 keeps the exception line under a traceback header: the header paths matched the
-    # filter but the one line that names the error did not, and a whole support round trip
-    # was spent recovering exactly that line by hand.
-    journalctl -u mdd-sim-gateway-orchestrator -n 400 --no-pager 2>/dev/null \
-      | grep -Ei -A6 'bridge|vpcd|reader|channel|modemmanager|traceback|error' \
-      | tail -80 | diag_redact || printf '(nothing matched)\n'
-  else
-    printf '(journalctl unavailable)\n'
-  fi
-
-  diag_section "eSIM chip read over each modem reader (masked)"
-  if [ ! -x "$MDD_DATA_DIR/lpac/lpac" ]; then
-    printf 'lpac is not built — run: sudo ./install.sh build-lpac\n'
-  else
-    diag_readers | grep -F 'VoWiFi Modem' > /tmp/mdd-diag-readers.$$ 2>/dev/null || true
-    if [ ! -s /tmp/mdd-diag-readers.$$ ]; then
-      printf '(no modem reader present, so nothing to read)\n'
-    else
-      # A running line owns the reader exclusively; lpac then fails for that reason alone.
-      while IFS= read -r entry; do
-        name=${entry#*: }
-        printf -- '--- %s ---\n' "$name"
-        LPAC_APDU=pcsc LPAC_APDU_PCSC_DRV_NAME="$name" \
-          "$MDD_DATA_DIR/lpac/lpac" chip info 2>&1 | head -30 | diag_redact || true
-        printf '\n'
-      done < /tmp/mdd-diag-readers.$$
-    fi
-    rm -f /tmp/mdd-diag-readers.$$
-  fi
-
-  diag_section "ModemManager"
-  if have mmcli; then mmcli -L 2>&1 | diag_redact || true; else printf '(mmcli unavailable)\n'; fi
-  printf '\n'
+firewall_ports() {
+  local rules
+  rules=$(firewall_rule_specs) || die "could not calculate exact firewall ports"
+  printf 'Required inbound ports for the two configured or predicted lines:\n'
+  while IFS='|' read -r spec comment; do
+    printf '  %-22s %s\n' "$spec" "$comment"
+  done <<< "$rules"
 }
 
-cmd_reset_admin() {
-  need_root
-  auth_file="$MDD_DATA_DIR/auth.json"
-  [ -f "$auth_file" ] || { info "administrator account is already unconfigured"; return; }
-  backup="$MDD_DATA_DIR/backups/auth-reset-$(date +%Y%m%d-%H%M%S).json"
-  mkdir -p "$(dirname -- "$backup")"
-  mv "$auth_file" "$backup"
-  chmod 600 "$backup" 2>/dev/null || true
-  info "administrator account reset; previous credential file preserved at $backup"
-  info "open the WebUI to create a new administrator account"
-}
-
-# Opt-in: build + install the patched CCID driver (patches/ccid/*) on the host. Kept out of
-# the default install because it replaces the distro libccid — only needed for quirky readers
-# (e.g. HSIC 1d99:0016, whose GetSlotStatus always reports "no card").
-#   patch     base fix only (01) — HSIC presence detection; safe for every card incl. eSIM.
-#   patch2    compatibility fix only (02) — synthesize missing ATR TCK for HSIC reader.
-#   patchprime SCR Prime device-table support only (03).
-#   patchall  all three patches (01 + 02 + 03).
-cmd_vpcd() {
-  # Also reachable as part of install/reload. Exposed on its own because that build is the one
-  # step that warns instead of aborting, so an operator who missed the warning — or who is on a
-  # host where it first failed for a missing dependency — needs a way to retry just this.
-  need_root
-  ensure_vpcd_host
-}
-
-cmd_patch() {
-  need_root
-  ensure_ccid_host slot 01_hsic_slot_status.patch
-}
-
-cmd_patch2() {
-  need_root
-  ensure_ccid_host atr 02_hsic_malformed_atr.patch
-}
-
-cmd_patchprime() {
-  need_root
-  ensure_ccid_host prime 03_scr_prime_reader.patch
-}
-
-cmd_patchall() {
-  need_root
-  ensure_ccid_host all 01_hsic_slot_status.patch 02_hsic_malformed_atr.patch 03_scr_prime_reader.patch
-}
-
-cmd_build_lpac() {
-  # Compile lpac (PC/SC + curl, STANDALONE) into $MDD_DATA_DIR/lpac for the eSIM UI.
-  # The resulting host-side helper is shared by both local and Docker control-plane modes.
-  #
-  # lpac STANDALONE uses cmake_policy(CMP0177) which needs CMake >= 3.31.
-  # Ubuntu 22.04 / Armbian ship 3.22 — we fetch a Kitware binary toolchain into
-  # $MDD_DATA_DIR/tools/cmake when needed.
-  need_root
-  LPAC_SRC="${LPAC_SRC:-}"
-  DEST=""
-  CMAKE_MIN=3.31
-  CMAKE_FETCH_VER="${CMAKE_FETCH_VER:-3.31.12}"
-  # shellcheck disable=SC2086
-  set -- $ARGS
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --lpac-src)
-        [ $# -ge 2 ] || die "--lpac-src requires a path"
-        LPAC_SRC="$2"; shift 2 ;;
-      --dest)
-        [ $# -ge 2 ] || die "--dest requires a path"
-        DEST="$2"; shift 2 ;;
-      *) die "unknown build-lpac arg: $1 (supported: --lpac-src PATH, --dest DIR)" ;;
-    esac
-  done
-  DEST="${DEST:-$MDD_DATA_DIR/lpac}"
-
-  if [ -z "$LPAC_SRC" ]; then
-    LPAC_SRC="$MDD_DATA_DIR/sources/lpac-$LPAC_VERSION"
-    if [ ! -d "$LPAC_SRC/.git" ]; then
-      info "fetching lpac v$LPAC_VERSION source…"
-      mkdir -p "$MDD_DATA_DIR/sources"
-      git clone --depth 1 --branch "v$LPAC_VERSION" https://github.com/estkme-group/lpac.git "$LPAC_SRC"
-    fi
-    [ "$(git -C "$LPAC_SRC" rev-parse HEAD)" = "$LPAC_COMMIT" ] || die "lpac source commit mismatch"
-  fi
-  [ -f "$LPAC_SRC/CMakeLists.txt" ] || die "not an lpac source tree: $LPAC_SRC"
-
-  # Apply MDD fixes (patches/lpac/*) — e.g. the upstream pcsc reader-selection bug that
-  # pins lpac to reader 0 and segfaults on LPAC_APDU_PCSC_DRV_IFID. Idempotent: a patch
-  # that no longer applies cleanly is assumed to be present already (source commit is pinned).
-  for lpatch in "$REPO_DIR"/patches/lpac/*.patch; do
-    [ -f "$lpatch" ] || continue
-    if patch -p1 -d "$LPAC_SRC" -N --dry-run < "$lpatch" >/dev/null 2>&1; then
-      info "applying lpac patch $(basename "$lpatch")"
-      patch -p1 -d "$LPAC_SRC" -N < "$lpatch"
-    else
-      info "lpac patch $(basename "$lpatch") already applied"
-    fi
-  done
-
-  cmake_version_ok() {
-    ver=$("$1" --version 2>/dev/null | head -1 | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
-    [ -n "$ver" ] || return 1
-    major=${ver%%.*}
-    minor=${ver#*.}; minor=${minor%%.*}
-    need_major=${CMAKE_MIN%%.*}
-    need_minor=${CMAKE_MIN#*.}; need_minor=${need_minor%%.*}
-    if [ "$major" -gt "$need_major" ] 2>/dev/null; then return 0; fi
-    if [ "$major" -eq "$need_major" ] && [ "$minor" -ge "$need_minor" ] 2>/dev/null; then return 0; fi
-    return 1
-  }
-
-  ensure_cmake() {
-    if have cmake && cmake_version_ok "$(command -v cmake)"; then
-      CMAKE_BIN=$(command -v cmake)
-      info "using system cmake $($CMAKE_BIN --version | head -1)"
-      return 0
-    fi
-    TOOLS="$MDD_DATA_DIR/tools"
-    CMAKE_HOME="$TOOLS/cmake-$CMAKE_FETCH_VER"
-    CMAKE_BIN="$CMAKE_HOME/bin/cmake"
-    if [ -x "$CMAKE_BIN" ] && cmake_version_ok "$CMAKE_BIN"; then
-      info "using cached Kitware cmake at $CMAKE_BIN"
-      export PATH="$CMAKE_HOME/bin:$PATH"
-      return 0
-    fi
-    arch=$(uname -m)
-    case "$arch" in
-      x86_64|amd64)  cmake_arch=x86_64; cmake_digest=$CMAKE_SHA256_AMD64 ;;
-      aarch64|arm64) cmake_arch=aarch64; cmake_digest=$CMAKE_SHA256_ARM64 ;;
-      *) die "no Kitware cmake binary for arch=$arch; install cmake >= $CMAKE_MIN manually" ;;
-    esac
-    url="https://github.com/Kitware/CMake/releases/download/v${CMAKE_FETCH_VER}/cmake-${CMAKE_FETCH_VER}-linux-${cmake_arch}.tar.gz"
-    info "system cmake too old (need >= $CMAKE_MIN); fetching Kitware $CMAKE_FETCH_VER ($cmake_arch)"
-    mkdir -p "$TOOLS"
-    tmp=$(mktemp -d)
-    download_verified "$url" "$tmp/cmake.tgz" "$cmake_digest"
-    tar -xzf "$tmp/cmake.tgz" -C "$tmp"
-    rm -rf "$CMAKE_HOME"
-    mv "$tmp/cmake-${CMAKE_FETCH_VER}-linux-${cmake_arch}" "$CMAKE_HOME"
-    rm -rf "$tmp"
-    export PATH="$CMAKE_HOME/bin:$PATH"
-    CMAKE_BIN="$CMAKE_HOME/bin/cmake"
-    info "installed $("$CMAKE_BIN" --version | head -1) -> $CMAKE_HOME"
-  }
-
-  info "building lpac into $DEST (src: $LPAC_SRC)"
-  info "ensuring build dependencies"
-  if have apt-get; then
-    pkg_install build-essential pkg-config libpcsclite-dev libcurl4-openssl-dev git ca-certificates curl
-  elif have dnf || have yum; then
-    pkg_install gcc make pkgconfig pcsc-lite-devel libcurl-devel git curl
-  elif have zypper; then
-    pkg_install gcc make pkg-config pcsc-lite-devel libcurl-devel git curl
-  elif have pacman; then
-    pkg_install gcc make pkgconf pcsclite curl git
-  else
-    have gcc || die "missing gcc"
-    have pkg-config || die "missing pkg-config"
-  fi
-
-  ensure_cmake
-
-  BUILD_DIR="$LPAC_SRC/build-mdd"
-  STAGE_DIR=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap 'rm -rf "$STAGE_DIR"' EXIT
-
-  info "configuring lpac (STANDALONE, PCSC+curl) in $BUILD_DIR"
-  rm -rf "$BUILD_DIR"
-  "$CMAKE_BIN" -S "$LPAC_SRC" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DSTANDALONE_MODE=ON \
-    -DLPAC_WITH_APDU_PCSC=ON \
-    -DLPAC_WITH_HTTP_CURL=ON \
-    -DLPAC_WITH_APDU_AT=OFF \
-    -DLPAC_WITH_APDU_QMI=OFF \
-    -DLPAC_WITH_APDU_QMI_QRTR=OFF \
-    -DLPAC_WITH_APDU_UQMI=OFF \
-    -DLPAC_WITH_APDU_MBIM=OFF \
-    -DLPAC_WITH_APDU_GBINDER=OFF
-
-  info "building"
-  "$CMAKE_BIN" --build "$BUILD_DIR" --parallel "$(nproc 2>/dev/null || echo 2)"
-
-  info "installing to staging"
-  DESTDIR="$STAGE_DIR" "$CMAKE_BIN" --install "$BUILD_DIR"
-
-  SRC_BIN=""
-  for candidate in "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/usr/bin" \
-                   "$STAGE_DIR/executables" "$STAGE_DIR/usr/executables"; do
-    if [ -x "$candidate/lpac" ]; then SRC_BIN="$candidate"; break; fi
-  done
-  if [ -z "$SRC_BIN" ]; then
-    find "$STAGE_DIR" -type f -name lpac 2>/dev/null || true
-    die "lpac binary not found after install under $STAGE_DIR"
-  fi
-
-  info "deploying to $DEST"
-  mkdir -p "$(dirname -- "$DEST")"
-  rm -rf "$DEST.tmp"
-  mkdir -p "$DEST.tmp"
-  cp -a "$SRC_BIN/lpac" "$DEST.tmp/lpac"
-  [ -d "$SRC_BIN/lib" ] && cp -a "$SRC_BIN/lib" "$DEST.tmp/lib"
-  [ -d "$SRC_BIN/driver" ] && cp -a "$SRC_BIN/driver" "$DEST.tmp/driver"
-  chmod +x "$DEST.tmp/lpac"
-  rm -rf "$DEST"
-  mv "$DEST.tmp" "$DEST"
-
-  info "self-check: lpac driver apdu list"
-  if ! "$DEST/lpac" driver apdu list >/dev/null; then
-    warn "lpac driver apdu list failed (pcscd may be down); binary is installed at $DEST/lpac"
-  else
-    "$DEST/lpac" version || true
-    info "OK: $DEST/lpac"
-  fi
-  trap - EXIT
-  rm -rf "$STAGE_DIR"
-}
-
-cmd_logs() {
-  resolve_mode
-  # `|| true` so that Ctrl-C'ing out of a follow (non-zero exit) doesn't abort the caller —
-  # matters when invoked from the interactive control menu.
-  if [ "$MODE" = local ]; then
-    have systemctl || die "systemd not available"
-    journalctl -fu mdd-sim-gateway-control || true
-  else
-    docker logs -f "$CONTROL_NAME" || true
-  fi
-}
-
-# Default action when invoked with no subcommand. Multi-functional:
-#   - NOT installed  -> run the installer (needs root).
-#   - installed      -> auto-detect the mode and offer basic controls. On a TTY this is an
-#                       interactive menu; non-interactively it prints status + the command list.
-cmd_auto() {
-  installed=$(detect_installed_mode)
-  if [ "$installed" = none ]; then
-    info "no existing installation detected — installing…"
-    cmd_install
+configure_firewall_rules() {
+  local rules
+  rules=$(firewall_rule_specs) || die "could not calculate exact firewall ports"
+  firewall_ports
+  ((configure_firewall)) || return
+  if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    touch "$state_dir/firewall-created"
+    chmod 0600 "$state_dir/firewall-created"
+    while IFS='|' read -r spec comment; do
+      if ! ufw status | grep -Eq "^${spec//\//\\/}[[:space:]]+ALLOW"; then
+        ufw allow "$spec" comment "$comment"
+        grep -Fqx "$spec" "$state_dir/firewall-created" || printf '%s\n' "$spec" >> "$state_dir/firewall-created"
+      fi
+    done <<< "$rules"
     return
   fi
-  MODE="$installed"
-  info "existing installation detected — mode: ${B}$MODE${N}"
-  cmd_status
-  if [ ! -t 0 ]; then
-    printf '\n%sControls:%s %s start | stop | restart | enable-autostart | disable-autostart | reload | logs | uninstall\n' \
-      "$B" "$N" "$0"
-    return
-  fi
-  # Interactive control menu.
-  autostart_state() {
-    if [ "$MODE" = local ]; then
-      systemctl is-enabled --quiet mdd-sim-gateway-control 2>/dev/null && echo on || echo off
-    else
-      case "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTROL_NAME" 2>/dev/null)" in
-        ""|no) echo off;; *) echo on;; esac
+  if nft list ruleset 2>/dev/null | grep -q .; then
+    if nft list table inet mdd_sim_gateway >/dev/null 2>&1 && [[ ! -f "$state_dir/firewall-nft-created" ]]; then
+      die "nftables table inet mdd_sim_gateway already exists but is not recorded as MDD-owned"
     fi
-  }
-  while :; do
-    control_running && run="running" || run="stopped"
-    printf '\n%sMDD control (%s) — %s, autostart %s%s\n' "$B" "$MODE" "$run" "$(autostart_state)" "$N"
-    printf '  1) %s control plane\n' "$([ "$run" = running ] && echo stop || echo start)"
-    printf '  2) restart control plane\n'
-    printf '  3) %s autostart\n' "$([ "$(autostart_state)" = on ] && echo disable || echo enable)"
-    printf '  4) status\n'
-    printf '  5) logs (follow)\n'
-    printf '  6) reload (rebuild + restart)\n'
-    printf '  7) uninstall\n'
-    printf '  q) quit\n'
-    printf 'choose: '
-    read -r choice || break
-    case "$choice" in
-      1) [ "$run" = running ] && cmd_stop || cmd_start ;;
-      2) cmd_restart ;;
-      3) [ "$(autostart_state)" = on ] && cmd_disable_autostart || cmd_enable_autostart ;;
-      4) cmd_status ;;
-      5) cmd_logs ;;
-      6) cmd_reload ;;
-      7) cmd_uninstall; break ;;
-      q|Q|"") break ;;
-      *) warn "unknown choice: $choice" ;;
-    esac
-  done
+    {
+      printf 'table inet mdd_sim_gateway {\n  chain input {\n'
+      printf '    type filter hook input priority -5; policy accept;\n'
+      while IFS='|' read -r spec comment; do
+        local range protocol
+        range=${spec%/*}; range=${range/:/-}; protocol=${spec##*/}
+        printf '    %s dport %s accept comment "%s"\n' "$protocol" "$range" "$comment"
+      done <<< "$rules"
+      printf '  }\n}\n'
+    } > "$state_dir/mdd-sim-gateway.nft"
+    if [[ -f "$state_dir/firewall-nft-created" ]]; then
+      nft delete table inet mdd_sim_gateway >/dev/null 2>&1 || true
+    fi
+    nft -f "$state_dir/mdd-sim-gateway.nft"
+    touch "$state_dir/firewall-nft-created"
+    chmod 0600 "$state_dir/firewall-nft-created"
+    warn "nftables rules were loaded from $state_dir/mdd-sim-gateway.nft; integrate this file into your distro persistence policy"
+  else
+    info "no active UFW/nftables policy detected; no firewall change was needed"
+  fi
 }
 
-usage() {
-  cat <<EOF
-${B}MDD Sim Gateway installer${N}
-
-  $0                      auto: install if absent, else show status + control menu
-  $0 install [--mode local|docker]   install + run (Release assets when available)
-  $0 reload  [--mode local|docker] [--no-cache] [--engines]   rebuild + restart (keep data)
-  $0 start | stop | restart          control-plane lifecycle (systemd or docker per mode)
-  $0 enable-autostart     start on boot
-  $0 disable-autostart    do not start on boot
-  $0 uninstall [--purge]  remove MDD containers/images/service (--purge also deletes data+venv)
-  $0 status               show mode + component status
-  $0 diagnose             print a masked card-path report (readers, bridges, lpac, logs)
-  $0 reset-admin          reset the local administrator (old credential file is backed up)
-  $0 logs                 follow control-plane logs
-  $0 vpcd                 rebuild the virtual smart-card driver with enough card slots
-  $0 build-lpac [--lpac-src PATH] [--dest DIR]   compile lpac into data/lpac (local eSIM LPA)
-  $0 patch                build + install the CCID driver with the base HSIC fix (01) — opt-in,
-                          for the HSIC 1d99:0016 reader (safe for every card, incl. physical eSIM)
-  $0 patch2               add only the ATR-compatibility fix (02) for non-compliant (U)SIM ATRs
-  $0 patchprime           add SCR Prime 04d9:c001 support (03)
-  $0 patchall             apply all CCID patches (01 + 02 + 03)
-
-${B}Modes:${N}
-  local  (default) control plane runs natively (venv + systemd 'mdd-sim-gateway-control');
-                   Docker is the engine layer only. WebUI compiled via a throwaway
-                   Node container, so the host needs no Node.
-  docker           control plane AND engine run in containers.
-  Both modes version-lock pcsc-lite ($PCSC_VERSION) and bake engine patches.
-  Run with no arguments to auto-install, or to manage an existing install.
-
-Env: MDD_MODE(=local) MDD_PORT(=$MDD_PORT) MDD_DATA_DIR(=$MDD_DATA_DIR)
-     MDD_ADVERTISE_ADDR(auto) MDD_BIND(=$MDD_BIND) PCSC_VERSION(=$PCSC_VERSION)
-     MDD_BUILD_IMAGES(=0; set 1 to force source builds)
-EOF
+health_check() {
+  systemctl is-active --quiet mdd-sim-gateway-control.service || die "Control service is not active"
+  systemctl is-active --quiet mdd-sim-gateway-orchestrator.service || die "orchestrator service is not active"
+  curl --fail --silent --show-error --insecure --max-time 20 https://127.0.0.1:8443/api/auth/status >/dev/null || die "HTTPS health check failed"
+  docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null || die "stable Engine image is missing"
+  docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh "$ENGINE_STABLE_IMAGE" -c 'test -c /dev/net/tun' >/dev/null
+  if [[ -f "$state_dir/managed.env" ]]; then
+    local req_scr req_cell
+    req_scr=$(awk -F= '$1=="REQUIRE_SCR_PRIME" {print $2}' "$state_dir/managed.env")
+    req_cell=$(awk -F= '$1=="REQUIRE_CELLULAR" {print $2}' "$state_dir/managed.env")
+    if [[ "$req_scr" == 1 ]]; then
+      lsusb -d 04d9:c001 >/dev/null || die "SCR Prime USB health gate failed"
+      scr_prime_pcsc_visible || die "SCR Prime PC/SC health gate failed"
+    fi
+    if [[ "$req_cell" == 1 ]]; then mmcli -L 2>/dev/null | grep -q '/Modem/' || die "cellular modem health gate failed"; fi
+  fi
+  info "HTTPS, systemd, Docker/TUN and required hardware health checks passed"
 }
 
-# ------------------------------------------------------------------ dispatch
-CMD="${1:-}"; [ $# -gt 0 ] && shift || true
-
-# Parse args: extract --mode <val> / --mode=<val>, collect the rest into ARGS, note --no-cache.
-# The bottom `shift` is always safe: we only reach it inside `while [ $# -gt 0 ]`, and the
-# `--mode <val>` branch consumes its value with `shift 2` + `continue` (avoids a bare `shift`
-# on an empty arg list, which is a fatal special-builtin error in dash even with `|| true`).
-MODE_ARG=""
-ARGS=""
-NOCACHE_FLAG=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --mode)
-      [ $# -ge 2 ] || die "--mode requires a value: local | docker"
-      MODE_ARG="$2"; shift 2; continue ;;
-    --mode=*)   MODE_ARG="${1#--mode=}" ;;
-    --no-cache) NOCACHE_FLAG="--no-cache"; ARGS="$ARGS $1" ;;
-    *)          ARGS="$ARGS $1" ;;
-  esac
-  shift
-done
-
-case "$CMD" in
-  install)            cmd_install ;;
-  reload)             cmd_reload ;;
-  start)              cmd_start ;;
-  stop)               cmd_stop ;;
-  restart)            cmd_restart ;;
-  enable-autostart)   cmd_enable_autostart ;;
-  disable-autostart)  cmd_disable_autostart ;;
-  uninstall)          cmd_uninstall ;;
-  status)             cmd_status ;;
-  diagnose)           cmd_diagnose ;;
-  reset-admin)        cmd_reset_admin ;;
-  logs)               cmd_logs ;;
-  build-lpac)         cmd_build_lpac ;;
-  patch)              cmd_patch ;;
-  patch2)             cmd_patch2 ;;
-  patchprime)         cmd_patchprime ;;
-  vpcd)               cmd_vpcd ;;
-  patchall)           cmd_patchall ;;
-  "")                 cmd_auto ;;
-  -h|--help|help)     usage ;;
-  *) err "unknown command: $CMD"; usage; exit 1 ;;
+case "$action" in
+  prepare)
+    detect_distro
+    prepare_build
+    ;;
+  verify)
+    [[ -n "$source_dir" && -n "$build_root" && -n "$sha" ]] || die "verify requires --source, --build-root and --sha"
+    source_dir=$(realpath "$source_dir")
+    verify_prepared_build "$source_dir" "$build_root" "$sha" || die "verified build does not match source $sha"
+    ;;
+  activate)
+    activate_build
+    ;;
+  health)
+    source_dir=${source_dir:-$install_dir}
+    health_check
+    ;;
+  install)
+    detect_distro
+    install -d -m 0700 "$state_dir"
+    preflight_host
+    if ((assume_yes)); then info "--yes accepted; checksum, network, hardware and health gates remain mandatory"; fi
+    prepare_network_guard
+    network_guard_armed=1
+    network_guard_cleanup() {
+      local code=${1:-1}
+      trap - EXIT HUP INT TERM
+      if ((network_guard_armed)); then
+        warn "installation stopped before the network guard passed; restoring the previous network policy"
+        restore_network_guard
+      fi
+      exit "$code"
+    }
+    trap 'network_guard_cleanup $?' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    install_packages
+    verify_network_guard
+    network_guard_armed=0
+    trap - EXIT HUP INT TERM
+    install_modemmanager_dropin
+    install_source_checkout
+    write_managed_state
+    ensure_singbox
+    ensure_xray
+    ensure_vpcd
+    ensure_lpac
+    scr_prime_gate
+    cellular_gate
+    build_root="$cache_dir/builds/$sha"
+    [[ -f "$build_root/READY" ]] || no_cache=1
+    prepare_build
+    activate_build
+    configure_firewall_rules
+    if ((no_start == 0)); then
+      systemctl restart mdd-sim-gateway-orchestrator.service mdd-sim-gateway-control.service
+      health_check
+    else
+      info "services installed but not started (--no-start)"
+    fi
+    info "installation complete; manage this VM with mddctl"
+    ;;
 esac

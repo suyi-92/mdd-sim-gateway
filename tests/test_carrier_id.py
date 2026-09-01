@@ -21,6 +21,21 @@ class CarrierIdTests(unittest.TestCase):
         self.assertEqual(value["match_source"], "mccmnc+spn")
         self.assertTrue(value["specific"])
 
+    def test_local_spn_rule_identifies_cmlink_on_shared_ee_plmn(self):
+        value = carrier_id.lookup({
+            "mcc": "234", "mnc": "33",
+            "carrier_identity": {"spn": "CMLink", "gid1": "0000", "gid2": "FFFF"},
+        })
+        self.assertEqual(value["name"], "CMLink UK")
+        self.assertEqual(value["home_network"], "EE")
+        self.assertEqual(value["match_source"], "mccmnc+spn")
+        self.assertTrue(value["specific"])
+
+    def test_shared_ee_plmn_without_cmlink_spn_stays_generic(self):
+        value = carrier_id.lookup({"mcc": "234", "mnc": "33"})
+        self.assertEqual(value["name"], "EE")
+        self.assertFalse(value["specific"])
+
     def test_gid_prefix_is_case_insensitive_and_tolerates_sim_padding(self):
         value = carrier_id.lookup({
             "mcc": "310", "mnc": "240",

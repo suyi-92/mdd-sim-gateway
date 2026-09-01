@@ -251,9 +251,9 @@ def main():
             f.write(rendered)
         print(f"[render] {tpl} -> {dest}")
 
-    # Bundled prompts. Shipped in templates/ so the overlay image carries them: the base
-    # image's Asterisk sound packages are a side effect of its build, not something this
-    # repository asserts, so nothing here may depend on them existing.
+    # Bundled prompts travel with every locally built Engine image. Asterisk sound packages
+    # are a side effect of its build, not something this repository asserts, so nothing here
+    # may depend on them existing.
     if ctx.get("vm_enabled"):
         # Record() will not create its own directory, and a failure there loses the message
         # with nothing but a dialplan warning to show for it.
@@ -295,8 +295,8 @@ def main():
         # different order. Empty -> fall back to USIM_READER_INDEX.
         put("USIM_READER_PORT", cfg.get("reader_port", ""))
         put("USIM_IMSI", ctx["imsi"])
-        # IMEI / IMEISV for the ePDG DEVICE_IDENTITY response. imeisv falls back to a value
-        # derived from the IMEI if the instance didn't carry one (hand-authored config).
+        # IMEI / IMEISV for the ePDG DEVICE_IDENTITY response. imeisv derives from a real IMEI
+        # when present; both remain blank for an identity-less native PC/SC reader.
         imei_digits = "".join(ch for ch in str(cfg.get("imei", "")) if ch.isdigit())
         put("SWU_IMEI", imei_digits)
         put("SWU_IMEISV", cfg.get("imeisv") or imeisv_from_imei(cfg.get("imei", "")))

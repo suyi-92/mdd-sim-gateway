@@ -1,6 +1,6 @@
-"""Unprivileged control channel for per-modem cellular and VoWiFi capabilities.
+"""Control channel for per-modem cellular and VoWiFi capabilities.
 
-The control container writes desired state while the host orchestrator publishes observed state.
+The native Control service writes desired state while the host orchestrator publishes observed state.
 ModemManager is a host-wide dependency, so its shared state is reported separately
 instead of pretending every modem owns an isolated copy of the service.
 """

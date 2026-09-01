@@ -28,6 +28,17 @@ _SCORES = {
     "preferred_apn": 1,
 }
 
+# Small, evidence-backed additions for operators absent from the public AOSP table. Keep these
+# rules stricter than a PLMN-only match because 234-33 is shared by EE and hosted brands.
+_LOCAL_SPN_RULES = (
+    {
+        "plmns": ("23433",),
+        "spns": ("CMLink", "CMLink UK"),
+        "name": "CMLink UK",
+        "home_network": "EE",
+    },
+)
+
 
 def _value(text: str) -> str | int:
     text = text.strip()
@@ -161,6 +172,20 @@ def lookup(identity: dict | None) -> dict | None:
     if not plmns:
         return None
     carriers, by_id, version = _database()
+    carrier_identity = identity.get("carrier_identity") or {}
+    spn = str(carrier_identity.get("spn") or "").strip().casefold()
+    for rule in _LOCAL_SPN_RULES:
+        matched_plmn = next((value for value in plmns if value in rule["plmns"]), "")
+        if matched_plmn and spn in {value.casefold() for value in rule["spns"]}:
+            return {
+                "name": rule["name"],
+                "home_network": rule["home_network"],
+                "plmn": f"{matched_plmn[:3]}-{matched_plmn[3:]}",
+                "match_source": "mccmnc+spn",
+                "specific": True,
+                "database": "mdd",
+                "database_version": version,
+            }
     best: tuple[int, int, dict, str, list[str]] | None = None
     for order, carrier in enumerate(carriers):
         for attribute in carrier.get("attributes") or []:

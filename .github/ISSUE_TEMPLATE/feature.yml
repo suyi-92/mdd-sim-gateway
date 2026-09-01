@@ -5,7 +5,7 @@ labels: [enhancement]
 body:
   - type: markdown
     attributes:
-      value: Never include credentials, subscriber identifiers, phone numbers, private URLs or tokens. A read-only Codex workflow may analyze this public request and post a clearly marked draft response; a maintainer makes the final decision.
+      value: Never include credentials, subscriber identifiers, hardware identities, phone numbers, private URLs, tokens, or message content.
   - type: textarea
     id: problem
     attributes:

@@ -21,16 +21,6 @@ except ModuleNotFoundError:  # Imported as control.run by tests and tooling.
     from .app import config as cfg
 
 
-def _runtime_path(path):
-    """Translate persisted Docker-mode /data paths when the control plane runs natively."""
-    path = str(path or "")
-    if path.startswith("/data/") and os.path.abspath(cfg.DATA_DIR) != "/data":
-        translated = os.path.join(cfg.DATA_DIR, os.path.relpath(path, "/data"))
-        if os.path.exists(translated):
-            return translated
-    return path
-
-
 def _self_signed(cert_path, key_path):
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -86,8 +76,8 @@ def main():
     port = int(os.environ.get("MDD_HTTP_PORT", settings.get("http_port", 8443)))
     bind = os.environ.get("MDD_BIND", settings.get("bind", "0.0.0.0"))
 
-    configured_cert = _runtime_path(tls.get("cert_path"))
-    configured_key = _runtime_path(tls.get("key_path"))
+    configured_cert = str(tls.get("cert_path") or "")
+    configured_key = str(tls.get("key_path") or "")
     if configured_cert and os.path.exists(configured_cert) and \
             configured_key and os.path.exists(configured_key):
         cert_path, key_path = configured_cert, configured_key
@@ -99,9 +89,13 @@ def main():
             _self_signed(cert_path, key_path)
 
     print(f"[run] serving https://{bind}:{port}")
+    # A stale or slow browser WebSocket can otherwise keep Uvicorn in "Waiting for
+    # connections to close" for about 30 seconds during an explicit service stop.
+    # One second still allows ordinary requests to drain before Uvicorn cancels stragglers
+    # and runs the application's deterministic lifespan cleanup.
     uvicorn.run("app.main:app", host=bind, port=port,
                 ssl_certfile=cert_path, ssl_keyfile=key_path,
-                log_level="info")
+                log_level="info", timeout_graceful_shutdown=1)
 
 
 if __name__ == "__main__":

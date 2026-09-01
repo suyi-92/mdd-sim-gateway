@@ -7,14 +7,13 @@
 #   - render.py     : renders /config/instance.json -> Asterisk configs at container start
 #
 # Reproducibility: source inputs and the multi-architecture base manifest are pinned. Fedora
-# packages still resolve from the supported Fedora 44 repositories at build time, so every
-# release workflow performs a clean image build instead of claiming byte-for-byte reproducibility.
+# packages still resolve from the supported Fedora 44 repositories at build time, so the VMware
+# acceptance gate performs a clean local image build instead of claiming byte-for-byte reproducibility.
 FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898 AS build
 
-# pcsc-lite is pinned to a fixed upstream version and built from source (see below), so the
-# engine's PC/SC client library matches the host pcscd EXACTLY across any distro — this is the
-# same PCSC_VERSION the installer pins on the host and the control image uses. Avoids the
-# client/server protocol mismatch that distro-default pcsc-lite packages cause.
+# pcsc-lite is pinned to a fixed upstream version and built from source (see below), keeping
+# the Engine client stable while the guest continues to use its distribution pcscd. Supported
+# Debian/Ubuntu packages interoperate through pcsc-lite's stable socket protocol.
 ARG PCSC_VERSION=2.3.3
 ARG PCSC_SHA256=00b667aa71504ed1d39a48ad377de048c70dbe47229e8c48a3239ab62979c70f
 ARG PJPROJECT_REPOSITORY=https://github.com/MddIdd/pjproject-sysmocom-mirror.git
@@ -43,7 +42,7 @@ RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads
 
 # Build pcsc-lite ${PCSC_VERSION} from source (client library + headers). Installs over any
 # distro-provided libpcsclite pulled in by python3-pyscard so pyscard (loads libpcsclite.so.1 at
-# runtime) uses the pinned version and talks the same protocol as the host pcscd.
+# runtime) uses the pinned version and interoperates with the guest's distribution pcscd.
 RUN cd /tmp && \
     wget -qO pcsc.tar.gz "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}.tar.gz" && \
     echo "${PCSC_SHA256}  pcsc.tar.gz" | sha256sum -c - && \
@@ -182,9 +181,8 @@ COPY templates/      /opt/mdd-sim-gateway/templates/
 COPY entrypoint.sh   /entrypoint.sh
 RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
 
-# Fingerprints of what went into this image. A later reload compares them against the checkout
-# to decide between reusing the image, refreshing the scripts through Dockerfile.overlay, and
-# rebuilding from source (see ensure_engine_image in install.sh).
+# Fingerprints of what went into this image. The VMware builder compares them with the checkout
+# and always performs a complete source build for a new commit.
 ARG RUNTIME_FP=""
 ARG BASE_FP=""
 ARG MDD_VERSION=""
@@ -192,6 +190,6 @@ LABEL io.mdd-sim-gateway.managed="true" \
       io.mdd-sim-gateway.runtime-fp="${RUNTIME_FP}" \
       io.mdd-sim-gateway.base-fp="${BASE_FP}" \
       org.opencontainers.image.version="${MDD_VERSION}" \
-      org.opencontainers.image.source="https://github.com/MddIdd/mdd-sim-gateway" \
+      org.opencontainers.image.source="https://github.com/suyi-92/mdd-sim-gateway" \
       org.opencontainers.image.title="MDD Sim Gateway VoWiFi engine"
 ENTRYPOINT ["/entrypoint.sh"]

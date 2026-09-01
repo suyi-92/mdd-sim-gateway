@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
-               estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
+               estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
 from .version import VERSION
 from .ami import AmiClient
@@ -82,7 +82,6 @@ LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 # Comfortably below store.LINE_STATE_CONTINUITY_SECONDS, so throttled writes still read back
 # as one uninterrupted observation.
 LINE_STATE_WRITE_INTERVAL_SECONDS = 30
-UPDATE_CHECK_INTERVAL_SECONDS = float(os.environ.get("MDD_UPDATE_CHECK_INTERVAL", "21600"))
 _line_state_written: dict[str, tuple[str, float]] = {}
 _line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
                                                  # "last registered" stamp
@@ -400,7 +399,8 @@ def _ensure_card_draft(info: dict) -> dict | None:
             "apn": "ims",
             "idr_mode": "apn",
             "cp_mode": "auto",
-            "sip": {**cfg.carrier_sip_defaults(mcc, mnc, iccid),
+            "sip": {**cfg.carrier_sip_defaults(
+                        mcc, mnc, iccid, _carrier_identity(info)),
                     "listen_addr": "0.0.0.0", "transport": "udp", "external": [],
                     "webrtc": {"enable": True}},
             "debug": {"asterisk": False, "charon": False},
@@ -597,10 +597,11 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
                           reason: str = "manual"):
     """Translate fail-closed egress errors into an actionable API response."""
     if not cfg.line_allowed(str(inst.get("id") or "")):
+        limit = cfg.sim_line_limit()
         raise HTTPException(409, {
             "code": "line_limit",
-            "message": (f"MDD Sim Gateway supports at most "
-                        f"{cfg.MAX_SIM_LINES} SIM lines. Delete an existing line "
+            "message": (f"MDD Sim Gateway is configured for at most "
+                        f"{limit} SIM lines. Delete an existing line or raise the limit "
                         "before starting this one."),
         })
     try:
@@ -895,16 +896,17 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
     mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
     mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
     smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
-    imei, hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
+    imei, hardware_id, device_type = _hardware_imei_for_card(card_info, cards)
     missing = []
     if not imsi:
         missing.append("IMSI")
     if not mcc or not mnc:
         missing.append("MCC/MNC")
-    if len(imei) != 15:
+    # A cellular modem has a real hardware IMEI and must never start without it.  A native
+    # PC/SC reader has no mobile-equipment identity of its own: leaving DEVICE_IDENTITY absent
+    # matches native-reader implementations and lets the ePDG decide whether it is mandatory.
+    if device_type != "reader" and len(imei) != 15:
         missing.append("IMEI")
-    if not smsc:
-        missing.append("SMSC")
     if card_info.get("pin_enabled") is True and not inst.get("pin"):
         missing.append("SIM PIN")
     if missing:
@@ -914,7 +916,8 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
     svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
            and previous_imeisv[-2:].isdigit() else _random_svn())
     sip = cfg.merge_carrier_sip_defaults(
-        mcc, mnc, card_info.get("iccid") or imsi or imei, inst.get("sip"))
+        mcc, mnc, card_info.get("iccid") or imsi or imei, inst.get("sip"),
+        _carrier_identity(card_info) or _carrier_identity(inst))
     # A draft normally arrives already named; only a name generated here needs deduplicating.
     resolved_iccid = str(card_info.get("iccid") or inst.get("iccid") or "")
     generated_name = not str(inst.get("name") or "").strip()
@@ -959,6 +962,37 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
     egress.publish()
     log.info("hotplug draft %s auto-provisioned for MCC %s", inst["id"], mcc)
     return promoted
+
+
+def _draft_provisioning_missing(inst: dict, card_info: dict,
+                                hardware_imei: str,
+                                hardware_type: str = "") -> list[str]:
+    """Stable, non-sensitive field keys explaining why a draft cannot start."""
+    imsi = str(card_info.get("imsi") or inst.get("imsi") or "")
+    mcc = str(card_info.get("mcc") or inst.get("mcc")
+              or (imsi[:3] if len(imsi) >= 3 else ""))
+    mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
+    missing = []
+    if not imsi:
+        missing.append("imsi")
+    if not mcc or not mnc:
+        missing.append("mcc_mnc")
+    if hardware_type != "reader" and len(str(hardware_imei or "")) != 15:
+        missing.append("imei")
+    if card_info.get("pin_enabled") is True and not inst.get("pin"):
+        missing.append("pin")
+    return missing
+
+
+def _provisioning_warnings(inst: dict, card_info: dict,
+                           hardware_imei: str, hardware_type: str) -> list[str]:
+    """Non-blocking feature warnings for an otherwise startable VoWiFi line."""
+    warnings = []
+    if not str(card_info.get("smsc") or inst.get("smsc") or ""):
+        warnings.append("outbound_sms_disabled")
+    if hardware_type == "reader" and len(str(hardware_imei or "")) != 15:
+        warnings.append("device_identity_omitted")
+    return warnings
 
 
 async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
@@ -2303,26 +2337,10 @@ def apply_health(iid, inst, st, container_id: str | None = None):
     return st
 
 
-async def update_automation_poller():
-    """Check releases without requiring a browser login.
-
-    Notification delivery and the promotion-gated auto-update decision are blocking network/
-    filesystem work, so keep them off the API event loop. A short startup delay lets the host
-    finish restoring routes after boot; later checks use the same six-hour cadence as the UI.
-    """
-    await asyncio.sleep(30)
-    while True:
-        try:
-            await asyncio.to_thread(update_check.automation_cycle)
-        except Exception as exc:  # noqa: a failed poll must never take the control plane down
-            log.warning("background update check failed: %s", type(exc).__name__)
-        await asyncio.sleep(max(300, UPDATE_CHECK_INTERVAL_SECONDS))
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.init()
-    # An upgrade from an older/self-use build may inherit more than five running containers.
+    # A lowered operator limit may leave more saved or running lines than currently allowed.
     # Keep every saved record, but stop excess engines before background recovery begins.
     for saved_line in cfg.list_instances():
         iid = str(saved_line.get("id") or "")
@@ -2357,7 +2375,6 @@ async def lifespan(app: FastAPI):
     sms_poller = asyncio.create_task(cellular_sms_poller())
     host_poller = asyncio.create_task(host_health_poller())
     segment_reaper = asyncio.create_task(sms_segment_reaper())
-    update_poller = asyncio.create_task(update_automation_poller())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
@@ -2366,11 +2383,10 @@ async def lifespan(app: FastAPI):
     sms_poller.cancel()
     host_poller.cancel()
     segment_reaper.cancel()
-    update_poller.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, update_poller, return_exceptions=True)
+                         segment_reaper, return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
         await c.close()
@@ -3258,8 +3274,9 @@ async def _preflight_pin(inst: dict) -> dict:
 @app.post("/api/provision")
 async def api_provision(body: dict):
     """Provision a detected card: verify PIN, read identity, create the line and start it.
-    PIN is required only when CHV1 is enabled. IMEI is auto-read from bridge metadata when
-    available, otherwise the caller must supply it. Optional: imeisv (auto-derived from imei if blank), name, smsc,
+    PIN is required only when CHV1 is enabled. A modem's IMEI is read from bridge metadata;
+    a native PC/SC reader may omit DEVICE_IDENTITY because it has no equipment IMEI.
+    Optional: imeisv (auto-derived from imei if blank), name, smsc,
     reader_index, reader (name), sip, webrtc, id, port_mode ('auto'|'manual'), sip_port
     (int, when manual), apn (default 'ims'), idr_mode ('apn'|'fqdn', default 'apn')."""
     idx = await asyncio.to_thread(_resolve_reader_index, body)
@@ -3275,20 +3292,30 @@ async def api_provision(body: dict):
     sip = cfg.merge_carrier_sip_defaults(
         c.mcc, c.mnc, c.iccid or c.imsi,
         body.get("sip") or {"listen_addr": "0.0.0.0", "transport": "udp",
-                            "external": []})
+                            "external": []},
+        _carrier_identity(c))
     sip.setdefault("webrtc", {"enable": bool(body.get("webrtc", True))})
     # SMSC: manual override wins; otherwise read from the SIM (EF_SMSP, authoritative).
-    # If the SIM can't provide it we ask the user to type it (no carrier presets).
-    smsc = (body.get("smsc") or "").strip() or c.smsc
-    if not smsc:
-        raise HTTPException(422, "smsc_unreadable: could not read the SMS centre from the SIM — "
-                                 "please provide it manually.")
+    # It is needed only for mobile-originated SMS, not IKE/IMS registration or voice calls.
+    # Keep it blank when unreadable instead of blocking VoWiFi; the send endpoint reports the
+    # narrower feature limitation if the operator later tries to send a message.
+    smsc = str((body.get("smsc") or "").strip() or c.smsc or "")
     live_cards = hub.cards_list()
     live_card = next((item for item in live_cards
                       if (item.get("name") == c.reader or item.get("index") == idx
                           or (c.iccid and item.get("iccid") == c.iccid))), {})
+    if not live_card:
+        # The card monitor may still be catching up with this explicit detect request.  Preserve
+        # the modem/reader distinction without inventing an identity: modem bridge metadata is
+        # authoritative when available; an ordinary PC/SC reader is identity-less by design.
+        modem_identity = _modem_identity_for_reader(c.reader)
+        live_card = {
+            "name": c.reader, "index": idx, "reader_port": c.reader_port or "",
+            "iccid": c.iccid, "hardware_kind": "modem" if modem_identity else "reader",
+            "hardware_id": (modem_identity or {}).get("hardware_id") or "",
+        }
     imei, _hardware_id, _hardware_type = _hardware_imei_for_card(live_card, live_cards)
-    if len(imei) != 15:
+    if _hardware_type != "reader" and len(imei) != 15:
         raise HTTPException(422, "imei_unavailable: configure a 15-digit IMEI in "
                                  "Device > Hardware before provisioning this SIM.")
     inst = {
@@ -3302,10 +3329,10 @@ async def api_provision(body: dict):
         "proxy_country": egress.normalize_country(body.get("proxy_country")),
         "imei": imei,
         "imei_source_device_id": _hardware_id,
-        # IMEISV for DEVICE_IDENTITY: user value if provided, else auto-derive (14-digit IMEI
-        # base + random 2-digit SVN) so each line looks like a distinct handset build.
-        "imeisv": (body.get("imeisv") or "").strip()
-                  or cfg.imeisv_from_imei(imei, svn=_random_svn()),
+        # A blank native-reader identity stays blank all the way into the engine.  Never fall
+        # back to a sample or generated equipment identity.
+        "imeisv": (((body.get("imeisv") or "").strip()
+                     or cfg.imeisv_from_imei(imei, svn=_random_svn())) if imei else ""),
         "pin": pin,
         "reader": f"imsi:{c.imsi}",
         "reader_index": idx,  # store the physical reader index for USB device passthrough
@@ -3492,7 +3519,17 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
     if not card_info:
         return inst
     imei, _device_id, _device_type = _hardware_imei_for_card(card_info, cards)
-    if len(imei) != 15:
+    if imei and len(imei) != 15:
+        if _device_type == "reader":
+            # A SIM moved from a modem to a plain reader must not keep presenting the modem's
+            # identity.  Clear the stale snapshot and let swu_ike omit DEVICE_IDENTITY.
+            if (cfg.normalize_imei(inst.get("imei", "")) or inst.get("imeisv")
+                    or str(inst.get("imei_source_device_id") or "") != _device_id):
+                return cfg.upsert_instance({
+                    "id": str(inst["id"]), "imei": "", "imeisv": "",
+                    "imei_source_device_id": _device_id,
+                })
+            return inst
         raise HTTPException(409, {
             "code": "hardware_imei_required",
             "message": "configure a 15-digit IMEI in Device > Hardware before starting VoWiFi",
@@ -3709,12 +3746,17 @@ async def _unified_devices() -> list[dict]:
                 "carrier_identity": (inst or {}).get("carrier_identity") or {},
             }
         carrier = _carrier_description(inst, card_info, cellular_view)
-        if native_card:
-            hardware_imei, _hardware_id, _hardware_type = _hardware_imei_for_card(
-                native_card, cards)
-            hardware_record = device_state.hardware().get(device_id) or hardware_record
+        if is_native_reader:
+            if native_card:
+                hardware_imei, _hardware_id, hardware_type = _hardware_imei_for_card(
+                    native_card, cards)
+                hardware_record = device_state.hardware().get(device_id) or hardware_record
+            else:
+                hardware_imei = cfg.normalize_imei(hardware_record.get("imei", ""))
+                hardware_type = "reader"
         else:
             hardware_imei = cfg.normalize_imei(identity.get("imei", ""))
+            hardware_type = "modem"
         masked_imei = _masked_identifier(hardware_imei)
         bridge_active = bool(actual_state.get("vowifi_bridge_active"))
         logical_channels = (None if is_native_reader else
@@ -3728,6 +3770,11 @@ async def _unified_devices() -> list[dict]:
                              "off" if not flight_desired and radio_on else
                              "starting" if flight_desired else "stopping")
             flight_available = not is_native_reader and not serial_only
+        provisioning_missing = (_draft_provisioning_missing(
+            inst, card_info, hardware_imei, hardware_type)
+                                if is_draft else [])
+        provisioning_warnings = (_provisioning_warnings(
+            inst or {}, card_info, hardware_imei, hardware_type) if inst else [])
         result.append({
             "id": device_id, "device_type": "reader" if is_native_reader else "modem",
             "name": (card_info.get("display_name") or card_info.get("name")
@@ -3774,10 +3821,8 @@ async def _unified_devices() -> list[dict]:
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},
             "provisioning": {"state": "draft" if is_draft else "ready" if inst else "detecting",
-                "missing": ([key for key, value in (
-                    ("imsi", (inst or card_info).get("imsi")),
-                    ("imei", hardware_imei),
-                    ("smsc", (inst or card_info).get("smsc"))) if not value])},
+                             "missing": provisioning_missing,
+                             "warnings": provisioning_warnings},
             "capabilities": {"cellular": {"desired": cell_desired, "actual": cell_actual,
                                              "reason": cell_reason},
                              "flight": {"desired": flight_desired,
@@ -3814,7 +3859,7 @@ async def api_device_hardware(device_id: str, body: dict):
         raise HTTPException(400, "a modem reports its hardware IMEI automatically")
     raw = str((body or {}).get("imei") or "").strip()
     imei = cfg.normalize_imei(raw)
-    if len(imei) != 15:
+    if raw and len(imei) != 15:
         raise HTTPException(422, "IMEI must contain exactly 15 digits")
     record = device_state.set_hardware(device_id, {
         "device_type": "reader", "name": device.get("name") or "Smart-card reader",
@@ -3824,14 +3869,15 @@ async def api_device_hardware(device_id: str, body: dict):
     # change immediately to the SIM currently inserted in this reader.
     iid = str(device.get("instance_id") or "")
     applied = False
-    if iid and imei:
+    if iid:
         inst = cfg.get_instance(iid) or {}
         previous_imeisv = str(inst.get("imeisv") or "")
         svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
                and previous_imeisv[-2:].isdigit() else _random_svn())
         inst = cfg.upsert_instance({"id": iid, "imei": imei,
                                     "imei_source_device_id": device_id,
-                                    "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
+                                    "imeisv": (cfg.imeisv_from_imei(imei, svn=svn)
+                                                if imei else "")})
         if await asyncio.to_thread(engine.is_running, iid):
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
@@ -4083,6 +4129,11 @@ def api_get_settings():
 def api_put_settings(body: dict):
     # Ignore the legacy field from older cached clients. Product identity is fixed.
     body.pop("system_name", None)
+    if "max_sim_lines" in body:
+        try:
+            body["max_sim_lines"] = cfg.validate_sim_line_limit(body["max_sim_lines"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     proxy = body.get("proxy")
     if proxy is not None:
         if not isinstance(proxy, dict) or not isinstance(proxy.get("profiles", {}), dict) \
@@ -4169,25 +4220,9 @@ def api_put_settings(body: dict):
             notify_push.build_notification_message(sample, feishu)
         except ValueError as exc:
             raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
-    if "updates" in body:
-        try:
-            body["updates"] = update_check.validate_update_settings(body.get("updates"))
-        except update_check.UpdateNetworkError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        if body["updates"]["proxy_mode"] == "library":
-            effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
-                               else cfg.get_settings().get("proxy")) or {}
-            update_profile = (effective_proxy.get("profiles") or {}).get(
-                body["updates"]["proxy_profile_id"]) or {}
-            if not update_profile:
-                raise HTTPException(400, "update proxy references an unknown proxy library entry")
-            if update_profile.get("type") == "subscription":
-                raise HTTPException(400, "updates cannot select a subscription; use a country exit")
-        elif body["updates"]["proxy_mode"] == "country":
-            effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
-                               else cfg.get_settings().get("proxy")) or {}
-            if body["updates"]["proxy_country"] not in (effective_proxy.get("exits") or {}):
-                raise HTTPException(400, "update proxy references an unknown country exit")
+    # Release-based update settings are retired in the VMware edition. Ignore stale cached
+    # clients instead of persisting hidden updater policy or credentials.
+    body.pop("updates", None)
     hardware = body.get("hardware")
     if hardware is not None:
         if not isinstance(hardware, dict):
@@ -4258,27 +4293,47 @@ def _egress_not_ready_reason(country: str, latest: dict) -> str:
 
 async def _test_egress_country(country: str):
     country = egress.normalize_country(country)
-    exits = (cfg.get_settings().get("proxy") or {}).get("exits") or {}
+    proxy = cfg.get_settings().get("proxy") or {}
+    exits = proxy.get("exits") or {}
     if not country or country not in exits:
         raise HTTPException(404, "country exit is not configured")
+    if not proxy.get("enabled"):
+        raise HTTPException(503,
+                            "country proxy routing is switched off — enable it before testing an exit")
+    if not (exits.get(country) or {}).get("enabled", False):
+        raise HTTPException(503, f"the {country.upper()} exit is configured but not enabled")
+    baseline_updated_at = float(egress.status().get("updated_at") or 0)
     egress.publish()
+    try:
+        token, _requested_at = await asyncio.to_thread(egress.request_test, country)
+    except OSError as exc:
+        raise HTTPException(503, "the temporary country exit could not be requested — "
+                                 "check shared data directory permissions") from exc
     deadline = time.monotonic() + 25
     latest = {}
-    while time.monotonic() < deadline:
-        latest = (egress.status().get("exits") or {}).get(country) or {}
-        if latest.get("ready"):
-            host, port = str(latest.get("proxy_host") or ""), int(latest.get("proxy_port") or 0)
-            if not host or not port:
-                raise HTTPException(503, "country exit has no UDP test endpoint")
-            try:
-                latency = await asyncio.to_thread(egress.test_udp_proxy, host, port)
-            except egress.EgressError as exc:
-                raise HTTPException(503, str(exc)) from exc
-            return {"ok": True, "country": country, "node": latest.get("node") or "",
-                    "interface": latest.get("interface") or "", "latency_ms": latency}
-        if latest.get("error"):
-            break
-        await asyncio.sleep(.5)
+    try:
+        while time.monotonic() < deadline:
+            document = egress.status()
+            latest = (document.get("exits") or {}).get(country) or {}
+            # Ignore a ready/error snapshot left by an earlier run.  The test request wakes the
+            # orchestrator; its next publication proves the requested temporary exit exists now.
+            fresh = float(document.get("updated_at") or 0) > baseline_updated_at
+            if fresh and latest.get("ready"):
+                host = str(latest.get("proxy_host") or "")
+                port = int(latest.get("proxy_port") or 0)
+                if not host or not port:
+                    raise HTTPException(503, "country exit has no UDP test endpoint")
+                try:
+                    latency = await asyncio.to_thread(egress.test_udp_proxy, host, port)
+                except egress.EgressError as exc:
+                    raise HTTPException(503, str(exc)) from exc
+                return {"ok": True, "country": country, "node": latest.get("node") or "",
+                        "interface": latest.get("interface") or "", "latency_ms": latency}
+            if fresh and latest.get("error"):
+                break
+            await asyncio.sleep(.5)
+    finally:
+        await asyncio.to_thread(egress.finish_test, country, token)
     raise HTTPException(503, await asyncio.to_thread(
         _egress_not_ready_reason, country, latest))
 
@@ -4389,8 +4444,7 @@ def api_system_status():
         "unheard_voicemails": sum(store.unheard_voicemail_counts().values()),
         "timezone": settings.get("timezone") or "UTC",
         "version": VERSION,
-        "repository_url": f"https://github.com/{update_check.repository()}",
-        "backups": operations.list_local_backups(),
+        "repository_url": "https://github.com/suyi-92/mdd-sim-gateway",
         "security": {
             "https": True,
             "certificate_mode": "self-signed" if (settings.get("tls") or {}).get("self_signed") else "custom",
@@ -4418,66 +4472,6 @@ def api_host_alerts_clear():
     hub.host_alerts = []
     _save_host_alert_state(hub.host_alert_state)
     return {"ok": True, "cleared": cleared}
-
-
-@app.get("/api/system/update/check")
-async def api_system_update_check(force: bool = False):
-    """Read-only release lookup. Requires an admin session (see _AUTH_PUBLIC).
-
-    The periodic UI poll uses the short in-process cache; only an explicit "Check for updates"
-    click passes force=true, so repeated logins/reloads cannot burn GitHub's unauthenticated
-    rate limit.
-    """
-    return await asyncio.to_thread(update_check.check, force)
-
-
-@app.get("/api/system/update/releases")
-async def api_system_update_releases(force: bool = False):
-    """Published stable/test versions available for an explicit manual channel switch."""
-    return await asyncio.to_thread(update_check.releases, force)
-
-
-@app.get("/api/system/repository/stars")
-async def api_system_repository_stars(force: bool = False):
-    """Repository metadata is retried independently of the slower release poll."""
-    return await asyncio.to_thread(update_check.repository_stars, force)
-
-
-@app.post("/api/system/update/apply")
-async def api_system_update_apply(body: dict):
-    """One-click update: publish a request for the host orchestrator, which runs the detached
-    updater (host/mdd_update.py). Responds immediately; progress is polled separately."""
-    version = body.get("version")
-    return await asyncio.to_thread(update_check.request_apply, version=version)
-
-
-@app.get("/api/system/update/progress")
-def api_system_update_progress():
-    return update_check.apply_status()
-
-
-@app.post("/api/system/update/cancel")
-async def api_system_update_cancel():
-    """Clear a progress document left behind by an updater that never finished, so the dialog
-    can offer the update again instead of resuming into a dead progress view."""
-    return await asyncio.to_thread(update_check.cancel_apply)
-
-
-@app.post("/api/system/backups")
-async def api_system_backup():
-    settings = cfg.get_settings()
-    return await asyncio.to_thread(
-        operations.create_local_backup, "mdd-sim-gateway")
-
-
-@app.delete("/api/system/backups/{name}")
-async def api_system_backup_delete(name: str):
-    try:
-        return await asyncio.to_thread(operations.delete_local_backup, name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="backup not found") from exc
 
 
 @app.post("/api/system/maintenance")
@@ -5078,6 +5072,12 @@ async def _watch_sms_delivery(iid: str, mid: int, since: int, timeout: float = 4
 async def _send_sms_vowifi(iid: str, to: str, text: str,
                            ami: AmiClient | None = None) -> dict:
     """Submit one MO SMS through Asterisk/IMS and start its delivery watcher."""
+    inst = cfg.get_instance(str(iid)) or {}
+    if not str(inst.get("smsc") or "").strip():
+        return {"ok": False, "unavailable": True, "message": None,
+                "error": ("VoWiFi outbound SMS is disabled because this SIM's SMS centre "
+                          "could not be read. Voice calling and registration are unaffected."),
+                "transport": "vowifi"}
     ami = ami or await hub.ami_for(iid)
     if not ami:
         return {"ok": False, "unavailable": True, "message": None,
@@ -5115,6 +5115,8 @@ async def _registered_vowifi_ami(iid: str) -> AmiClient | None:
     operation begins, ``auto`` never retries on the other transport: an action timeout may still
     mean that the first copy reached the SMSC.
     """
+    if not str((cfg.get_instance(str(iid)) or {}).get("smsc") or "").strip():
+        return None
     ami = await hub.ami_for(iid)
     if not ami or not ami.connected:
         return None
@@ -5168,6 +5170,8 @@ async def send_sms_on_line(iid: str, to: str, text: str,
         if transport == "cellular":
             return await _send_sms_cellular(iid, to, text)
 
+        vowifi_sms_configured = bool(str(
+            (cfg.get_instance(iid) or {}).get("smsc") or "").strip())
         ami = await _registered_vowifi_ami(iid)
         if ami:
             result = await _send_sms_vowifi(iid, to, text, ami=ami)
@@ -5175,7 +5179,10 @@ async def send_sms_on_line(iid: str, to: str, text: str,
             result = await _send_sms_cellular(iid, to, text)
             if result.get("unavailable"):
                 cellular_error = result.get("error") or "Cellular SMS is unavailable."
-                result["error"] = f"VoWiFi is not registered. {cellular_error}"
+                vowifi_error = ("VoWiFi outbound SMS is disabled because the SMS centre is "
+                                 "unavailable." if not vowifi_sms_configured
+                                 else "VoWiFi is not registered.")
+                result["error"] = f"{vowifi_error} {cellular_error}"
         result["requested_transport"] = "auto"
         return result
 
@@ -5616,7 +5623,7 @@ def api_keepalive_save(iid: str, body: dict):
 
 @app.get("/api/keepalive/summary")
 async def api_keepalive_summary():
-    """One aggregate for the whole page: at most five lines, so a per-line fan-out of four
+    """One aggregate for the whole page: a bounded configured line set, so a per-line fan-out of four
     requests each would be pure overhead."""
     now = int(time.time())
     rows = []
@@ -5884,12 +5891,17 @@ def api_softphone(iid: str, request: Request):
     wr = sip.get("webrtc", {}) or {}
     ports = inst.get("ports", {})
     host = (request.headers.get("host") or "").split(":")[0] or request.url.hostname
+    # Publish the same literal host address used for Asterisk ICE candidate rewriting.  The
+    # browser uses it only to choose one of its already-gathered local RTP candidates, preventing
+    # a Clash/Mihomo 198.18.0.0/15 adapter from becoming the SDP default media destination.
+    media_host = cfg.ice_advertise_address(cfg.get_settings())
     return {
         "enabled": bool(wr.get("enable", True)),
         "username": wr.get("username", "webrtc"),
         "password": wr.get("password", ""),
         "ws_port": ports.get("webrtc", 8089),
         "host": host,
+        "media_host": media_host,
         "realm": cfg.ims_realm(inst["mcc"], inst["mnc"]),
     }
 

@@ -24,14 +24,38 @@ DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
 _lock = threading.RLock()
 
-# Product safety boundary. This is intentionally a source-level limit rather than an environment
-# variable: operators must not be able to turn the gateway into a bulk-SIM service by changing
-# deployment configuration.
-MAX_SIM_LINES = 5
+# Operator-controlled product boundary. The Web UI exposes the configured value, while this
+# source-level range prevents a typo or malformed client from creating an unbounded workload.
+MIN_SIM_LINE_LIMIT = 1
+DEFAULT_SIM_LINE_LIMIT = 13
+MAX_SIM_LINE_LIMIT = 32
 
 
 class LineLimitError(ValueError):
     pass
+
+
+def validate_sim_line_limit(value) -> int:
+    """Return one integer line limit inside the supported operator-configurable range."""
+    if isinstance(value, bool):
+        raise ValueError("SIM line limit must be an integer")
+    text = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ValueError("SIM line limit must be an integer")
+    limit = int(text)
+    if not MIN_SIM_LINE_LIMIT <= limit <= MAX_SIM_LINE_LIMIT:
+        raise ValueError(
+            f"SIM line limit must be from {MIN_SIM_LINE_LIMIT} to {MAX_SIM_LINE_LIMIT}")
+    return limit
+
+
+def sim_line_limit(settings: dict | None = None) -> int:
+    """Resolve the configured limit, falling back safely for old or malformed files."""
+    source = get_settings() if settings is None else settings
+    try:
+        return validate_sim_line_limit(source.get("max_sim_lines", DEFAULT_SIM_LINE_LIMIT))
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_SIM_LINE_LIMIT
 
 
 def _private_dir(path: str) -> None:
@@ -50,6 +74,7 @@ DEFAULTS = {
     "internal": {},
     "settings": {
         "timezone": "Asia/Shanghai",
+        "max_sim_lines": DEFAULT_SIM_LINE_LIMIT,
         "device_defaults": {"cellular_enabled": False, "vowifi_enabled": True},
         "http_port": 8443,
         "bind": "0.0.0.0",
@@ -118,8 +143,7 @@ DEFAULTS = {
             "verify_tls": True,
             "events": {"incoming_sms": True, "incoming_call": True,
                        "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
+                       "keepalive_result": True, "balance_low": True},
         },
         "telegram": {
             "enabled": False,
@@ -132,8 +156,7 @@ DEFAULTS = {
             "message_templates": {},
             "events": {"incoming_sms": True, "incoming_call": True,
                        "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
+                       "keepalive_result": True, "balance_low": True},
         },
         "pushplus": {
             "enabled": False,
@@ -144,8 +167,7 @@ DEFAULTS = {
             "message_templates": {},
             "events": {"incoming_sms": True, "incoming_call": True,
                        "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
+                       "keepalive_result": True, "balance_low": True},
         },
         "feishu": {
             "enabled": False,
@@ -154,8 +176,7 @@ DEFAULTS = {
             "message_templates": {},
             "events": {"incoming_sms": True, "incoming_call": True,
                        "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
+                       "keepalive_result": True, "balance_low": True},
         },
         "security": {
             "https_only": True,
@@ -165,19 +186,6 @@ DEFAULTS = {
         "maintenance": {
             "notification_history_days": 30,
             "support_bundle_log_lines": 500,
-        },
-        # Software update traffic tries direct first, then definitions from the proxy library.
-        # Keeping only the library id avoids a second credential store for the updater.
-        "updates": {
-            "proxy_mode": "auto",
-            "proxy_profile_id": "",
-            "proxy_country": "",
-            # Automatic and notify-only are mutually exclusive. New installations track stable
-            # releases explicitly classified as main automatically; every automatic install
-            # still requires an exact
-            # promotion in update-policy.json.
-            "update_mode": "automatic",
-            "version_scope": "main",
         },
         # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
         # $MDD_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
@@ -289,6 +297,7 @@ def load() -> dict:
         # merge defaults (shallow for settings)
         out = deepcopy(DEFAULTS)
         out["settings"].update(data.get("settings", {}))
+        out["settings"]["max_sim_lines"] = sim_line_limit(out["settings"])
         if "tls" in data.get("settings", {}):
             out["settings"]["tls"] = {**DEFAULTS["settings"]["tls"], **data["settings"]["tls"]}
         out["settings"]["retry"] = {**DEFAULTS["settings"]["retry"],
@@ -307,6 +316,9 @@ def load() -> dict:
             # Number keeping superseded the old manually-entered activation countdown. Do not
             # preserve its hidden checkbox forever when loading a pre-keepalive config.
             merged["events"].pop("activation_reminder", None)
+            # VMware editions are source-updated through mddctl; retired Release notifications
+            # must not survive in an older configuration as a hidden delivery event.
+            merged["events"].pop("software_update", None)
             out["settings"][key] = merged
         # Telegram is notification-only. Drop command settings left by an older configuration
         # so an upgrade cannot preserve a remote call/SMS control channel.
@@ -338,8 +350,7 @@ def load() -> dict:
             })
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
-        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults",
-                    "updates"):
+        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults"):
             saved = data.get("settings", {}).get(key, {}) or {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
         # Proxy profiles were introduced after the original single-subscription/country-form
@@ -405,63 +416,9 @@ def load() -> dict:
             country = subscription_country(telegram_profile_id)
             if country:
                 telegram.update(proxy_mode="country", proxy_profile_id="", proxy_country=country)
-        # Import legacy updater proxy definitions into the shared library without changing the
-        # route the operator selected. Manual SOCKS settings become a private library entry;
-        # an existing country selection remains pinned to that country.
-        updates = out["settings"].get("updates") or {}
-        update_mode = str(updates.get("proxy_mode") or "auto").lower()
-        update_profile_id = ""
-        update_country = ""
-        if update_mode == "country":
-            country = str(updates.get("proxy_country") or "").strip().lower()
-            if re.fullmatch(r"[a-z]{2}", country) and isinstance(exits.get(country), dict):
-                update_country = country
-        elif update_mode == "manual":
-            raw = str(updates.get("proxy_url") or "").strip()
-            parsed = urllib.parse.urlsplit(raw)
-            if parsed.scheme.lower() in {"socks5", "socks5h"} and parsed.hostname:
-                update_profile_id = "legacy-update-proxy"
-                profiles.setdefault(update_profile_id, {
-                    "name": "Software update proxy", "type": "socks5",
-                    "server": parsed.hostname, "port": parsed.port or 1080,
-                    "username": urllib.parse.unquote(parsed.username or ""),
-                    "password": urllib.parse.unquote(parsed.password or ""),
-                })
-        elif update_mode == "library" and str(updates.get("proxy_profile_id") or "") in profiles:
-            selected_profile_id = str(updates["proxy_profile_id"])
-            if (profiles.get(selected_profile_id) or {}).get("type") == "subscription":
-                update_country = subscription_country(selected_profile_id)
-                if update_country:
-                    update_mode = "country"
-            else:
-                update_profile_id = selected_profile_id
-        normalized_update_mode = "country" if update_mode == "country" and update_country \
-            else "library" if update_mode in {"library", "manual"} and update_profile_id \
-            else (update_mode if update_mode in {"auto", "direct"} else "auto")
-        raw_updates = data.get("settings", {}).get("updates", {}) or {}
-        update_mode = str(raw_updates.get("update_mode") or "").lower()
-        version_scope = str(raw_updates.get("version_scope") or "").lower()
-        if version_scope == "feature":
-            version_scope = "main"
-        if update_mode not in {"automatic", "notify"}:
-            legacy_auto_update = raw_updates.get("auto_update")
-            update_mode = "automatic" if legacy_auto_update is True else \
-                "notify" if legacy_auto_update is False else "automatic"
-            if not version_scope:
-                version_scope = str(raw_updates.get("notification_mode") or "all") \
-                    if update_mode == "notify" else "all" if legacy_auto_update is True \
-                    else "main"
-            if version_scope == "feature":
-                version_scope = "main"
-        if version_scope not in {"all", "main"}:
-            version_scope = "main" if update_mode == "automatic" else "all"
-        out["settings"]["updates"] = {
-            "proxy_mode": normalized_update_mode,
-            "proxy_profile_id": update_profile_id if normalized_update_mode == "library" else "",
-            "proxy_country": update_country if normalized_update_mode == "country" else "",
-            "update_mode": update_mode,
-            "version_scope": version_scope,
-        }
+        # Release-based update settings are deliberately retired. Drop them from the resolved
+        # view so stale clients cannot persist hidden updater credentials or policy.
+        out["settings"].pop("updates", None)
         # Asterisk debug includes complete SIP messages and IMS identities.  Older manual
         # provisioning forms accidentally enabled it by default, so normalize every loaded
         # line as well as new writes; this makes an upgrade safe before the operator next edits
@@ -499,10 +456,16 @@ def get_settings() -> dict:
 
 
 def update_settings(patch: dict) -> dict:
+    patch = dict(patch)
+    # VMware installations are updated only through mddctl. Stale WebUI tabs from an older
+    # release may still submit this key, so ignore it instead of saving hidden updater policy.
+    patch.pop("updates", None)
+    if "max_sim_lines" in patch:
+        patch["max_sim_lines"] = validate_sim_line_limit(patch["max_sim_lines"])
     data = load()
     data["settings"].update(patch)
     save(data)
-    return data["settings"]
+    return load()["settings"]
 
 
 def list_instances() -> list:
@@ -557,11 +520,21 @@ def _reserved_ports(data: dict, exclude_iid: str | None = None) -> set[int]:
     return used
 
 
-def _host_port_free(port: int) -> bool:
-    """True if the host isn't already LISTENing on this TCP or UDP port. Best-effort:
-    we try to bind; EADDRINUSE => taken. Uses SO_REUSEADDR off so an active listener
-    is detected. Any unexpected error is treated as 'free' (don't block provisioning)."""
-    for fam, typ in ((socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET, socket.SOCK_DGRAM)):
+def _host_port_free(port: int, *, tcp: bool = True, udp: bool = True) -> bool:
+    """True if the requested host protocols can bind ``port``.
+
+    Service ports conservatively probe both TCP and UDP. RTP callers request UDP only so an
+    unrelated TCP listener does not waste an otherwise valid media range. This bind probe also
+    sees listeners owned by other host services. Any bind ``OSError`` means unavailable;
+    non-OS unexpected errors remain best-effort and do not block provisioning.
+    """
+    types = []
+    if tcp:
+        types.append(socket.SOCK_STREAM)
+    if udp:
+        types.append(socket.SOCK_DGRAM)
+    for typ in types:
+        fam = socket.AF_INET
         s = socket.socket(fam, typ)
         try:
             s.bind(("0.0.0.0", port))
@@ -576,14 +549,18 @@ def _host_port_free(port: int) -> bool:
 
 def _block_free(block: dict, reserved: set[int]) -> bool:
     """A candidate block is usable if none of its ports collide with reserved ports and
-    none of its 4 service ports are already listening on the host."""
+    none of its service or effective RTP ports are already listening on the host."""
     bp = _block_ports(block)
     if bp & reserved:
         return False
-    # Only probe the 4 service ports on the host (probing 60 RTP ports every try is slow;
-    # RTP conflicts are caught by the reserved-set check against other instances).
     for port in (block["sip_udp"], block["sip_tls"], block["webrtc"], block["ami"]):
         if not _host_port_free(port):
+            return False
+    # New blocks expose only 12 RTP ports. Legacy saved blocks can expose 60, but a bounded bind
+    # probe is still cheaper and safer than letting Docker create a dead container after a late
+    # conflict with an unrelated host process.
+    for port in range(block["rtp_start"], block["rtp_start"] + rtp_span(block)):
+        if not _host_port_free(port, tcp=False, udp=True):
             return False
     return True
 
@@ -634,6 +611,10 @@ def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None
                        (block["webrtc"], "WebRTC"), (block["ami"], "control")):
         if not _host_port_free(port):
             raise ValueError(f"port {port} ({name}) is already in use on the host. "
+                             f"Choose a different port or use Automatic.")
+    for port in range(block["rtp_start"], block["rtp_start"] + rtp_span(block)):
+        if not _host_port_free(port, tcp=False, udp=True):
+            raise ValueError(f"port {port} (RTP/UDP) is already in use on the host. "
                              f"Choose a different port or use Automatic.")
     return block
 
@@ -709,9 +690,10 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     # instances with a computed `status` and `has_pin`); never persist them to config.
     inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
     existing = data["instances"].get(iid, {})
-    if not existing and len(data["instances"]) >= MAX_SIM_LINES:
+    limit = sim_line_limit(data["settings"])
+    if not existing and len(data["instances"]) >= limit:
         raise LineLimitError(
-            f"MDD Sim Gateway supports at most {MAX_SIM_LINES} SIM lines")
+            f"MDD Sim Gateway is configured for at most {limit} SIM lines")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:
@@ -759,11 +741,10 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
 
 
 def line_allowed(iid: str) -> bool:
-    """Whether a saved line is inside the product's deterministic five-line set.
+    """Whether a saved line is inside the operator's deterministic configured set.
 
-    Old/self-use installations may already contain more than five records. Keep their data so
-    an upgrade is non-destructive, but prevent every engine start path from using line six and
-    above. Existing UI order (`index`) wins; ids break ties deterministically.
+    Lowering the limit never deletes records. Existing UI order (`index`) wins and ids break ties
+    deterministically, while every engine-start path refuses records after the configured limit.
     """
     def order(item: dict):
         try:
@@ -772,8 +753,10 @@ def line_allowed(iid: str) -> bool:
             index = 1 << 30
         return index, str(item.get("id") or "")
 
+    data = load()
+    limit = sim_line_limit(data["settings"])
     allowed = {str(item.get("id")) for item in
-               sorted(list_instances(), key=order)[:MAX_SIM_LINES]}
+               sorted(data["instances"].values(), key=order)[:limit]}
     return str(iid) in allowed
 
 
@@ -928,8 +911,24 @@ CARRIER_SIP_PROFILES = {
     },
 }
 
+# A shared PLMN is not enough to select these: generic EE and its hosted brands need not use
+# identical SIP presentation. Match the private SIM SPN locally, then render only the resulting
+# protocol flags into instance.json.
+CARRIER_SIP_SPN_PROFILES = (
+    {
+        "plmns": ("234-33", "234-033"),
+        "spns": ("CMLink", "CMLink UK"),
+        "profile": {
+            "pani_country": "GB",
+            "access_type": "wlan1",
+            "user_eq_phone": True,
+        },
+    },
+)
 
-def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "") -> dict:
+
+def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "",
+                         carrier_identity: dict | None = None) -> dict:
     """Return safe SIP presentation defaults for a characterised carrier.
 
     P-Access-Network-Info needs a plausible, stable Wi-Fi node identity. Derive a locally
@@ -941,8 +940,13 @@ def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "") -> dict:
         "%s-%s" % (str(mcc).zfill(3), str(mnc).zfill(3)),
         "%s-%s" % (mcc, str(mnc).lstrip("0") or mnc),
     )
-    profile = next((CARRIER_SIP_PROFILES[key] for key in keys
-                    if key in CARRIER_SIP_PROFILES), None)
+    spn = str((carrier_identity or {}).get("spn") or "").strip().casefold()
+    profile = next((rule["profile"] for rule in CARRIER_SIP_SPN_PROFILES
+                    if any(key in rule["plmns"] for key in keys)
+                    and spn in {value.casefold() for value in rule["spns"]}), None)
+    if profile is None:
+        profile = next((CARRIER_SIP_PROFILES[key] for key in keys
+                        if key in CARRIER_SIP_PROFILES), None)
     if not profile:
         return {}
     seed = str(identity or keys[0]).strip()
@@ -959,9 +963,10 @@ def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "") -> dict:
 
 
 def merge_carrier_sip_defaults(mcc: str, mnc: str, identity: str,
-                               sip: dict | None) -> dict:
+                               sip: dict | None,
+                               carrier_identity: dict | None = None) -> dict:
     """Merge carrier SIP defaults, treating blank text fields as 'use automatic'."""
-    defaults = carrier_sip_defaults(mcc, mnc, identity)
+    defaults = carrier_sip_defaults(mcc, mnc, identity, carrier_identity)
     explicit = dict(sip or {})
     for key in defaults:
         if explicit.get(key) in (None, ""):
@@ -998,7 +1003,8 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
     ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
     sip = merge_carrier_sip_defaults(
         inst.get("mcc", ""), inst.get("mnc", ""),
-        inst.get("iccid") or inst.get("imsi") or inst.get("imei"), inst.get("sip"))
+        inst.get("iccid") or inst.get("imsi") or inst.get("imei"), inst.get("sip"),
+        inst.get("carrier_identity") or {})
     webrtc = sip.get("webrtc", {}) or {}
     ami_secret = str(inst.get("ami_secret") or "")
     webrtc_password = str(webrtc.get("password") or "")
@@ -1013,8 +1019,8 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "mnc": inst["mnc"],
         "imei": inst.get("imei", ""),
         # IMEISV (16 digits) for the ePDG DEVICE_IDENTITY response. Explicit stored value wins;
-        # otherwise auto-derive from the IMEI (14-digit base + '00' SVN). Empty stays empty
-        # (swu_ike then derives its own or falls back).
+        # otherwise auto-derive from the IMEI (14-digit base + '00' SVN). Empty stays empty and
+        # swu_ike omits DEVICE_IDENTITY when an identity-less native reader is used.
         "imeisv": inst.get("imeisv", "") or imeisv_from_imei(inst.get("imei", ""), inst.get("imeisv", "")),
         "pin": inst.get("pin", ""),
         "reader": inst.get("reader") or f"imsi:{inst['imsi']}",

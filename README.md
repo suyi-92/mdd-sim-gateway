@@ -2,168 +2,215 @@
   <img src="assets/logo-lockup.svg" width="520" alt="MDD Sim Gateway">
 </p>
 
-<p align="center"><strong>把物理 SIM 和 eSIM 变成自己可控的 VoWiFi、通话、短信与独立网络出口网关。</strong></p>
+<p align="center"><strong>在 VMware Linux 客户机中，以本地源码构建方式运行两条 SIM 通信线路。</strong></p>
 
 <p align="center">
   <a href="README.en.md">English</a> ·
-  <a href="#快速安装">快速安装</a> ·
-  <a href="docs/ARCHITECTURE.md">架构</a> ·
-  <a href="docs/INSTALL.md">安装文档</a> ·
-  <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">社区讨论</a>
+  <a href="#一键安装">一键安装</a> ·
+  <a href="docs/INSTALL.md">完整安装说明</a> ·
+  <a href="docs/TROUBLESHOOTING.md">故障排查</a> ·
+  <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
 
-MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 SIM 通信网关。它将蜂窝模块、USB 读卡器、IMS、EAP-AKA、eSIM、ModemManager 和 sing-box 整合进一个中英文 Web 控制台。
+`vmware` 分支面向 Windows x86_64 宿主机上的 VMware Workstation。Control 与 WebUI
+在 Linux 客户机中由 systemd 原生运行；只有每条 SIM 的 Engine 使用 rootful Docker。
+项目不使用 GitHub Actions、GitHub Release 自动更新、预编译 Control/Engine/WebUI 资产或
+Git LFS 交付包。首次安装和后续更新都在客户机本地从当前源码构建。
 
-| 真实 SIM 鉴权 | 通话与短信 | 多模块管理 | 独立国家出口 |
-|---|---|---|---|
-| 在物理 SIM/eSIM 内完成 EAP-AKA 与 IMS-AKA，不读取 Ki/OP/OPc | 浏览器软电话、短信收发、通话记录与来电通知 | 统一管理蜂窝模块、PC/SC 读卡器和 eUICC | 为不同 SIM 的 ePDG 路由分配独立国家 TUN，UDP 失败时不泄漏 |
+## 支持范围
 
-## 界面导览
+| 项目 | 支持范围 |
+|---|---|
+| CPU | x86_64 / amd64 |
+| 虚拟化 | VMware Workstation，桥接网络 |
+| 客户机 | Ubuntu 24.04、Ubuntu 26.04、Debian 12、Debian 13 |
+| Control / WebUI | Python venv + systemd，本机 8443/TCP |
+| Engine | rootful Docker，一条 SIM 一个容器 |
+| 智能卡 | 三体电子 SCR Prime `04d9:c001`，一张 SIM，VoWiFi-only |
+| 蜂窝模块 | 一个 Quectel 类 USB 复合设备，另一张 SIM，4G + VoWiFi |
+| 线路数 | 默认最多 13 条，管理员可设置 1–32；本部署同时运行两条 |
 
-![MDD Sim Gateway 中文界面导览（使用虚构演示数据）](assets/product-tour.zh-CN.gif)
+SCR Prime 没有蜂窝射频，因此不会出现 4G 开关。它只把 SIM 暴露为 PC/SC 智能卡，
+VoWiFi 认证、通话和可用的短信功能由该路径完成。4G 数据来自另一台 Quectel 类模块。
 
-<p align="center">概览 → 设备管理 → 浏览器通话 → 短信 → 余额与保号 → 系统更新　·　界面中的身份与内容均为虚构演示数据</p>
+## VMware 人工前置步骤
 
-## 快速安装
+安装脚本无法修改 VMware Workstation 图形界面的 USB 和网络设置。启动客户机前完成：
 
-推荐使用具备 systemd、Docker、USB 和稳定网络的 Debian、Ubuntu 或 Armbian ARM64 主机。
+1. VM 网卡使用“桥接”，不要使用 NAT；在路由器中按 VM 网卡 MAC 做 DHCP 地址保留。
+2. 建议配置 4 vCPU、8 GiB RAM、64 GiB 动态磁盘；扩大虚拟磁盘后还必须扩展客户机根分区
+   和文件系统，以 `df -h /` 为准。
+3. VM 设置中启用 USB 3.1 控制器。
+4. 从 Workstation 的可移动设备菜单，把 SCR Prime 和**整个 Quectel USB 复合设备**连接到
+   客户机；不能只把 Windows COM 口映射进去。
+5. 只为这两个确定的设备启用“随虚拟机连接”。不要启用“所有新 USB 设备自动连接”。
+6. Windows 的 VMware USB Arbitration Service 必须运行。设备连接到 VM 后，Windows 不应
+   再占用对应驱动。
 
-存储要求：根文件系统安装前至少应有 **4 GiB 可用空间**；建议使用 **16 GB 或更大**的系统盘，
-并在升级前保留约 **6 GiB**，以同时容纳新镜像和一代回滚镜像。开发 checkout 或显式源码构建
-还会产生更大的临时构建缓存，不适合空间紧张的设备。虚拟机只扩大虚拟硬盘还不够，必须同步
-扩展根分区和文件系统，并以 `df -h /` 显示的容量为准。
+## 一键安装
 
-```bash
-git clone https://github.com/MddIdd/mdd-sim-gateway.git
-cd mdd-sim-gateway
-sudo ./install.sh install
-```
-
-安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。
-
-> 本项目直接控制蜂窝模块、SIM、网络路由和 IMS。运营商是否开放 Wi‑Fi Calling 仍取决于套餐、区域、设备身份和网络策略。
-
-## 系统架构
-
-![MDD Sim Gateway 系统架构](docs/architecture.svg)
-
-## 完整截图
-
-<details>
-<summary>查看概览、设备、通话、短信、余额与保号及系统更新页面</summary>
-
-![MDD Sim Gateway 中文概览（使用虚构演示数据）](screenshots/overview-redacted.zh-CN.png)
-
-![MDD Sim Gateway 中文设备页（使用虚构演示数据）](screenshots/devices-redacted.zh-CN.png)
-
-![MDD Sim Gateway 中文通话页（使用虚构演示数据）](screenshots/calls-redacted.zh-CN.png)
-
-![MDD Sim Gateway 中文短信页（使用虚构演示数据）](screenshots/sms-redacted.zh-CN.png)
-
-![MDD Sim Gateway 中文余额与保号页（使用虚构演示数据）](screenshots/keepalive-redacted.zh-CN.png)
-
-![MDD Sim Gateway 中文系统更新页（使用虚构演示数据）](screenshots/settings-redacted.zh-CN.png)
-
-</details>
-
-## 核心能力
-
-- 自动识别蜂窝模块与普通 PC/SC 读卡器；模块可同时管理 4G 和 VoWiFi，读卡器仅显示其支持的 VoWiFi 能力。
-- 每个物理模块独立保存 4G、飞行模式和 VoWiFi 期望状态：4G 开关只控制移动数据承载，飞行模式单独控制射频，VoWiFi 独立启停；状态按各自 ModemManager 对象读取。
-- 在“余额与保号”页统一查看余额、套餐到期、在线状态和保号结果；预付费线路可定时发送一条真实计费短信，套餐线路可监测续费余额并在不足时提醒。
-- 后台每 6 小时检查新版本；可选择自动更新或仅提示更新。“全部版本”跟随获准推送的最新 Release，“仅主版本”跟随独立配置的稳定主版本，即使已有更新补丁也能补装该主版本。无人值守安装仍须由 `update-policy.json` 明确许可具体版本和最早执行时间。
-- 使用物理 SIM/eSIM 完成 EAP-AKA 与 IMS-AKA；不读取、不保存 Ki/OP/OPc，也不使用演示鉴权向量。
-- 自动读取 IMSI、ICCID、MCC/MNC、SIM SPN/GID 和模块 IMEI；使用内置 AOSP Carrier ID 数据离线识别宿主网络与部分 MVNO，PIN 开启时仅在本机加密边界内使用。
-- 每张模块 SIM 显式展示三条逻辑通道的容量、实际分配、用途和错误；部分分配失败会主动释放已打开通道。
-- 登录后使用的浏览器软电话、短信收发、通话记录、未接来电通知和可按线路启用的本地语音留言；录音只保存在网关，不随通知或支持包发送；不开放独立 SIP 客户端接入。
-- 可建立包含多个订阅、具体节点和 SOCKS5 的代理库，再为国家出口复用其中一项；Reality/XHTTP 节点由 Xray-core 兼容层承载，其余节点与国家 TUN 由 sing-box 管理。候选节点必须通过 UDP 健康检查，失败时按 SIM 故障关闭，不泄漏到错误国家。
-- 标准 GET/POST Webhook、Telegram（直连/手动代理/国家出口）、PushPlus 和飞书/Lark
-  自定义机器人（支持可选签名校验）；四个通道都可按
-  事件自定义标题与正文模板，并提供预览及对应事件的测试推送。
-- Telegram 仅用于单向推送来电、短信和设备状态通知，不接受远程控制指令。
-- 使用 lpac 管理 eUICC 配置文件；支持需要显式选择安全元件的双 SE 卡。
-- 中英文界面、HTTPS、首次管理员设置、可持久化的 12 小时或 30 天会话登录、CSRF、防暴力登录、审计记录、脱敏支持包、备份与版本检查。
-
-## 硬件模型
-
-| 设备 | 4G 数据 | Wi‑Fi Calling | SIM 访问方式 |
-|---|---:|---:|---|
-| 支持 ModemManager 的蜂窝模块 | ✓ | ✓ | 模块 AT/逻辑通道桥接 |
-| 大疆/Quectel EC25 类模块 | ✓ | ✓ | 自动识别并创建所需虚拟读卡通道 |
-| USB PC/SC 读卡器 | — | ✓ | 直接 PC/SC |
-| 三体电子 SCR Prime（`04d9:c001`） | — | ✓ | 直接 PC/SC；安装时使用 `patchprime` 驱动补丁 |
-| eUICC/eSIM 读卡器 | — | ✓ | PC/SC + lpac |
-
-三体电子 SCR Prime 已通过本项目实机验证；“支持”表示系统具备相应技术路径，不代表所有 SIM、固件或运营商都会放行。多模块 4G 使用独立 ModemManager 对象、NetworkManager 连接和 bearer。
-
-
-## 安装器会做什么
-
-安装脚本会自动：
-
-1. 检查并复用现有系统 Docker（没有时才从发行版安装），安装 pcscd、ModemManager/NetworkManager；
-2. 按架构下载 sing-box 1.13.15 与 Xray-core 26.3.27 并验证 SHA-256；
-3. 下载固定版本 lpac 2.3.0 源码并本地构建；
-4. 构建 MDD 控制面、WebUI 与每 SIM VoWiFi 引擎；
-5. 安装 systemd 服务并设置开机启动。
-
-已有 Docker 不会被升级、重配或清理；安装前会检查 rootless 模式、端口占用与容器归属，只管理带 MDD 标记的容器。
-
-常用命令：
+在客户机的普通用户终端执行；不要给 `wget` 或整个下载管道加 `sudo`：
 
 ```bash
-sudo ./install.sh status
-sudo ./install.sh logs
-sudo ./install.sh reload
-sudo ./install.sh build-lpac
-sudo ./install.sh uninstall
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
 ```
 
-完整说明见 [安装与升级](docs/INSTALL.md)，系统边界见 [架构说明](docs/ARCHITECTURE.md)，问题排查见 [故障排查](docs/TROUBLESHOOTING.md)。参与开发前请先读 [开发与协作规范](docs/DEVELOPMENT.md)。
+入口脚本先以当前用户下载 `vmware` 分支，再集中进行一次 `sudo` 权限确认，并从本地文件
+启动 root 安装器。它不会直接以 root 执行网络取得的标准输入。
 
-## 使用边界
+安装会执行完整 Engine 源码构建。Asterisk、pjproject、pcsc-lite 和 Python 依赖的首次无缓存
+构建可能需要几十分钟，具体取决于 CPU、内存、Docker Hub/GitHub 连接和软件源速度。
+不要在构建期间关闭终端、暂停 VM 或断开网络。
 
-> **合规警告：** 本软件仅供号码实名持有人在运营商明确允许的范围内自用。严禁用于诈骗、群呼、营销骚扰、验证码接收、号码或线路出租、代拨转接、隐藏实际控制地点，或向第三人提供电信服务。使用者必须遵守所在地法律、电话实名制和运营商协议；本项目不构成任何电信业务许可或运营商授权。MDD Sim Gateway 最多保存和运行 **5 条 SIM 线路**，不提供独立 SIP 账号或 Telegram 远程拨号、发短信及挂断功能。技术限制不代表某种使用方式当然合法。
+### 一键入口参数
 
-## 社区与反馈
+```text
+install | update | doctor
+--install-dir PATH
+--data-dir PATH
+--ref vmware|<40 位 commit>
+--require-scr-prime
+--require-cellular
+--configure-firewall
+--no-start
+--dry-run
+--yes
+```
 
-- 安装、硬件和运营商兼容性讨论：[GitHub Discussions](https://github.com/MddIdd/mdd-sim-gateway/discussions)
-- 可复现的缺陷或明确的功能请求：[GitHub Issues](https://github.com/MddIdd/mdd-sim-gateway/issues/new/choose)
-- 参与代码或文档贡献：[CONTRIBUTING.md](CONTRIBUTING.md)
+- `--install-dir`：受管 Git 工作树，默认 `/opt/mdd-sim-gateway`。
+- `--data-dir`：运行数据，默认 `/var/lib/mdd-sim-gateway`。
+- `--ref`：安装 `vmware` 或一个精确的 40 位提交；受管分支仍命名为 `vmware`，后续更新只
+  允许快进到 `origin/vmware`。
+- `--require-scr-prime`：USB、PC/SC、ATR 或热插拔任一门禁失败即停止。此门禁需要按提示
+  实际拔插设备，`--yes` 不会绕过硬件验收。
+- `--require-cellular`：ModemManager 未发现模块即停止。
+- `--configure-firewall`：仅在明确指定时写入 MDD 自有的精确端口规则；否则只打印清单。
+- `--no-start`：完成安装和构建，但不启动 MDD 服务。
+- `--dry-run`：显示参数和预检意图，不修改系统。
+- `--yes`：接受普通确认，不跳过 Git、网络、校验和、硬件或健康门禁。
 
-如果项目对你有用，欢迎在 GitHub 上收藏它，并分享经过脱敏的硬件或运营商兼容性结果。
+## 安装器做什么
 
-## 国家出口如何工作
+安装器会：
 
-先在“网络出口”的代理库中添加一个或多个订阅、具体节点或 SOCKS5 代理，再为 SIM 国家选择出口。订阅模式继续用关键词匹配**节点名称**并允许自动/固定节点；选择具体节点或 SOCKS5 时则直接使用该项。Reality/XHTTP 分享链接通过本机回环上的 Xray-core 接入，不向局域网开放端口。界面中的眼睛开关默认关闭，订阅地址、节点链接和 SOCKS5 信息均以星号遮挡。
+1. 只接受上述四个发行版和 x86_64，检查 systemd PID 1、内存、根文件系统、可用磁盘、
+   `/dev/net/tun` 和 8443 端口；低于 4 GiB RAM、12 GiB 可用空间或 20 GiB 根文件系统会停止。
+2. 在安装 NetworkManager 前记录默认路由、管理网卡、源地址和现有网络后端。若主网卡原本不由
+   NetworkManager 管理，只允许它管理 GSM 设备；安装后路由或 SSH 地址变化会回滚并停止。
+3. 从发行版安装 `docker.io`、ModemManager、NetworkManager、pcscd、libccid 和编译依赖；
+   不替换 Docker daemon 配置，不清理或操作其他项目容器。
+4. 固定版本并校验 SHA-256 后安装 sing-box、Xray-core，编译 vsmartcard VPCD 与 lpac。
+5. 先检测 SCR Prime 是否已被系统 libccid 原生识别；只有 USB 可见而 PC/SC 不可见时，
+   才构建 CCID 1.6.2 并且只应用 `03_scr_prime_reader.patch`。安装器不会对 SCR Prime 使用
+   HSIC 的 `01_hsic_slot_status.patch` 或 `02_hsic_malformed_atr.patch`。
+6. 在固定版本和 amd64 digest 的 Node 容器中执行 `npm ci && npm run build`，在临时 venv 中安装 Control，构建带
+   当前提交 SHA 标签的 Engine；检查 amd64 架构、产品版本、源码和镜像身份、两类指纹、Asterisk、模块数量、
+   Python 依赖以及 `/dev/net/tun + NET_ADMIN` 后才切换稳定版本。
+7. 安装并启用原生 Control 与 host orchestrator systemd 服务，以及唯一管理入口 `mddctl`。
 
-系统对所有非直连出口额外验证 UDP 能力，因为 IKEv2/ESP NAT 穿越依赖 UDP 500/4500。每个国家使用独立 TUN（例如 `mdd-jp`），只有对应 SIM 的 ePDG 路由进入该接口。
+安装器不会下载项目的 Engine/Control tar 包，不会读取 GitHub Release API，也不会把
+`webui/dist`、venv、Node 模块、运行数据或构建缓存提交到 Git。
 
-## 安全与隐私
+## SCR Prime 驱动策略
 
-- 管理端默认 HTTPS，首次设置管理员密码，密码使用 scrypt 加盐保存。
-- 会话 Cookie 为 HttpOnly/Secure/SameSite=Strict；修改请求要求 CSRF 令牌。
-- 引擎事件使用安装级随机令牌，不接受未认证回调。
-- 支持包会移除 IMSI、ICCID、EID、号码、PIN、Token、URL、激活码、密钥与消息正文；分享前仍应人工复核。
-- 运行数据目录只允许 root 访问，含凭据的配置与线路文件以 `0600` 权限原子写入。
-- 不提供 Ki/OP/OPc 输入或软件 Milenage 路径，AKA 密钥留在 SIM/eSIM 内。
-- 订阅 URL、通知 Token、SIM PIN 和运营商身份属于敏感数据；不要提交 `data/`、`.env` 或真实截图。
+SCR Prime 的验收链是：
 
-安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，数据处理边界见 [PRIVACY.md](PRIVACY.md)。
+```text
+VMware USB 直通 → lsusb 04d9:c001 → pcscd → pcsc_scan → ATR → 拔插恢复
+```
 
-## 开源与致谢
+- 系统 libccid 已识别：记录 `native`，不打补丁、不 hold 软件包。
+- USB 可见但 PC/SC 不可见：备份现有 bundle，应用补丁 03，记录包版本、备份路径、补丁集
+  与安装前后哈希；只有确实覆盖发行版所属 bundle 时才新增 `libccid` hold。
+- 驱动重启前发布 PC/SC 维护标记，避免控制面把计划内重载误判成物理拔卡。
+- `mddctl update` 会重新探测发行版驱动；若已经原生支持 SCR Prime，则恢复发行版版本并
+  解除 hold，否则继续使用经过哈希验证的补丁版本。
+- `mddctl driver restore` 只有在 root 元数据证明文件由 MDD 修改且当前哈希仍匹配时才执行。
 
-MDD Sim Gateway 以 **GPL-3.0-only** 发布。它包含或调用多个独立上游组件，各自仍遵循原许可证；完整清单见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) 和 [NOTICE](NOTICE)。
+查看状态或恢复：
 
-特别感谢：
+```bash
+sudo mddctl driver status
+sudo mddctl driver restore
+```
 
-- [pagecat/vowifi_gateway](https://github.com/pagecat/vowifi_gateway)：本项目的上游基础（MIT）——VoWiFi 引擎与管理端/引擎/WebUI 的整体架构源自该项目；本项目在其之上增加了 4G 蜂窝数据与短信、按国家的网络出口路由、统一设备管理与自动开通、故障转移以及测试体系；
-- [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)：SWu IKEv2/IPsec 基础实现；
-- [phcoder/asterisk-docker](https://github.com/phcoder/asterisk-docker) 与 [sysmocom Asterisk](https://gitea.sysmocom.de/sysmocom/asterisk)、[sysmocom pjproject](https://gitea.sysmocom.de/sysmocom/pjproject)：IMS-AKA、语音和短信；
-- [mitshell/card](https://github.com/mitshell/card)：USIM/PCSC 辅助代码；
-- [SagerNet/sing-box](https://github.com/SagerNet/sing-box)：国家代理出口；
-- [estkme-group/lpac](https://github.com/estkme-group/lpac)：eSIM LPA；
-- [LudovicRousseau/PCSC](https://github.com/LudovicRousseau/PCSC)、[CCID](https://github.com/LudovicRousseau/CCID) 与 [pyscard](https://github.com/LudovicRousseau/pyscard)：智能卡基础设施；
-- [frankmorgner/vsmartcard](https://github.com/frankmorgner/vsmartcard)：虚拟 PC/SC 驱动（vpcd），4G 模组 SIM 槽位的基础。
+## 日常管理
 
-本项目不是上述项目、运营商或设备厂商的官方产品，也不受其背书。
+```text
+mddctl status
+mddctl doctor [--json]
+mddctl start|stop|restart|logs
+mddctl update [--no-cache]
+mddctl backup [--output PATH]
+mddctl restore --input PATH
+mddctl driver status|restore
+mddctl uninstall [--purge]
+```
+
+通常通过 `sudo mddctl ...` 执行。`doctor --json` 只输出服务、Docker/TUN、SCR Prime 与
+蜂窝模块的布尔状态和源码版本，不输出 IMSI、ICCID、IMEI、号码、凭据或消息正文。
+
+### 本地更新与回滚
+
+`mddctl update` 不访问 Release API。它要求 `/opt` 中是受管的干净 `vmware` 工作树、remote
+精确匹配且没有进行中的 Git 操作，然后获取 `origin/vmware`。只有当前 HEAD 是远端祖先时
+才允许 `--ff-only` 更新；分叉、认证失败和网络失败都会停止，不 merge、rebase 或强推。
+
+新提交先在临时 Git worktree 中完成 Shell/Python 检查、单元测试、WebUI/venv/Engine 构建。
+全部通过后才备份数据、停止服务、快进源码并切换产物。HTTPS、systemd、镜像身份、TUN 或
+必需硬件门禁失败时，工具恢复旧提交、旧 venv/WebUI/Engine 和更新前数据快照，再启动旧版。
+
+### 备份与整机迁移
+
+`mddctl backup` 会停止 MDD，确认 Engine 全停，对 SQLite 执行 WAL checkpoint 与 integrity
+check，再生成 root-only `tar.gz`、SHA-256 和不含秘密的 manifest；随后恢复此前运行状态。
+`restore` 会校验摘要、manifest、归档路径和 SQLite，把原数据保留为
+`.pre-restore-<时间>`，原子替换后执行健康检查，失败自动恢复旧数据。
+
+> 备份包包含明文 SIM PIN、通知令牌、代理凭据和其他运行秘密。只能保存到 BitLocker、
+> 加密移动盘或其他访问受控的加密介质。私有 Git 仓库不是加密存储。
+
+整机迁移的首选方式仍是：`sudo mddctl stop`，关闭 Linux 客户机，再从 VMware 导出或复制
+整个 VM。机器专属的 USB、桥接网卡 MAC、DHCP 保留和防火墙配置不会随数据归档迁移。
+
+## 两条线路与端口
+
+第一条线路使用 SCR Prime，配置为 VoWiFi-only；第二条线路使用 Quectel，配置为
+4G + VoWiFi。自动分配器会探测真实 TCP/UDP 占用并为每条线路选择不同端口块。默认前两块为：
+
+```text
+8443/tcp              Control/WebUI
+8089/tcp, 8099/tcp    WebRTC/WSS
+10000-10011/udp       第 1 条线路 RTP/RTCP
+12000-12011/udp       第 2 条线路 RTP/RTCP
+```
+
+安装器不会宽泛重写 UFW/nftables。以上是无冲突时的默认值；安装时会根据已有线路和真实
+TCP/UDP 占用计算两条线路的精确清单。未指定 `--configure-firewall` 时只打印，不写规则。
+
+## 验收状态
+
+仓库内的静态、Python 和 WebUI 门禁可自动运行，但下面各项只能在真实 VMware 客户机和硬件
+上确认，不能由源码审查替代：
+
+- 四个发行版分别从全新 VM 安装、重复安装、无更新、真实快进和失败回滚；
+- 安装前后桥接地址、默认路由和 DHCP 保留地址不变；
+- SCR Prime 的 USB、PC/SC、ATR、拔插和宿主机重启恢复；
+- Quectel 的 USB 拓扑、tty/WWAN、ModemManager、NetworkManager bearer 与 IP；
+- 两条线路同时 IMS 注册、呼入/呼出、浏览器双向音频及各自可用的短信路径。
+
+完整操作见 [安装文档](docs/INSTALL.md)，逐层诊断见
+[故障排查](docs/TROUBLESHOOTING.md)。
+
+## 安全与使用边界
+
+- 仅供号码实名持有人在法律、运营商和套餐明确允许的范围内自用；不得用于诈骗、群呼、
+  验证码收集、线路出租、代拨转接或向第三方提供电信服务。
+- AKA 密钥始终留在 SIM/eSIM 内；项目不读取或保存 Ki/OP/OPc。
+- `max_sim_lines` 默认 13、合法范围 1–32。降低上限保留已有记录，但超限线路不能启动。
+- 支持包和 `doctor --json` 必须脱敏；分享日志和截图前仍需人工复核。
+- Control 默认使用自签名 HTTPS。首次打开 `https://<VM 保留地址>:8443` 后立即创建管理员。
+
+本项目以 GPL-3.0-only 发布。CCID 补丁属于 CCID 的 LGPL-2.1-or-later 衍生内容，详见
+[patches/ccid/README.md](patches/ccid/README.md)、[NOTICE](NOTICE) 和
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。

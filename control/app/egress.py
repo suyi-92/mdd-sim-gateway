@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import ipaddress
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import struct
@@ -29,6 +31,7 @@ _DESIRED = os.path.join(_ORCH_DIR, "desired.json")
 _STATUS = os.path.join(_ORCH_DIR, "proxy-status.json")
 _RESELECT = os.path.join(_ORCH_DIR, "exit-reselect.json")
 _STALLED = os.path.join(_ORCH_DIR, "exit-stalled.json")
+_TEST_REQUEST_DIR = os.path.join(_ORCH_DIR, "exit-test-requests")
 # A line healthy at least this long has proved its exit node can carry IMS.
 RESELECT_MIN_STABLE_SECONDS = float(os.environ.get("MDD_EXIT_RESELECT_MIN_STABLE", "600"))
 
@@ -530,6 +533,50 @@ def publish(instances: list[dict] | None = None, settings: dict | None = None) -
     return document
 
 
+def request_test(country: str, ttl: float = 45.0) -> tuple[str, float]:
+    """Temporarily ask the host to run one configured country exit.
+
+    An exit normally exists only while at least one VoWiFi line needs it.  The settings page
+    must still be able to test a newly configured exit before that line is enabled, so publish
+    a short-lived, country-scoped request instead of making every configured exit permanent.
+    The opaque token prevents an older HTTP request from cancelling a newer test of the same
+    country in its ``finally`` block.
+    """
+    country = normalize_country(country)
+    if not country:
+        raise ValueError("invalid country exit")
+    now = time.time()
+    token = secrets.token_hex(12)
+    path = os.path.join(_TEST_REQUEST_DIR, f"{country}.json")
+    _atomic_json(path, {
+        "version": 1,
+        "country": country,
+        "token": token,
+        "requested_at": now,
+        "expires_at": now + max(10.0, min(float(ttl), 90.0)),
+    })
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return token, now
+
+
+def finish_test(country: str, token: str) -> bool:
+    """Release a temporary exit test without cancelling a newer request."""
+    country = normalize_country(country)
+    if not country or not token:
+        return False
+    path = os.path.join(_TEST_REQUEST_DIR, f"{country}.json")
+    if str(_read_json(path).get("token") or "") != str(token):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
 def status() -> dict:
     return _read_json(_STATUS)
 
@@ -626,7 +673,33 @@ def ensure_line(inst: dict, settings: dict, timeout: float = 18.0) -> dict:
         state = status()
         last = (state.get("lines") or {}).get(iid) or {}
         if last.get("ready"):
-            return last
+            mode = str(last.get("mode") or "")
+            if mode in {"direct", "legacy"}:
+                return last
+            if mode == "disabled":
+                if not inst.get("enabled", True):
+                    return last
+                # A newly discovered eSIM profile is first published as a disabled draft,
+                # then promoted and enabled a few milliseconds later. The orchestrator may
+                # still expose that draft snapshot when Engine startup begins. Returning it
+                # made engine.start reject the empty address list immediately; a manual retry
+                # seconds later worked after reconciliation. Treat only this enabled/disabled
+                # disagreement as pending and keep the existing bounded wait.
+                last = {**last, "error": "country exit has not applied the enabled line yet"}
+            public = []
+            for value in last.get("addresses") or []:
+                try:
+                    address = ipaddress.IPv4Address(str(value))
+                except ipaddress.AddressValueError:
+                    continue
+                if address.is_global:
+                    public.append(str(address))
+            if public:
+                return last
+            # A service restart may leave one ready snapshot containing the Fake-IP that caused
+            # the previous failure. Wait for the host reconciler to publish its proxy-DoH answer
+            # instead of creating an Engine that can only repeat the same broken lookup.
+            last = {**last, "error": "country exit has not published a public ePDG address yet"}
         # A terminal config error should be returned immediately; DNS/probe errors may recover.
         if last.get("terminal"):
             break

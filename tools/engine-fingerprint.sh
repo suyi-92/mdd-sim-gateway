@@ -1,8 +1,8 @@
 #!/bin/sh
-# Print the content fingerprint used to match a distributed Engine image to this checkout.
+# Print the content fingerprint used to match a locally built Engine image to this checkout.
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 engine_dir="$repo_dir/engine"
 kind=${1:-}
 

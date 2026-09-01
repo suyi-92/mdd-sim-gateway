@@ -1,0 +1,789 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Sole host-management entry point for the VMware edition.
+set -Eeuo pipefail
+umask 077
+
+readonly MANAGED_ENV=/etc/mdd-sim-gateway/managed.env
+readonly CONTROL_UNIT=mdd-sim-gateway-control.service
+readonly ORCHESTRATOR_UNIT=mdd-sim-gateway-orchestrator.service
+readonly ENGINE_STABLE_IMAGE=mdd-sim-gateway/engine:latest
+readonly MANAGED_LABEL=io.mdd-sim-gateway.managed=true
+
+info() { printf '==> %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mddctl status
+  mddctl doctor [--json]
+  mddctl start | stop | restart | logs
+  mddctl update [--no-cache] [--dry-run] [--yes]
+  mddctl backup [--output PATH]
+  mddctl restore --input PATH
+  mddctl driver status | restore
+  mddctl uninstall [--purge]
+EOF
+}
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die "run mddctl through sudo"
+[[ -r "$MANAGED_ENV" ]] || die "managed installation metadata is missing: $MANAGED_ENV"
+
+INSTALL_DIR="" DATA_DIR="" BACKUP_DIR="" STATE_DIR="" CACHE_DIR="" ORIGIN_URL="" BRANCH=""
+REQUIRE_SCR_PRIME=0 REQUIRE_CELLULAR=0
+while IFS= read -r line; do
+  [[ "$line" =~ ^([A-Z_]+)=([^[:space:]]+)$ ]] || continue
+  key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+  case "$key" in
+    INSTALL_DIR|DATA_DIR|BACKUP_DIR|STATE_DIR|CACHE_DIR|ORIGIN_URL|BRANCH|REQUIRE_SCR_PRIME|REQUIRE_CELLULAR)
+      printf -v "$key" '%s' "$value" ;;
+  esac
+done < "$MANAGED_ENV"
+
+validate_managed_path() {
+  local value=$1 label=$2
+  [[ "$value" == /* && "$value" != / && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || \
+    die "unsafe $label in managed metadata"
+}
+validate_managed_path "$INSTALL_DIR" INSTALL_DIR
+validate_managed_path "$DATA_DIR" DATA_DIR
+validate_managed_path "$BACKUP_DIR" BACKUP_DIR
+validate_managed_path "$STATE_DIR" STATE_DIR
+validate_managed_path "$CACHE_DIR" CACHE_DIR
+managed_paths=("$INSTALL_DIR" "$DATA_DIR" "$BACKUP_DIR" "$STATE_DIR" "$CACHE_DIR")
+for managed_path in "${managed_paths[@]}"; do
+  [[ "$managed_path" == "$(realpath -m "$managed_path")" ]] || die "managed metadata contains a non-canonical path"
+done
+for ((managed_i = 0; managed_i < ${#managed_paths[@]}; managed_i++)); do
+  for ((managed_j = managed_i + 1; managed_j < ${#managed_paths[@]}; managed_j++)); do
+    managed_first=${managed_paths[$managed_i]}; managed_second=${managed_paths[$managed_j]}
+    case "$managed_first" in "$managed_second"|"$managed_second"/*) die "managed metadata directories overlap" ;; esac
+    case "$managed_second" in "$managed_first"|"$managed_first"/*) die "managed metadata directories overlap" ;; esac
+  done
+done
+[[ "$ORIGIN_URL" == https://github.com/suyi-92/mdd-sim-gateway.git ]] || die "managed origin metadata is invalid"
+[[ "$BRANCH" == vmware ]] || die "managed branch metadata is invalid"
+readonly ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"
+
+command=${1:-}
+[[ -n "$command" ]] || { usage; exit 2; }
+shift
+
+acquire_lock() {
+  install -d -m 0755 /run/lock
+  exec 9>/run/lock/mdd-sim-gateway.lock
+  flock -n 9 || die "another mddctl operation is running"
+}
+
+service_is_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+managed_containers() { docker ps -aq --filter "label=$MANAGED_LABEL" --filter 'label=io.mdd-sim-gateway.component=engine'; }
+running_managed_containers() { docker ps -q --filter "label=$MANAGED_LABEL" --filter 'label=io.mdd-sim-gateway.component=engine'; }
+
+remember_run_state() {
+  CONTROL_WAS_ACTIVE=0 ORCHESTRATOR_WAS_ACTIVE=0
+  service_is_active "$CONTROL_UNIT" && CONTROL_WAS_ACTIVE=1
+  service_is_active "$ORCHESTRATOR_UNIT" && ORCHESTRATOR_WAS_ACTIVE=1
+}
+
+stop_runtime() {
+  systemctl stop "$ORCHESTRATOR_UNIT" >/dev/null 2>&1 || warn "systemd reported an error while stopping $ORCHESTRATOR_UNIT"
+  systemctl stop "$CONTROL_UNIT" >/dev/null 2>&1 || warn "systemd reported an error while stopping $CONTROL_UNIT"
+  service_is_active "$ORCHESTRATOR_UNIT" && die "$ORCHESTRATOR_UNIT did not stop"
+  service_is_active "$CONTROL_UNIT" && die "$CONTROL_UNIT did not stop"
+  local output
+  local -a ids=()
+  output=$(running_managed_containers) || die "could not list running managed Engine containers"
+  [[ -z "$output" ]] || mapfile -t ids <<< "$output"
+  ((${#ids[@]} == 0)) || docker stop "${ids[@]}" >/dev/null
+  output=$(running_managed_containers) || die "could not verify managed Engine container state"
+  [[ -z "$output" ]] || die "managed Engine containers did not stop"
+}
+
+start_runtime() {
+  systemctl start "$ORCHESTRATOR_UNIT" || return 1
+  if ! systemctl start "$CONTROL_UNIT"; then
+    systemctl stop "$ORCHESTRATOR_UNIT" >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+restore_run_state() {
+  local failed=0
+  if ((ORCHESTRATOR_WAS_ACTIVE)); then systemctl start "$ORCHESTRATOR_UNIT" || failed=1; fi
+  if ((CONTROL_WAS_ACTIVE)); then systemctl start "$CONTROL_UNIT" || failed=1; fi
+  return "$failed"
+}
+
+archive_tool() {
+  [[ -f "$ARCHIVE_TOOL" ]] || die "archive helper is missing: $ARCHIVE_TOOL"
+  python3 "$ARCHIVE_TOOL" "$@"
+}
+
+pcsc_scan_capture() { LC_ALL=C timeout "${1:-8}" pcsc_scan -n 2>&1 || true; }
+scr_pcsc_visible() { pcsc_scan_capture 8 | grep -Eiq 'SCR[[:space:]_-]*Prime'; }
+
+https_healthy() {
+  curl --fail --silent --insecure --max-time 12 https://127.0.0.1:8443/api/auth/status >/dev/null 2>&1
+}
+
+health_check() {
+  local commit active_commit image_commit
+  service_is_active "$CONTROL_UNIT" || return 1
+  service_is_active "$ORCHESTRATOR_UNIT" || return 1
+  https_healthy || return 1
+  [[ -c /dev/net/tun ]] || return 1
+  docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1 || return 1
+  commit=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null) || return 1
+  active_commit=$(tr -d '\r\n' < "$STATE_DIR/active-commit" 2>/dev/null) || return 1
+  image_commit=$(docker image inspect "$ENGINE_STABLE_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null) || return 1
+  [[ "$commit" == "$active_commit" && "$commit" == "$image_commit" ]] || return 1
+  docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh \
+    "$ENGINE_STABLE_IMAGE" -c 'test -c /dev/net/tun' >/dev/null 2>&1 || return 1
+  if [[ "$REQUIRE_SCR_PRIME" == 1 ]]; then
+    lsusb -d 04d9:c001 >/dev/null 2>&1 && scr_pcsc_visible || return 1
+  fi
+  if [[ "$REQUIRE_CELLULAR" == 1 ]]; then
+    mmcli -L 2>/dev/null | grep -q '/Modem/' || return 1
+  fi
+}
+
+cmd_status() {
+  local version commit control orchestrator containers driver_mode modem usb
+  version=$(tr -d '\r\n' < "$INSTALL_DIR/VERSION" 2>/dev/null || printf unknown)
+  commit=$(git -C "$INSTALL_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+  control=$(systemctl is-active "$CONTROL_UNIT" 2>/dev/null || true)
+  orchestrator=$(systemctl is-active "$ORCHESTRATOR_UNIT" 2>/dev/null || true)
+  containers=$(running_managed_containers 2>/dev/null | wc -w)
+  driver_mode=$(cat "$STATE_DIR/scr-prime-mode" 2>/dev/null || printf absent)
+  lsusb -d 04d9:c001 >/dev/null 2>&1 && usb=visible || usb=missing
+  mmcli -L 2>/dev/null | grep -q '/Modem/' && modem=visible || modem=missing
+  cat <<EOF
+MDD Sim Gateway $version ($commit)
+  Control:       $control
+  Orchestrator:  $orchestrator
+  Engine:        $containers running container(s)
+  SCR Prime:     USB $usb, driver $driver_mode
+  Cellular:      $modem
+  WebUI:         https://$(hostname -I 2>/dev/null | awk '{print $1}'):8443
+EOF
+}
+
+cmd_doctor() {
+  local json=0 dry_run=0
+  while (($#)); do case "$1" in --json) json=1 ;; --dry-run) dry_run=1 ;; *) die "unknown doctor option: $1" ;; esac; shift; done
+  local version commit control=0 orchestrator=0 https=0 tun=0 docker_ok=0 docker_rootful=0
+  local engine_image=0 engine_identity=0 engine_tun=0 scr_usb=0 scr_pcsc=0 cellular=0 driver_mode image_commit active_commit
+  version=$(tr -d '\r\n' < "$INSTALL_DIR/VERSION" 2>/dev/null || printf unknown)
+  commit=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || printf unknown)
+  service_is_active "$CONTROL_UNIT" && control=1
+  service_is_active "$ORCHESTRATOR_UNIT" && orchestrator=1
+  https_healthy && https=1
+  [[ -c /dev/net/tun ]] && tun=1
+  docker info >/dev/null 2>&1 && docker_ok=1
+  if ((docker_ok)) && ! docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -qi rootless; then docker_rootful=1; fi
+  if ((docker_ok)) && docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1; then engine_image=1; fi
+  if ((engine_image)); then
+    image_commit=$(docker image inspect "$ENGINE_STABLE_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+    active_commit=$(tr -d '\r\n' < "$STATE_DIR/active-commit" 2>/dev/null || true)
+    [[ "$commit" == "$image_commit" && "$commit" == "$active_commit" ]] && engine_identity=1
+  fi
+  if ((engine_image && tun)); then
+    docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh \
+      "$ENGINE_STABLE_IMAGE" -c 'test -c /dev/net/tun' >/dev/null 2>&1 && engine_tun=1
+  fi
+  lsusb -d 04d9:c001 >/dev/null 2>&1 && scr_usb=1
+  ((scr_usb)) && scr_pcsc_visible && scr_pcsc=1
+  mmcli -L 2>/dev/null | grep -q '/Modem/' && cellular=1
+  driver_mode=$(cat "$STATE_DIR/scr-prime-mode" 2>/dev/null || printf absent)
+  if ((json)); then
+    python3 - "$version" "$commit" "$control" "$orchestrator" "$https" "$tun" \
+      "$docker_ok" "$docker_rootful" "$engine_image" "$engine_identity" "$engine_tun" \
+      "$scr_usb" "$scr_pcsc" "$cellular" "$driver_mode" <<'PY'
+import json, sys
+(version, commit, control, orchestrator, https, tun, docker_ok, docker_rootful,
+ engine_image, engine_identity, engine_tun, scr_usb, scr_pcsc, cellular, driver_mode) = sys.argv[1:]
+b = lambda value: value == "1"
+print(json.dumps({
+    "version": version, "source_commit": commit,
+    "services": {"control": b(control), "orchestrator": b(orchestrator)},
+    "https": b(https), "tun": b(tun),
+    "docker": {"available": b(docker_ok), "rootful": b(docker_rootful),
+               "engine_image": b(engine_image), "engine_identity": b(engine_identity),
+               "engine_tun": b(engine_tun)},
+    "scr_prime": {"usb_visible": b(scr_usb), "pcsc_visible": b(scr_pcsc),
+                  "driver_mode": driver_mode},
+    "cellular": {"modem_visible": b(cellular)},
+}, sort_keys=True))
+PY
+  else
+    printf 'Control systemd:      %s\n' "$([[ $control == 1 ]] && echo PASS || echo FAIL)"
+    printf 'Orchestrator systemd: %s\n' "$([[ $orchestrator == 1 ]] && echo PASS || echo FAIL)"
+    printf 'HTTPS 8443:           %s\n' "$([[ $https == 1 ]] && echo PASS || echo FAIL)"
+    printf '/dev/net/tun:         %s\n' "$([[ $tun == 1 ]] && echo PASS || echo FAIL)"
+    printf 'Docker rootful:       %s\n' "$([[ $docker_rootful == 1 ]] && echo PASS || echo FAIL)"
+    printf 'Engine image/identity/TUN: %s/%s/%s\n' "$engine_image" "$engine_identity" "$engine_tun"
+    printf 'SCR Prime USB/PCSC:   %s/%s (%s)\n' "$scr_usb" "$scr_pcsc" "$driver_mode"
+    printf 'Cellular modem:       %s\n' "$cellular"
+    ((dry_run)) && info "doctor dry-run completed without changes"
+  fi
+  ((control && orchestrator && https && tun && docker_rootful && engine_image && engine_identity && engine_tun)) || return 1
+  [[ "$REQUIRE_SCR_PRIME" != 1 || $scr_pcsc == 1 ]] || return 1
+  [[ "$REQUIRE_CELLULAR" != 1 || $cellular == 1 ]] || return 1
+}
+
+backup_archive() {
+  local output=$1 restart_after=${2:-1} created_at temp="" checksum_temp=""
+  local checksum version commit transaction_armed=0 published=0
+  [[ "$output" == /* ]] || output=$(realpath -m "$output")
+  validate_managed_path "$output" "backup output"
+  case "$output" in "$DATA_DIR"|"$DATA_DIR"/*) die "backup output may not be inside the data directory" ;; esac
+  case "$output" in "$INSTALL_DIR"|"$INSTALL_DIR"/*|"$STATE_DIR"|"$STATE_DIR"/*|"$CACHE_DIR"|"$CACHE_DIR"/*)
+    die "backup output may not be inside managed source, state or cache directories" ;;
+  esac
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || die "managed data directory is missing or is a symbolic link"
+  [[ ! -e "$output" && ! -L "$output" && ! -e "$output.sha256" && ! -L "$output.sha256" ]] || \
+    die "backup output or checksum sidecar already exists"
+  install -d -m 0700 "$(dirname "$output")"
+  remember_run_state
+  transaction_armed=1
+  backup_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    [[ -z "$temp" ]] || rm -f -- "$temp"
+    [[ -z "$checksum_temp" ]] || rm -f -- "$checksum_temp"
+    if ((published)); then rm -f -- "$output" "$output.sha256"; fi
+    if ((transaction_armed)); then restore_run_state || true; fi
+    exit "$code"
+  }
+  trap 'backup_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  stop_runtime
+  created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  version=$(tr -d '\r\n' < "$INSTALL_DIR/VERSION")
+  commit=$(git -C "$INSTALL_DIR" rev-parse HEAD)
+  temp=$(mktemp "$(dirname "$output")/.mdd-backup.XXXXXX")
+  archive_tool create "$DATA_DIR" "$temp" "$version" "$commit" "$created_at"
+  chmod 0600 "$temp"
+  checksum=$(sha256sum "$temp" | awk '{print $1}')
+  checksum_temp=$(mktemp "$(dirname "$output")/.mdd-checksum.XXXXXX")
+  printf '%s  %s\n' "$checksum" "$(basename "$output")" > "$checksum_temp"
+  chmod 0600 "$checksum_temp"
+  mv -- "$temp" "$output"; temp=""; published=1
+  mv -- "$checksum_temp" "$output.sha256"; checksum_temp=""
+  ((restart_after)) && restore_run_state
+  transaction_armed=0
+  trap - EXIT HUP INT TERM
+  info "backup written: $output"
+}
+
+cmd_backup() {
+  local output=""
+  while (($#)); do case "$1" in --output) (($# >= 2)) || die "--output requires PATH"; output=$2; shift 2 ;; *) die "unknown backup option: $1" ;; esac; done
+  acquire_lock
+  install -d -m 0700 "$BACKUP_DIR"
+  output=${output:-$BACKUP_DIR/mdd-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz}
+  backup_archive "$output" 1
+  warn "the archive contains plaintext credentials; store it only on encrypted, controlled media"
+}
+
+verify_and_extract_archive() {
+  local input=$1 destination=$2 expected actual
+  [[ -f "$input" && -f "$input.sha256" ]] || die "backup and .sha256 sidecar are both required"
+  expected=$(awk 'NR==1 {print $1}' "$input.sha256")
+  actual=$(sha256sum "$input" | awk '{print $1}')
+  [[ "$expected" =~ ^[0-9a-f]{64}$ && "$actual" == "$expected" ]] || die "backup SHA-256 verification failed"
+  archive_tool verify-extract "$input" "$destination"
+}
+
+restore_archive() {
+  local input=$1 restart_after=${2:-1} stage="" old="" failed_data="" timestamp
+  local switched=0 runtime_remembered=0
+  [[ "$input" == /* ]] || input=$(realpath "$input")
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || die "managed data directory is missing or is a symbolic link"
+  stage=$(mktemp -d "$(dirname "$DATA_DIR")/.mdd-restore.XXXXXX")
+  restore_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    if ((runtime_remembered)); then stop_runtime >/dev/null 2>&1 || true; fi
+    if ((switched)) && [[ -n "$old" && -d "$old" ]]; then
+      if [[ -e "$DATA_DIR" ]]; then
+        failed_data="${DATA_DIR}.failed-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        mv -- "$DATA_DIR" "$failed_data" || true
+      fi
+      if mv -- "$old" "$DATA_DIR"; then
+        switched=0
+        warn "restore failed; previous data was put back"
+      else
+        warn "automatic data rollback failed; previous data remains at $old"
+      fi
+    fi
+    [[ -z "$stage" || ! -d "$stage" ]] || rm -rf -- "$stage"
+    if ((runtime_remembered)); then
+      restore_run_state || true
+      if ((CONTROL_WAS_ACTIVE && ORCHESTRATOR_WAS_ACTIVE)); then
+        health_check || warn "previous data was restored but the old runtime health check failed"
+      fi
+    fi
+    exit "$code"
+  }
+  trap 'restore_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  verify_and_extract_archive "$input" "$stage"
+  remember_run_state
+  runtime_remembered=1
+  stop_runtime
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ); old="${DATA_DIR}.pre-restore-${timestamp}"
+  [[ ! -e "$old" ]] || die "restore preservation path already exists: $old"
+  mv -- "$DATA_DIR" "$old"
+  switched=1
+  mv -- "$stage/data" "$DATA_DIR"
+  chown -R root:root "$DATA_DIR"; chmod 0700 "$DATA_DIR"
+  rm -rf -- "$stage"; stage=""
+  if ((restart_after)); then
+    start_runtime
+    if ! health_check; then
+      warn "restored data failed health checks; rolling back"
+      return 1
+    fi
+  fi
+  switched=0
+  trap - EXIT HUP INT TERM
+  info "restore complete; previous data retained at $old"
+}
+
+cmd_restore() {
+  local input=""
+  while (($#)); do case "$1" in --input) (($# >= 2)) || die "--input requires PATH"; input=$2; shift 2 ;; *) die "unknown restore option: $1" ;; esac; done
+  [[ -n "$input" ]] || die "restore requires --input PATH"
+  acquire_lock
+  restore_archive "$input" 1
+}
+
+git_operation_in_progress() {
+  local name path
+  for name in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+    path=$(git -C "$INSTALL_DIR" rev-parse --git-path "$name")
+    [[ -e "$path" ]] && return 0
+  done
+  path=$(git -C "$INSTALL_DIR" rev-parse --git-path rebase-merge); [[ -d "$path" ]] && return 0
+  path=$(git -C "$INSTALL_DIR" rev-parse --git-path rebase-apply); [[ -d "$path" ]] && return 0
+  return 1
+}
+
+validate_managed_checkout() {
+  git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$INSTALL_DIR is not a Git checkout"
+  [[ $(git -C "$INSTALL_DIR" remote get-url origin) == "$ORIGIN_URL" ]] || die "origin URL does not exactly match $ORIGIN_URL"
+  [[ $(git -C "$INSTALL_DIR" branch --show-current) == "$BRANCH" ]] || die "managed checkout is not on $BRANCH"
+  git_operation_in_progress && die "a Git operation is in progress"
+  [[ -z $(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal) ]] || die "managed checkout has non-ignored changes"
+}
+
+tree_hash() {
+  local root=$1
+  python3 - "$root" <<'PY'
+import hashlib, os, stat, sys
+root = os.path.realpath(sys.argv[1])
+if not os.path.isdir(root):
+    raise SystemExit(f"tree is missing: {root}")
+digest = hashlib.sha256()
+items = []
+for base, directories, files in os.walk(root, followlinks=False):
+    directories.sort(); files.sort()
+    items.extend(os.path.join(base, name) for name in directories)
+    items.extend(os.path.join(base, name) for name in files)
+for path in sorted(items):
+    metadata = os.lstat(path)
+    relative = os.path.relpath(path, root).replace(os.sep, "/")
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"tree contains a symbolic link: {relative}")
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = "d"; size = 0
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "f"; size = metadata.st_size
+    else:
+        raise SystemExit(f"tree contains an unsupported path: {relative}")
+    digest.update(f"{kind}\0{relative}\0{stat.S_IMODE(metadata.st_mode):o}\0{size}\0".encode())
+    if kind == "f":
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+driver_metadata_value() {
+  python3 - "$STATE_DIR/scr-prime-driver.json" "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream: value = json.load(stream)
+except (OSError, ValueError):
+    print(""); raise SystemExit
+item = value.get(sys.argv[2], "")
+print("true" if item is True else "false" if item is False else item)
+PY
+}
+
+driver_metadata_valid() {
+  python3 - "$STATE_DIR/scr-prime-driver.json" <<'PY'
+import json, os, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+except (OSError, ValueError):
+    raise SystemExit(1)
+valid_hash = re.compile(r"^[0-9a-f]{64}$").fullmatch
+if (not isinstance(value, dict) or value.get("managed") is not True or
+        value.get("device") != "04d9:c001" or
+        value.get("patches") != ["03_scr_prime_reader.patch"] or
+        not isinstance(value.get("dropdir"), str) or not os.path.isabs(value["dropdir"]) or
+        not isinstance(value.get("backup_path"), str) or not os.path.isabs(value["backup_path"]) or
+        not valid_hash(str(value.get("installed_hash", ""))) or
+        not (value.get("before_hash") == "missing" or valid_hash(str(value.get("before_hash", "")))) or
+        not isinstance(value.get("libccid_held"), bool) or
+        not isinstance(value.get("hold_was_present", False), bool)):
+    raise SystemExit(1)
+PY
+}
+
+driver_restore_internal() {
+  local metadata="$STATE_DIR/scr-prime-driver.json" drop backup bundle expected actual before
+  local hold_added hold_was_present held_before temp completed=0 runtime_remembered=0 replaced=0
+  if [[ ! -f "$metadata" ]] || ! driver_metadata_valid; then
+    die "MDD has no valid SCR Prime driver modification record to restore"
+  fi
+  drop=$(driver_metadata_value dropdir); backup=$(driver_metadata_value backup_path)
+  expected=$(driver_metadata_value installed_hash); before=$(driver_metadata_value before_hash)
+  hold_added=$(driver_metadata_value libccid_held); hold_was_present=$(driver_metadata_value hold_was_present)
+  validate_managed_path "$drop" "CCID dropdir"; validate_managed_path "$backup" "CCID backup"
+  [[ "$drop" =~ ^/usr/(local/)?lib(/[^/]+)?/pcsc/drivers$ ]] || die "recorded CCID dropdir is outside supported pcscd driver locations"
+  case "$backup" in "$STATE_DIR/driver-backups/"*) ;; *) die "recorded CCID backup is outside MDD driver state" ;; esac
+  bundle="$drop/ifd-ccid.bundle"
+  [[ -d "$bundle" ]] || die "recorded patched CCID bundle is missing"
+  actual=$(tree_hash "$bundle")
+  [[ "$actual" == "$expected" ]] || die "current CCID files no longer match the MDD-installed hash; refusing blind restore"
+  apt-mark showhold 2>/dev/null | grep -qx libccid && held_before=1 || held_before=0
+  temp=$(mktemp -d /tmp/mdd-driver-restore.XXXXXX)
+  cp -a -- "$bundle" "$temp/ifd-ccid.bundle"
+  cp -a -- "$metadata" "$temp/metadata.json"
+  [[ ! -f "$STATE_DIR/scr-prime-mode" ]] || cp -a -- "$STATE_DIR/scr-prime-mode" "$temp/scr-prime-mode"
+  remember_run_state
+  runtime_remembered=1
+  driver_restore_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    if ((completed == 0 && replaced)); then
+      stop_runtime >/dev/null 2>&1 || true
+      rm -rf -- "$bundle"
+      cp -a -- "$temp/ifd-ccid.bundle" "$bundle" || true
+      cp -a -- "$temp/metadata.json" "$metadata" || true
+      if [[ -f "$temp/scr-prime-mode" ]]; then cp -a -- "$temp/scr-prime-mode" "$STATE_DIR/scr-prime-mode"
+      else rm -f "$STATE_DIR/scr-prime-mode"
+      fi
+      if ((held_before)); then apt-mark hold libccid >/dev/null 2>&1 || true
+      else apt-mark unhold libccid >/dev/null 2>&1 || true
+      fi
+      systemctl restart pcscd.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$DATA_DIR/orchestrator/pcsc-maintenance"
+    rm -rf -- "$temp"
+    if ((runtime_remembered)); then restore_run_state || warn "could not fully restore the pre-operation service state"; fi
+    exit "$code"
+  }
+  trap 'driver_restore_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  stop_runtime
+  install -d -m 0700 "$DATA_DIR/orchestrator"; : > "$DATA_DIR/orchestrator/pcsc-maintenance"
+  if [[ -d "$backup/ifd-ccid.bundle" ]]; then
+    replaced=1
+    rm -rf -- "$bundle.mdd-restore"; cp -a -- "$backup/ifd-ccid.bundle" "$bundle.mdd-restore"
+    rm -rf -- "$bundle"; mv "$bundle.mdd-restore" "$bundle"
+    [[ $(tree_hash "$bundle") == "$before" ]] || die "recorded distribution CCID backup hash mismatch"
+  elif [[ "$before" == missing ]]; then
+    replaced=1; rm -rf -- "$bundle"
+  else
+    replaced=1
+    apt-mark unhold libccid >/dev/null 2>&1
+    apt-get install -y --reinstall libccid
+  fi
+  if [[ "$hold_was_present" == true ]]; then apt-mark hold libccid >/dev/null 2>&1
+  elif [[ "$hold_added" == true ]]; then apt-mark unhold libccid >/dev/null 2>&1
+  elif ((held_before)); then apt-mark hold libccid >/dev/null 2>&1
+  fi
+  systemctl restart pcscd.service
+  rm -f "$metadata" "$DATA_DIR/orchestrator/pcsc-maintenance"
+  if scr_pcsc_visible; then printf 'native\n' > "$STATE_DIR/scr-prime-mode"
+  else printf 'distribution\n' > "$STATE_DIR/scr-prime-mode"
+  fi
+  restore_run_state
+  completed=1
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$temp"
+  info "restored the distribution libccid driver and removed any MDD-owned package hold"
+}
+
+driver_reprobe_native() {
+  local metadata="$STATE_DIR/scr-prime-driver.json" drop bundle expected actual temp
+  local held_before hold_added hold_was_present completed=0
+  [[ ! -f "$metadata" ]] || driver_metadata_valid || die "SCR Prime driver metadata is invalid"
+  [[ -f "$metadata" ]] || return 0
+  lsusb -d 04d9:c001 >/dev/null 2>&1 || { warn "SCR Prime is absent; deferred native-driver re-probe"; return 0; }
+  drop=$(driver_metadata_value dropdir); bundle="$drop/ifd-ccid.bundle"; expected=$(driver_metadata_value installed_hash)
+  hold_added=$(driver_metadata_value libccid_held); hold_was_present=$(driver_metadata_value hold_was_present)
+  [[ "$drop" =~ ^/usr/(local/)?lib(/[^/]+)?/pcsc/drivers$ ]] || die "recorded CCID dropdir is outside supported pcscd driver locations"
+  actual=$(tree_hash "$bundle")
+  [[ "$actual" == "$expected" ]] || die "patched CCID changed outside MDD; refusing update-time driver re-probe"
+  apt-mark showhold 2>/dev/null | grep -qx libccid && held_before=1 || held_before=0
+  temp=$(mktemp -d /tmp/mdd-driver-reprobe.XXXXXX); cp -a "$bundle" "$temp/ifd-ccid.bundle"
+  cp -a -- "$metadata" "$temp/metadata.json"
+  [[ ! -f "$STATE_DIR/scr-prime-mode" ]] || cp -a -- "$STATE_DIR/scr-prime-mode" "$temp/scr-prime-mode"
+  driver_reprobe_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    if ((completed == 0)); then
+      rm -rf -- "$bundle"
+      cp -a -- "$temp/ifd-ccid.bundle" "$bundle" || true
+      cp -a -- "$temp/metadata.json" "$metadata" || true
+      if [[ -f "$temp/scr-prime-mode" ]]; then cp -a -- "$temp/scr-prime-mode" "$STATE_DIR/scr-prime-mode"
+      else rm -f "$STATE_DIR/scr-prime-mode"
+      fi
+      if ((held_before)); then apt-mark hold libccid >/dev/null 2>&1 || true
+      else apt-mark unhold libccid >/dev/null 2>&1 || true
+      fi
+      systemctl restart pcscd.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$DATA_DIR/orchestrator/pcsc-maintenance"
+    rm -rf -- "$temp"
+    exit "$code"
+  }
+  trap 'driver_reprobe_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  install -d -m 0700 "$DATA_DIR/orchestrator"; : > "$DATA_DIR/orchestrator/pcsc-maintenance"
+  apt-mark unhold libccid >/dev/null 2>&1
+  if apt-get install -y --reinstall libccid && systemctl restart pcscd.service && scr_pcsc_visible; then
+    if [[ "$hold_was_present" == true ]]; then apt-mark hold libccid >/dev/null 2>&1
+    elif [[ "$hold_added" == true ]]; then apt-mark unhold libccid >/dev/null 2>&1
+    elif ((held_before)); then apt-mark hold libccid >/dev/null 2>&1
+    fi
+    rm -f "$metadata"; printf 'native\n' > "$STATE_DIR/scr-prime-mode"
+    info "the current distribution libccid now supports SCR Prime; restored native driver"
+  else
+    rm -rf -- "$bundle"; cp -a "$temp/ifd-ccid.bundle" "$bundle"
+    if ((held_before)); then apt-mark hold libccid >/dev/null 2>&1
+    else apt-mark unhold libccid >/dev/null 2>&1
+    fi
+    systemctl restart pcscd.service
+    scr_pcsc_visible || die "SCR Prime did not recover after restoring the patched driver"
+    info "distribution libccid still lacks SCR Prime; retained patch 03"
+  fi
+  rm -f "$DATA_DIR/orchestrator/pcsc-maintenance"
+  completed=1
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$temp"
+}
+
+cmd_driver() {
+  local sub=${1:-}; shift || true
+  case "$sub" in
+    status)
+      local usb=no pcsc=no mode held=no
+      lsusb -d 04d9:c001 >/dev/null 2>&1 && usb=yes
+      [[ "$usb" == yes ]] && scr_pcsc_visible && pcsc=yes
+      mode=$(cat "$STATE_DIR/scr-prime-mode" 2>/dev/null || printf absent)
+      apt-mark showhold 2>/dev/null | grep -qx libccid && held=yes
+      printf 'SCR Prime USB: %s\nPC/SC reader: %s\nDriver mode: %s\nlibccid held: %s\n' "$usb" "$pcsc" "$mode" "$held"
+      ;;
+    restore) acquire_lock; driver_restore_internal ;;
+    *) die "usage: mddctl driver status|restore" ;;
+  esac
+}
+
+cmd_update() {
+  local no_cache=0 dry_run=0 assume_yes=0
+  while (($#)); do case "$1" in --no-cache) no_cache=1 ;; --dry-run) dry_run=1 ;; --yes|-y) assume_yes=1 ;; *) die "unknown update option: $1" ;; esac; shift; done
+  acquire_lock
+  validate_managed_checkout
+  local old new worktree="" build snapshot="" previous_image old_build
+  local worktree_active=0 transaction_armed=0
+  old=$(git -C "$INSTALL_DIR" rev-parse HEAD)
+  old_build="$CACHE_DIR/builds/$old"
+  if ((dry_run)); then info "update preflight passed for $old; no fetch or build performed"; return; fi
+  git -C "$INSTALL_DIR" fetch --prune origin "$BRANCH"
+  new=$(git -C "$INSTALL_DIR" rev-parse "origin/$BRANCH")
+  git -C "$INSTALL_DIR" merge-base --is-ancestor "$old" "$new" || die "local and origin/$BRANCH diverged; update will not merge, rebase, reset or force"
+  if [[ "$old" == "$new" ]]; then (driver_reprobe_native); info "already up to date ($old)"; return; fi
+  ((assume_yes)) || { printf 'Update %s -> %s? [y/N] ' "${old:0:12}" "${new:0:12}"; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "update cancelled"; }
+  [[ -f "$old_build/READY" && -x "$old_build/venv/bin/python" && -f "$old_build/webui/index.html" ]] || \
+    die "the current verified build is unavailable; refusing an update without a rollback generation"
+  docker image inspect "mdd-sim-gateway/engine:$old" >/dev/null 2>&1 || \
+    die "the current commit-specific Engine image is unavailable; refusing an update without rollback"
+  bash "$INSTALL_DIR/install.sh" verify --source "$INSTALL_DIR" --build-root "$old_build" --sha "$old"
+  [[ $(docker image inspect "$ENGINE_STABLE_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null) == "$old" ]] || \
+    die "the stable Engine image does not match the managed source commit"
+
+  worktree="$CACHE_DIR/update/worktree-$new"; build="$CACHE_DIR/builds/$new"
+  install -d -m 0700 "$CACHE_DIR/update"
+  [[ "$worktree" == "$CACHE_DIR/update/"* ]] || die "unsafe update worktree path"
+  git -C "$INSTALL_DIR" worktree prune
+  if [[ -e "$worktree" ]]; then
+    git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
+  fi
+  git -C "$INSTALL_DIR" worktree add --detach "$worktree" "$new"
+  worktree_active=1
+  update_cleanup() {
+    local code=${1:-1} rollback_failed=0 current_status current_branch current_remote
+    trap - EXIT HUP INT TERM
+    if ((worktree_active)); then
+      git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
+      worktree_active=0
+    fi
+    if ((transaction_armed)); then
+      warn "update did not complete; restoring the verified $old generation"
+      stop_runtime >/dev/null 2>&1 || true
+      current_status=$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal 2>/dev/null || printf invalid)
+      current_branch=$(git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || true)
+      current_remote=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)
+      if [[ -z "$current_status" && "$current_branch" == "$BRANCH" && "$current_remote" == "$ORIGIN_URL" ]] && \
+          ! git_operation_in_progress; then
+        git -C "$INSTALL_DIR" reset --hard "$old" >/dev/null || rollback_failed=1
+      else
+        warn "managed checkout changed during activation; refusing automatic source reset"
+        rollback_failed=1
+      fi
+      if ((rollback_failed == 0)); then
+        bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$old_build" --sha "$old" || rollback_failed=1
+      fi
+      if ((rollback_failed == 0)) && docker image inspect "$previous_image" >/dev/null 2>&1; then
+        docker tag "$previous_image" "$ENGINE_STABLE_IMAGE" || rollback_failed=1
+      fi
+      if ((rollback_failed == 0)); then
+        (restore_archive "$snapshot" 0) || rollback_failed=1
+      fi
+      if ((rollback_failed == 0)); then
+        start_runtime || rollback_failed=1
+        health_check || rollback_failed=1
+      fi
+      if ((rollback_failed)); then
+        warn "automatic update rollback is incomplete; services remain stopped and snapshot is $snapshot"
+      else
+        warn "update was rolled back completely to $old"
+      fi
+    fi
+    exit "$code"
+  }
+  trap 'update_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  bash -n "$worktree/bootstrap.sh" "$worktree/install.sh" "$worktree/scripts/mddctl" "$worktree/engine/entrypoint.sh"
+  python3 -m compileall -q "$worktree/control" "$worktree/engine" "$worktree/host" "$worktree/scripts"
+  args=(prepare --source "$worktree" --build-root "$build")
+  ((no_cache)) && args+=(--no-cache)
+  bash "$worktree/install.sh" "${args[@]}"
+  (cd "$worktree" && "$build/venv/bin/python" -m unittest discover -s tests -p 'test_*.py')
+  (driver_reprobe_native)
+
+  snapshot="$BACKUP_DIR/pre-update-$old-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
+  (backup_archive "$snapshot" 0)
+  previous_image="mdd-sim-gateway/engine:previous-$old"
+  transaction_armed=1
+  docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1 && docker tag "$ENGINE_STABLE_IMAGE" "$previous_image"
+
+  git -C "$INSTALL_DIR" merge --ff-only "origin/$BRANCH"
+  bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$build" --sha "$new"
+  start_runtime
+  health_check
+  transaction_armed=0
+  printf '%s\n' "$old" > "$STATE_DIR/previous-commit"
+  git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
+  worktree_active=0
+  while IFS= read -r image; do
+    [[ "$image" == "$previous_image" ]] || docker image rm "$image" >/dev/null 2>&1 || true
+  done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep '^mdd-sim-gateway/engine:previous-' || true)
+  while IFS= read -r archive; do
+    [[ "$archive" == "$snapshot" ]] || rm -f -- "$archive" "$archive.sha256"
+  done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'pre-update-*.tar.gz' -print)
+  trap - EXIT HUP INT TERM
+  info "updated successfully to $new; previous source/image/data generation retained"
+}
+
+cmd_uninstall() {
+  local purge=0
+  while (($#)); do case "$1" in --purge) purge=1 ;; *) die "unknown uninstall option: $1" ;; esac; shift; done
+  acquire_lock
+  if ((purge)); then
+    printf 'Purge source, runtime data and backups? Type PURGE: '
+    read -r answer
+    [[ "$answer" == PURGE ]] || die "purge cancelled"
+  fi
+  if [[ -f "$STATE_DIR/scr-prime-driver.json" ]]; then driver_restore_internal; fi
+  stop_runtime
+  systemctl disable "$CONTROL_UNIT" "$ORCHESTRATOR_UNIT" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$CONTROL_UNIT" "/etc/systemd/system/$ORCHESTRATOR_UNIT"
+  rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
+  rm -f /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf
+  if [[ -f /etc/reader.conf.d/.vpcd.mdd-disabled && ! -e /etc/reader.conf.d/vpcd ]]; then
+    mv /etc/reader.conf.d/.vpcd.mdd-disabled /etc/reader.conf.d/vpcd
+  fi
+  apt-mark unhold vsmartcard-vpcd >/dev/null 2>&1 || true
+  if [[ -f "$STATE_DIR/firewall-nft-created" ]]; then
+    nft delete table inet mdd_sim_gateway >/dev/null 2>&1 || true
+  fi
+  if have ufw && [[ -f "$STATE_DIR/firewall-created" ]]; then
+    while IFS= read -r spec; do
+      if [[ "$spec" =~ ^[0-9]{1,5}(:[0-9]{1,5})?/(tcp|udp)$ ]]; then
+        ufw --force delete allow "$spec" >/dev/null 2>&1 || true
+      fi
+    done < "$STATE_DIR/firewall-created"
+  fi
+  local output path
+  local -a ids=() images=()
+  output=$(managed_containers) || die "could not list managed Engine containers during uninstall"
+  [[ -z "$output" ]] || mapfile -t ids <<< "$output"
+  ((${#ids[@]} == 0)) || docker rm -f "${ids[@]}" >/dev/null
+  output=$(docker image ls --format '{{.Repository}}:{{.Tag}}') || die "could not list Docker images during uninstall"
+  output=$(grep '^mdd-sim-gateway/engine:' <<< "$output" || true)
+  [[ -z "$output" ]] || mapfile -t images <<< "$output"
+  ((${#images[@]} == 0)) || docker image rm "${images[@]}" >/dev/null 2>&1 || true
+  for path in "$INSTALL_DIR" "$CACHE_DIR"; do
+    validate_managed_path "$path" "uninstall target"
+    rm -rf -- "$path"
+  done
+  if ((purge)); then
+    for path in "$DATA_DIR" "$BACKUP_DIR"; do validate_managed_path "$path" "purge target"; rm -rf -- "$path"; done
+  else
+    warn "runtime data retained at $DATA_DIR; backups retained at $BACKUP_DIR"
+  fi
+  rm -rf -- "$STATE_DIR"
+  systemctl daemon-reload
+  rm -f /usr/local/sbin/mddctl
+  info "MDD Sim Gateway uninstalled"
+}
+
+case "$command" in
+  status) (($# == 0)) || die "status takes no options"; cmd_status ;;
+  doctor) cmd_doctor "$@" ;;
+  start) (($# == 0)) || die "start takes no options"; acquire_lock; start_runtime; health_check || die "start health check failed" ;;
+  stop) (($# == 0)) || die "stop takes no options"; acquire_lock; stop_runtime ;;
+  restart) (($# == 0)) || die "restart takes no options"; acquire_lock; stop_runtime; start_runtime; health_check || die "restart health check failed" ;;
+  logs) (($# == 0)) || die "logs takes no options"; exec journalctl -f -u "$CONTROL_UNIT" -u "$ORCHESTRATOR_UNIT" ;;
+  update) cmd_update "$@" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  driver) cmd_driver "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command: $command" ;;
+esac

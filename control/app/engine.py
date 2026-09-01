@@ -6,13 +6,14 @@ The manager renders instance.json, starts/stops/recreates the container with the
 mounts/caps/ports, and reads the engine's runtime status files (bind-mounted run dir):
 the swu_ike daemon publishes swu_status.json {state: CONNECTED} for tunnel state.
 
-PC/SC: engine containers are pcscd CLIENTS — they mount the HOST pcscd socket (/run/pcscd).
-The pcsc-lite client library in the engine image is pinned to the SAME version as the host
-pcscd (Dockerfile PCSC_VERSION == install.sh PCSC_VERSION) so client/server protocol matches.
+PC/SC: Engine containers are pcscd clients — they mount the host pcscd socket (/run/pcscd).
+The guest uses its distribution pcscd; the image pins its client library and relies on the
+stable pcsc-lite socket protocol rather than replacing the guest daemon.
 """
 from __future__ import annotations
 
 from datetime import datetime
+import ipaddress
 import json
 import logging
 import os
@@ -68,9 +69,6 @@ SIP_EVIDENCE_LINES = 40
 DATA_DIR = cfg.DATA_DIR
 IMAGE = os.environ.get("MDD_ENGINE_IMAGE", "mdd-sim-gateway/engine")
 PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
-# Absolute host path to the project data dir (needed for bind mounts when the manager
-# itself runs in a container; defaults to DATA_DIR on the host).
-HOST_DATA_DIR = os.environ.get("MDD_HOST_DATA", DATA_DIR)
 MANAGED_LABEL = "io.mdd-sim-gateway.managed"
 
 
@@ -78,38 +76,6 @@ def _owned(container) -> bool:
     labels = (container.attrs.get("Config") or {}).get("Labels") or {}
     image = str((container.attrs.get("Config") or {}).get("Image") or "")
     return labels.get(MANAGED_LABEL) == "true" or image.startswith("mdd-sim-gateway/")
-
-
-def _host_data_path(path: str) -> str:
-    """Translate a control-container path under MDD_DATA to the same file on the host.
-
-    Explicit TLS files are configured from the WebUI as /data/... in Docker mode. Sibling
-    engine containers cannot bind-mount that container-only path; Docker needs the host's
-    /opt/... data path instead. Paths outside DATA_DIR are already host/native paths.
-    """
-    absolute = os.path.abspath(path)
-    data_root = os.path.abspath(DATA_DIR)
-    try:
-        if os.path.commonpath([absolute, data_root]) == data_root:
-            return os.path.join(os.path.abspath(HOST_DATA_DIR), os.path.relpath(absolute, data_root))
-    except ValueError:
-        pass
-    return absolute
-
-
-def _runtime_data_path(path: str) -> str:
-    """Translate a TLS path persisted while the manager used Docker's /data mount.
-
-    The native control plane and sibling engine both use the host data directory.  Without this
-    migration, the WebUI can have the public certificate while Asterisk silently falls back to
-    an old self-signed certificate, causing browsers to reject the softphone WSS connection.
-    """
-    value = str(path or "")
-    if value.startswith("/data/") and os.path.abspath(DATA_DIR) != "/data":
-        translated = os.path.join(DATA_DIR, os.path.relpath(value, "/data"))
-        if os.path.exists(translated):
-            return translated
-    return value
 
 
 _docker_client = None
@@ -144,10 +110,11 @@ def container_name(iid: str) -> str:
 
 def _instance_paths(iid: str):
     base = os.path.join(DATA_DIR, "instances", str(iid))
-    host_base = os.path.join(HOST_DATA_DIR, "instances", str(iid))
     os.makedirs(os.path.join(base, "run"), exist_ok=True)
     os.makedirs(os.path.join(base, "logs"), exist_ok=True)
-    return base, host_base
+    # VMware Control is a native systemd process, so its data path is already the host path
+    # Docker must bind; no container-to-host path translation is needed.
+    return base, base
 
 
 def _clear_runtime_state(base: str):
@@ -370,7 +337,26 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     # Fail closed before creating the container when country routing is enabled. The host-side
     # orchestrator confirms that this carrier's outer ePDG address is routed through the selected
     # country TUN; inner IMS/SIP/RTP then stays inside the resulting IPsec tunnel.
-    egress.ensure_line(inst, settings)
+    line_egress = egress.ensure_line(inst, settings) or {}
+    extra_hosts = {"host.docker.internal": "host-gateway"}
+    proxy_enabled = bool((settings.get("proxy") or {}).get("enabled"))
+    if proxy_enabled and line_egress.get("mode") not in {"direct", "legacy"}:
+        epdg_host = egress.epdg_for(inst)
+        addresses = []
+        for value in line_egress.get("addresses") or []:
+            try:
+                address = ipaddress.IPv4Address(str(value))
+            except ipaddress.AddressValueError:
+                continue
+            if address.is_global:
+                addresses.append(str(address))
+        if not epdg_host or not addresses:
+            raise egress.EgressError(
+                "country exit did not publish a public ePDG address for the Engine")
+        # The Engine inherits Docker's DNS, which may reach the same resolver that produced a
+        # Clash Fake-IP on the host. Pin this one container to
+        # the real address the orchestrator just routed through the selected country exit.
+        extra_hosts[epdg_host] = sorted(set(addresses))[0]
     cfg.write_instance_json(inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
@@ -398,29 +384,29 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     # the timeline, the WebUI and the operator's shell read local time. Correlating a rekey or
     # a teardown with an outage meant doing the offset in your head. Give the container the
     # host's zone; nothing parses these timestamps, so this is display only.
-    if os.path.exists("/etc/localtime"):
-        volumes["/etc/localtime"] = {"bind": "/etc/localtime", "mode": "ro"}
+    # VMware editions support only systemd Linux guests, where /etc/localtime is part of the
+    # base system. Bind it unconditionally so Engine timestamps match Control and the operator.
+    volumes["/etc/localtime"] = {"bind": "/etc/localtime", "mode": "ro"}
     # TLS cert for the local SIP-TLS / WebRTC (WSS 8089) transport. An explicit cert in
     # settings.tls wins; otherwise fall back to the control plane's own self-signed cert
     # (generated by run.py under $MDD_DATA/certs) so the engine's WSS listener always has
     # a cert — without it Asterisk fails to bind 8089 and the browser softphone can't connect.
-    # Bind-mounts must use the HOST path (engine is a sibling container); check existence via
-    # the in-container DATA_DIR but mount the HOST_DATA_DIR path.
+    # Control runs natively on the host, so DATA_DIR is also the Engine bind-mount source.
     tls = settings.get("tls", {})
-    configured_cert = _runtime_data_path(tls.get("cert_path"))
-    configured_key = _runtime_data_path(tls.get("key_path"))
+    configured_cert = str(tls.get("cert_path") or "")
+    configured_key = str(tls.get("key_path") or "")
     cert_host = key_host = None
     if configured_cert and os.path.exists(configured_cert) and \
             configured_key and os.path.exists(configured_key):
-        cert_host = _host_data_path(configured_cert)
-        key_host = _host_data_path(configured_key)
+        cert_host = os.path.abspath(configured_cert)
+        key_host = os.path.abspath(configured_key)
     else:
         # self-signed pair written by run.py: $MDD_DATA/certs/self-signed.{crt,key}
         ss_crt = os.path.join(DATA_DIR, "certs", "self-signed.crt")
         ss_key = os.path.join(DATA_DIR, "certs", "self-signed.key")
         if os.path.exists(ss_crt) and os.path.exists(ss_key):
-            cert_host = os.path.join(HOST_DATA_DIR, "certs", "self-signed.crt")
-            key_host = os.path.join(HOST_DATA_DIR, "certs", "self-signed.key")
+            cert_host = os.path.join(DATA_DIR, "certs", "self-signed.crt")
+            key_host = os.path.join(DATA_DIR, "certs", "self-signed.key")
         else:
             log.warning("no TLS cert available for engine %s WSS/8089 — browser softphone will "
                         "not connect until a cert exists (control plane cert at %s missing)", iid, ss_crt)
@@ -449,10 +435,13 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     for p in range(rtp_start, rtp_start + cfg.rtp_span(ports)):
         port_bindings[f"{p}/udp"] = p
 
-    c = client.containers.run(
+    # Split create/start so a Docker start failure (most commonly a late host-port collision)
+    # leaves us holding the exact container generation that failed. containers.run() raises
+    # before returning it, which previously stranded a same-name container in Created state and
+    # made every retry fail with a name conflict.
+    c = client.containers.create(
         IMAGE,
         name=container_name(iid),
-        detach=True,
         cap_add=["NET_ADMIN"],
         devices=["/dev/net/tun:/dev/net/tun:rwm"],
         volumes=volumes,
@@ -471,8 +460,20 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
             "net.ipv6.conf.all.use_tempaddr": "0",
             "net.ipv6.conf.default.use_tempaddr": "0",
         },
-        extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
+        extra_hosts=extra_hosts,
     )
+    try:
+        c.start()
+    except Exception:
+        try:
+            c.reload()
+            state = (c.attrs.get("State") or {})
+            if not state.get("Running") and state.get("Status") == "created":
+                c.remove(force=True)
+                log.warning("removed failed Created engine container %s", c.name)
+        except Exception as cleanup_exc:  # noqa
+            log.warning("could not clean failed engine container %s: %s", c.name, cleanup_exc)
+        raise
     log.info("started engine container %s", c.name)
     return c.id
 

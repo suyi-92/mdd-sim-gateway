@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import socket
 import time
 import io
 import tempfile
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from control.app import egress
+from host import mdd_orchestrator as orch
 from host.mdd_orchestrator import (Orchestrator, clash_outbound, node_needs_xray,
                                    parse_manual_outbound, parse_proxy_url, parse_share_link,
                                    xray_outbound)
@@ -65,6 +67,46 @@ class CountryEgressTests(unittest.TestCase):
             self.assertEqual(state["gb"]["node_tag"], "exit-gb-1")
             self.assertNotIn("_member_names", state["gb"])
 
+    def test_temporary_exit_test_is_country_scoped_and_token_safe(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(egress, "_TEST_REQUEST_DIR", temp):
+            token, requested_at = egress.request_test("GB", ttl=30)
+            path = Path(temp) / "gb.json"
+            request = json.loads(path.read_text())
+            self.assertEqual(request["country"], "gb")
+            self.assertEqual(request["token"], token)
+            self.assertGreater(request["expires_at"], requested_at)
+            self.assertFalse(egress.finish_test("gb", "older-request"))
+            self.assertTrue(path.exists())
+            self.assertTrue(egress.finish_test("gb", token))
+            self.assertFalse(path.exists())
+
+    def test_orchestrator_uses_only_live_test_requests(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path.cwd(), dry_run=True)
+            app.exit_test_request_dir.mkdir(parents=True)
+            (app.exit_test_request_dir / "gb.json").write_text(json.dumps({
+                "country": "gb", "token": "current", "requested_at": 100,
+                "expires_at": 130,
+            }))
+            (app.exit_test_request_dir / "us.json").write_text(json.dumps({
+                "country": "us", "token": "expired", "requested_at": 10,
+                "expires_at": 20,
+            }))
+            self.assertEqual(app.active_exit_tests(now=110), {"gb"})
+
+    def test_idle_test_runtime_is_limited_to_the_requested_country(self):
+        desired = {"proxy": {"enabled": True, "profiles": {"node": {}}, "exits": {
+            "gb": {"enabled": True, "profile_id": "node"},
+            "us": {"enabled": True, "profile_id": "node"},
+        }}, "lines": [{"id": "draft", "enabled": False}]}
+        scoped = Orchestrator.proxy_reconcile_desired(desired, False, {"gb"})
+        self.assertEqual(set(scoped["proxy"]["exits"]), {"gb"})
+        self.assertEqual(set(desired["proxy"]["exits"]), {"gb", "us"})
+        self.assertEqual(Orchestrator.proxy_reconcile_desired(
+            desired, False, set())["proxy"], {"enabled": False})
+        self.assertIs(Orchestrator.proxy_reconcile_desired(
+            desired, True, {"gb"}), desired)
 
 class SubscriptionNodeConversionTests(unittest.TestCase):
     """Fields dropped here produce outbounds that look valid and never connect."""
@@ -385,6 +427,96 @@ class EpdgAddressRetentionTests(unittest.TestCase):
             app.retained_epdg_addresses("us:epdg.us", ["208.54.2.163"])
             self.assertEqual(app.retained_epdg_addresses("gb:epdg.gb", ["31.94.76.1"]),
                              ["31.94.76.1"])
+
+
+class EpdgFakeIpResolutionTests(unittest.TestCase):
+    @staticmethod
+    def _answer(address):
+        return [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", (address, 0))]
+
+    def test_public_system_answer_needs_no_proxy_lookup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            with patch.object(orch.socket, "getaddrinfo",
+                              return_value=self._answer("31.94.76.1")), \
+                    patch.object(orch, "resolve_ipv4_via_socks_doh") as remote:
+                resolved = app.resolve("epdg.example", "172.17.0.1", 22157)
+        self.assertEqual(resolved, ["31.94.76.1"])
+        remote.assert_not_called()
+
+    def test_fake_ip_is_replaced_by_an_answer_resolved_inside_the_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            with patch.object(orch.socket, "getaddrinfo",
+                              return_value=self._answer("198.18.2.58")), \
+                    patch.object(orch, "resolve_ipv4_via_socks_doh",
+                                 return_value=(["31.94.76.1", "31.94.76.9"], 90)) as remote:
+                first = app.resolve("epdg.example", "172.17.0.1", 22157)
+                second = app.resolve("epdg.example", "172.17.0.1", 22157)
+        self.assertEqual(first, ["31.94.76.1", "31.94.76.9"])
+        self.assertEqual(second, first)
+        remote.assert_called_once_with("epdg.example", "172.17.0.1", 22157,
+                                       orch.EPDG_DOH_TIMEOUT)
+
+    def test_fake_ip_is_never_used_when_proxy_resolution_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            with patch.object(orch.socket, "getaddrinfo",
+                              return_value=self._answer("198.18.2.58")), \
+                    patch.object(orch, "resolve_ipv4_via_socks_doh",
+                                 side_effect=RuntimeError("timeout")):
+                with self.assertRaisesRegex(RuntimeError, "Fake-IP.*proxy resolution failed"):
+                    app.resolve("epdg.example", "172.17.0.1", 22157)
+
+    def test_doh_parser_keeps_only_public_a_records(self):
+        addresses, ttl = orch._parse_doh_ipv4({
+            "Status": 0,
+            "Answer": [
+                {"type": 5, "data": "alias.example", "TTL": 120},
+                {"type": 1, "data": "198.18.2.58", "TTL": 90},
+                {"type": 1, "data": "31.94.76.9", "TTL": 80},
+                {"type": 1, "data": "31.94.76.1", "TTL": 70},
+            ],
+        })
+        self.assertEqual(addresses, ["31.94.76.1", "31.94.76.9"])
+        self.assertEqual(ttl, 70)
+
+    def test_engine_readiness_waits_past_a_stale_fake_ip_snapshot(self):
+        settings = {"proxy": {"enabled": True,
+                              "exits": {"gb": {"enabled": True}}}}
+        stale = {"lines": {"2": {"ready": True, "mode": "manual",
+                                     "addresses": ["198.18.2.58"]}}}
+        fresh = {"lines": {"2": {"ready": True, "mode": "manual",
+                                     "addresses": ["31.94.76.1"]}}}
+        with patch.object(egress, "publish"), \
+                patch.object(egress, "status", side_effect=[stale, fresh]), \
+                patch.object(egress.time, "sleep"):
+            state = egress.ensure_line({"id": "2", "mcc": "234"}, settings, timeout=1)
+        self.assertEqual(state["addresses"], ["31.94.76.1"])
+
+    def test_engine_readiness_waits_past_a_stale_disabled_draft_snapshot(self):
+        settings = {"proxy": {"enabled": True,
+                              "exits": {"gb": {"enabled": True}}}}
+        stale = {"lines": {"5": {"ready": True, "mode": "disabled"}}}
+        fresh = {"lines": {"5": {"ready": True, "mode": "manual",
+                                     "addresses": ["31.94.76.1"]}}}
+        with patch.object(egress, "publish"), \
+                patch.object(egress, "status", side_effect=[stale, fresh]), \
+                patch.object(egress.time, "sleep"):
+            state = egress.ensure_line(
+                {"id": "5", "mcc": "234", "enabled": True}, settings, timeout=1)
+        self.assertEqual(state["mode"], "manual")
+        self.assertEqual(state["addresses"], ["31.94.76.1"])
+
+    def test_engine_readiness_accepts_disabled_state_for_disabled_line(self):
+        settings = {"proxy": {"enabled": True,
+                              "exits": {"gb": {"enabled": True}}}}
+        disabled = {"lines": {"5": {"ready": True, "mode": "disabled"}}}
+        with patch.object(egress, "publish"), \
+                patch.object(egress, "status", return_value=disabled):
+            state = egress.ensure_line(
+                {"id": "5", "mcc": "234", "enabled": False}, settings, timeout=1)
+        self.assertEqual(state["mode"], "disabled")
 
 
 class ManagedReselectTests(unittest.TestCase):
@@ -789,7 +921,7 @@ class IdleBackoffTests(unittest.TestCase):
                 if len(slept) == 2:              # an operator saves settings mid-wait
                     app.desired_path.write_text('{"changed": true}')
 
-            with patch("host.mdd_orchestrator.time.sleep", fake_sleep), \
+            with patch.object(app._stop_event, "wait", side_effect=fake_sleep), \
                     patch("host.mdd_orchestrator.time.time", lambda: clock[0]):
                 app._sleep_for_work(60.0)
             # It returned long before the 60s backoff, without a full reconcile in between.
@@ -807,7 +939,7 @@ class IdleBackoffTests(unittest.TestCase):
                 slept.append(seconds)
                 clock[0] += seconds
 
-            with patch("host.mdd_orchestrator.time.sleep", fake_sleep), \
+            with patch.object(app._stop_event, "wait", side_effect=fake_sleep), \
                     patch("host.mdd_orchestrator.time.time", lambda: clock[0]):
                 app._sleep_for_work(15.0)
             self.assertTrue(all(x <= app.interval + 0.001 for x in slept),
@@ -825,18 +957,20 @@ class IdleBackoffTests(unittest.TestCase):
             def fake_sleep(seconds):
                 calls.append(seconds)
                 clock[0] += seconds
-                app.stop = True
+                app.request_stop()
+                return True
 
-            with patch("host.mdd_orchestrator.time.sleep", fake_sleep), \
+            with patch.object(app._stop_event, "wait", side_effect=fake_sleep), \
                     patch("host.mdd_orchestrator.time.time", lambda: clock[0]):
                 app._sleep_for_work(600.0)
             self.assertEqual(len(calls), 1)
+            self.assertTrue(app._stop_event.is_set())
 
     def test_missing_documents_do_not_break_the_comparison(self):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
 
 
 class HotplugResponsivenessTests(unittest.TestCase):
@@ -856,7 +990,7 @@ class HotplugResponsivenessTests(unittest.TestCase):
             self.assertNotEqual(two_devices, three_devices,
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
 
 
 class PastedNodeFidelityTests(unittest.TestCase):

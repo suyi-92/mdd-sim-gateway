@@ -47,6 +47,11 @@ except Exception:                     # pragma: no cover
 
 from card.USIM import *
 
+try:                                # installed scripts live together in /usr/local/bin
+    from pin_keeper import select_adf_usim as _shared_select_adf_usim
+except ImportError:                 # source-tree imports use the namespace package
+    from engine.pin_keeper import select_adf_usim as _shared_select_adf_usim
+
 requests.packages.urllib3.disable_warnings()
 
 _WORKER_LOG_PATH = None
@@ -319,9 +324,10 @@ DEFAULT_IK = '0123456789ABCDEF0123456789ABCDEF'
 DEFAULT_RES = '0123456789ABCDEF'
 
 
-# IMEI (15 digits) and IMEISV (16 digits) - used in DEVICE_IDENTITY notify response
-IMEI                                    = '123456789012347'   # 15 digits. The last digit (7) is the checksum digit.
-IMEISV                                  = '1234567890123456'  # 16 digits
+# IMEI (15 digits) and IMEISV (16 digits) used in DEVICE_IDENTITY.  Empty is deliberate:
+# a native PC/SC reader is not mobile equipment and has no honest hardware IMEI to invent.
+IMEI                                    = ''
+IMEISV                                  = ''
 
 
 NONE = 0
@@ -837,16 +843,16 @@ class swu():
         self.message_id_responses = 0
 
         self.role = ROLE_INITIATOR
-        self.old_ike_message_received = False        
+        self.old_ike_message_received = False
         self.ike_spi_initiator_old = None
         self.ike_spi_responder_old = None
         self.next_reauth_id = None
-        
+
         self.check_nat = True
         self.device_identity_requested = False
         self.device_identity_type = None
-        # Per-instance IMEI/IMEISV for the ePDG DEVICE_IDENTITY response. Default to the module
-        # constants (upstream behaviour) until set_device_identity() overrides them.
+        # Per-instance IMEI/IMEISV for the ePDG DEVICE_IDENTITY response.  Blank means the
+        # Notify is omitted; never substitute sample equipment identity for a native reader.
         self.imei = IMEI
         self.imeisv = IMEISV
 
@@ -1926,7 +1932,7 @@ class swu():
 
     def set_ts_list(self,type, ts_list):
         if type == TSI: self.ts_list_initiator = ts_list
-        if type == TSR: self.ts_list_responder = ts_list    
+        if type == TSR: self.ts_list_responder = ts_list
 
     def set_cp_list(self, cp_list):
          self.cp_list = cp_list
@@ -1936,22 +1942,28 @@ class swu():
 
         IMEI: digits only (a formatted '35212721-360029-6' is accepted and stripped).
         IMEISV: 16 digits; if blank, derive it from the IMEI's first 14 digits (TAC+SNR, i.e.
-        without the check digit) + a '00' SVN. Empty IMEI keeps the module defaults so a bare
-        run still works."""
+        without the check digit) + a '00' SVN. Empty/invalid input clears the identity, causing
+        DEVICE_IDENTITY to be omitted instead of answered with a fabricated value."""
         imei_d = "".join(ch for ch in str(imei or "") if ch.isdigit())
         isv_d = "".join(ch for ch in str(imeisv or "") if ch.isdigit())
-        if imei_d:
-            self.imei = imei_d
-        if isv_d:
-            self.imeisv = (isv_d + "0" * 16)[:16]
-        elif imei_d:
-            self.imeisv = (imei_d[:14].ljust(14, "0")) + "00"
-        swu_log("device identity configured")
+        self.imei = imei_d if len(imei_d) == 15 else ""
+        self.imeisv = (isv_d if len(isv_d) == 16 else
+                       self.imei[:14] + "00" if self.imei else "")
+        swu_log("device identity configured" if self.has_device_identity()
+                else "device identity not configured; DEVICE_IDENTITY will be omitted")
+
+    def has_device_identity(self):
+        """Whether the requested DEVICE_IDENTITY type can be answered honestly."""
+        if self.device_identity_type == 0x01:
+            return len(self.imei) == 15
+        if self.device_identity_type == 0x02:
+            return len(self.imeisv) == 16
+        return len(self.imeisv) == 16 or len(self.imei) == 15
 
     def set_identification(self,payload_type, id_type,value):
         if payload_type == IDI: self.identification_initiator = (id_type, value)
-        if payload_type == IDR: self.identification_responder = (id_type, value)        
-        
+        if payload_type == IDR: self.identification_responder = (id_type, value)
+
     def set_ike_packet_length(self,packet):
         packet = bytearray(packet)
         packet[24:28] = struct.pack("!I",len(packet))
@@ -2149,8 +2161,8 @@ class swu():
         elif protocol == ESP:
             num_spi = len(spi_list) // 4
             return bytes([ESP]) + b'\x04' + struct.pack("!H",num_spi) + spi_list
-            
- 
+
+
     def encode_payload_type_n(self,protocol,spi,notify_message_type,notification_data= b''):
         spi_size = len(spi)
         return bytes([protocol]) + bytes([spi_size]) + struct.pack("!H",notify_message_type) + spi + notification_data
@@ -2163,15 +2175,18 @@ class swu():
         Identity type 0x02 = IMEISV (16 digits)
         Uses the per-instance self.imei / self.imeisv (set via set_device_identity).
         """
-        if self.device_identity_type == 0x02:
+        if not self.has_device_identity():
+            raise ValueError("DEVICE_IDENTITY requested but no equipment identity is configured")
+        if (self.device_identity_type == 0x02
+                or (self.device_identity_type not in (0x01, 0x02)
+                    and len(self.imeisv) == 16)):
             identity_type = 0x02
-            digits = (self.imeisv or IMEISV)
+            digits = self.imeisv
         else:  # 0x01 or fallback
             identity_type = 0x01
-            imei = (self.imei or IMEI)
+            imei = self.imei
             digits = imei[:15] + 'F'  # pad 15-digit IMEI to 16 chars with trailing F
-        swu_log("answering DEVICE_IDENTITY (type=0x%02x) with %s" %
-                (identity_type, digits.rstrip('F')))
+        swu_log("answering DEVICE_IDENTITY (type=0x%02x; value redacted)" % identity_type)
 
         bcd = b''
         for i in range(0, len(digits), 2):
@@ -3546,22 +3561,25 @@ class swu():
         return encrypted_and_integrity_packet
 
     def create_IKE_AUTH_EAP_IDENTITY(self):
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, EAP, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)        
-        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_eap())        
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, EAP, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)
+        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_eap())
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
 
 
     def create_IKE_AUTH_2(self):
         header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, EAP, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)
-        if self.device_identity_requested:
+        identity_requested = self.device_identity_requested
+        if identity_requested and self.has_device_identity():
             payload  = self.encode_generic_payload_header(N,0,self.encode_payload_type_eap())
             payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',DEVICE_IDENTITY,self.encode_device_identity_notification_data()))
-            self.device_identity_requested = False
         else:
             payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_eap())
+            if identity_requested:
+                swu_log("ePDG requested DEVICE_IDENTITY but none is configured; omitting Notify")
+        self.device_identity_requested = False
         packet = self.set_ike_packet_length(header+payload)
 
         encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
@@ -3784,8 +3802,13 @@ class swu():
 
         # A DEVICE_IDENTITY request wins over a plain status ack: answer with our identity.
         if device_identity_requested:
-            swu_log("INFORMATIONAL request: ePDG asked for DEVICE_IDENTITY; answering")
-            self.send_data(self.answer_INFORMATIONAL_device_identity())
+            if self.has_device_identity():
+                swu_log("INFORMATIONAL request: ePDG asked for DEVICE_IDENTITY; answering")
+                self.send_data(self.answer_INFORMATIONAL_device_identity())
+            else:
+                swu_log("INFORMATIONAL request: ePDG asked for DEVICE_IDENTITY, but none is "
+                        "configured; acknowledging without the Notify")
+                self.send_data(self.answer_INFORMATIONAL_empty())
             return True
 
         if saw_notify:
@@ -6108,43 +6131,10 @@ def read_res_ck_ik_2(reader_index,rand,autn):
 
 
 # --- USIM AKA with CHV1 verify, single connection (VoWiFi engine addition) ------------------
-# Mirrors engine/pin_keeper.py: SELECT MF -> EF.DIR (scan for the 3GPP USIM AID, robust across
-# vendors that list CSIM first) -> ADF.USIM -> [VERIFY CHV1] -> AUTHENTICATE(AKA). Returns the
-# same (res, ck, ik) / (auts, None, None) convention the caller expects.
-_USIM_AID_PREFIX = "A0000000871002"
-
-
+# Reuse pin_keeper's card-vendor continuation and EF_DIR parser so IKE AKA cannot disagree with
+# the PIN and SIP AKA paths about whether the same physical card contains a USIM application.
 def _swu_select_adf_usim(conn):
-    conn.transmit(toBytes("00a40004023f0000"))               # SELECT MF
-    d, s1, s2 = conn.transmit(toBytes("00a40004022f0000"))   # SELECT EF.DIR
-    if s1 != 0x61:
-        return False
-    fcp, s1, s2 = conn.transmit(toBytes("00C00000") + [s2])
-    if s1 != 0x90 or len(fcp) < 8:
-        return False
-    rec_len = fcp[7]
-    aid = None
-    first = None
-    for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(toBytes("00b2") + [rec, 0x04, rec_len])
-        if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
-            break
-        aid_len = d[3]
-        a = "".join("%02X" % b for b in d[4:4 + aid_len])
-        if len(a) < aid_len * 2:
-            break
-        if a.startswith(_USIM_AID_PREFIX):
-            aid = (aid_len, a)
-            break
-        if first is None:
-            first = (aid_len, a)
-    if aid is None:
-        aid = first
-    if aid is None:
-        return False
-    aid_len, a = aid
-    d, s1, s2 = conn.transmit(toBytes("00a40404") + [aid_len] + toBytes(a))
-    return s1 == 0x61
+    return _shared_select_adf_usim(conn)
 
 
 def _swu_verify_chv1(conn, pin):
