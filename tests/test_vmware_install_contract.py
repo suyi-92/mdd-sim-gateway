@@ -145,6 +145,29 @@ printf '%s\\n' '{"LPAC_APDU":["pcsc","stdio"],"LPAC_HTTP":["curl","stdio"]}'
         self.assertIn("default route or SSH address changed", INSTALL)
         self.assertIn("SetLogging s INFO", INSTALL)
 
+    def test_optional_cellular_probe_does_not_enter_the_required_wait_loop(self):
+        gate = shell_function(INSTALL, "cellular_gate")
+        self.assertLess(gate.index("require_cellular == 0"),
+                        gate.index("deadline=$((SECONDS + 90))"))
+        self.assertIn("no Quectel-class modem is visible", gate)
+        self.assertIn("no cellular modem detected", gate)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "cellular timing contract runs in a supported Linux guest")
+    def test_optional_cellular_probe_never_sleeps(self):
+        gate = shell_function(INSTALL, "cellular_gate")
+        script = gate + """
+}
+require_cellular=0
+mmcli() { return 1; }
+sleep() { exit 97; }
+warn() { :; }
+info() { :; }
+die() { exit 98; }
+cellular_gate
+"""
+        subprocess.run(["bash", "-euc", script], check=True)
+
     def test_firewall_cleanup_tracks_only_rules_created_by_mdd(self):
         firewall = shell_function(INSTALL, "configure_firewall_rules")
         self.assertNotIn(': > "$state_dir/firewall-created"', firewall)

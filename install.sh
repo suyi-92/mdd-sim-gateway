@@ -638,14 +638,23 @@ PY
 }
 
 cellular_gate() {
-  local deadline=$((SECONDS + 90)) listing=""
+  local deadline listing=""
+  listing=$(mmcli -L 2>/dev/null || true)
+  if grep -q '/Modem/' <<<"$listing"; then
+    info "ModemManager detected a cellular modem"
+    return
+  fi
+  if ((require_cellular == 0)); then
+    warn "no Quectel-class modem is visible to ModemManager"
+    return
+  fi
+  deadline=$((SECONDS + 90))
   while ((SECONDS < deadline)); do
     listing=$(mmcli -L 2>/dev/null || true)
     grep -q '/Modem/' <<<"$listing" && break
     sleep 3
   done
   if ! grep -q '/Modem/' <<<"$listing"; then
-    ((require_cellular == 0)) && { warn "no Quectel-class modem is visible to ModemManager"; return; }
     die "no cellular modem detected; pass the complete Quectel USB composite device to the guest"
   fi
   info "ModemManager detected a cellular modem"
