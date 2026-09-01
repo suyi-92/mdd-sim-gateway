@@ -91,6 +91,8 @@ class InstallerContractTests(unittest.TestCase):
                       "org.opencontainers.image.revision=$sha", "--cap-add NET_ADMIN",
                       "--device /dev/net/tun", "asterisk_modules"):
             self.assertIn(value, prepare)
+        self.assertIn('-f "$source_dir/engine/Dockerfile" "$source_dir/engine"', prepare)
+        self.assertTrue((ROOT / "engine/.dockerignore").exists())
 
     def test_scr_prime_uses_native_probe_then_patch_three_only(self):
         gate = shell_function(INSTALL, "scr_prime_gate")

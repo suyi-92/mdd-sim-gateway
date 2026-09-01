@@ -725,11 +725,11 @@ prepare_build() {
   local build_args=(docker build --pull --label "org.opencontainers.image.revision=$sha" \
     --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
     --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
-    -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir")
+    -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir/engine")
   ((no_cache)) && build_args=(docker build --pull --no-cache --label "org.opencontainers.image.revision=$sha" \
     --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
     --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
-    -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir")
+      -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir/engine")
   "${build_args[@]}"
   [[ $(docker image inspect "$image" --format '{{.Architecture}}') == amd64 ]] || die "Engine image architecture is not amd64"
   [[ $(docker image inspect "$image" --format '{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}') == "$runtime_fp" ]] || die "Engine runtime fingerprint mismatch"
