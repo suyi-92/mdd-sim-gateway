@@ -21,9 +21,9 @@ ARG ASTERISK_REPOSITORY=https://github.com/MddIdd/asterisk-sysmocom-mirror.git
 
 WORKDIR /home/asterisk-build
 
-RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+RUN dnf -y --refresh --setopt=zchunk=False --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
     --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 upgrade && \
-    dnf -y --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+    dnf -y --setopt=zchunk=False --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
     --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 \
     --setopt=install_weak_deps=False install \
     git gcc g++ openssl-devel patch libedit-devel opus-devel libuuid-devel autoconf \
@@ -135,9 +135,9 @@ RUN set -eu; \
 FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898 AS runtime
 
 COPY --from=build /runtime-packages.txt /tmp/runtime-packages.txt
-RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+RUN dnf -y --refresh --setopt=zchunk=False --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
     --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 upgrade && \
-    dnf -y --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+    dnf -y --setopt=zchunk=False --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
     --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 \
     --setopt=install_weak_deps=False install $(cat /tmp/runtime-packages.txt) && \
     dnf clean all && rm -rf /var/cache/dnf /tmp/runtime-packages.txt
