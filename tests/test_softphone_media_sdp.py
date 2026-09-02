@@ -38,6 +38,31 @@ process.stdout.write(JSON.stringify(rewriteLocalSdpForMediaHost(input.sdp, input
     return json.loads(completed.stdout)
 
 
+def release_audio_sink(owned: bool) -> list[str]:
+    script = r"""
+import { releaseAudioSink } from './webui/src/audio-sink.js'
+const events = []
+const sink = {
+  srcObject: { id: 'remote-stream' },
+  pause() { events.push('pause') },
+  remove() { events.push('remove') },
+}
+releaseAudioSink(sink, JSON.parse(process.argv[1]))
+if (sink.srcObject === null) events.push('cleared')
+process.stdout.write(JSON.stringify(events))
+"""
+    completed = subprocess.run(
+        [NODE, "--input-type=module", "--eval", script, json.dumps(owned)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=15,
+    )
+    return json.loads(completed.stdout)
+
+
 @unittest.skipUnless(NODE, "Node.js is required for the WebRTC SDP unit tests")
 class BrowserMediaSdpTests(unittest.TestCase):
     SDP = "\r\n".join((
@@ -74,6 +99,12 @@ class BrowserMediaSdpTests(unittest.TestCase):
     def test_sdp_without_the_proxy_range_is_unchanged(self):
         ordinary = self.SDP.replace("198.18.0.1", "192.168.101.50").replace("61069", "61072")
         self.assertEqual(rewrite_sdp(ordinary, "192.168.101.50"), ordinary)
+
+    def test_react_owned_audio_sink_is_cleared_but_not_removed(self):
+        self.assertEqual(release_audio_sink(False), ["pause", "cleared"])
+
+    def test_wrapper_owned_fallback_audio_sink_is_removed(self):
+        self.assertEqual(release_audio_sink(True), ["pause", "remove", "cleared"])
 
 
 @unittest.skipIf(main is None, "control plane dependencies are not installed")

@@ -1,5 +1,6 @@
 // Browser softphone: JsSIP UA over WSS to the engine's Asterisk WebRTC transport.
 import JsSIP from 'jssip'
+import { releaseAudioSink } from './audio-sink.js'
 import { rewriteLocalSdpForMediaHost } from './media-sdp.js'
 
 // Surface JsSIP internals in the console to aid troubleshooting (registration, ICE, etc.)
@@ -15,6 +16,7 @@ export class Softphone {
     this.ua = null
     this.session = null
     this.remoteAudio = audioEl || null
+    this._ownsRemoteAudio = false
     this._dead = false                // set true by stop() to inert late JsSIP events
     this._unlocked = false
     this._rec = null
@@ -26,7 +28,14 @@ export class Softphone {
   emit(type, data) { try { this.onEvent(type, data) } catch {} }
 
   // Point the class at the React-owned <audio> element. Called from the component's ref effect.
-  setAudioEl(el) { if (el) this.remoteAudio = el }
+  setAudioEl(el) {
+    if (!el) return
+    if (this.remoteAudio && this.remoteAudio !== el && this._ownsRemoteAudio) {
+      releaseAudioSink(this.remoteAudio, true)
+    }
+    this.remoteAudio = el
+    this._ownsRemoteAudio = false
+  }
 
   ensureAudio() {
     // Fallback only: if no element was injected (shouldn't happen in the React app), create a
@@ -38,6 +47,7 @@ export class Softphone {
       el.style.display = 'none'
       try { document.body.appendChild(el) } catch {}
       this.remoteAudio = el
+      this._ownsRemoteAudio = true
     }
     return this.remoteAudio
   }
@@ -302,8 +312,9 @@ export class Softphone {
     if (this._rec) { try { this._rec.stop() } catch {}; this._rec = null }
     if (this.ua) { try { this.ua.stop() } catch {} this.ua = null }
     if (this.remoteAudio) {
-      try { this.remoteAudio.srcObject = null; this.remoteAudio.remove() } catch {}
+      releaseAudioSink(this.remoteAudio, this._ownsRemoteAudio)
       this.remoteAudio = null
+      this._ownsRemoteAudio = false
     }
   }
 }

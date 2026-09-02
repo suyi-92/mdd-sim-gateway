@@ -24,7 +24,7 @@ Usage:
   mddctl update [--no-cache] [--dry-run] [--yes]
   mddctl backup [--output PATH]
   mddctl restore --input PATH
-  mddctl driver status | restore
+  mddctl driver status | install | restore
   mddctl uninstall [--purge]
 EOF
 }
@@ -691,6 +691,7 @@ cmd_driver() {
   local sub=${1:-}; shift || true
   case "$sub" in
     status)
+      (($# == 0)) || die "driver status takes no options"
       local usb=no pcsc=no mode held=no
       lsusb -d 04d9:c001 >/dev/null 2>&1 && usb=yes
       [[ "$usb" == yes ]] && scr_pcsc_visible && pcsc=yes
@@ -698,8 +699,21 @@ cmd_driver() {
       apt-mark showhold 2>/dev/null | grep -qx libccid && held=yes
       printf 'SCR Prime USB: %s\nPC/SC reader: %s\nDriver mode: %s\nlibccid held: %s\n' "$usb" "$pcsc" "$mode" "$held"
       ;;
-    restore) acquire_lock; driver_restore_internal ;;
-    *) die "usage: mddctl driver status|restore" ;;
+    install)
+      (($# == 0)) || die "driver install takes no options"
+      acquire_lock
+      validate_managed_checkout
+      validate_active_generation
+      lsusb -d 04d9:c001 >/dev/null 2>&1 || \
+        die "SCR Prime 04d9:c001 is not visible; connect the complete USB device to this VMware guest"
+      bash "$INSTALL_DIR/install.sh" driver --source "$INSTALL_DIR"
+      ;;
+    restore)
+      (($# == 0)) || die "driver restore takes no options"
+      acquire_lock
+      driver_restore_internal
+      ;;
+    *) die "usage: mddctl driver status|install|restore" ;;
   esac
 }
 

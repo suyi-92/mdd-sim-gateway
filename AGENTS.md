@@ -193,6 +193,9 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
   `03_scr_prime_reader.patch`。严禁应用 HSIC 专用 patch、`patch2` 或 `patchall`。
 - 驱动操作先发布 PC/SC maintenance marker；只有 MDD 元数据和当前哈希证明文件由本项目修改
   时，`mddctl driver restore` 才能恢复、解除 hold 并重启 pcscd。
+- 首次安装后才接入 SCR Prime，且 USB 可见但 PC/SC 不可见时，使用
+  `mddctl driver install`。它必须先验证受管 checkout 和 active generation，再复用固定 CCID、
+  补丁 03、备份、原子替换与失败回滚；不得为此重跑完整 bootstrap/install 或手工覆盖 bundle。
 - Quectel 必须把完整 USB 复合设备连接到 VM，不能只传 Windows COM 口。验收顺序为
   `lsusb/lsusb -t`、tty/WWAN、`mmcli -L`、modem/SIM、NetworkManager GSM profile、bearer/IP。
 - NetworkManager 只管理蜂窝设备，不能接管桥接管理网卡；默认路由或 SSH 地址变化必须回滚并

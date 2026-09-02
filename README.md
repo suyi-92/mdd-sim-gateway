@@ -31,16 +31,17 @@ WebUI、pcscd、ModemManager、NetworkManager 和 Engine 仍会完成安装。
 
 1. 在 VMware Workstation 中把 SCR Prime 和**整个 Quectel USB 复合设备**连接到客户机，并在
    SCR Prime 中插入 SIM；不能只传 Windows COM 口。
-2. 重新执行下面的硬件验收命令：
+2. 让受管驱动入口探测刚接入的 SCR Prime：
 
    ```bash
-   bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
+   sudo mddctl driver install
    ```
 
-   重复安装是幂等的；同一提交会复用已经验证的本地构建和 Docker 缓存。SCR Prime 会先尝试
-   发行版原生驱动，必要时自动安装仅含补丁 03 的 CCID，并要求验证 ATR 和真实拔插恢复；
-   Quectel 最多等待约 90 秒，直到 `mmcli -L` 能看到 modem。
-3. 按 SCR Prime 验收过程的提示拔下、重新连接设备，然后运行：
+   该命令先验证正式 checkout 和 active generation，再尝试发行版原生驱动；只有 USB 可见而
+   PC/SC 不可见时，才事务安装仅含补丁 03 的固定 CCID。没有插卡时只警告，reader 成功枚举后
+   仍需插入 SIM 并确认 ATR。Quectel 通常会被 ModemManager 自动热发现。
+3. 插卡后用 `pcsc_scan` 确认 reader 和 ATR，断开再接回 SCR Prime 并确认 reader 自动恢复，
+   然后运行：
 
    ```bash
    sudo mddctl doctor
@@ -50,10 +51,9 @@ WebUI、pcscd、ModemManager、NetworkManager 和 Engine 仍会完成安装。
    线路；把 Quectel 建成 **modem、4G + VoWiFi** 线路，并填写该 SIM 的 APN/4G 设置，使
    NetworkManager 建立 GSM profile、bearer 和 IP。
 
-只后插其中一台设备时，只加对应的 `--require-scr-prime` 或 `--require-cellular` 即可。Quectel
-通常能被 ModemManager 热发现，但仍需在 WebUI 建线；SCR Prime 则应重新运行验收命令，因为
-只有看到真实 `04d9:c001` 后，安装器才能判断是否需要 CCID 补丁。若客户机已启用防火墙，可在
-硬件验收命令中再加 `--configure-firewall`，或按安装器打印的精确端口手工放行。
+Quectel 热发现后仍需在 WebUI 建线；SCR Prime 后插时运行一次 `sudo mddctl driver install`，
+不要为了驱动重跑完整 bootstrap/install。若客户机启用了防火墙，按首次安装器打印的精确端口
+放行。
 
 `vmware` 分支面向 Windows x86_64 宿主机上的 VMware Workstation。Control 与 WebUI
 在 Linux 客户机中由 systemd 原生运行；只有每条 SIM 的 Engine 使用 rootful Docker。
@@ -162,6 +162,8 @@ VMware USB 直通 → lsusb 04d9:c001 → pcscd → pcsc_scan → ATR → 拔插
 - USB 可见但 PC/SC 不可见：备份现有 bundle，应用补丁 03，记录包版本、备份路径、补丁集
   与安装前后哈希；只有确实覆盖发行版所属 bundle 时才新增 `libccid` hold。
 - 驱动重启前发布 PC/SC 维护标记，避免控制面把计划内重载误判成物理拔卡。
+- `mddctl driver install` 先验证受管 checkout 和 active generation，再复用相同的固定下载、
+  备份、原子替换、哈希证据与失败回滚；用于首次安装完成后才接入 SCR Prime 的机器。
 - `mddctl update` 会重新探测发行版驱动；若已经原生支持 SCR Prime，则恢复发行版版本并
   解除 hold，否则继续使用经过哈希验证的补丁版本。
 - `mddctl driver restore` 只有在 root 元数据证明文件由 MDD 修改且当前哈希仍匹配时才执行。
@@ -170,6 +172,7 @@ VMware USB 直通 → lsusb 04d9:c001 → pcscd → pcsc_scan → ATR → 拔插
 
 ```bash
 sudo mddctl driver status
+sudo mddctl driver install
 sudo mddctl driver restore
 ```
 
@@ -182,7 +185,7 @@ mddctl start|stop|restart|logs
 mddctl update [--no-cache]
 mddctl backup [--output PATH]
 mddctl restore --input PATH
-mddctl driver status|restore
+mddctl driver status|install|restore
 mddctl uninstall [--purge]
 ```
 

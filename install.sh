@@ -41,6 +41,7 @@ Internal commands used by mddctl:
   install.sh verify   --source PATH --build-root PATH --sha COMMIT
   install.sh activate --source PATH --build-root PATH --sha COMMIT
   install.sh health   --source PATH
+  install.sh driver   --source PATH
 EOF
 }
 
@@ -49,7 +50,7 @@ EOF
 action=${1:-}
 [[ -n "$action" ]] || { usage; exit 2; }
 shift
-case "$action" in install|prepare|verify|activate|health) ;; -h|--help|help) usage; exit 0 ;; *) die "unknown action: $action" ;; esac
+case "$action" in install|prepare|verify|activate|health|driver) ;; -h|--help|help) usage; exit 0 ;; *) die "unknown action: $action" ;; esac
 
 source_dir=""
 install_dir=/opt/mdd-sim-gateway
@@ -474,6 +475,19 @@ pcsc_scan_capture() {
 }
 scr_prime_pcsc_visible() { pcsc_scan_capture 8 | grep -Eiq 'SCR[[:space:]_-]*Prime'; }
 
+validate_scr_prime_reader() {
+  local output=$1
+  grep -Eiq 'SCR[[:space:]_-]*Prime' <<<"$output" || \
+    die "SCR Prime disappeared during PC/SC validation"
+  if grep -Eiq 'ATR:[[:space:]]*[0-9A-F]' <<<"$output"; then
+    return 0
+  fi
+  if ((require_scr_prime)); then
+    die "insert a SIM in SCR Prime so its ATR can be validated"
+  fi
+  warn "SCR Prime reader is visible, but no card ATR is available; continuing because hardware acceptance was not required"
+}
+
 tree_hash() {
   local root=$1
   python3 - "$root" <<'PY'
@@ -631,8 +645,7 @@ PY
   fi
 
   output=$(pcsc_scan_capture 45)
-  grep -Eiq 'SCR[[:space:]_-]*Prime' <<<"$output" || die "SCR Prime disappeared during PC/SC validation"
-  grep -Eiq 'ATR:[[:space:]]*[0-9A-F]' <<<"$output" || die "insert a SIM in SCR Prime so its ATR can be validated"
+  validate_scr_prime_reader "$output"
   if ((require_scr_prime)); then
     [[ -t 0 ]] || die "SCR Prime hot-plug acceptance needs an interactive terminal"
     printf 'Unplug SCR Prime, then press Enter. The installer will verify disappearance: '
@@ -1084,6 +1097,19 @@ case "$action" in
   health)
     source_dir=${source_dir:-$install_dir}
     health_check
+    ;;
+  driver)
+    [[ -n "$source_dir" ]] || die "driver requires --source"
+    source_dir=$(realpath "$source_dir")
+    [[ -r "$source_dir/patches/ccid/03_scr_prime_reader.patch" ]] || \
+      die "verified SCR Prime CCID patch is missing from the active source"
+    detect_distro
+    for dependency in curl tar patch meson ninja systemctl lsusb pcsc_scan; do
+      have "$dependency" || die "SCR Prime driver installation dependency is missing: $dependency"
+    done
+    install -d -m 0700 "$state_dir"
+    scr_prime_gate
+    info "SCR Prime driver validation completed"
     ;;
   install)
     detect_distro

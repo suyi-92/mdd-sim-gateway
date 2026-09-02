@@ -102,7 +102,14 @@ timeout 15 pcsc_scan -n
 sudo mddctl driver status
 ```
 
-安装器只有在这组证据成立时才构建 CCID，并且只应用
+若 USB 已出现而 PC/SC reader 仍不存在，使用受管的后插设备修复入口：
+
+```bash
+sudo mddctl driver install
+```
+
+该入口先验证正式 checkout、active-commit、激活链接、build manifest 和 Engine 身份；任一
+证据异常都会在驱动变化前停止。验证通过后才复用安装器的驱动事务，且只应用
 `patches/ccid/03_scr_prime_reader.patch`。检查元数据：
 
 ```bash
@@ -129,7 +136,9 @@ MDD 安装后哈希不一致。遇到拒绝先保留现场，不要手工覆盖�
 - 观察 pcscd 日志中 power-on/communication 错误；
 - 将 SCR Prime 从 VM 断开再重新连接，确认无需重启客户机即可恢复。
 
-`--require-scr-prime` 会要求真实拔插。`--yes` 不能跳过这项。
+`mddctl driver install` 在没有 ATR 时只警告，因为驱动安装不应依赖卡片在场；reader 不可见仍
+会失败。首次安装显式使用 `--require-scr-prime` 时会继续强制 ATR 和真实拔插，`--yes` 不能
+跳过这项。
 
 ## 7. Quectel 在 Windows 中有 COM 口，客户机没有 modem
 

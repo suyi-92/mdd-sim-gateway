@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
+CSS = (ROOT / "webui/src/index.css").read_text(encoding="utf-8")
 
 
 class NotificationTemplateUiTests(unittest.TestCase):
@@ -43,6 +44,11 @@ class NotificationTemplateUiTests(unittest.TestCase):
         self.assertIn("sudo mddctl update", SOURCE)
         self.assertNotIn("checkUpdate", SOURCE)
         self.assertNotIn("openUpdateDialog", SOURCE)
+
+    def test_notification_and_system_saves_use_normal_sized_action_rows(self):
+        self.assertEqual(SOURCE.count('className="u-settings-actions"'), 2)
+        self.assertIn(".u-settings-actions .btn { flex:none; width:auto; min-width:88px; }", CSS)
+        self.assertNotIn(".u-settings-actions .btn { width:100%; }", CSS)
 
 
 if __name__ == "__main__":

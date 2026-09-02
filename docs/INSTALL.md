@@ -186,8 +186,18 @@ CMake。Engine Dockerfile还会按固定提交取得 Asterisk 与 pjproject。�
 6. 备份原 `ifd-ccid.bundle`，原子替换并记录 root-only JSON 元数据；
 7. 只有确实替换发行版 bundle 时才 `apt-mark hold libccid`；
 8. 发布 `orchestrator/pcsc-maintenance` 后重启 pcscd；
-9. 再次确认 reader 和 ATR；
-10. 按终端提示拔出、确认 USB 消失、重新连接并确认 PC/SC 自动恢复。
+9. 再次确认 reader；普通安装或 `mddctl driver install` 在未插卡时警告并继续；
+10. 显式 `--require-scr-prime` 时还必须确认 ATR，并按终端提示拔出、确认 USB 消失、重新连接
+    并确认 PC/SC 自动恢复。
+
+若首次安装时设备尚未直通，之后 USB 已可见但 PC/SC 不可见，不要重跑完整安装。执行：
+
+```bash
+sudo mddctl driver install
+```
+
+该命令在驱动变化前验证受管 checkout 与完整 active generation，并复用相同的备份、原子替换、
+哈希记录和失败回滚。
 
 补丁元数据：
 

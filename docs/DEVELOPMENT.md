@@ -72,6 +72,7 @@ Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行�
 - native Control / Docker Engine；
 - 临时构建与原子切换；
 - SCR Prime 原生优先和补丁 03 only；
+- SCR Prime 后插安装入口在任何驱动变化前验证 active generation，且无卡时只跳过 ATR 门禁；
 - NetworkManager 默认路由保护；
 - Git 精确 remote、clean、fast-forward-only；
 - backup/restore 校验和与路径安全；

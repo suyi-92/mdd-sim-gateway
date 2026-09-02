@@ -291,6 +291,55 @@ printf '%s\\n' fingerprint-ok
         self.assertIn("apt-mark hold libccid", patched)
         self.assertIn("scr-prime-driver.json", patched)
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "SCR Prime reader validation runs in a supported Linux shell")
+    def test_optional_scr_prime_validation_accepts_a_reader_without_a_card(self):
+        validator = shell_function(INSTALL, "validate_scr_prime_reader")
+        script = validator + r'''
+}
+warn() { printf 'warning:%s\n' "$*"; }
+die() { printf 'error:%s\n' "$*" >&2; exit 9; }
+require_scr_prime=$1
+validate_scr_prime_reader "$2"
+'''
+        reader_only = "Reader 0: SCR Prime CCID Reader 00 00"
+        optional = subprocess.run(
+            ["bash", "-c", script, "scr-reader-check", "0", reader_only],
+            check=False, text=True, capture_output=True)
+        required = subprocess.run(
+            ["bash", "-c", script, "scr-reader-check", "1", reader_only],
+            check=False, text=True, capture_output=True)
+        with_atr = subprocess.run(
+            ["bash", "-c", script, "scr-reader-check", "1",
+             f"{reader_only}\nATR: 3B 00"],
+            check=False, text=True, capture_output=True)
+
+        self.assertEqual(optional.returncode, 0, optional.stderr)
+        self.assertIn("no card ATR is available", optional.stdout)
+        self.assertEqual(required.returncode, 9)
+        self.assertIn("insert a SIM", required.stderr)
+        self.assertEqual(with_atr.returncode, 0, with_atr.stderr)
+
+    def test_driver_install_validates_active_source_before_touching_the_driver(self):
+        command = shell_function(MDDCTL, "cmd_driver")
+        install_case = command[command.index("install)"):command.index("restore)")]
+        checkout = install_case.index("validate_managed_checkout")
+        generation = install_case.index("validate_active_generation")
+        usb = install_case.index("lsusb -d 04d9:c001")
+        handoff = install_case.index('bash "$INSTALL_DIR/install.sh" driver')
+        self.assertLess(checkout, generation)
+        self.assertLess(generation, usb)
+        self.assertLess(usb, handoff)
+        self.assertIn("driver --source", install_case)
+
+    def test_internal_driver_action_uses_only_the_active_patch_and_gate(self):
+        action = INSTALL[INSTALL.index("  driver)\n"):INSTALL.index("  install)\n")]
+        self.assertIn("03_scr_prime_reader.patch", action)
+        self.assertIn("detect_distro", action)
+        self.assertIn("scr_prime_gate", action)
+        self.assertNotIn("install_packages", action)
+        self.assertNotIn("install_source_checkout", action)
+
     def test_lpac_build_gate_does_not_require_a_pcsc_reader(self):
         validator = shell_function(INSTALL, "lpac_binary_valid")
         ensure = shell_function(INSTALL, "ensure_lpac")
