@@ -67,6 +67,16 @@ done
 [[ "$ORIGIN_URL" == https://github.com/suyi-92/mdd-sim-gateway.git ]] || die "managed origin metadata is invalid"
 [[ "$BRANCH" == vmware ]] || die "managed branch metadata is invalid"
 readonly ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"
+ACTIVE_GENERATION_COMMIT=""
+ACTIVE_GENERATION_BUILD=""
+MANAGED_CHECKOUT_STATUS_KIND=""
+UPDATE_OLD=""
+UPDATE_OLD_BUILD=""
+UPDATE_WORKTREE=""
+UPDATE_SNAPSHOT=""
+UPDATE_PREVIOUS_IMAGE=""
+UPDATE_WORKTREE_ACTIVE=0
+UPDATE_TRANSACTION_ARMED=0
 
 command=${1:-}
 [[ -n "$command" ]] || { usage; exit 2; }
@@ -379,12 +389,38 @@ cmd_restore() {
 git_operation_in_progress() {
   local name path
   for name in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
-    path=$(git -C "$INSTALL_DIR" rev-parse --git-path "$name")
+    path=$(git -C "$INSTALL_DIR" rev-parse --path-format=absolute --git-path "$name")
     [[ -e "$path" ]] && return 0
   done
-  path=$(git -C "$INSTALL_DIR" rev-parse --git-path rebase-merge); [[ -d "$path" ]] && return 0
-  path=$(git -C "$INSTALL_DIR" rev-parse --git-path rebase-apply); [[ -d "$path" ]] && return 0
+  path=$(git -C "$INSTALL_DIR" rev-parse --path-format=absolute --git-path rebase-merge); [[ -d "$path" ]] && return 0
+  path=$(git -C "$INSTALL_DIR" rev-parse --path-format=absolute --git-path rebase-apply); [[ -d "$path" ]] && return 0
   return 1
+}
+
+managed_checkout_status_kind() {
+  GIT_OPTIONAL_LOCKS=0 python3 - "$INSTALL_DIR" <<'PY'
+import subprocess
+import sys
+
+repository = sys.argv[1]
+result = subprocess.run(
+    ["git", "-C", repository, "status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    check=False,
+)
+if result.returncode:
+    raise SystemExit(2)
+entries = result.stdout.split(b"\0")
+if entries[-1:] == [b""]:
+    entries.pop()
+if not entries:
+    print("clean")
+elif entries == [b"?? .venv", b"?? webui/dist"]:
+    print("legacy-activation-links")
+else:
+    raise SystemExit(1)
+PY
 }
 
 validate_managed_checkout() {
@@ -392,7 +428,56 @@ validate_managed_checkout() {
   [[ $(git -C "$INSTALL_DIR" remote get-url origin) == "$ORIGIN_URL" ]] || die "origin URL does not exactly match $ORIGIN_URL"
   [[ $(git -C "$INSTALL_DIR" branch --show-current) == "$BRANCH" ]] || die "managed checkout is not on $BRANCH"
   git_operation_in_progress && die "a Git operation is in progress"
-  [[ -z $(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal) ]] || die "managed checkout has non-ignored changes"
+  MANAGED_CHECKOUT_STATUS_KIND=$(managed_checkout_status_kind) || \
+    die "managed checkout has staged, tracked, conflicted or unexpected untracked changes"
+}
+
+validate_active_generation() {
+  local head active build link expected raw canonical component stable_commit
+  head=$(git -C "$INSTALL_DIR" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
+    die "managed checkout HEAD is not a commit"
+  [[ "$head" =~ ^[0-9a-f]{40}$ && $(git -C "$INSTALL_DIR" rev-parse HEAD) == "$head" ]] || \
+    die "managed checkout HEAD is not an exact 40-character commit"
+
+  [[ -f "$STATE_DIR/active-commit" && ! -L "$STATE_DIR/active-commit" ]] || \
+    die "active-commit is missing or is not a regular file"
+  active=$(<"$STATE_DIR/active-commit")
+  [[ "$active" =~ ^[0-9a-f]{40}$ && "$active" == "$head" ]] || \
+    die "active-commit does not exactly match managed checkout HEAD"
+
+  build="$CACHE_DIR/builds/$head"
+  [[ -d "$build" && ! -L "$build" && $(realpath -e -- "$build" 2>/dev/null) == "$build" ]] || \
+    die "active build root is missing, symbolic or outside the managed build cache"
+  [[ -f "$build/READY" && ! -L "$build/READY" && \
+     -f "$build/manifest.json" && ! -L "$build/manifest.json" && \
+     -d "$build/venv" && ! -L "$build/venv" && \
+     -d "$build/webui" && ! -L "$build/webui" ]] || \
+    die "active build READY, manifest, venv or WebUI evidence is invalid"
+
+  for component in venv webui; do
+    if [[ "$component" == venv ]]; then
+      link="$INSTALL_DIR/.venv"
+    else
+      link="$INSTALL_DIR/webui/dist"
+    fi
+    expected="$build/$component"
+    [[ -L "$link" ]] || die "active $component path is not a symbolic link"
+    raw=$(readlink -- "$link") || die "active $component link cannot be read"
+    [[ "$raw" == /* && "$raw" == "$expected" ]] || \
+      die "active $component link is not the exact installer-generated absolute target"
+    canonical=$(realpath -e -- "$link" 2>/dev/null) || die "active $component link is dangling"
+    [[ "$canonical" == "$expected" && $(realpath -e -- "$expected" 2>/dev/null) == "$expected" ]] || \
+      die "active $component link resolves outside its exact commit build"
+  done
+
+  bash "$INSTALL_DIR/install.sh" verify --source "$INSTALL_DIR" --build-root "$build" --sha "$head" || \
+    die "active build identity verification failed"
+  stable_commit=$(docker image inspect "$ENGINE_STABLE_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+  [[ "$stable_commit" == "$head" ]] || die "stable Engine image does not match active HEAD"
+
+  ACTIVE_GENERATION_COMMIT=$head
+  ACTIVE_GENERATION_BUILD=$build
 }
 
 tree_hash() {
@@ -623,25 +708,25 @@ cmd_update() {
   while (($#)); do case "$1" in --no-cache) no_cache=1 ;; --dry-run) dry_run=1 ;; --yes|-y) assume_yes=1 ;; *) die "unknown update option: $1" ;; esac; shift; done
   acquire_lock
   validate_managed_checkout
+  validate_active_generation
   local old new worktree="" build snapshot="" previous_image old_build
-  local worktree_active=0 transaction_armed=0
-  old=$(git -C "$INSTALL_DIR" rev-parse HEAD)
-  old_build="$CACHE_DIR/builds/$old"
+  old=$ACTIVE_GENERATION_COMMIT
+  old_build=$ACTIVE_GENERATION_BUILD
+  UPDATE_OLD=$old
+  UPDATE_OLD_BUILD=$old_build
+  UPDATE_WORKTREE=""
+  UPDATE_SNAPSHOT=""
+  UPDATE_PREVIOUS_IMAGE=""
+  UPDATE_WORKTREE_ACTIVE=0
+  UPDATE_TRANSACTION_ARMED=0
   if ((dry_run)); then info "update preflight passed for $old; no fetch or build performed"; return; fi
   git -C "$INSTALL_DIR" fetch --prune origin "$BRANCH"
   new=$(git -C "$INSTALL_DIR" rev-parse "origin/$BRANCH")
   git -C "$INSTALL_DIR" merge-base --is-ancestor "$old" "$new" || die "local and origin/$BRANCH diverged; update will not merge, rebase, reset or force"
   if [[ "$old" == "$new" ]]; then (driver_reprobe_native); info "already up to date ($old)"; return; fi
   ((assume_yes)) || { printf 'Update %s -> %s? [y/N] ' "${old:0:12}" "${new:0:12}"; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "update cancelled"; }
-  [[ -f "$old_build/READY" && -x "$old_build/venv/bin/python" && -f "$old_build/webui/index.html" ]] || \
-    die "the current verified build is unavailable; refusing an update without a rollback generation"
-  docker image inspect "mdd-sim-gateway/engine:$old" >/dev/null 2>&1 || \
-    die "the current commit-specific Engine image is unavailable; refusing an update without rollback"
-  bash "$INSTALL_DIR/install.sh" verify --source "$INSTALL_DIR" --build-root "$old_build" --sha "$old"
-  [[ $(docker image inspect "$ENGINE_STABLE_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null) == "$old" ]] || \
-    die "the stable Engine image does not match the managed source commit"
-
   worktree="$CACHE_DIR/update/worktree-$new"; build="$CACHE_DIR/builds/$new"
+  UPDATE_WORKTREE=$worktree
   install -d -m 0700 "$CACHE_DIR/update"
   [[ "$worktree" == "$CACHE_DIR/update/"* ]] || die "unsafe update worktree path"
   git -C "$INSTALL_DIR" worktree prune
@@ -649,44 +734,86 @@ cmd_update() {
     git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
   fi
   git -C "$INSTALL_DIR" worktree add --detach "$worktree" "$new"
-  worktree_active=1
+  UPDATE_WORKTREE_ACTIVE=1
   update_cleanup() {
     local code=${1:-1} rollback_failed=0 current_status current_branch current_remote
     trap - EXIT HUP INT TERM
-    if ((worktree_active)); then
-      git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
-      worktree_active=0
+    if ((UPDATE_WORKTREE_ACTIVE)); then
+      git -C "$INSTALL_DIR" worktree remove --force "$UPDATE_WORKTREE" >/dev/null 2>&1 || rm -rf -- "$UPDATE_WORKTREE"
+      UPDATE_WORKTREE_ACTIVE=0
     fi
-    if ((transaction_armed)); then
-      warn "update did not complete; restoring the verified $old generation"
-      stop_runtime >/dev/null 2>&1 || true
-      current_status=$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal 2>/dev/null || printf invalid)
+    if ((UPDATE_TRANSACTION_ARMED)); then
+      warn "update did not complete; restoring the verified $UPDATE_OLD generation"
+      if ! (stop_runtime) >/dev/null 2>&1; then
+        warn "rollback could not fully stop the failed generation; continuing bounded recovery"
+      fi
+      current_status=$(managed_checkout_status_kind 2>/dev/null || printf invalid)
       current_branch=$(git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || true)
       current_remote=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)
-      if [[ -z "$current_status" && "$current_branch" == "$BRANCH" && "$current_remote" == "$ORIGIN_URL" ]] && \
+      if [[ "$current_status" == legacy-activation-links ]] && ! (validate_active_generation); then
+        current_status=invalid
+      fi
+      if [[ "$current_status" == clean || "$current_status" == legacy-activation-links ]] && \
+          [[ "$current_branch" == "$BRANCH" && "$current_remote" == "$ORIGIN_URL" ]] && \
           ! git_operation_in_progress; then
-        git -C "$INSTALL_DIR" reset --hard "$old" >/dev/null || rollback_failed=1
+        if ! git -C "$INSTALL_DIR" reset --hard "$UPDATE_OLD" >/dev/null; then
+          warn "rollback could not restore the previous source commit"
+          rollback_failed=1
+        fi
       else
         warn "managed checkout changed during activation; refusing automatic source reset"
         rollback_failed=1
       fi
       if ((rollback_failed == 0)); then
-        bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$old_build" --sha "$old" || rollback_failed=1
-      fi
-      if ((rollback_failed == 0)) && docker image inspect "$previous_image" >/dev/null 2>&1; then
-        docker tag "$previous_image" "$ENGINE_STABLE_IMAGE" || rollback_failed=1
-      fi
-      if ((rollback_failed == 0)); then
-        (restore_archive "$snapshot" 0) || rollback_failed=1
+        if ! bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" \
+            --build-root "$UPDATE_OLD_BUILD" --sha "$UPDATE_OLD"; then
+          warn "rollback could not reactivate the previous venv and WebUI"
+          rollback_failed=1
+        fi
       fi
       if ((rollback_failed == 0)); then
-        start_runtime || rollback_failed=1
+        if docker image inspect "$UPDATE_PREVIOUS_IMAGE" >/dev/null 2>&1; then
+          if ! docker tag "$UPDATE_PREVIOUS_IMAGE" "$ENGINE_STABLE_IMAGE"; then
+            warn "rollback could not retag the previous stable Engine image"
+            rollback_failed=1
+          fi
+        else
+          warn "previous stable Engine tag is unavailable; verifying the reactivated commit-specific image"
+        fi
+      fi
+      if ((rollback_failed == 0)); then
+        if ! (restore_archive "$UPDATE_SNAPSHOT" 0); then
+          warn "rollback could not restore the pre-update data snapshot"
+          rollback_failed=1
+        fi
+      fi
+      if ((rollback_failed == 0)); then
+        if ! (validate_active_generation); then
+          warn "rollback restored files but active-generation identity is invalid"
+          rollback_failed=1
+        fi
+      fi
+      if ((rollback_failed == 0)); then
+        if ! restore_run_state; then
+          warn "rollback could not restore the previous service run state"
+          rollback_failed=1
+        fi
+      fi
+      if ((rollback_failed == 0)); then
+        if ((CONTROL_WAS_ACTIVE)); then service_is_active "$CONTROL_UNIT" || rollback_failed=1
+        elif service_is_active "$CONTROL_UNIT"; then rollback_failed=1
+        fi
+        if ((ORCHESTRATOR_WAS_ACTIVE)); then service_is_active "$ORCHESTRATOR_UNIT" || rollback_failed=1
+        elif service_is_active "$ORCHESTRATOR_UNIT"; then rollback_failed=1
+        fi
+      fi
+      if ((rollback_failed == 0 && CONTROL_WAS_ACTIVE && ORCHESTRATOR_WAS_ACTIVE)); then
         health_check || rollback_failed=1
       fi
       if ((rollback_failed)); then
-        warn "automatic update rollback is incomplete; services remain stopped and snapshot is $snapshot"
+        warn "automatic update rollback is incomplete; services remain stopped and snapshot is $UPDATE_SNAPSHOT"
       else
-        warn "update was rolled back completely to $old"
+        warn "update was rolled back completely to $UPDATE_OLD"
       fi
     fi
     exit "$code"
@@ -705,25 +832,28 @@ cmd_update() {
   (driver_reprobe_native)
 
   snapshot="$BACKUP_DIR/pre-update-$old-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
+  UPDATE_SNAPSHOT=$snapshot
+  remember_run_state
   (backup_archive "$snapshot" 0)
   previous_image="mdd-sim-gateway/engine:previous-$old"
-  transaction_armed=1
+  UPDATE_PREVIOUS_IMAGE=$previous_image
+  UPDATE_TRANSACTION_ARMED=1
   docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1 && docker tag "$ENGINE_STABLE_IMAGE" "$previous_image"
 
   git -C "$INSTALL_DIR" merge --ff-only "origin/$BRANCH"
   bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$build" --sha "$new"
   start_runtime
   health_check
-  transaction_armed=0
   printf '%s\n' "$old" > "$STATE_DIR/previous-commit"
   git -C "$INSTALL_DIR" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf -- "$worktree"
-  worktree_active=0
+  UPDATE_WORKTREE_ACTIVE=0
   while IFS= read -r image; do
     [[ "$image" == "$previous_image" ]] || docker image rm "$image" >/dev/null 2>&1 || true
   done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep '^mdd-sim-gateway/engine:previous-' || true)
   while IFS= read -r archive; do
     [[ "$archive" == "$snapshot" ]] || rm -f -- "$archive" "$archive.sha256"
   done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'pre-update-*.tar.gz' -print)
+  UPDATE_TRANSACTION_ARMED=0
   trap - EXIT HUP INT TERM
   info "updated successfully to $new; previous source/image/data generation retained"
 }

@@ -215,12 +215,34 @@ sudo mddctl update --no-cache
 ```bash
 sudo git -C /opt/mdd-sim-gateway status --short --branch
 sudo git -C /opt/mdd-sim-gateway remote -v
-sudo git -C /opt/mdd-sim-gateway rev-parse --git-path MERGE_HEAD
+sudo git -C /opt/mdd-sim-gateway rev-parse --path-format=absolute --git-path MERGE_HEAD
 ```
 
 受管工作树不允许 staged、unstaged 或未忽略 untracked。不要用 `mddctl update` 覆盖手工
 改动。remote 必须精确为 `https://github.com/suyi-92/mdd-sim-gateway.git`，分支必须为
 `vmware`。分叉时工具不会 merge/rebase/reset/force；先在开发仓库处理并推送可快进历史。
+
+早期安装可能仅显示以下两项未跟踪路径，因为当时 `.gitignore` 的尾随 `/` 只匹配目录，不能
+匹配正式激活 symlink：
+
+```text
+?? .venv
+?? webui/dist
+```
+
+这类旧安装不能先用旧版 `mddctl update` 取得修复，也不要删除、改写两个链接，不要修改
+`/opt/mdd-sim-gateway` 权限或写 `.git/info/exclude`。运行最新流式 bootstrap 的事务更新：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) update
+```
+
+bootstrap 会以普通用户下载完整最新源码，再运行下载源码中的新版 `scripts/mddctl update`，而
+不是旧 `/usr/local/sbin/mddctl`。新版预检只兼容这两个精确未跟踪 symlink，并核验其绝对 raw
+target 与规范化目标都属于当前 HEAD/`active-commit` 的提交专属 build、READY 和完整产物身份。
+任一额外文件、tracked/staged/conflict、链接越界或身份不一致都会在 fetch 前停止。成功后新
+忽略规则使工作树自然干净；激活或健康失败则由同一事务恢复旧源码、链接、Engine、数据和原
+运行状态。不要使用 bootstrap `install` 代替该更新事务。
 
 ## 12. update 构建通过但启动失败
 

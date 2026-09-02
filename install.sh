@@ -297,6 +297,19 @@ EOF
   systemctl restart ModemManager.service
 }
 
+git_operation_in_progress_at() {
+  local repository=$1 name path
+  for name in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+    path=$(git -C "$repository" rev-parse --path-format=absolute --git-path "$name")
+    [[ -e "$path" ]] && return 0
+  done
+  path=$(git -C "$repository" rev-parse --path-format=absolute --git-path rebase-merge)
+  [[ -d "$path" ]] && return 0
+  path=$(git -C "$repository" rev-parse --path-format=absolute --git-path rebase-apply)
+  [[ -d "$path" ]] && return 0
+  return 1
+}
+
 install_source_checkout() {
   [[ -n "$source_dir" ]] || die "install requires --source"
   source_dir=$(realpath "$source_dir")
@@ -333,11 +346,12 @@ install_source_checkout() {
     git -C "$install_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$install_dir is not a Git checkout"
     [[ $(git -C "$install_dir" remote get-url origin) == "$ORIGIN_URL" ]] || die "managed checkout remote mismatch"
     [[ $(git -C "$install_dir" branch --show-current) == vmware ]] || die "managed checkout is not on vmware"
-    [[ -z $(git -C "$install_dir" status --porcelain --untracked-files=normal) ]] || die "managed checkout is dirty"
-    current=$(git -C "$install_dir" rev-parse HEAD)
-    git -C "$install_dir" fetch --no-tags "$source_dir" "$source_sha"
-    git -C "$install_dir" merge-base --is-ancestor "$current" "$source_sha" || die "existing checkout and requested source diverged"
-    git -C "$install_dir" merge --ff-only "$source_sha"
+    git_operation_in_progress_at "$install_dir" && die "a Git operation is in progress in the managed checkout"
+    [[ -z $(git -C "$install_dir" status --porcelain=v1 --untracked-files=normal) ]] || \
+      die "managed checkout is dirty; use the latest bootstrap update for a managed upgrade"
+    current=$(git -C "$install_dir" rev-parse --verify 'HEAD^{commit}')
+    [[ "$current" == "$source_sha" ]] || \
+      die "install does not update an existing managed checkout; run the latest bootstrap update"
   fi
   source_dir=$install_dir
   sha=$(git -C "$source_dir" rev-parse HEAD)

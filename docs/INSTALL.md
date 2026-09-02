@@ -114,7 +114,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmwar
 | 参数 | 作用 |
 |---|---|
 | `install` | 全新安装或幂等重复安装 |
-| `update` | 转发到已安装的 `mddctl update` |
+| `update` | 下载完整最新源码并运行其中的新版 `scripts/mddctl update` |
 | `doctor` | 转发到已安装的 `mddctl doctor` |
 | `--install-dir PATH` | 受管源码，默认 `/opt/mdd-sim-gateway` |
 | `--data-dir PATH` | 运行数据，默认 `/var/lib/mdd-sim-gateway` |
@@ -290,7 +290,13 @@ port block 和 `mddctl doctor` 为准，再调整规则。
 ```bash
 sudo mddctl update
 sudo mddctl update --no-cache
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) update
 ```
+
+前两条用于管理入口已经是当前版本的正常更新。若旧版 `mddctl` 因历史激活 symlink 忽略规则而
+无法启动更新，使用第三条：bootstrap 会以普通用户完整下载最新 `vmware`，核对源码身份后运行
+下载源码中的新版 `scripts/mddctl update`，但仍操作同一个受管 checkout 并复用下述事务。
+`install` 不会快进已有正式 checkout。
 
 预检：
 
@@ -298,19 +304,23 @@ sudo mddctl update --no-cache
 - origin URL 精确匹配；
 - 当前分支是 `vmware`；
 - 没有 staged、unstaged、未忽略 untracked、冲突或进行中的 Git 操作。
+- 当前 HEAD 与 `active-commit` 一致，`.venv` 与 `webui/dist` 都是指向
+  `/var/cache/mdd-sim-gateway/builds/<HEAD>/{venv,webui}` 的安装器绝对 symlink；
+- 当前 READY、manifest、venv/WebUI、提交专属 Engine 与 stable Engine 身份全部有效。
 
 然后：
 
-1. `fetch origin vmware`；
-2. 当前 HEAD 等于远端：只重探测 SCR Prime 原生驱动并结束；
-3. 当前 HEAD 必须是远端祖先，否则停止；
-4. 在临时 worktree 执行 Bash 语法、Python compile、单元测试和全部本地构建；
-5. 重探测发行版 SCR Prime 驱动；
-6. 创建更新前数据备份并保留旧 Engine tag；
-7. 停止 Control、orchestrator 和全部带 MDD Engine 标签的运行容器；
-8. `merge --ff-only origin/vmware`；
-9. 激活已验证产物并启动；
-10. 检查 HTTPS、systemd、Docker/TUN 和必需硬件。
+1. 在 dry-run、fetch 和 no-op 判断前完成上述 active-generation 验证；
+2. `fetch origin vmware`；
+3. 当前 HEAD 等于远端：只重探测 SCR Prime 原生驱动并结束；
+4. 当前 HEAD 必须是远端祖先，否则停止；
+5. 在临时 worktree 执行 Bash 语法、Python compile、单元测试和全部本地构建；
+6. 重探测发行版 SCR Prime 驱动；
+7. 创建更新前数据备份并保留旧 Engine tag；
+8. 停止 Control、orchestrator 和全部带 MDD Engine 标签的运行容器；
+9. `merge --ff-only origin/vmware`；
+10. 激活已验证产物并启动；
+11. 检查 HTTPS、systemd、Docker/TUN 和必需硬件。
 
 任何激活/健康失败都会在确认工作树仍干净后：
 
@@ -318,7 +328,7 @@ sudo mddctl update --no-cache
 - 激活旧 venv/WebUI；
 - 恢复旧 Engine tag；
 - 恢复更新前数据快照；
-- 启动并验证旧版本。
+- 按更新前的 active/inactive 状态恢复服务；原先两项服务都运行时再执行完整旧版本健康验证。
 
 成功后保留一代旧提交身份、Engine 和数据备份。构建缓存不会被更新命令自动批量删除。
 

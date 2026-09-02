@@ -6,11 +6,11 @@ data/*
 **/__pycache__/
 *.pyc
 node_modules/
-webui/dist/
+/webui/dist
 
 # Python venv (native/local control-plane install)
-.venv/
-control/.venv/
+/.venv
+/control/.venv
 
 # local env overrides (may hold secrets/paths)
 .env

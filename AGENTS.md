@@ -154,6 +154,13 @@ npm run build
   与 curl driver 已编入，但不能在基础安装阶段实际访问读卡器。
 - WebUI 在固定 Node 镜像的临时目录中执行 `npm ci && npm run build`，成功后才原子切换；不能
   把开发目录的 `webui/dist` 当作正式产物。
+- 正式 checkout 中的 `.venv` 与 `webui/dist` 是安装器原子激活到
+  `/var/cache/mdd-sim-gateway/builds/<提交>/` 的 symlink；`.gitignore` 必须用限定仓库位置且
+  同时匹配目录和 symlink 的规则，不能使用只匹配目录的尾随 `/`。若旧安装因此把这两个链接
+  报为未跟踪，只能运行最新流式 bootstrap 的 `update`；bootstrap 以普通用户下载完整最新源码，
+  再运行其中的新版 `scripts/mddctl update`，复用临时 worktree、备份、激活和完整回滚事务。
+  不得改用 `install` 绕过更新事务，不得手工删除或改写链接，也不得修改 `/opt` 权限、写本地
+  Git exclude 或放宽 `mddctl update` 的 clean 门禁。
 
 ## 安装与启动诊断
 
@@ -208,12 +215,16 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
 
 ## 更新、回滚与数据安全
 
-- 正式管理只使用 `/usr/local/sbin/mddctl`。不要在正式 checkout 手工执行 pull、merge、reset
-  或直接替换 `.venv`/`webui/dist` symlink。
+- 正常正式管理只使用 `/usr/local/sbin/mddctl`；旧版管理入口无法取得自举修复时，唯一例外是
+  最新流式 bootstrap `update` 运行其刚下载且已核验的 `scripts/mddctl`。不要在正式 checkout
+  手工执行 pull、merge、reset 或直接替换 `.venv`/`webui/dist` symlink。
 - `mddctl update` 预检要求正式 checkout 的 origin URL、`vmware` 分支、Git 操作状态和工作树
-  完全符合受管元数据；只允许当前 HEAD 到 `origin/vmware` 的快进。
+  完全符合受管元数据；还必须在 dry-run、fetch 和 no-op 判断前验证 HEAD、`active-commit`、两个
+  激活 symlink 的绝对 raw target 与规范化目标、READY/manifest、venv/WebUI 和 Engine 身份。
+  只允许当前 HEAD 到 `origin/vmware` 的快进。
 - 新版本必须先在临时 worktree 完成静态检查、单元测试和构建，然后创建数据快照、停止服务、
-  快进源码并切换已验证产物。健康失败时恢复旧源码、venv/WebUI、Engine tag 和数据快照。
+  快进源码并切换已验证产物。健康失败时恢复旧源码、venv/WebUI、Engine tag、数据快照和更新前
+  的服务运行状态。
 - 自动回滚期间不要手工切换源码或重启部分服务，避免留下“新源码 + 旧服务”的混合状态。
 - backup/restore 必须校验 SHA-256、manifest、归档路径安全和 SQLite；备份含明文凭据，只能存放
   在 BitLocker、加密移动盘或其他受控介质。

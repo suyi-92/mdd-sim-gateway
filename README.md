@@ -93,8 +93,9 @@ VoWiFi 认证、通话和可用的短信功能由该路径完成。4G 数据来�
 ## 安装过程与参数
 
 上面的命令都应在客户机的普通用户终端执行；不要给 `wget` 或整个下载管道加 `sudo`。入口
-脚本先以当前用户完整下载 `vmware` 单分支源码，再集中进行一次 `sudo` 权限确认，并从本地
-文件启动 root 安装器。它不会直接以 root 执行网络取得的标准输入。
+脚本先以当前用户完整下载 `vmware` 单分支源码，再集中进行一次 `sudo` 权限确认。`install`
+从本地文件启动 root 安装器；`update` 运行下载源码中的新版 `scripts/mddctl` 事务入口，因此旧
+管理脚本无法自举时也不需要绕过更新门禁。它不会直接以 root 执行网络取得的标准输入。
 
 安装会执行完整 Engine 源码构建。Asterisk、pjproject、pcsc-lite 和 Python 依赖的首次无缓存
 构建可能需要几十分钟，具体取决于 CPU、内存、Docker Hub/GitHub 连接和软件源速度。
@@ -190,9 +191,11 @@ mddctl uninstall [--purge]
 
 ### 本地更新与回滚
 
-`mddctl update` 不访问 Release API。它要求 `/opt` 中是受管的干净 `vmware` 工作树、remote
-精确匹配且没有进行中的 Git 操作，然后获取 `origin/vmware`。只有当前 HEAD 是远端祖先时
-才允许 `--ff-only` 更新；分叉、认证失败和网络失败都会停止，不 merge、rebase 或强推。
+`mddctl update` 不访问 Release API。它要求 `/opt` 中是受管的 `vmware` 工作树、remote 精确
+匹配且没有进行中的 Git 操作，并在 fetch 前验证 HEAD/`active-commit`、两个激活 symlink、
+READY/manifest、venv/WebUI 和 Engine 身份。只有当前 HEAD 是远端祖先时才允许 `--ff-only`
+更新；分叉、认证失败和网络失败都会停止，不 merge、rebase 或强推。旧管理入口无法更新时，
+运行最新流式 bootstrap `update`，由刚下载的新版 `scripts/mddctl` 执行同一事务。
 
 新提交先在临时 Git worktree 中完成 Shell/Python 检查、单元测试、WebUI/venv/Engine 构建。
 全部通过后才备份数据、停止服务、快进源码并切换产物。HTTPS、systemd、镜像身份、TUN 或

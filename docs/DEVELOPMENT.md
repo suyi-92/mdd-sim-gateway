@@ -34,6 +34,8 @@ worktree，再推送 `vmware`。
 - 修改线路上限时同时验证 API、自动建线和所有 Engine 启动入口；
 - 修改端口时同时探测 TCP 与 UDP，并覆盖 `Created` 容器清理；
 - 不把运行数据、`.venv`、`node_modules`、`webui/dist`、build cache 或备份加入 Git；
+- 正式 `.venv` 与 `webui/dist` 是指向提交专属 build cache 的激活 symlink；忽略规则必须限定
+  仓库位置并同时匹配真实目录和 symlink，不能写成只匹配目录的尾随 `/` 形式；
 - 不添加 Engine/Control/WebUI tar 包或 Git LFS 资产；
 - 不把 IMSI、ICCID、IMEI、号码、凭据、私有 URL 或消息正文写入测试和文档。
 
@@ -75,6 +77,12 @@ Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行�
 - backup/restore 校验和与路径安全；
 - doctor JSON 不含用户身份字段；
 - 仓库无 workflows、Release manifest 和 LFS。
+
+旧安装若因历史目录式忽略规则仅把 `.venv` 与 `webui/dist` 激活 symlink 报为未跟踪，兼容入口
+只能是最新流式 bootstrap 的 `update`。bootstrap 下载完整最新 `vmware` 源码并运行其中的新版
+`scripts/mddctl update`，由同一更新事务在 dry-run/fetch/no-op 前验证两个精确路径、绝对 raw
+target、规范化目标、HEAD/`active-commit`、READY 与完整产物身份；其他 dirty 状态和 Git 操作
+继续 fail closed。`install` 对已有正式 checkout 只接受同一提交的幂等重装，不负责快进更新。
 
 脚本行为测试应通过 fake command PATH 或临时目录覆盖包管理器、systemctl、Git、Docker、
 lsusb、pcsc_scan、mmcli 和网络输出。测试不得真实修改开发机 systemd、驱动或防火墙。

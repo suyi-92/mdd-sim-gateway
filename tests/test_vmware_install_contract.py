@@ -14,6 +14,7 @@ BOOTSTRAP = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
 INSTALL = (ROOT / "install.sh").read_text(encoding="utf-8")
 MDDCTL = (ROOT / "scripts/mddctl").read_text(encoding="utf-8")
 ARCHIVE = (ROOT / "scripts/mdd_archive.py").read_text(encoding="utf-8")
+GITIGNORE = (ROOT / ".gitignore").read_text(encoding="utf-8")
 
 
 def shell_function(source: str, name: str) -> str:
@@ -31,6 +32,13 @@ class BootstrapContractTests(unittest.TestCase):
                         BOOTSTRAP.index('sudo -H bash "$stage/repository/install.sh"'))
         self.assertNotIn("curl | sudo", BOOTSTRAP)
         self.assertNotIn("wget | sudo", BOOTSTRAP)
+
+    def test_update_uses_the_downloaded_transactional_manager(self):
+        self.assertIn('sudo -H bash "$stage/repository/scripts/mddctl"', BOOTSTRAP)
+        self.assertEqual(BOOTSTRAP.count('exec sudo mddctl "${args[@]}"'), 1)
+        self.assertLess(BOOTSTRAP.index("clone --single-branch --branch vmware"),
+                        BOOTSTRAP.index('sudo -H bash "$stage/repository/scripts/mddctl"'))
+        self.assertIn("fsck --full --no-dangling", BOOTSTRAP)
 
     def test_bootstrap_checkout_is_complete_for_the_local_git_transport(self):
         self.assertIn("clone --single-branch --branch vmware", BOOTSTRAP)
@@ -73,6 +81,12 @@ class BootstrapContractTests(unittest.TestCase):
 
 
 class InstallerContractTests(unittest.TestCase):
+    def test_activation_ignore_rules_match_root_paths_without_directory_only_semantics(self):
+        rules = GITIGNORE.splitlines()
+        for value in ("/.venv", "/control/.venv", "/webui/dist"):
+            self.assertIn(value, rules)
+            self.assertNotIn(f"{value}/", rules)
+
     def test_only_the_four_x86_64_guest_targets_are_accepted(self):
         self.assertIn('ubuntu:24.04|ubuntu:26.04|debian:12|debian:13', INSTALL)
         self.assertIn('[[ $(uname -m) == x86_64 ]]', INSTALL)
@@ -92,6 +106,23 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('python3 -m venv --clear "$temp/venv"', INSTALL)
         self.assertIn('mv -Tf "$source_dir/.venv.new"', INSTALL)
         self.assertIn('mv -Tf "$source_dir/webui/dist.new"', INSTALL)
+
+    def test_active_generation_is_raw_canonical_and_identity_checked(self):
+        validator = shell_function(MDDCTL, "validate_active_generation")
+        update = shell_function(MDDCTL, "cmd_update")
+        checkout = shell_function(INSTALL, "install_source_checkout")
+        self.assertIn('raw=$(readlink -- "$link")', validator)
+        self.assertIn('"$raw" == /* && "$raw" == "$expected"', validator)
+        self.assertIn('canonical=$(realpath -e -- "$link"', validator)
+        self.assertIn('bash "$INSTALL_DIR/install.sh" verify', validator)
+        self.assertIn('docker image inspect "$ENGINE_STABLE_IMAGE"', validator)
+        self.assertLess(update.index("validate_active_generation"), update.index("if ((dry_run))"))
+        self.assertLess(update.index("validate_active_generation"), update.index("fetch --prune"))
+        self.assertIn("install does not update an existing managed checkout", checkout)
+        self.assertNotIn('fetch --no-tags "$source_dir"', checkout)
+        self.assertNotIn("merge --ff-only", checkout)
+        for forbidden in ("rm -f", "rm -rf", "unlink", "git clean", "reset --hard"):
+            self.assertNotIn(forbidden, validator)
 
     def test_engine_build_is_commit_specific_and_has_tun_and_fingerprint_gates(self):
         prepare = shell_function(INSTALL, "prepare_build")
@@ -302,16 +333,23 @@ class MddctlContractTests(unittest.TestCase):
         update = shell_function(MDDCTL, "cmd_update")
         checkout = shell_function(MDDCTL, "validate_managed_checkout")
         self.assertIn("remote get-url origin", checkout)
-        self.assertIn("status --porcelain --untracked-files=normal", checkout)
+        self.assertIn("managed_checkout_status_kind", checkout)
+        status = shell_function(MDDCTL, "managed_checkout_status_kind")
+        self.assertIn('"--porcelain=v1", "-z"', status)
+        self.assertIn('b"?? .venv", b"?? webui/dist"', status)
+        self.assertIn("--path-format=absolute", MDDCTL)
+        self.assertIn("validate_active_generation", update)
         self.assertIn('merge-base --is-ancestor "$old" "$new"', update)
         self.assertIn('merge --ff-only "origin/$BRANCH"', update)
         self.assertNotIn(" rebase ", update)
         self.assertNotIn("push --force", update)
         self.assertLess(update.index("backup_archive"), update.index("merge --ff-only"))
-        self.assertIn('reset --hard "$old"', update)
-        self.assertIn("transaction_armed=1", update)
+        self.assertIn('reset --hard "$UPDATE_OLD"', update)
+        self.assertIn("UPDATE_TRANSACTION_ARMED=1", update)
         self.assertIn("update_cleanup", update)
-        self.assertIn('install.sh" verify', update)
+        self.assertIn('current_status" == legacy-activation-links', update)
+        self.assertIn("remember_run_state", update)
+        self.assertIn("restore_run_state", update)
 
     def test_update_and_archive_transactions_have_exit_and_signal_cleanup(self):
         update = shell_function(MDDCTL, "cmd_update")
