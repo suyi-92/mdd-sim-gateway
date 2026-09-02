@@ -303,6 +303,15 @@ EPDG_FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
 EPDG_DOH_HOST = os.environ.get("MDD_EPDG_DOH_HOST", "cloudflare-dns.com")
 EPDG_DOH_TIMEOUT = float(os.environ.get("MDD_EPDG_DOH_TIMEOUT", "8"))
 EPDG_DOH_CACHE_TTL = float(os.environ.get("MDD_EPDG_DOH_CACHE_TTL", "60"))
+# Xray is a separate process beside sing-box. Once a country TUN exists, UDP resolver
+# traffic from that process can enter the TUN and be sent back to the same Xray SOCKS
+# bridge, recursively preventing the VLESS server name from ever resolving. Resolve its
+# dial address over TCP DNS first; REALITY/TLS still receives the original name.
+PROXY_SERVER_DNS_IPS = tuple(value.strip() for value in os.environ.get(
+    "MDD_PROXY_SERVER_DNS_IPS", "1.1.1.1,8.8.8.8").split(",") if value.strip())
+PROXY_SERVER_DNS_TIMEOUT = float(os.environ.get("MDD_PROXY_SERVER_DNS_TIMEOUT", "5"))
+PROXY_SERVER_DNS_CACHE_TTL = float(os.environ.get(
+    "MDD_PROXY_SERVER_DNS_CACHE_TTL", "300"))
 # How long a node that just failed a line is kept out of the candidate pool.
 EXIT_RESELECT_COOLDOWN = float(os.environ.get("MDD_EXIT_RESELECT_COOLDOWN", "900"))
 EXIT_RESELECT_MAX_AGE = float(os.environ.get("MDD_EXIT_RESELECT_MAX_AGE", "600"))
@@ -424,6 +433,81 @@ def _parse_doh_ipv4(document: dict) -> tuple[list[str], float]:
         raise RuntimeError("proxy DoH resolver returned no public IPv4 ePDG address")
     ttl = min(ttls) if ttls else EPDG_DOH_CACHE_TTL
     return sorted(addresses), max(15.0, min(ttl, 300.0))
+
+
+def _skip_dns_name(message: bytes, offset: int) -> int:
+    """Return the first byte after one possibly compressed DNS name."""
+    while offset < len(message):
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 2 > len(message):
+                break
+            return offset + 2
+        offset += 1
+        if length == 0:
+            return offset
+        if length > 63 or offset + length > len(message):
+            break
+        offset += length
+    raise RuntimeError("direct TCP DNS returned an invalid name")
+
+
+def resolve_ipv4_direct_dns_tcp(host: str, timeout: float = PROXY_SERVER_DNS_TIMEOUT
+                                ) -> tuple[list[str], float]:
+    """Resolve a proxy dial host without the UDP path captured by a country TUN."""
+    encoded = str(host).encode("idna")
+    labels = encoded.rstrip(b".").split(b".")
+    if not labels or any(not label or len(label) > 63 for label in labels):
+        raise RuntimeError("proxy node DNS name is invalid")
+    transaction = os.urandom(2)
+    question = b"".join(bytes([len(label)]) + label for label in labels) \
+        + b"\x00\x00\x01\x00\x01"
+    query = transaction + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+    last_error = None
+    for resolver in PROXY_SERVER_DNS_IPS:
+        try:
+            ipaddress.IPv4Address(resolver)
+            with socket.create_connection((resolver, 53), timeout=timeout) as stream:
+                stream.settimeout(timeout)
+                stream.sendall(len(query).to_bytes(2, "big") + query)
+                size = int.from_bytes(_recv_exact(stream, 2), "big")
+                response = _recv_exact(stream, size)
+            if len(response) < 12 or response[:2] != transaction \
+                    or not response[2] & 0x80 or response[3] & 0x0F:
+                raise RuntimeError("direct TCP DNS returned an invalid response")
+            questions = int.from_bytes(response[4:6], "big")
+            answers = int.from_bytes(response[6:8], "big")
+            offset = 12
+            for _ in range(questions):
+                offset = _skip_dns_name(response, offset) + 4
+                if offset > len(response):
+                    raise RuntimeError("direct TCP DNS question is truncated")
+            addresses, ttls = set(), []
+            for _ in range(answers):
+                offset = _skip_dns_name(response, offset)
+                if offset + 10 > len(response):
+                    raise RuntimeError("direct TCP DNS answer is truncated")
+                kind = int.from_bytes(response[offset:offset + 2], "big")
+                record_class = int.from_bytes(response[offset + 2:offset + 4], "big")
+                ttl = int.from_bytes(response[offset + 4:offset + 8], "big")
+                length = int.from_bytes(response[offset + 8:offset + 10], "big")
+                offset += 10
+                data = response[offset:offset + length]
+                if len(data) != length:
+                    raise RuntimeError("direct TCP DNS record is truncated")
+                offset += length
+                if kind == 1 and record_class == 1 and length == 4:
+                    address = ipaddress.IPv4Address(data)
+                    if address.is_global:
+                        addresses.add(str(address))
+                        ttls.append(float(ttl))
+            if not addresses:
+                raise RuntimeError("direct TCP DNS returned no public IPv4 address")
+            ttl = min(ttls) if ttls else PROXY_SERVER_DNS_CACHE_TTL
+            return sorted(addresses), max(15.0, min(ttl, 300.0))
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+            last_error = exc
+    raise RuntimeError("direct TCP DNS lookup failed") from last_error
 
 
 def resolve_ipv4_via_socks_doh(host: str, proxy_host: str, proxy_port: int,
@@ -659,6 +743,9 @@ class Orchestrator:
         # when the inherited host resolver returns a Clash-style Fake-IP.
         self.epdg_proxy_dns: dict[str, tuple[float, list[str]]] = {}
         self.epdg_fake_dns_reported: set[str] = set()
+        # Proxy server names must be resolved before Xray sends UDP through a country TUN.
+        # Keep a stable address while it remains in DNS to avoid restarting a healthy exit.
+        self.proxy_server_dns: dict[str, tuple[float, str]] = {}
         # Last node change per country, so the UI can say why the exit is not the pinned one.
         self.exit_last_change: dict[str, dict] = {
             str(country): dict(state["last_change"])
@@ -1856,6 +1943,34 @@ class Orchestrator:
             raise RuntimeError("PyYAML is required for subscription mode")
         return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
 
+    def resolve_proxy_server(self, server: str) -> str:
+        """Return a stable IPv4 dial address while leaving TLS/REALITY naming untouched."""
+        server = str(server or "").strip()
+        if not server:
+            raise ValueError("Xray node server is empty")
+        try:
+            return str(ipaddress.ip_address(server))
+        except ValueError:
+            pass
+        if self.dry_run:
+            return server
+        key = server.lower()
+        now = time.time()
+        cached = self.proxy_server_dns.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        try:
+            addresses, ttl = resolve_ipv4_direct_dns_tcp(server)
+        except RuntimeError as exc:
+            if cached:
+                return cached[1]
+            raise RuntimeError(
+                "proxy node DNS lookup failed before country TUN activation") from exc
+        address = cached[1] if cached and cached[1] in addresses else addresses[0]
+        self.proxy_server_dns[key] = (
+            now + max(PROXY_SERVER_DNS_CACHE_TTL, float(ttl)), address)
+        return address
+
     def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
         """Register one loopback-only Xray endpoint and return its sing-box detour."""
         if runtime_id not in self._xray_ports:
@@ -1870,7 +1985,13 @@ class Orchestrator:
                                         "protocol": "socks", "tag": inbound_tag,
                                         "settings": {"auth": "noauth", "udp": True,
                                                      "ip": "127.0.0.1"}})
-            self._xray_outbounds.append(xray_outbound(node, outbound_tag))
+            original_server = str(node.get("server") or "").strip()
+            dial_node = dict(node)
+            # xray_outbound falls back to `server` for serverName. Preserve that original
+            # name before replacing only the network dial address with its pinned IPv4.
+            dial_node["servername"] = str(node.get("servername") or original_server)
+            dial_node["server"] = self.resolve_proxy_server(original_server)
+            self._xray_outbounds.append(xray_outbound(dial_node, outbound_tag))
             self._xray_rules.append({"type": "field", "inboundTag": [inbound_tag],
                                      "outboundTag": outbound_tag})
         return {"type": "socks", "tag": sing_tag, "version": "5",

@@ -1150,6 +1150,77 @@ class RealityRunsOnXrayTests(unittest.TestCase):
         self.assertEqual(xray_out["protocol"], "vless")
         self.assertEqual(xray_out["streamSettings"]["security"], "reality")
 
+    def test_xray_dials_a_resolved_ip_without_replacing_the_reality_name(self):
+        link_without_explicit_sni = (
+            "vless://uuid-1@relay.example.net:443?security=reality&type=tcp"
+            "&fp=chrome&pbk=public-key&sid=abcd&flow=xtls-rprx-vision"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=False)
+            with patch("host.mdd_orchestrator.resolve_ipv4_direct_dns_tcp",
+                       return_value=(["192.0.2.44"], 60)) as resolve:
+                for _ in range(2):
+                    app.build_proxy_config({
+                        "profiles": {"node-one": {"name": "Reality", "type": "node",
+                                                    "value": link_without_explicit_sni}},
+                        "exits": {"gb": {"enabled": True,
+                                           "profile_id": "node-one"}},
+                    })
+            # Rebuilding the same desired state reuses the pinned address instead of
+            # resolving and restarting a healthy Xray generation every reconcile cycle.
+            resolve.assert_called_once_with("relay.example.net")
+            xray_out = app.next_xray_config["outbounds"][0]
+        self.assertEqual(
+            xray_out["settings"]["vnext"][0]["address"], "192.0.2.44")
+        self.assertEqual(
+            xray_out["streamSettings"]["realitySettings"]["serverName"],
+            "relay.example.net",
+        )
+
+    def test_xray_proxy_server_ip_literals_need_no_dns_lookup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=False)
+            with patch("host.mdd_orchestrator.resolve_ipv4_direct_dns_tcp") as resolve:
+                self.assertEqual(app.resolve_proxy_server("192.0.2.45"), "192.0.2.45")
+            resolve.assert_not_called()
+
+    def test_proxy_server_resolver_uses_a_framed_tcp_dns_query(self):
+        transaction = b"\x12\x34"
+        question = (b"\x07example\x03com\x00\x00\x01\x00\x01")
+        answer = (b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04"
+                  b"\x5d\xb8\xd8\x22")
+        response = (transaction + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+                    + question + answer)
+
+        class Stream(io.BytesIO):
+            sent = b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, value):
+                self.sent += value
+
+            def recv(self, size):
+                return self.read(size)
+
+        stream = Stream(len(response).to_bytes(2, "big") + response)
+        with patch.object(orch, "PROXY_SERVER_DNS_IPS", ("1.1.1.1",)), \
+                patch("host.mdd_orchestrator.os.urandom", return_value=transaction), \
+                patch("host.mdd_orchestrator.socket.create_connection",
+                      return_value=stream) as connect:
+            addresses, ttl = orch.resolve_ipv4_direct_dns_tcp("example.com")
+        self.assertEqual(addresses, ["93.184.216.34"])
+        self.assertEqual(ttl, 60)
+        self.assertEqual(connect.call_args.args[0], ("1.1.1.1", 53))
+        self.assertEqual(int.from_bytes(stream.sent[:2], "big"), len(stream.sent) - 2)
+
     def test_the_node_test_reports_which_engine_carries_it(self):
         parsed = egress.describe_proxy_profile({"type": "node", "value": self.REALITY_LINK})
         self.assertEqual(parsed["engine"], "xray")

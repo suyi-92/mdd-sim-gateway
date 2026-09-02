@@ -212,7 +212,7 @@ export default function App() {
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className="u-content"><div className="u-note" role="note">{t('Responsible use notice')}</div>{content}</div></main>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className="u-content"><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div>{content}</div></main>
     {toast&&<div className="u-toast" key={toast.id} role="status">{toast.message}</div>}
   </div>
 }

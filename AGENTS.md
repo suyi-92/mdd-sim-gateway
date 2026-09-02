@@ -205,6 +205,10 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
 - “代理库节点 UDP 测试通过”只证明临时测试链可用，不证明已保存国家出口的常驻
   sing-box/Xray 链路可用。若国家出口的 DNS/STUN 全部超时，应优先检查常驻出口状态、
   inbound/outbound 与 SOCKS UDP ASSOCIATE 返回地址，而不是立即判定节点不支持 UDP。
+- Xray-backed REALITY/XHTTP 出口必须在国家 TUN 启动前通过宿主直连 TCP DNS 解析节点域名，
+  Xray 只用固定 IPv4 拨号，同时继续把原始域名用于 REALITY/TLS server name。若让 Xray 在
+  TUN 已启动后走 UDP DNS，查询会被 TUN 送回同一 Xray SOCKS bridge，形成递归并让所有
+  DNS/STUN 测试超时；不得通过删除 UDP 测试、改成直连出口或暴露生成配置来掩盖。
 - 国家出口测试会交错尝试 DNS 和 STUN，并为每个目标建立独立 UDP ASSOCIATE；任一目标响应
   即通过。诊断时保留每个目标的失败信息。
 - 运行证据位于 `/var/lib/mdd-sim-gateway/orchestrator/` 下的 `proxy-status.json`、

@@ -279,6 +279,14 @@ sha256sum -c /path/to/backup.tar.gz.sha256
 
 ## 14. VoWiFi、通话和短信
 
+如果国家出口测试的 DNS 与 STUN 目标全部超时，但同一节点的 TCP 连接正常，先区分临时节点
+测试和常驻的 sing-box → Xray bridge。Xray-backed REALITY/XHTTP 出口应在 TUN 启动前经
+宿主直连 TCP DNS 固定节点拨号 IPv4，并继续保留原始 REALITY/TLS server name；旧实现让
+Xray 在 TUN 启动后再发 UDP DNS，查询会被送回同一 bridge，表现为节点可连但所有 UDP 探针
+沉默超时。不要手工编辑 `sing-box.json`/`xray.json`、删除测试或改成直连绕过；更新到包含该
+保护的版本后重新运行国家出口 UDP 测试。取证时只比较 listener、relay、传输类型和通过/失败，
+不得输出节点地址、server name、链接或凭据。
+
 VoWiFi 链路：
 
 ```text
