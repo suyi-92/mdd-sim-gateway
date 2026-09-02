@@ -8,6 +8,11 @@ import subprocess
 import tempfile
 import unittest
 
+from tests.bootstrap_test_support import (
+    handoff_test_tree_to_bootstrap_user,
+    run_bootstrap_as_user,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
@@ -23,6 +28,20 @@ def shell_function(source: str, name: str) -> str:
     if next_function < 0:
         raise AssertionError(f"could not bound shell function {name}")
     return source[start:next_function]
+
+
+def run_public_bootstrap(arguments: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        bootstrap = workspace / "bootstrap.sh"
+        shutil.copy2(ROOT / "bootstrap.sh", bootstrap)
+        bootstrap.chmod(0o755)
+        handoff_test_tree_to_bootstrap_user(workspace)
+        return run_bootstrap_as_user(
+            ["bash", str(bootstrap), *arguments],
+            cwd=workspace,
+            check=check,
+        )
 
 
 class BootstrapContractTests(unittest.TestCase):
@@ -60,12 +79,12 @@ class BootstrapContractTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
                      "bootstrap execution contract runs as an ordinary Linux user")
     def test_install_dry_run_parses_all_hardware_and_path_options_without_sudo(self):
-        result = subprocess.run(
-            ["bash", str(ROOT / "bootstrap.sh"), "install", "--dry-run", "--yes",
+        result = run_public_bootstrap(
+            ["install", "--dry-run", "--yes",
              "--install-dir", "/opt/mdd-test", "--data-dir", "/var/lib/mdd-test",
              "--ref", "vmware", "--require-scr-prime", "--require-cellular",
              "--configure-firewall", "--no-start"],
-            check=True, text=True, capture_output=True)
+            check=True)
         self.assertIn("dry-run: action=install", result.stdout)
         self.assertIn("require_scr_prime=1", result.stdout)
         self.assertNotIn("confirming administrator access", result.stdout)
@@ -73,9 +92,9 @@ class BootstrapContractTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
                      "bootstrap execution contract runs in Linux")
     def test_invalid_ref_stops_before_any_privileged_action(self):
-        result = subprocess.run(
-            ["bash", str(ROOT / "bootstrap.sh"), "install", "--dry-run", "--ref", "main"],
-            text=True, capture_output=True)
+        result = run_public_bootstrap(
+            ["install", "--dry-run", "--ref", "main"],
+            check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exact 40-character commit", result.stderr)
 

@@ -8,6 +8,10 @@ import subprocess
 import tempfile
 import unittest
 
+from tests.bootstrap_test_support import (
+    handoff_test_tree_to_bootstrap_user,
+    run_bootstrap_as_user,
+)
 from tests.test_mddctl_active_generation import ActiveGenerationFixture
 
 
@@ -117,6 +121,9 @@ exec "$@"
             new_path_log = root / "new-path.log"
             new_args_log = root / "new-args.log"
             old_log = root / "old.log"
+            bootstrap = root / "bootstrap.sh"
+            shutil.copy2(BOOTSTRAP, bootstrap)
+            bootstrap.chmod(0o755)
             environment = {
                 **GIT_ENV,
                 "PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
@@ -127,8 +134,9 @@ exec "$@"
                 "NEW_MDDCTL_ARGS_LOG": str(new_args_log),
                 "OLD_MDDCTL_LOG": str(old_log),
             }
-            result = run(
-                ["bash", str(BOOTSTRAP), "update", "--no-cache", "--yes", "--dry-run"],
+            handoff_test_tree_to_bootstrap_user(root)
+            result = run_bootstrap_as_user(
+                ["bash", str(bootstrap), "update", "--no-cache", "--yes", "--dry-run"],
                 cwd=root,
                 check=False,
                 env=environment,
