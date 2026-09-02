@@ -497,15 +497,17 @@ for path in sorted(items):
     metadata = os.lstat(path)
     relative = os.path.relpath(path, root).replace(os.sep, "/")
     if stat.S_ISLNK(metadata.st_mode):
-        raise SystemExit(f"tree contains a symbolic link: {relative}")
-    if stat.S_ISDIR(metadata.st_mode):
+        kind = "l"; size = metadata.st_size
+    elif stat.S_ISDIR(metadata.st_mode):
         kind = "d"; size = 0
     elif stat.S_ISREG(metadata.st_mode):
         kind = "f"; size = metadata.st_size
     else:
         raise SystemExit(f"tree contains an unsupported path: {relative}")
     digest.update(f"{kind}\0{relative}\0{stat.S_IMODE(metadata.st_mode):o}\0{size}\0".encode())
-    if kind == "f":
+    if kind == "l":
+        digest.update(os.fsencode(os.readlink(path)))
+    elif kind == "f":
         with open(path, "rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)

@@ -340,6 +340,36 @@ validate_scr_prime_reader "$2"
         self.assertNotIn("install_packages", action)
         self.assertNotIn("install_source_checkout", action)
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "driver tree hashing runs in a supported Linux shell")
+    def test_driver_tree_hash_records_symlink_shape_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "ifd-ccid.bundle"
+            bundle.mkdir()
+            outside_a = root / "distribution-a.plist"
+            outside_b = root / "distribution-b.plist"
+            outside_a.write_text("first", encoding="utf-8")
+            outside_b.write_text("second", encoding="utf-8")
+            link = bundle / "Info.plist"
+            link.symlink_to(outside_a)
+
+            def digest(source: str) -> str:
+                helper = shell_function(source, "tree_hash")
+                result = subprocess.run(
+                    ["bash", "-c", helper + '\n}\ntree_hash "$1"',
+                     "driver-tree-hash", str(bundle)],
+                    check=True, text=True, capture_output=True)
+                return result.stdout.strip()
+
+            installer_hash = digest(INSTALL)
+            self.assertEqual(installer_hash, digest(MDDCTL))
+            outside_a.write_text("changed but deliberately not followed", encoding="utf-8")
+            self.assertEqual(installer_hash, digest(INSTALL))
+            link.unlink()
+            link.symlink_to(outside_b)
+            self.assertNotEqual(installer_hash, digest(INSTALL))
+
     def test_lpac_build_gate_does_not_require_a_pcsc_reader(self):
         validator = shell_function(INSTALL, "lpac_binary_valid")
         ensure = shell_function(INSTALL, "ensure_lpac")
