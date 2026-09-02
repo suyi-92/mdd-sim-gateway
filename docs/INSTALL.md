@@ -199,6 +199,12 @@ sudo mddctl driver install
 该命令在驱动变化前验证受管 checkout 与完整 active generation，并复用相同的备份、原子替换、
 哈希记录和失败回滚。
 
+Engine 不是独立运行 pcscd，而是访问宿主 `/run/pcscd`。pcsc-lite 的客户端/daemon socket
+协议并不保证任意版本互通；不匹配时 `SCardEstablishContext` 会返回 service stopped，即使主机
+`pcsc_scan` 正常。因此 Control 创建 Engine 时还会从 `libpcsclite1` 包清单解析真实库文件，
+验证它是 root 所有、不可由组/其他用户写入的 x86_64 ELF，再只读覆盖容器的
+`libpcsclite.so.1`。验证失败时在创建容器前停止，不从任意路径加载库。
+
 补丁元数据：
 
 ```text

@@ -6,9 +6,10 @@ The manager renders instance.json, starts/stops/recreates the container with the
 mounts/caps/ports, and reads the engine's runtime status files (bind-mounted run dir):
 the swu_ike daemon publishes swu_status.json {state: CONNECTED} for tunnel state.
 
-PC/SC: Engine containers are pcscd clients — they mount the host pcscd socket (/run/pcscd).
-The guest uses its distribution pcscd; the image pins its client library and relies on the
-stable pcsc-lite socket protocol rather than replacing the guest daemon.
+PC/SC: Engine containers are pcscd clients — they mount the host pcscd socket (/run/pcscd)
+and the host distribution's matching client library. pcsc-lite rejects incompatible IPC
+protocol revisions with SCARD_E_SERVICE_STOPPED, so a separately pinned container client is
+not sufficient even though the public WinSCard ABI remains stable.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ import logging
 import os
 import re
 import shutil
+import stat
+import subprocess
 import threading
 import time
 
@@ -70,6 +73,49 @@ DATA_DIR = cfg.DATA_DIR
 IMAGE = os.environ.get("MDD_ENGINE_IMAGE", "mdd-sim-gateway/engine")
 PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
 MANAGED_LABEL = "io.mdd-sim-gateway.managed"
+CONTAINER_PCSCLITE_LIBRARY = "/usr/lib64/libpcsclite.so.1"
+
+
+def _host_pcsclite_library() -> str:
+    """Return the trusted distro client that matches the host pcscd IPC protocol.
+
+    Only a root-owned, non-writable x86_64 ELF file listed by Debian's ``libpcsclite1``
+    package is accepted. The real file is mounted read-only; symlink resolution happens on
+    the host before Docker sees the source path, so a later link swap cannot redirect a
+    running container mount.
+    """
+    try:
+        result = subprocess.run(
+            ["dpkg-query", "-L", "libpcsclite1"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot enumerate the host libpcsclite1 package") from exc
+
+    candidates = []
+    for listed in result.stdout.splitlines():
+        if not re.fullmatch(r"/(?:usr/)?lib/[^\n]*/libpcsclite\.so\.1(?:\.\d+)*", listed):
+            continue
+        resolved = os.path.realpath(listed)
+        try:
+            metadata = os.stat(resolved)
+            with open(resolved, "rb") as stream:
+                header = stream.read(20)
+        except OSError:
+            continue
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
+                metadata.st_mode & 0o022):
+            continue
+        # ELF64, little-endian, EM_X86_64. All supported guests are x86_64.
+        if (header[:6] != b"\x7fELF\x02\x01" or len(header) < 20 or
+                int.from_bytes(header[18:20], "little") != 62):
+            continue
+        candidates.append(resolved)
+    candidates = sorted(set(candidates))
+    if len(candidates) != 1:
+        raise RuntimeError("host libpcsclite1 does not expose one trusted x86_64 client library")
+    return candidates[0]
 
 
 def _owned(container) -> bool:
@@ -380,6 +426,8 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         os.path.join(host_base, "run"): {"bind": "/run/mdd-sim-gateway", "mode": "rw"},
         PCSCD_SOCK: {"bind": "/run/pcscd", "mode": "rw"},
     }
+    host_pcsclite = _host_pcsclite_library()
+    volumes[host_pcsclite] = {"bind": CONTAINER_PCSCLITE_LIBRARY, "mode": "ro"}
     # The image has no timezone, so every engine log (IKE, Asterisk) was stamped in UTC while
     # the timeline, the WebUI and the operator's shell read local time. Correlating a rekey or
     # a teardown with an outage meant doing the offset in your head. Give the container the

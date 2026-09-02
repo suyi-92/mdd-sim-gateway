@@ -40,9 +40,10 @@ RUN dnf -y --refresh --setopt=zchunk=False --setopt=fastestmirror=True --setopt=
     meson ninja-build perl-podlators systemd-devel \
     tcpdump bind-utils iputils
 
-# Build pcsc-lite ${PCSC_VERSION} from source (client library + headers). Installs over any
-# distro-provided libpcsclite pulled in by python3-pyscard so pyscard (loads libpcsclite.so.1 at
-# runtime) uses the pinned version and interoperates with the guest's distribution pcscd.
+# Build pcsc-lite ${PCSC_VERSION} from source (client library + headers) for Asterisk linkage,
+# image self-tests and a deterministic fallback. At managed runtime Control bind-mounts the
+# guest distribution's libpcsclite.so.1 over this copy: pcsc-lite's private socket protocol can
+# reject a newer client talking to an older host daemon even though the public ABI is stable.
 RUN cd /tmp && \
     wget -qO pcsc.tar.gz "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}.tar.gz" && \
     echo "${PCSC_SHA256}  pcsc.tar.gz" | sha256sum -c - && \
@@ -143,8 +144,9 @@ RUN dnf -y --refresh --setopt=zchunk=False --setopt=fastestmirror=True --setopt=
     dnf clean all && rm -rf /var/cache/dnf /tmp/runtime-packages.txt
 
 # Asterisk and its bundled pjproject are built outside Fedora's RPM database. Copy only their
-# installed runtime trees. The pinned pcsc-lite client overwrites Fedora's client library so it
-# continues to match the host pcscd protocol exactly.
+# installed runtime trees. The pinned pcsc-lite client keeps the image self-contained; Control
+# overlays the host distribution client when it creates a managed Engine container so client
+# and daemon use the same private IPC protocol revision.
 COPY --from=build /usr/sbin/asterisk /usr/sbin/asterisk
 COPY --from=build /usr/lib/asterisk/ /usr/lib/asterisk/
 COPY --from=build /usr/lib/libasteriskpj.so /usr/lib/libasteriskpj.so

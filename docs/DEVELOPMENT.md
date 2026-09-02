@@ -13,6 +13,8 @@
 - 构建：客户机本地源码构建；
 - 无 GitHub Actions、Release API、网页更新、预编译项目资产、Docker Control、WSL/usbipd；
 - SCR Prime 自动路径只能应用 `03_scr_prime_reader.patch`；
+- Engine 的 PC/SC socket 与客户端库必须成对来自宿主：容器只读挂载经过包路径、root 权限和
+  x86_64 ELF 验证的 `libpcsclite1` 文件，不能依赖跨版本私有 IPC；
 - `max_sim_lines` 默认 13、范围 1–32，并由所有入口共用。
 
 ## 开发前检查
@@ -73,6 +75,8 @@ Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行�
 - 临时构建与原子切换；
 - SCR Prime 原生优先和补丁 03 only；
 - SCR Prime 后插安装入口在任何驱动变化前验证 active generation，且无卡时只跳过 ATR 门禁；
+- Engine 创建参数包含宿主 PC/SC socket 及匹配的只读发行版 client library；不受管、可写或
+  非 x86_64 ELF 路径必须在创建容器前拒绝；
 - NetworkManager 默认路由保护；
 - Git 精确 remote、clean、fast-forward-only；
 - backup/restore 校验和与路径安全；

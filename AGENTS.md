@@ -196,6 +196,9 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
 - 首次安装后才接入 SCR Prime，且 USB 可见但 PC/SC 不可见时，使用
   `mddctl driver install`。它必须先验证受管 checkout 和 active generation，再复用固定 CCID、
   补丁 03、备份、原子替换与失败回滚；不得为此重跑完整 bootstrap/install 或手工覆盖 bundle。
+- Engine 访问宿主 pcscd 时必须同时只读挂载发行版 `libpcsclite1` 的匹配客户端库；pcsc-lite
+  私有 socket 协议会拒绝某些跨版本组合。库路径必须来自包清单并验证 root 所有、不可写和
+  x86_64 ELF，不能从任意路径或运行数据加载。
 - Quectel 必须把完整 USB 复合设备连接到 VM，不能只传 Windows COM 口。验收顺序为
   `lsusb/lsusb -t`、tty/WWAN、`mmcli -L`、modem/SIM、NetworkManager GSM profile、bearer/IP。
 - NetworkManager 只管理蜂窝设备，不能接管桥接管理网卡；默认路由或 SSH 地址变化必须回滚并

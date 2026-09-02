@@ -40,6 +40,56 @@ class EnginePathTests(unittest.TestCase):
             factory.assert_called_once_with(timeout=30)
             engine.close_client()
 
+    @unittest.skipUnless(os.name == "posix" and Path("/usr/bin/dpkg-query").exists(),
+                         "host pcsc-lite validation requires a supported Debian-family guest")
+    def test_host_pcsclite_resolver_accepts_the_distribution_elf_only(self):
+        engine = self.engine_module()
+        library = Path(engine._host_pcsclite_library())
+        metadata = library.stat()
+        self.assertTrue(library.is_absolute())
+        self.assertTrue(library.is_file())
+        self.assertEqual(metadata.st_uid, 0)
+        self.assertEqual(metadata.st_mode & 0o022, 0)
+        header = library.read_bytes()[:20]
+        self.assertEqual(header[:6], b"\x7fELF\x02\x01")
+        self.assertEqual(int.from_bytes(header[18:20], "little"), 62)
+
+    def test_unlisted_pcsclite_path_is_rejected_before_container_creation(self):
+        engine = self.engine_module()
+        result = SimpleNamespace(stdout="/tmp/unmanaged/libpcsclite.so.1\n")
+        with patch.object(engine.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "one trusted x86_64"):
+                engine._host_pcsclite_library()
+
+    def test_engine_mounts_the_matching_host_pcsclite_client_read_only(self):
+        engine = self.engine_module()
+        captured = {}
+
+        class _Containers:
+            def get(self, name):
+                raise engine.docker.errors.NotFound(name)
+
+            def create(self, image, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""),
+                                       start=lambda: None)
+
+        client = SimpleNamespace(containers=_Containers())
+        inst = {"id": "sim1", "ports": {"webrtc": 8089, "rtp_start": 10000,
+                                            "rtp_span": 12}}
+        host_library = "/usr/lib/x86_64-linux-gnu/libpcsclite.so.1.0.0"
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "_client", lambda: client), \
+                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
+                patch.object(engine, "_clear_runtime_state", lambda base: None), \
+                patch.object(engine, "_host_pcsclite_library", return_value=host_library), \
+                patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
+            engine.start(inst, {})
+
+        self.assertEqual(captured["volumes"][host_library], {
+            "bind": "/usr/lib64/libpcsclite.so.1", "mode": "ro"})
+
     def test_ami_debug_port_is_published_on_loopback_only(self):
         """The optional AMI diagnostic port must never reach the LAN."""
         engine = self.engine_module()

@@ -140,6 +140,12 @@ MDD 安装后哈希不一致。遇到拒绝先保留现场，不要手工覆盖�
 会失败。首次安装显式使用 `--require-scr-prime` 时会继续强制 ATR 和真实拔插，`--yes` 不能
 跳过这项。
 
+若主机 `pcsc_scan` 正常，而 Engine 的 `pin_status.json` 只报告
+`Failed to establish context` / `Service was stopped`，检查容器是否同时只读挂载宿主
+`libpcsclite.so.1`。这通常是容器 client 与宿主 pcscd 私有 IPC 版本不兼容，不是 SIM 或 CCID
+补丁失败；不要把主机 socket 暴露给任意版本的容器客户端，也不要手工复制未知库。正常修复走
+源码更新，由 Control 从受支持发行版的 `libpcsclite1` 包清单验证并挂载匹配库。
+
 ## 7. Quectel 在 Windows 中有 COM 口，客户机没有 modem
 
 只传 COM 口不等于传完整复合 USB。客户机验收：

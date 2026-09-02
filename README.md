@@ -164,6 +164,8 @@ VMware USB 直通 → lsusb 04d9:c001 → pcscd → pcsc_scan → ATR → 拔插
 - 驱动重启前发布 PC/SC 维护标记，避免控制面把计划内重载误判成物理拔卡。
 - `mddctl driver install` 先验证受管 checkout 和 active generation，再复用相同的固定下载、
   备份、原子替换、哈希证据与失败回滚；用于首次安装完成后才接入 SCR Prime 的机器。
+- Engine 同时只读挂载宿主 `libpcsclite1` 提供的客户端库。pcsc-lite 的 socket IPC 会拒绝不兼容
+  的新旧版本，不能只挂 `/run/pcscd` 后假设容器内任意版本客户端都能与宿主 daemon 通信。
 - `mddctl update` 会重新探测发行版驱动；若已经原生支持 SCR Prime，则恢复发行版版本并
   解除 hold，否则继续使用经过哈希验证的补丁版本。
 - `mddctl driver restore` 只有在 root 元数据证明文件由 MDD 修改且当前哈希仍匹配时才执行。
