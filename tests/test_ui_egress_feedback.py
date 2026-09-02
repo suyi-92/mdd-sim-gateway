@@ -14,20 +14,21 @@ def css_rule(selector: str) -> str:
 
 
 class EgressFeedbackLayoutTests(unittest.TestCase):
-    def test_proxy_parse_summary_no_longer_sizes_the_button_column(self):
+    def test_proxy_diagnostics_stay_in_the_record_instead_of_adding_a_row(self):
         start = SOURCE.index('<div className="u-proxy-actions">')
         actions = SOURCE[start:SOURCE.index("</div>", start)]
-        self.assertNotIn("u-test-parsed", actions)
-        self.assertIn("u-test-parsed", SOURCE[SOURCE.index("</div>", start):])
+        self.assertNotIn("u-proxy-diagnostic", actions)
+        self.assertIn("u-proxy-diagnostic", SOURCE[:start])
+        self.assertNotIn("u-test-row", SOURCE)
 
         actions_rule = css_rule(".u-proxy-actions")
         self.assertIn("min-width:0", actions_rule)
         self.assertNotIn("max-content", actions_rule)
-        parsed_rule = css_rule(".u-test-parsed")
-        self.assertIn("grid-column:2 / -1", parsed_rule)
-        self.assertIn("min-width:0", parsed_rule)
-        self.assertIn("overflow-wrap:anywhere", parsed_rule)
-        self.assertIn("overflow:hidden", parsed_rule)
+        diagnostic_rule = css_rule(".u-proxy-diagnostic")
+        self.assertIn("min-width:0", diagnostic_rule)
+        self.assertIn("overflow:hidden", diagnostic_rule)
+        self.assertIn("text-overflow:ellipsis", diagnostic_rule)
+        self.assertIn("white-space:nowrap", diagnostic_rule)
 
     def test_country_udp_test_has_persistent_busy_and_result_state(self):
         self.assertIn("const [exitTests, setExitTests] = useState({})", SOURCE)
@@ -42,6 +43,22 @@ class EgressFeedbackLayoutTests(unittest.TestCase):
         self.assertIn("t('Runtime node')", SOURCE)
         self.assertIn("const [saveState, setSaveState] = useState('loading')", SOURCE)
         self.assertIn("setS(saved)", SOURCE)
+
+    def test_proxy_and_country_records_follow_their_container_width(self):
+        self.assertIn('className="u-egress-list"', SOURCE)
+        self.assertIn('className="card u-exit-row"', SOURCE)
+        self.assertIn("container:proxy-list / inline-size", CSS)
+        self.assertIn("container:egress-list / inline-size", CSS)
+        self.assertIn("@container proxy-list (max-width:1100px)", CSS)
+        self.assertIn("@container egress-list (max-width:720px)", CSS)
+
+    def test_pages_fill_the_browser_and_transient_surfaces_have_no_black_shadow(self):
+        page = css_rule(".u-page")
+        toast = css_rule(".u-toast")
+        save_bar = css_rule(".u-egress-save-bar")
+        self.assertIn("max-width:none", page)
+        self.assertIn("box-shadow:none", toast)
+        self.assertIn("box-shadow:none", save_bar)
 
     def test_draft_vowifi_notice_links_to_each_missing_setup_area(self):
         self.assertIn("<DraftProvisioningNotice device={d} setTab={setTab}/>", SOURCE)

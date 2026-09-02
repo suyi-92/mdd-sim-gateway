@@ -197,7 +197,7 @@ def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
                    username: str = "", password: str = "") -> int:
     """Prove a SOCKS5 listener carries UDP, and return the round trip in ms.
 
-    Country exits expose a loopback/bridge-only SOCKS5 listener. Testing that listener checks
+    Country exits expose a loopback-only SOCKS5 listener. Testing that listener checks
     the complete configured outbound, including the UDP path VoWiFi IKE actually requires.
 
     DNS alone was the wrong question to ask. VoWiFi carries IKE on UDP 500/4500 and never

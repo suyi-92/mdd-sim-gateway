@@ -301,6 +301,15 @@ class NotificationChannelTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not ready"):
                 telegram_session({"proxy_mode": "country", "proxy_country": "gb"})
 
+    def test_native_country_telegram_proxy_defaults_to_loopback(self):
+        with patch("control.app.notify_push.egress.status", return_value={"exits": {
+                "gb": {"ready": True, "interface": "mdd-gb", "proxy_port": 22027}}}):
+            session = telegram_session({"proxy_mode": "country", "proxy_country": "gb"})
+            try:
+                self.assertEqual(session.proxies["https"], "socks5h://127.0.0.1:22027")
+            finally:
+                session.close()
+
     def test_delivery_history_retries_and_never_stores_message_body(self):
         calls = []
         def sender(_cfg, _payload):

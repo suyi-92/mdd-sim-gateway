@@ -337,7 +337,10 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
-COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
+# Control runs natively under systemd in the VMware edition. Keep its diagnostic SOCKS entry on
+# loopback, removing the old Docker-Control bridge dependency and keeping the TCP control stream
+# and UDP relay on one unambiguous local path.
+COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "127.0.0.1")
 COUNTRY_PROXY_PORT_BASE = int(os.environ.get("MDD_COUNTRY_PROXY_PORT_BASE", "22000"))
 
 
@@ -2010,8 +2013,8 @@ class Orchestrator:
                                  "address": [f"172.29.{20 + tun_index}.1/30"], "auto_route": False,
                                  "strict_route": True})
                 tun_index += 1
-                # TCP/UDP SOCKS entry reachable only from Docker's host bridge. The control
-                # container uses host.docker.internal, while LAN clients cannot reach it.
+                # TCP/UDP SOCKS entry for the native Control process. Loopback keeps this
+                # diagnostic relay private and avoids carrying a Docker-Control-era address.
                 inbounds.append({"type": "socks", "tag": f"proxy-{country}",
                                  "listen": COUNTRY_PROXY_LISTEN, "listen_port": proxy_port})
                 outbounds.append(outbound)

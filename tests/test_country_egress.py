@@ -18,6 +18,19 @@ from host.mdd_orchestrator import (Orchestrator, clash_outbound, node_needs_xray
 
 
 class CountryEgressTests(unittest.TestCase):
+    def test_native_control_country_probe_uses_the_loopback_socks_address(self):
+        self.assertEqual(orch.COUNTRY_PROXY_LISTEN, "127.0.0.1")
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            config, states = app.build_proxy_config({
+                "profiles": {"node": {"name": "Upstream", "type": "socks5",
+                                         "server": "proxy.example", "port": 1080}},
+                "exits": {"gb": {"enabled": True, "profile_id": "node"}},
+            })
+        inbound = next(item for item in config["inbounds"] if item["tag"] == "proxy-gb")
+        self.assertEqual(inbound["listen"], "127.0.0.1")
+        self.assertEqual(states["gb"]["proxy_host"], "127.0.0.1")
+
     def test_mcc_mapping_and_override(self):
         self.assertEqual(egress.country_for_mcc("234"), "gb")
         self.assertEqual(egress.line_country({"mcc": "234", "proxy_country": "US"}), "us")

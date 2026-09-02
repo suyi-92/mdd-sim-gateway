@@ -630,7 +630,7 @@ def telegram_session(cfg: dict) -> requests.Session:
         # host's DNS first. On filtered networks that can yield a poisoned address even though
         # the selected node itself reaches Telegram. The orchestrator's country SOCKS inbound
         # follows the same verified outbound, while socks5h delegates DNS to sing-box.
-        proxy_host = str(state.get("proxy_host") or "172.17.0.1").strip()
+        proxy_host = str(state.get("proxy_host") or "127.0.0.1").strip()
         if not proxy_host:
             raise RuntimeError("selected country exit is not ready")
         proxy = f"socks5h://{proxy_host}:{proxy_port}"

@@ -570,6 +570,12 @@ export function EgressPage({ showToast }) {
     <div className="u-section-title u-proxy-library-head"><div><h2>{t('Proxy library')}</h2><p>{t('Add reusable subscriptions, individual nodes, or SOCKS5 proxies, then assign them to country exits below.')}</p></div><div className="u-proxy-toolbar"><button className="u-icon-button" type="button" aria-pressed={revealSensitive} onClick={() => setRevealSensitive(x => !x)} title={t(revealSensitive ? 'Hide sensitive information' : 'Show sensitive information')}><EyeIcon open={revealSensitive}/><span>{t('Sensitive information')}</span></button><button className="btn btn-primary" onClick={openAddProfile}>{t('+ Add proxy')}</button></div></div>
     {!Object.keys(profiles).length ? <Empty title={t('No proxies configured')} detail={t('Add a subscription, individual node, or SOCKS5 proxy above.')} /> : <div className="u-proxy-list">{Object.entries(profiles).map(([id, profile]) => {
       const usedBy = Object.entries(proxy.exits || {}).filter(([, ex]) => ex.profile_id === id).map(([country]) => countryLabel(country, language))
+      const profileTest = profileTests[id]
+      const parsed = parsedSummary(profileTest?.parsed)
+      const diagnostic = profileTest?.busy ? t('Testing…') : profileTest
+        ? [profileTest.ok ? `${t('Passed')} · ${profileTest.latency} ms` : `${t('Failed')}: ${profileTest.error}`, parsed].filter(Boolean).join(' · ')
+        : profile.type === 'node' ? t('Reality/XHTTP and common share-link protocols')
+          : profile.type === 'socks5' ? 'SOCKS5 · UDP ASSOCIATE' : ''
       return <div className="card u-proxy-row" key={id}>
         <div className="u-proxy-identity"><span className="u-proxy-kind">{profileTypeLabel(profile)}</span><input aria-label={t('Name')} value={profile.name || ''} onChange={e => patchProfile(id, { name: e.target.value })} />{usedBy.length ? <small>{t('Used by {countries}', { countries: usedBy.join(', ') })}</small> : <small>{t('Not assigned to a country exit')}</small>}</div>
         <div className="u-proxy-primary">
@@ -580,29 +586,16 @@ export function EgressPage({ showToast }) {
         </div>
         <div className="u-proxy-secondary">
           {profile.type === 'subscription' && <><label>{t('Refresh interval')}</label><div className="u-number-suffix"><input type="number" min="1" value={profile.refresh_minutes || 30} onChange={e => patchProfile(id, { refresh_minutes: +e.target.value })} /><span>{t('minutes')}</span></div></>}
-          {profile.type === 'node' && <small className="u-proxy-hint">{t('Reality/XHTTP and common share-link protocols')}</small>}
-          {profile.type === 'socks5' && <><label>{t('Port')}</label><input type="number" min="1" max="65535" value={profile.port || 1080} onChange={e => patchProfile(id, { port: +e.target.value })} /></>}
+          {profile.type === 'node' && <small className={`u-proxy-diagnostic ${profileTest && !profileTest.busy ? profileTest.ok ? 'u-test-ok' : 'u-test-error' : ''}`} title={diagnostic}>{diagnostic}</small>}
+          {profile.type === 'socks5' && <><label>{t('Port')}</label><input type="number" min="1" max="65535" value={profile.port || 1080} onChange={e => patchProfile(id, { port: +e.target.value })} /><small className={`u-proxy-diagnostic ${profileTest && !profileTest.busy ? profileTest.ok ? 'u-test-ok' : 'u-test-error' : ''}`} title={diagnostic}>{diagnostic}</small></>}
           {profile.type === 'existing' && <small>{t('Compatibility entry')}</small>}
         </div>
         {profile.type === 'socks5' && <div className="u-proxy-auth"><div><label>{t('Username')}</label><input type={revealSensitive ? 'text' : 'password'} autoComplete="off" value={profile.username || ''} onChange={e => patchProfile(id, { username: e.target.value })} /></div><div><label>{t('Password')}</label><input type={revealSensitive ? 'text' : 'password'} autoComplete="new-password" value={profile.password || ''} onChange={e => patchProfile(id, { password: e.target.value })} /></div></div>}
         <div className="u-proxy-actions">{['node', 'socks5'].includes(profile.type) && <button className="btn btn-ghost" disabled={profileTests[id]?.busy} onClick={() => testProfile(id)}>{t(profileTests[id]?.busy ? 'Testing…' : 'Test UDP')}</button>}<button className="btn btn-ghost u-proxy-remove" onClick={() => removeProfile(id)}>{t('Remove')}</button></div>
-        {/* A verdict and the parsed link are two different things and neither is short. Sharing
-            one crowded row truncated both — the summary that explains a failure was the part
-            that got cut. They get their own full-width line under the node instead. */}
-        {['node', 'socks5'].includes(profile.type) && profileTests[id] && !profileTests[id].busy
-          && <div className={`u-test-row ${profileTests[id].ok ? 'is-ok' : 'is-error'}`}>
-            <span className="u-test-verdict">
-              {profileTests[id].ok ? `${t('Passed')} · ${profileTests[id].latency} ms` : t('Failed')}
-            </span>
-            {parsedSummary(profileTests[id].parsed)
-              && <span className="u-test-parsed" title={t('How this gateway read the link')}>{parsedSummary(profileTests[id].parsed)}</span>}
-            {!profileTests[id].ok && profileTests[id].error
-              && <span className="u-test-detail">{profileTests[id].error}</span>}
-          </div>}
       </div>
     })}</div>}
     <div className="u-section-title"><div><h2>{t('Country exits')}</h2><p>{t('If no healthy UDP exit exists, only that SIM’s VoWiFi stops; 4G remains available.')}</p></div><div className="u-inline u-add-exit"><select value={newCountry} onChange={e => setNewCountry(e.target.value)}><option value="">{t('Select a country/region…')}</option>{available.map(code => <option key={code} value={code}>{countryLabel(code, language)}</option>)}</select><button className="btn btn-primary" disabled={!newCountry} onClick={addExit}>{t('+ Add')}</button></div></div>
-    {!Object.keys(proxy.exits || {}).length ? <Empty title={t('No country exits configured')} detail={t('Choose a country above, then configure its node source and keywords.')} /> : <div className="u-device-grid">{Object.entries(proxy.exits).map(([country, ex]) => {
+    {!Object.keys(proxy.exits || {}).length ? <Empty title={t('No country exits configured')} detail={t('Choose a country above, then configure its node source and keywords.')} /> : <div className="u-egress-list">{Object.entries(proxy.exits).map(([country, ex]) => {
       const st = live?.exits?.[country]
       const selected = profiles[ex.profile_id]
       const subscription = selected?.type === 'subscription'
@@ -615,17 +608,18 @@ export function EgressPage({ showToast }) {
         : st?.error ? t('Not connected') : idle ? t('Saved · idle')
           : !runtimePublished ? t('Status unavailable') : t('Not configured')
       const exitTest = exitTests[country]
-      return <div className="card u-panel" key={country}><div className="u-card-head"><h3>{countryLabel(country, language)}</h3><div className="u-head-actions"><Badge state={badgeState}>{badgeText}</Badge><label className="u-title-toggle"><span>{t('Enabled')}</span><input type="checkbox" className="u-toggle" checked={ex.enabled !== false} onChange={e => patchExit(country, { enabled: e.target.checked })} /></label></div></div>
-        <label>{t('Exit proxy')}</label><select value={ex.mode === 'direct' ? '__direct' : ex.profile_id || ''} onChange={e => patchExit(country, e.target.value === '__direct' ? { mode: 'direct', profile_id: '' } : { mode: '', profile_id: e.target.value })}><option value="">{t('Select a proxy…')}</option>{Object.entries(profiles).map(([id, item]) => <option key={id} value={id}>{item.name || t('Unnamed proxy')} · {profileTypeLabel(item)}</option>)}<option value="__direct">{t('Explicit direct connection')}</option></select>
-        {subscription && <><label>{t('Node-name keywords (comma-separated)')}</label><input value={(ex.keywords || []).join(', ')} onChange={e => patchExit(country, { keywords: e.target.value.split(',').map(x => x.trim()).filter(Boolean) })} /></>}
+      const runtimeNode = st?.node || t('Idle — starts on demand')
+      return <div className="card u-exit-row" key={country}>
+        <div className="u-exit-identity"><h3>{countryLabel(country, language)}</h3><Badge state={badgeState}>{badgeText}</Badge><label className="u-title-toggle"><span>{t('Enabled')}</span><input type="checkbox" className="u-toggle" checked={ex.enabled !== false} onChange={e => patchExit(country, { enabled: e.target.checked })} /></label></div>
+        <label className="u-row-field u-exit-proxy-field"><span>{t('Exit proxy')}</span><select value={ex.mode === 'direct' ? '__direct' : ex.profile_id || ''} onChange={e => patchExit(country, e.target.value === '__direct' ? { mode: 'direct', profile_id: '' } : { mode: '', profile_id: e.target.value })}><option value="">{t('Select a proxy…')}</option>{Object.entries(profiles).map(([id, item]) => <option key={id} value={id}>{item.name || t('Unnamed proxy')} · {profileTypeLabel(item)}</option>)}<option value="__direct">{t('Explicit direct connection')}</option></select></label>
         {subscription
-          ? <><label>{t('Current node')}</label>
+          ? <div className="u-exit-subscription"><label className="u-row-field"><span>{t('Node-name keywords (comma-separated)')}</span><input value={(ex.keywords || []).join(', ')} onChange={e => patchExit(country, { keywords: e.target.value.split(',').map(x => x.trim()).filter(Boolean) })} /></label><label className="u-row-field"><span>{t('Current node')}</span>
             {/* The pinned name is kept in the list even when the live status is missing, so
                 opening this page before the orchestrator answers cannot silently drop it. */}
             <select className="u-proxy-node-select" value={ex.pinned_node || ''} onChange={e => patchExit(country, { pinned_node: e.target.value })}>
               <option value="">{st?.node ? t('Automatic — changes only when a line fails ({node})', { node: st.node }) : t('Automatic')}</option>
               {[...new Set([...(st?.candidates || []), ...(ex.pinned_node ? [ex.pinned_node] : [])])].map(name => <option key={name} value={name}>{name}</option>)}
-            </select>
+            </select></label>
             {st?.pinned_missing && <p className="u-error u-proxy-node-text"><ProxyNodeName text={t('Pinned node “{node}” is no longer offered by the subscription; automatic selection is in use.', { node: ex.pinned_node })} /></p>}
             {/* Without this the picker shows the chosen node while the exit quietly runs on
                 another one, which reads as "my setting did nothing". */}
@@ -633,18 +627,16 @@ export function EgressPage({ showToast }) {
               && ((ex.pin_mode || 'lock') === 'lock'
                 ? <p className="u-error u-proxy-node-text"><ProxyNodeName text={t('Not in use: the exit is running on “{node}”. Check whether the locked node is reachable.', { node: st.node })} /></p>
                 : <p className="u-note u-proxy-node-text"><ProxyNodeName text={`${t('The preferred node is not in use; the exit is running on “{node}”. It returns to your preferred node the next time the exit has to change.', { node: st.node })} ${exitChangeReason(st, t, language)}`} /></p>)}
-            {!!ex.pinned_node && <><label>{t('If that node stops working')}</label>
+            {!!ex.pinned_node && <><label className="u-row-field"><span>{t('If that node stops working')}</span>
               <select value={ex.pin_mode || 'lock'} onChange={e => patchExit(country, { pin_mode: e.target.value })}>
                 <option value="lock">{t('Keep using it — never switch automatically')}</option>
                 <option value="prefer">{t('Move to another node, and come back to this one later')}</option>
-              </select>
+              </select></label>
               <p className="u-note">{(ex.pin_mode || 'lock') === 'lock'
                 ? t('Locked: the line stays down until you change this. Use it for a controlled comparison.')
-                : t('Preferred: a failing line moves to another node, and returns to this one the next time the exit has to change anyway.')}</p></>}</>
-          : <><div className="u-detail"><span>{t('Saved assignment')}</span><b className="u-proxy-node-text"><ProxyNodeName text={assignmentName} /></b></div><div className="u-detail"><span>{t('Runtime node')}</span><b className="u-proxy-node-text"><ProxyNodeName text={st?.node || t('Idle — starts on demand')} /></b></div></>}
-        {idle && <p className="u-note">{t('This assignment is saved. No line is using the country exit now; it starts when an enabled line or a UDP test needs it.')}</p>}
-        {st?.error && <p className="u-error">{st.error}</p>}
-        <div className="u-inline u-exit-actions"><button className="btn btn-ghost" disabled={exitTest?.busy || saving} onClick={() => testExit(country)}>{t(exitTest?.busy ? 'Testing…' : 'Test UDP')}</button>{exitTest && !exitTest.busy && <small className={`u-exit-test-result ${exitTest.ok ? 'u-test-ok' : 'u-test-error'}`} title={exitTest.error || ''}>{exitTest.ok ? `${t('Passed')} · ${exitTest.latency} ms` : `${t('Failed')}: ${exitTest.error}`}</small>}<button className="btn btn-ghost" onClick={() => removeExit(country)}>{t('Remove')}</button></div>
+                : t('Preferred: a failing line moves to another node, and returns to this one the next time the exit has to change anyway.')}</p></>}{idle && <p className="u-note">{t('This assignment is saved. No line is using the country exit now; it starts when an enabled line or a UDP test needs it.')}</p>}{st?.error && <p className="u-error">{st.error}</p>}</div>
+          : <div className="u-exit-runtime"><span>{t('Saved assignment')}: <b className="u-proxy-node-text"><ProxyNodeName text={assignmentName} /></b></span><span>{t('Runtime node')}: <b className="u-proxy-node-text"><ProxyNodeName text={runtimeNode} /></b></span>{idle && <small title={t('This assignment is saved. No line is using the country exit now; it starts when an enabled line or a UDP test needs it.')}>{t('Saved · idle')}</small>}{st?.error && <small className="u-test-error" title={st.error}>{st.error}</small>}</div>}
+        <div className="u-exit-actions">{exitTest && !exitTest.busy && <small className={`u-exit-test-result ${exitTest.ok ? 'u-test-ok' : 'u-test-error'}`} title={exitTest.error || ''}>{exitTest.ok ? `${t('Passed')} · ${exitTest.latency} ms` : `${t('Failed')}: ${exitTest.error}`}</small>}<button className="btn btn-ghost" disabled={exitTest?.busy || saving} onClick={() => testExit(country)}>{t(exitTest?.busy ? 'Testing…' : 'Test UDP')}</button><button className="btn btn-ghost" onClick={() => removeExit(country)}>{t('Remove')}</button></div>
       </div>
     })}</div>}
     <div className={`u-egress-save-bar state-${saving ? 'saving' : saveState === 'error' ? 'error' : proxyDirty ? 'dirty' : 'saved'}`} role="status"><span>{t(saving ? 'Saving…' : saveState === 'error' ? 'Save failed' : proxyDirty ? 'Unsaved changes' : 'Saved configuration')}</span><button className="btn btn-primary" disabled={saving || (!proxyDirty && saveState !== 'error')} onClick={save}>{t(saving ? 'Saving…' : 'Save and apply')}</button></div>
