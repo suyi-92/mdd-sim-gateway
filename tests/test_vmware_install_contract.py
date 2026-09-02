@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -176,6 +177,67 @@ printf '%s\\n' fingerprint-ok
                 ["bash", "-euc", script, "fingerprint-helper", directory],
                 check=True, text=True, capture_output=True)
             self.assertEqual(result.stdout.strip(), "fingerprint-ok")
+
+    @unittest.skipIf(
+        os.name == "nt" or not shutil.which("git") or not shutil.which("sh"),
+        "Engine fingerprint regression requires Git and a POSIX shell",
+    )
+    def test_engine_fingerprint_uses_only_git_managed_worktree_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "engine/patches").mkdir(parents=True)
+            (repo / "engine/templates").mkdir()
+            shutil.copy2(ROOT / "tools/engine-fingerprint.sh", repo / "tools")
+            (repo / "engine/Dockerfile").write_text("FROM scratch\n", encoding="ascii")
+            (repo / "engine/entrypoint.sh").write_text("#!/bin/sh\n", encoding="ascii")
+            patch = repo / "engine/patches/managed.py"
+            template = repo / "engine/templates/managed.py"
+            patch.write_text("PATCH_VALUE = 1\n", encoding="ascii")
+            template.write_text("TEMPLATE_VALUE = 1\n", encoding="ascii")
+            subprocess.run(
+                ["git", "init", "--quiet", "--initial-branch=vmware", "."],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(["git", "add", "engine", "tools"], cwd=repo, check=True)
+
+            def fingerprint(kind: str) -> str:
+                result = subprocess.run(
+                    ["sh", str(repo / "tools/engine-fingerprint.sh"), kind],
+                    cwd=repo,
+                    env={**os.environ, "PCSC_VERSION": "2.3.3"},
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                return result.stdout.strip()
+
+            base_before = fingerprint("base")
+            runtime_before = fingerprint("runtime")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "compileall",
+                    "-q",
+                    str(repo / "engine/patches"),
+                    str(repo / "engine/templates"),
+                ],
+                check=True,
+            )
+            (repo / "engine/patches/generated.tmp").write_text("ignored\n", encoding="ascii")
+            (repo / "engine/templates/generated.tmp").write_text("ignored\n", encoding="ascii")
+            self.assertTrue(list((repo / "engine/patches").glob("__pycache__/*.pyc")))
+            self.assertTrue(list((repo / "engine/templates").glob("__pycache__/*.pyc")))
+            self.assertEqual(fingerprint("base"), base_before)
+            self.assertEqual(fingerprint("runtime"), runtime_before)
+
+            patch.write_text("PATCH_VALUE = 2\n", encoding="ascii")
+            self.assertNotEqual(fingerprint("base"), base_before)
+            self.assertEqual(fingerprint("runtime"), runtime_before)
+            template.write_text("TEMPLATE_VALUE = 2\n", encoding="ascii")
+            self.assertNotEqual(fingerprint("runtime"), runtime_before)
 
     def test_initial_install_uses_cache_unless_no_cache_is_explicit(self):
         install_action = INSTALL[INSTALL.index('case "$action" in'):]
