@@ -312,6 +312,10 @@ Xray 在 TUN 启动后再发 UDP DNS，查询会被送回同一 bridge，表现�
 保护的版本后重新运行国家出口 UDP 测试。取证时只比较 listener、relay、传输类型和通过/失败，
 不得输出节点地址、server name、链接或凭据。
 
+单次失败后立即重试成功通常是冷启动 UDP generation 的首代丢包，不能只因一次 503 就判定节点
+不支持 UDP。新版测试会完整尝试每个配置的 DNS/STUN 目标，整轮静默后再做一次有界确认；
+两轮全部超时才报失败，并保留每个目标的最终错误。
+
 VoWiFi 链路：
 
 ```text
@@ -331,7 +335,11 @@ Q.850 127 是未明确映射的互通失败，不能据此声称“本地未发�
 
 CMLink UK 的 `10086` 是其官方语音短号，保持原样拨打；不要改写成 `+4410086`。它属于
 home-local number：只有 SIM 的 CMLink SPN 与共享 PLMN 同时匹配时，Engine 才在 IMS
-Request-URI 中保留原短号并附加归属域 `phone-context`。它接通的是带音频的客服通话，不是
+Request-URI 中保留原短号并附加归属域 `phone-context`。该域从成功 REGISTER 返回的
+`P-Associated-URI` 中与当前电话身份对应的 SIP URI 学习，严格校验后内部保存并重建该线路。
+MVNO 可以同时使用标准 3GPP 认证 realm 和另一个电话身份域；若仍用前者作 `phone-context`，
+上游可在 INVITE 后立即拒绝。SIP 形式的 home-local Request-URI 将该受验证域同时用于
+`phone-context` 和 host 部分。不要手工填写或打印学到的域名。该短号接通的是带音频的客服通话，不是
 USSD；不要隐藏麦克风/扬声器/DTMF，也不要把相同规则套到普通 EE 或其他 MVNO。
 
 若浏览器显示“通话已拒接”，先对照通话记录的最终状态。出站 VoWiFi 未接通时，Asterisk 会在

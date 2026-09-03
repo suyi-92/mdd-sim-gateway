@@ -36,8 +36,11 @@ worktree，再推送 `vmware`。
 - 修改线路上限时同时验证 API、自动建线和所有 Engine 启动入口；
 - 修改端口时同时探测 TCP 与 UDP，并覆盖 `Created` 容器清理；
 - 修改运营商数字语音短号时，同时覆盖严格的 PLMN+SPN 匹配、Engine contract、渲染后的
-  Request-URI 和 WebUI 最终状态；home-local 号码必须携带归属 IMS 域 `phone-context`，但仍是
-  有音频的普通通话，不能复用 USSD 的无音频交互；
+  Request-URI 和 WebUI 最终状态；home-local 号码必须携带同一注册的 `P-Associated-URI` 中与该号码
+  绑定的、经 DNS 形状校验的 `phone-context`，不能用通用认证 realm 猜测。它仍是有音频的
+  普通通话，不能复用 USSD 的无音频交互；
+- 修改异步操作界面时，覆盖列表中的单记录 busy 归属、固定反馈槽、按钮宽度，以及宽/中/窄
+  容器下的对齐；结果出现时不能让旁边的开关、选项和按钮移位；
 - 不把运行数据、`.venv`、`node_modules`、`webui/dist`、build cache 或备份加入 Git；
 - 正式 `.venv` 与 `webui/dist` 是指向提交专属 build cache 的激活 symlink；忽略规则必须限定
   仓库位置并同时匹配真实目录和 symlink，不能写成只匹配目录的尾随 `/` 形式；

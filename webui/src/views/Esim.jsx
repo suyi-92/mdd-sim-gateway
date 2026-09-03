@@ -137,7 +137,7 @@ function RenameModal({ profile, busy, onClose, onSave }) {
         </label>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>{t('Cancel')}</button>
-          <button className="btn btn-primary" disabled={busy} onClick={() => onSave(nick.trim())}>
+          <button className="btn btn-primary u-update-action" disabled={busy} onClick={() => onSave(nick.trim())}>
             {t(busy ? 'Saving…' : 'Update')}
           </button>
         </div>
@@ -345,7 +345,7 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
               <input ref={fileInput} type="file" accept="image/*" style={{ display: 'none' }}
                 onChange={(e) => { readQr(e.target.files?.[0]); e.target.value = '' }} />
-              <button type="button" className="btn btn-ghost" disabled={qrBusy} onClick={() => fileInput.current?.click()}>
+              <button type="button" className="btn btn-ghost u-upload-action" disabled={qrBusy} onClick={() => fileInput.current?.click()}>
                 {t(qrBusy ? 'Reading QR…' : 'Upload QR image')}
               </button>
               <span style={{ fontSize: 12, color: 'var(--text-mute)' }}>{t('or paste / drop a QR screenshot into this dialog')}</span>
@@ -376,7 +376,7 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
         {err && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 10 }}>{err}</div>}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button className="btn btn-ghost" onClick={onClose}>{t('Cancel')}</button>
-          <button className="btn btn-primary" disabled={busy || (dual && !seId)} onClick={submit}>
+          <button className="btn btn-primary u-download-action" disabled={busy || (dual && !seId)} onClick={submit}>
             {t(busy ? 'Starting…' : 'Download')}
           </button>
         </div>
@@ -715,7 +715,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
             ))}
           </select>
         </label>
-        <button className="btn btn-ghost" onClick={requestLoad} disabled={loading || !!busyOp}>
+        <button className="btn btn-ghost u-load-action" onClick={requestLoad} disabled={loading || !!busyOp}>
           {t(loading ? 'Loading…' : 'Load')}
         </button>
         <button className="btn btn-primary" onClick={requestDownload}
@@ -736,7 +736,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                 {matchedInst ? ` (${t('line')} ${matchedInst.id}${matchedInst.name ? ` · ${matchedInst.name}` : ''})` : ''}
               </div>
             </div>
-            <button className="btn btn-primary" onClick={stopLine} disabled={busyOp === 'stop' || !matchedInst}>
+            <button className="btn btn-primary u-stop-action" onClick={stopLine} disabled={busyOp === 'stop' || !matchedInst}>
               {t(busyOp === 'stop' ? 'Stopping…' : 'Stop line')}
             </button>
           </div>

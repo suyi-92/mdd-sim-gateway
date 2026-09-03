@@ -162,7 +162,7 @@ same => n,Set(DIALDEST=PJSIP/${DIALTARGET}@volte_ims)
 ; putting the context into PJSIP/user@endpoint prevents Asterisk's user_eq_phone detector from
 ; recognising the user as numeric and drops user=phone.
 {% for code in home_local_voice_codes | default([]) %}
-same => n,ExecIf($["${EXTEN}"="{{ code }}"]?Set(DIALDEST=PJSIP/volte_ims/sip:${EXTEN}\;phone-context={{ realm }}@{{ realm }}\;user=phone))
+same => n,ExecIf($["${EXTEN}"="{{ code }}"]?Set(DIALDEST=PJSIP/volte_ims/sip:${EXTEN}\;phone-context={{ home_phone_context }}@{{ home_phone_context }}\;user=phone))
 {% endfor %}
 same => n,Dial(${DIALDEST},{{ ring_timeout }},b(ims-outbound-headers^s^1))
 ; Dial only returns here when the call was NEVER answered (reject/busy/no-answer/congestion);

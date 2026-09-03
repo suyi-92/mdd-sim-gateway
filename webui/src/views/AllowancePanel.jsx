@@ -130,12 +130,12 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
   if (loading) return <div className="card" role="status" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading')}…</div>
   if (loadError) return <div className="card u-error" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading failed')}</div>
   return <div className="card" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+    <div className="u-allowance-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <div style={{ flex: 1, minWidth: 180 }}><b>{t('Balance and allowance')}</b>
         <div style={{ color: 'var(--text-mute)', fontSize: 11 }}>{t('Updated')}: {updated}{value.source === 'sms' ? ` · ${t('Carrier SMS')}` : ''}</div></div>
-      {mode === 'overview' && <button className="btn btn-ghost" disabled={busy} onClick={() => { setDraft({ ...EMPTY, ...value }); setEditing(!editing) }}>{editing ? t('Cancel') : t('Edit')}</button>}
-      <button className="btn btn-primary" disabled={busy} onClick={query}>{busy ? t('Working…') : t('Query allowance')}</button>
-      <button className="btn btn-ghost" disabled={busy} onClick={() => setEditingRule(!editingRule)}>{t('Query settings')}</button>
+      {mode === 'overview' && <button className="btn btn-ghost u-edit-action" disabled={busy} onClick={() => { setDraft({ ...EMPTY, ...value }); setEditing(!editing) }}>{editing ? t('Cancel') : t('Edit')}</button>}
+      <button className="btn btn-primary u-query-action" disabled={busy} onClick={query}>{busy ? t('Working…') : t('Query allowance')}</button>
+      <button className="btn btn-ghost u-query-settings-action" disabled={busy} onClick={() => setEditingRule(!editingRule)}>{t('Query settings')}</button>
     </div>
     {!editing && <div className="u-details cols" style={compact ? {
       marginTop: 10, gridTemplateColumns: 'repeat(6, minmax(110px, 1fr))',

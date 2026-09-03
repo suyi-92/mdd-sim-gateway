@@ -7,8 +7,10 @@ the underlying PLMN is shared with EE and other hosted brands.
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -27,8 +29,9 @@ SHORT_CODE = "10086"
 REALM = "ims.mnc033.mcc234.3gppnetwork.org"
 
 
-def instance(*, spn: str = "CMLink", mnc: str = "33") -> dict:
-    return {
+def instance(*, spn: str = "CMLink", mnc: str = "33",
+             ims_home_domain: str = "") -> dict:
+    value = {
         "id": "1",
         "index": 0,
         "imsi": "234330123456789",
@@ -40,15 +43,19 @@ def instance(*, spn: str = "CMLink", mnc: str = "33") -> dict:
         "carrier_identity": {"spn": spn},
         "sip": {"webrtc": {"enable": True, "password": "test-password"}},
     }
+    if ims_home_domain:
+        value["ims_home_domain"] = ims_home_domain
+    return value
 
 
-def render_dialplan(codes=()) -> str:
+def render_dialplan(codes=(), home_phone_context=REALM) -> str:
     context = {
         "webrtc_enable": True,
         "webrtc_user": "webrtc",
         "ring_timeout": 35,
         "msisdn": "+15550000000",
         "realm": REALM,
+        "home_phone_context": home_phone_context,
         "vm_enabled": False,
         "vm_ring_seconds": 25,
         "vm_max_seconds": 120,
@@ -80,6 +87,18 @@ class CarrierRuleTests(unittest.TestCase):
             (),
         )
 
+    def test_a_replaced_sim_or_carrier_cannot_reuse_the_learned_home_domain(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.multiple(
+                config, DATA_DIR=temporary,
+                CONFIG_PATH=str(Path(temporary) / "config.yaml")):
+            config.upsert_instance(instance(ims_home_domain="voice.mvno.example.invalid"))
+            replaced = config.upsert_instance({
+                "id": "1",
+                "iccid": "8944110000000000001",
+                "carrier_identity": {"spn": "EE"},
+            })
+        self.assertEqual(replaced.get("ims_home_domain"), "")
+
 
 class EngineContractTests(unittest.TestCase):
     def test_control_emits_the_derived_code_for_cmlink_only(self):
@@ -88,6 +107,27 @@ class EngineContractTests(unittest.TestCase):
 
         generic = config.render_instance_json(instance(spn="EE"), {})
         self.assertEqual(generic["sip"]["home_local_voice_codes"], [])
+        self.assertEqual(generic["sip"]["home_phone_context"], "")
+
+    def test_carrier_published_home_domain_overrides_the_authentication_realm(self):
+        home_domain = "voice.mvno.example.invalid"
+        rendered = config.render_instance_json(
+            instance(ims_home_domain=home_domain), {})
+        self.assertEqual(rendered["sip"]["home_phone_context"], home_domain)
+
+        rendered["local_addr"] = "192.0.2.20"
+        context = engine_render.build_context(rendered)
+        self.assertEqual(context["home_phone_context"], home_domain)
+        self.assertNotEqual(context["home_phone_context"], context["realm"])
+
+    def test_invalid_learned_domain_cannot_enter_the_engine_template(self):
+        for unsafe in ("bad;Set(unsafe)=1", "../bad", "127.0.0.1"):
+            rendered = config.render_instance_json(
+                instance(ims_home_domain=unsafe), {})
+            self.assertEqual(rendered["sip"]["home_phone_context"], REALM)
+            rendered["sip"]["home_phone_context"] = unsafe
+            rendered["local_addr"] = "192.0.2.20"
+            self.assertEqual(engine_render.build_context(rendered)["home_phone_context"], REALM)
 
     def test_engine_rejects_non_numeric_or_unbounded_hand_authored_values(self):
         cfg = config.render_instance_json(instance(), {})
@@ -101,10 +141,11 @@ class EngineContractTests(unittest.TestCase):
         self.assertEqual(context["home_local_voice_codes"], (SHORT_CODE,))
 
     def test_rendered_short_code_uri_has_context_and_user_phone(self):
-        dialplan = render_dialplan((SHORT_CODE,))
+        home_domain = "voice.mvno.example.invalid"
+        dialplan = render_dialplan((SHORT_CODE,), home_domain)
         expected = (
             "Set(DIALDEST=PJSIP/volte_ims/sip:${EXTEN}\\;phone-context="
-            f"{REALM}@{REALM}\\;user=phone)"
+            f"{home_domain}@{home_domain}\\;user=phone)"
         )
         self.assertIn(expected, dialplan)
         self.assertIn('ExecIf($["${EXTEN}"="10086"]?', dialplan)
@@ -149,6 +190,18 @@ process.stdout.write(JSON.stringify(result))
             "rejected": "Declined",
             "direct": "Call declined",
         })
+
+
+@unittest.skipIf(main is None, "control plane dependencies are not installed")
+class ImsHomeDomainPrivacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_learned_home_domain_is_not_returned_to_the_browser(self):
+        stored = instance(ims_home_domain="voice.mvno.example.invalid")
+        with patch.object(main.cfg, "list_instances", return_value=[stored]), \
+                patch.object(main, "_cached_line_status", return_value={}), \
+                patch.object(main, "_reader_index_for_instance", return_value=None), \
+                patch.object(main, "_reader_port_for_instance", return_value=""):
+            response = await main.api_instances()
+        self.assertNotIn("ims_home_domain", response["instances"][0])
 
 
 if __name__ == "__main__":

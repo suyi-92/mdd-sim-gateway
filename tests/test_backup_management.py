@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ except ImportError:  # source-only hosts need not have the complete Control venv
 
 
 ROOT = Path(__file__).resolve().parent.parent
+NODE = shutil.which("node")
 WORKER_SPEC = importlib.util.spec_from_file_location(
     "mdd_backup_worker", ROOT / "scripts" / "mdd_backup_worker.py")
 assert WORKER_SPEC and WORKER_SPEC.loader
@@ -268,6 +270,37 @@ class BackupUiContractTests(unittest.TestCase):
         self.assertNotIn('type="file"', view)
         self.assertIn(".u-backup-copy { display:grid; min-width:0", css)
         self.assertIn(".u-backup-row { align-items:stretch; flex-direction:column", css)
+
+    @unittest.skipUnless(NODE, "Node.js is required for the backup row state test")
+    def test_only_the_selected_archive_reports_restoring(self):
+        script = r"""
+import { activeBackupOperation } from './webui/src/backup-operation.js'
+const names = ['first.tar.gz', 'second.tar.gz', 'third.tar.gz']
+const local = activeBackupOperation(
+  { action: 'restore', backupName: 'second.tar.gz' },
+  { state: 'idle' },
+)
+const remote = activeBackupOperation(null, {
+  state: 'running', action: 'restore', backup_name: 'third.tar.gz',
+})
+process.stdout.write(JSON.stringify({
+  local: names.map(name => local.action === 'restore' && local.backupName === name),
+  remote: names.map(name => remote.action === 'restore' && remote.backupName === name),
+}))
+"""
+        completed = subprocess.run(
+            [NODE, "--input-type=module", "--eval", script],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=15,
+        )
+        self.assertEqual(json.loads(completed.stdout), {
+            "local": [False, True, False],
+            "remote": [False, False, True],
+        })
 
 
 if __name__ == "__main__":

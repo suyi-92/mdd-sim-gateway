@@ -1265,13 +1265,34 @@ class UdpProbeTargetTests(unittest.TestCase):
 
     def test_every_probe_failing_names_each_one(self):
         with patch.object(egress, "_udp_probe_once",
-                          side_effect=egress.EgressError("timed out")):
+                          side_effect=egress.EgressError("timed out")), \
+                patch("control.app.egress.time.sleep"):
             with self.assertRaises(egress.EgressError) as caught:
                 egress.test_udp_proxy("127.0.0.1", 1080)
         message = str(caught.exception)
         for name in ("1.1.1.1", "8.8.8.8", "9.9.9.9",
                      "stun.cloudflare.com", "stun.l.google.com"):
             self.assertIn(name, message)
+        self.assertEqual(message.count("attempts"), len(egress.udp_probe_plan()))
+
+    def test_a_silent_cold_generation_gets_one_bounded_confirmation_pass(self):
+        plan = egress.udp_probe_plan()
+        calls = []
+
+        def probe(host, port, target, timeout, username="", password=""):
+            calls.append((target, timeout))
+            if len(calls) <= len(plan):
+                raise egress.EgressError("timed out")
+            return 73
+
+        with patch.object(egress, "_udp_probe_once", side_effect=probe), \
+                patch("control.app.egress.time.sleep") as pause:
+            self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 73)
+
+        self.assertEqual([target for target, _ in calls[:len(plan)]], plan)
+        self.assertEqual(calls[len(plan)][0], plan[0])
+        self.assertGreaterEqual(calls[0][1], 2.0)
+        pause.assert_called_once_with(.4)
 
     def test_stun_carries_the_verdict_when_port_53_is_intercepted(self):
         """The reported case: DNS is rewritten end to end, the exit itself carries UDP.

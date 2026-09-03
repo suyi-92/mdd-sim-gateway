@@ -411,7 +411,8 @@ class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
         corrected = {**current, "msisdn": "+447000000001", "msisdn_source": "ims"}
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
                 patch.object(main.engine, "exec_cli", return_value=""), \
-                patch.object(main, "extract_msisdn", return_value=corrected["msisdn"]), \
+                patch.object(main, "extract_ims_identity",
+                             return_value={"msisdn": corrected["msisdn"]}), \
                 patch.object(main.cfg, "get_instance", return_value=current), \
                 patch.object(main.cfg, "upsert_instance", return_value=corrected) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \

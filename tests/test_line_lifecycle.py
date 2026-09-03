@@ -826,7 +826,8 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
 
     async def _verify(self, stored, observed, source="ims"):
         inst = {"id": "5", "name": "voxi", "msisdn": stored, "msisdn_source": source}
-        with patch.object(main, "extract_msisdn", return_value=observed), \
+        with patch.object(main, "extract_ims_identity",
+                          return_value={"msisdn": observed} if observed else {}), \
                 patch.object(main.engine, "exec_cli") as exec_cli, \
                 patch.object(main.cfg, "upsert_instance",
                              side_effect=lambda x: {**inst, **x}) as upsert, \
@@ -882,7 +883,8 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_failed_rebuild_does_not_commit_the_new_number(self):
         inst = {"id": "5", "name": "voxi", "msisdn": "+447700900456",
                 "msisdn_source": "ims"}
-        with patch.object(main, "extract_msisdn", return_value="+447700900123"), \
+        with patch.object(main, "extract_ims_identity",
+                          return_value={"msisdn": "+447700900123"}), \
                 patch.object(main.engine, "exec_cli"), \
                 patch.object(main.cfg, "upsert_instance") as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
@@ -909,6 +911,70 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 "[Aug 21 09:00:00] NOTICE[123] res_pjsip_outbound_registration.c: "
                 "IMS public identity: <sip:+447700000001@ims.example.invalid>\n")):
             self.assertEqual(main.extract_msisdn("5"), "+447700000001")
+
+    def test_the_home_domain_is_read_only_from_the_same_dialable_sip_identity(self):
+        with patch.object(main.engine, "logs", return_value=(
+                "IMS public identity: <sip:234100000000001@auth.example.invalid>,"
+                "<sip:+447700000003@voice.mvno.example.invalid>,<tel:+447700000003>\n")):
+            self.assertEqual(main.extract_ims_identity("5"), {
+                "msisdn": "+447700000003",
+                "home_domain": "voice.mvno.example.invalid",
+            })
+
+    async def test_cmlink_learns_home_domain_and_rebuilds_even_when_number_is_unchanged(self):
+        iid = "6"
+        main.hub._msisdn_checked.pop(iid, None)
+        inst = {
+            "id": iid,
+            "mcc": "234",
+            "mnc": "33",
+            "carrier_identity": {"spn": "CMLink"},
+            "msisdn": "+447700000003",
+            "msisdn_source": "ims",
+        }
+        observed = {
+            "msisdn": inst["msisdn"],
+            "home_domain": "voice.mvno.example.invalid",
+        }
+        with patch.object(main, "extract_ims_identity", return_value=observed), \
+                patch.object(main.cfg, "upsert_instance",
+                             side_effect=lambda value: {**inst, **value}) as upsert, \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main, "_start_engine_checked") as restart, \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()), \
+                patch.object(main.notify_push, "dispatch") as dispatch:
+            await main._verify_ims_msisdn(iid, inst)
+
+        candidate = restart.call_args.args[0]
+        self.assertEqual(candidate["ims_home_domain"], observed["home_domain"])
+        self.assertEqual(upsert.call_args.args[0], {
+            "id": iid,
+            "ims_home_domain": observed["home_domain"],
+        })
+        dispatch.assert_not_called()
+
+    async def test_generic_shared_plmn_never_learns_the_mvno_home_domain(self):
+        iid = "7"
+        main.hub._msisdn_checked.pop(iid, None)
+        inst = {
+            "id": iid,
+            "mcc": "234",
+            "mnc": "33",
+            "carrier_identity": {"spn": "EE"},
+            "msisdn": "+447700000003",
+            "msisdn_source": "ims",
+        }
+        observed = {
+            "msisdn": inst["msisdn"],
+            "home_domain": "voice.mvno.example.invalid",
+        }
+        with patch.object(main, "extract_ims_identity", return_value=observed), \
+                patch.object(main, "_start_engine_checked") as restart, \
+                patch.object(main.cfg, "upsert_instance") as upsert:
+            await main._verify_ims_msisdn(iid, inst)
+        restart.assert_not_called()
+        upsert.assert_not_called()
 
     def test_an_imsi_derived_identity_does_not_hide_the_dialable_number(self):
         """Carriers list every public identity. The IMSI-derived IMPU comes first and carries

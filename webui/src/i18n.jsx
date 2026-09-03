@@ -3,6 +3,7 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Administrative policy': '管理策略',
   'Local backups': '本地备份',
   'Source updates': '源码更新',
   'This VMware edition is updated from the managed local Git checkout, not from GitHub Releases.': 'VMware 版本从受管的本地 Git 工作树更新，不使用 GitHub Release。',

@@ -6,6 +6,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CSS = (ROOT / "webui/src/index.css").read_text(encoding="utf-8")
 APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
+UNIFIED = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
+ALLOWANCE = (ROOT / "webui/src/views/AllowancePanel.jsx").read_text(encoding="utf-8")
+ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
 
 
 def css_rule(selector: str) -> str:
@@ -37,21 +40,31 @@ class PageRhythmTests(unittest.TestCase):
     def test_compliance_notice_has_its_own_spacing_before_every_page(self):
         self.assertIn('className="u-note u-compliance-note" role="note"', APP)
         rule = css_rule(".u-compliance-note")
-        self.assertIn("margin:0 0 20px", rule)
-        self.assertIn("line-height:1.65", rule)
+        self.assertIn("margin:0 0 26px", rule)
+        self.assertIn("line-height:1.7", rule)
 
-    def test_shared_text_and_form_spacing_is_not_compacted_by_settings(self):
+    def test_settings_use_explicit_equal_rhythm_sections_and_aligned_fields(self):
         self.assertIn("line-height: 1.5", css_rule("body"))
-        self.assertIn(
-            ".u-panel > h2:not(:first-child),.u-panel > h3:not(:first-child) "
-            "{ margin-top:26px",
-            CSS,
-        )
-        self.assertIn(".u-form-grid { column-gap:14px; row-gap:18px; }", CSS)
-        self.assertIn(
-            ".u-panel > label:has(>.u-toggle) { min-height:34px; margin:10px 0",
-            CSS,
-        )
+        self.assertIn(".u-settings-form { display:grid; gap:0; }", CSS)
+        self.assertIn(".u-settings-section { min-width:0; display:grid; gap:16px; }", CSS)
+        self.assertIn(".u-settings-section+.u-settings-section { margin-top:20px; padding-top:20px", CSS)
+        self.assertIn(".u-form-grid>div>label { min-height:18px; margin:0; }", CSS)
+        self.assertIn(".u-form-grid input,.u-form-grid select { min-height:38px; }", CSS)
+        self.assertIn('className="u-settings-option"', UNIFIED)
+
+    def test_other_multi_button_async_controls_reserve_their_width(self):
+        for class_name, source in (
+                ("u-refresh-action", UNIFIED),
+                ("u-edit-action", ALLOWANCE),
+                ("u-query-action", ALLOWANCE),
+                ("u-query-settings-action", ALLOWANCE),
+                ("u-load-action", ESIM),
+                ("u-update-action", ESIM),
+                ("u-download-action", ESIM),
+                ("u-upload-action", ESIM),
+                ("u-stop-action", ESIM)):
+            self.assertIn(class_name, source)
+            self.assertIn(f".{class_name}", CSS)
 
 
 if __name__ == "__main__":

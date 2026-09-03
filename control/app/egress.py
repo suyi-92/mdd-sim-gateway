@@ -193,7 +193,7 @@ def _udp_probe_once(host: str, port: int, probe: tuple, timeout: float,
     return max(1, round((time.monotonic() - started) * 1000))
 
 
-def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
+def test_udp_proxy(host: str, port: int, timeout: float = 24.0,
                    username: str = "", password: str = "") -> int:
     """Prove a SOCKS5 listener carries UDP, and return the round trip in ms.
 
@@ -209,20 +209,30 @@ def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
 
     Each probe gets its own ASSOCIATE: a relay binds to the source port of the first
     datagram it sees, so a second target sent through the same session is discarded rather
-    than answered.
+    than answered. A completely silent first pass is repeated once. In the field, a country
+    exit that had just been started sometimes dropped its first UDP generation and passed an
+    immediate manual retry; doing that bounded confirmation here avoids turning a cold-start
+    race into an operator-visible failure while two fully silent passes still fail closed.
     """
     plan = udp_probe_plan()
-    per_probe = max(2.0, timeout / len(plan))
-    deadline = time.monotonic() + timeout
-    failures = []
-    for index, probe in enumerate(plan):
-        if index and time.monotonic() >= deadline:
-            break
-        try:
-            return _udp_probe_once(host, port, probe, per_probe, username, password)
-        except (EgressError, OSError, ValueError, struct.error) as exc:
-            failures.append(f"{probe[0]}/{probe[1]}: {exc}")
-    raise EgressError("UDP test failed — " + "; ".join(failures))
+    attempts = 2
+    per_probe = max(2.0, timeout / (len(plan) * attempts))
+    failures: dict[tuple, tuple[str, int]] = {}
+    for attempt in range(attempts):
+        for probe in plan:
+            try:
+                return _udp_probe_once(host, port, probe, per_probe, username, password)
+            except (EgressError, OSError, ValueError, struct.error) as exc:
+                previous = failures.get(probe)
+                failures[probe] = (str(exc), (previous[1] if previous else 0) + 1)
+        if attempt + 1 < attempts:
+            time.sleep(.4)
+    detail = []
+    for probe in plan:
+        error, count = failures[probe]
+        suffix = f" ({count} attempts)" if count > 1 else ""
+        detail.append(f"{probe[0]}/{probe[1]}: {error}{suffix}")
+    raise EgressError("UDP test failed — " + "; ".join(detail))
 
 
 def _free_loopback_port() -> int:
@@ -358,7 +368,7 @@ def describe_proxy_profile(profile: dict) -> dict:
            "engine": summary["engine"]}
 
 
-def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
+def test_proxy_profile(profile: dict, timeout: float = 24.0) -> int:
     """Test a node/SOCKS5 profile without assigning it to or changing a country exit."""
     kind = str(profile.get("type") or "").lower()
     if kind == "socks5":

@@ -156,6 +156,13 @@ def build_context(cfg):
     home_local_voice_codes = tuple(dict.fromkeys(
         str(value) for value in raw_home_local_voice_codes
         if re.fullmatch(r"[0-9]{2,6}", str(value))))
+    raw_home_phone_context = str(sip.get("home_phone_context") or "").strip().lower().rstrip(".")
+    labels = raw_home_phone_context.split(".")
+    home_phone_context = raw_home_phone_context if (
+        len(raw_home_phone_context) <= 253 and len(labels) > 1
+        and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels)
+        and re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", labels[-1])) else realm
     ctx = {
         "id": str(cfg.get("id", "1")),
         "imsi": imsi,
@@ -185,6 +192,7 @@ def build_context(cfg):
         "user_agent": "MDD-Sim-Gateway",
         "user_eq_phone": bool(sip.get("user_eq_phone", False)),
         "home_local_voice_codes": home_local_voice_codes,
+        "home_phone_context": home_phone_context,
         # SDP identity (s=/o= lines) — Asterisk defaults s=Asterisk which fingerprints it.
         "sdp_session": (sip.get("sdp_session") or "-"),
         "sdp_owner": (sip.get("sdp_owner") or "-"),

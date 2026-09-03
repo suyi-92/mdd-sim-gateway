@@ -248,6 +248,25 @@ def ims_realm(mcc: str, mnc: str) -> str:
     return f"ims.mnc{str(mnc).zfill(3)}.mcc{str(mcc)}.3gppnetwork.org"
 
 
+def normalize_ims_home_domain(value: str) -> str:
+    """Return one safe DNS home domain learned from a successful IMS registration.
+
+    Some MVNOs authenticate in the standard 3GPP realm but publish telephone identities in
+    their own home domain. That published domain is the phone-context for a home-local number.
+    It is internal carrier evidence, not an operator-editable SIP fragment, so keep the accepted
+    alphabet deliberately narrower than a general URI before it can reach an Asterisk template.
+    """
+    domain = str(value or "").strip().lower().rstrip(".")
+    if not domain or len(domain) > 253 or "." not in domain:
+        return ""
+    labels = domain.split(".")
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+           for label in labels) or not re.fullmatch(
+               r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", labels[-1]):
+        return ""
+    return domain
+
+
 def advertise_address(settings: dict) -> str:
     """The host-reachable address to advertise to local SIP clients. Precedence: explicit
     TLS domain (already used as the TLS external address) > MDD_ADVERTISE_ADDR env >
@@ -717,6 +736,18 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
         inst.pop("pin", None)
         if existing.get("pin"):
             inst["pin"] = existing["pin"]
+    # The learned IMS home domain belongs to one SIM/carrier identity. Reusing it after a card
+    # replacement could route a local service number into the previous MVNO's dial plan. Internal
+    # IMS verification may set a newly observed domain in the same update; browser/API callers
+    # cannot supply this field.
+    subscriber_changed = bool(existing and any(
+        key in inst and str(inst.get(key) or "") != str(existing.get(key) or "")
+        for key in ("imsi", "iccid")))
+    carrier_changed = bool(existing and "carrier_identity" in inst
+                           and (inst.get("carrier_identity") or {}) !=
+                           (existing.get("carrier_identity") or {}))
+    if (subscriber_changed or carrier_changed) and "ims_home_domain" not in inst:
+        inst["ims_home_domain"] = ""
     merged = {**existing, **inst}
     # Production Asterisk debug can expose complete SIP messages and subscriber identities.
     # Diagnostic SIP logging is enabled briefly at runtime by the dedicated number-learning
@@ -1037,6 +1068,9 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
     home_local_voice_codes = carrier_home_local_voice_codes(
         inst.get("mcc", ""), inst.get("mnc", ""),
         inst.get("carrier_identity") or {})
+    home_phone_context = ((normalize_ims_home_domain(inst.get("ims_home_domain", ""))
+                           or ims_realm(inst.get("mcc", ""), inst.get("mnc", "")))
+                          if home_local_voice_codes else "")
     ami_secret = str(inst.get("ami_secret") or "")
     webrtc_password = str(webrtc.get("password") or "")
     if not ami_secret:
@@ -1123,6 +1157,11 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             # rather than E.164 identities. The Engine qualifies only this exact derived list
             # with the home IMS domain as phone-context; arbitrary short inputs stay untouched.
             "home_local_voice_codes": list(home_local_voice_codes),
+            # A home-local number belongs to the domain published with this line's telephone
+            # identity. MVNOs can publish a different domain from their 3GPP authentication
+            # realm; the latter remains a safe first-registration fallback until Control learns
+            # the P-Associated-URI and rebuilds this one line.
+            "home_phone_context": home_phone_context,
             "pani": sip.get("pani", ""),
             "access_type": sip.get("access_type", ""),
             "webrtc": {

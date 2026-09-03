@@ -93,7 +93,9 @@ git remote -v
   Fake-IP ICE candidate。
 - CMLink UK 的 `10086` 保持原样，不改写为 `+4410086`；它是带音频的 home-local 语音短号，
   只在 SIM 的 CMLink SPN 与共享 PLMN 同时匹配时为 IMS Request-URI 加归属域
-  `phone-context`。不得把它泛化到普通 EE/其他 MVNO，也不得误归入无音频的 USSD 路径。
+  `phone-context`。该域必须来自同一 IMS 注册中该电话身份的受验证
+  `P-Associated-URI`；MVNO 的该域可与标准 3GPP 认证 realm 不同，不得猜测、硬编码或向
+  浏览器暴露。不得把它泛化到普通 EE/其他 MVNO，也不得误归入无音频的 USSD 路径。
 - 保留 Feishu 通知、IKE SA rekey、原生 reader recovery、Xray 错误反馈和通知代理路由。
 - 不重新引入 WSL/usbipd/PowerShell、Docker Control、Release API、网页自动更新、工作流或
   项目预编译资产。
@@ -218,12 +220,15 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
   TUN 已启动后走 UDP DNS，查询会被 TUN 送回同一 Xray SOCKS bridge，形成递归并让所有
   DNS/STUN 测试超时；不得通过删除 UDP 测试、改成直连出口或暴露生成配置来掩盖。
 - 国家出口测试会交错尝试 DNS 和 STUN，并为每个目标建立独立 UDP ASSOCIATE；任一目标响应
-  即通过。诊断时保留每个目标的失败信息。
+  即通过。第一轮全部静默时允许一次有界确认，以吸收冷启动首代丢包；两轮都无响应仍
+  必须失败。诊断时保留每个目标的失败信息。
 - 运行证据位于 `/var/lib/mdd-sim-gateway/orchestrator/` 下的 `proxy-status.json`、
   `sing-box.json` 和 `xray.json`。这些文件可能包含私有节点、服务器地址或凭据；只提取所需
   字段并脱敏，禁止整文件粘贴到对话、Issue、测试或提交。
 - UI 必须分别呈现“已保存分配”和“运行节点”。测试 busy/result 要保留在对应记录内，不能只
   依赖会消失的 toast；敏感信息开关关闭时不得通过 tooltip、ARIA 文本或错误详情泄漏节点值。
+- 异步测试、备份和恢复的状态必须留在对应记录的固定反馈槽内；文案变化不得推动同行开关、
+  输入框或按钮。设置页各分组使用一致的标题到控件间距和表单基线。
 
 ## 更新、回滚与数据安全
 

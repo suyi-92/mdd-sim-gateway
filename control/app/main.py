@@ -1171,22 +1171,35 @@ async def card_monitor():
 _IMS_IDENTITY_LINE = re.compile(
     r'^.*(?:IMS public identity:|P-Associated-Uri:).*$', re.I | re.M)
 _IMS_IDENTITY_NUMBER = re.compile(r'(?:tel|sip):(\+\d{5,})', re.I)
+_IMS_IDENTITY_SIP = re.compile(
+    r'sip:(\+\d{5,})@([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)', re.I)
 
 
-def extract_msisdn(iid):
-    """Learn the registered MSISDN from the P-Associated-URI the engine logged.
+def extract_ims_identity(iid) -> dict:
+    """Learn the dialable number and its home domain from P-Associated-URI.
 
     The newest identity wins: a ported number is the same SIM being answered with a different
     public identity, so the last registration is the only one that still describes the line.
     Within one line the first dialable URI wins — carriers list the IMSI-derived IMPU (no
     number in it) alongside the E.164 identities, and the first `+` URI is the primary one.
+    A SIP URI for that same number additionally names the carrier-published home domain used to
+    qualify home-local short numbers. Raw identities never leave this parser.
     """
     logs = engine.logs(iid, MSISDN_LOG_TAIL_LINES)
     for line in reversed(_IMS_IDENTITY_LINE.findall(logs)):
         found = _IMS_IDENTITY_NUMBER.search(line)
         if found:
-            return found.group(1)
-    return None
+            number = found.group(1)
+            domain = next((cfg.normalize_ims_home_domain(match.group(2))
+                           for match in _IMS_IDENTITY_SIP.finditer(line)
+                           if match.group(1) == number), "")
+            return {"msisdn": number, "home_domain": domain}
+    return {}
+
+
+def extract_msisdn(iid):
+    """Compatibility wrapper for callers that need only the registered telephone number."""
+    return extract_ims_identity(iid).get("msisdn")
 
 
 def _needs_ims_msisdn_learning(inst: dict) -> bool:
@@ -1202,7 +1215,7 @@ def _needs_ims_msisdn_learning(inst: dict) -> bool:
 
 
 async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
-    """Follow the number the carrier hands out at registration.
+    """Follow the telephone identity the carrier hands out at registration.
 
     A ported number is exactly this: the same SIM, registering normally, answered with a
     different public identity. Treating the first IMS answer as permanent left the line
@@ -1213,9 +1226,16 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
     with "503 Service Unavailable" (issue #8) — a rejected registration that the health policy
     then acts on, so asking a healthy line for its number was enough to take it down.
 
-    A manually entered number is never overridden: that is a deliberate operator choice.
+    A manually entered number is never overridden: that is a deliberate operator choice. For
+    the narrowly matched home-local carrier profile, its validated SIP identity domain is still
+    learned independently because it is routing evidence rather than a replacement number.
     """
-    if inst.get("msisdn_source") != "ims":
+    local_codes = cfg.carrier_home_local_voice_codes(
+        inst.get("mcc", ""), inst.get("mnc", ""), inst.get("carrier_identity") or {})
+    number_is_ims_managed = inst.get("msisdn_source") == "ims"
+    # A manual number remains authoritative, but a carrier-published home domain is separate
+    # routing evidence and can still be learned for this carrier's local service number.
+    if not number_is_ims_managed and not local_codes:
         return
     # A freshly booted host can have a monotonic clock below the interval.  Treat a missing
     # entry as "never checked" instead of comparing it with the clock's zero point.
@@ -1225,47 +1245,64 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
         return
     hub._msisdn_checked[iid] = time.monotonic()
     try:
-        observed = await asyncio.to_thread(extract_msisdn, iid)
+        observed_identity = await asyncio.to_thread(extract_ims_identity, iid)
     except Exception as exc:  # noqa: a transient log read failure is retried on the next interval
         log.debug("IMS number verification failed for line %s: %s", iid, type(exc).__name__)
         hub._msisdn_checked[iid] = (
             time.monotonic() - MSISDN_VERIFY_INTERVAL_SECONDS
             + MSISDN_VERIFY_FAILURE_RETRY_SECONDS)
         return
+    observed = str(observed_identity.get("msisdn") or "")
     stored = str(inst.get("msisdn") or "")
-    if not observed or observed == stored:
+    observed_domain = cfg.normalize_ims_home_domain(
+        observed_identity.get("home_domain", "")) if local_codes else ""
+    stored_domain = cfg.normalize_ims_home_domain(inst.get("ims_home_domain", ""))
+    number_changed = bool(number_is_ims_managed and observed and observed != stored)
+    domain_changed = bool(observed_domain and observed_domain != stored_domain)
+    if not observed or (not number_changed and not domain_changed):
         return
-    log.warning("line %s number changed at the carrier: %s -> %s", iid, stored, observed)
+    if number_changed:
+        log.warning("line %s number changed at the carrier: %s -> %s", iid, stored, observed)
+    if domain_changed:
+        # The value is carrier routing material and can identify a private deployment. Record
+        # only that it changed; never copy the domain into ordinary logs.
+        log.info("line %s learned a new IMS home domain", iid)
     # instance.json and Asterisk's dialplan are snapshots taken at container start, so the
     # line would keep presenting the old number as caller identity until it is rebuilt. Rebuild
     # BEFORE committing the new number: if fail-closed egress or Docker rejects the rebuild, the
     # stored old value makes the next verification retry instead of declaring a half-applied
     # change complete.
-    candidate = {**inst, "id": iid, "msisdn": observed, "msisdn_source": "ims"}
+    update = {"id": iid}
+    if number_changed:
+        update.update(msisdn=observed, msisdn_source="ims")
+    if domain_changed:
+        update["ims_home_domain"] = observed_domain
+    candidate = {**inst, **update}
     try:
         await hub.drop_ami(iid)
         await asyncio.to_thread(_start_engine_checked, candidate, cfg.get_settings(),
                                 os.environ.get("MDD_DEV_MOUNTS", "") == "1",
-                                "number-changed")
-        updated = await asyncio.to_thread(
-            cfg.upsert_instance, {"id": iid, "msisdn": observed, "msisdn_source": "ims"})
+                                "ims-identity-changed")
+        updated = await asyncio.to_thread(cfg.upsert_instance, update)
     except Exception as exc:  # noqa: background verification must never leak an unhandled task
         hub._msisdn_checked[iid] = (
             time.monotonic() - MSISDN_VERIFY_INTERVAL_SECONDS
             + MSISDN_VERIFY_FAILURE_RETRY_SECONDS)
-        log.warning("IMS number change could not be applied for line %s (%s); will retry",
+        log.warning("IMS identity change could not be applied for line %s (%s); will retry",
                     iid, type(exc).__name__)
         return
     client = hub.ami.get(iid)
-    if client:
+    if client and number_changed:
         client.msisdn = observed
     await hub.broadcast({"type": "engine", "instance": iid,
-                         "event": "msisdn_updated", "args": []})
-    asyncio.create_task(asyncio.to_thread(
-        notify_push.dispatch, cfg.get_settings(), notify_push.EV_NUMBER_CHANGED, updated,
-        observed, f"{stored or '(未知)'} → {observed}\n"
-                  "运营商在 IMS 注册时下发了新号码（通常是携号转网）。线路已重建，"
-                  "主叫身份和短信发信人已同步更新。"))
+                         "event": ("msisdn_updated" if number_changed
+                                   else "ims_home_domain_updated"), "args": []})
+    if number_changed:
+        asyncio.create_task(asyncio.to_thread(
+            notify_push.dispatch, cfg.get_settings(), notify_push.EV_NUMBER_CHANGED, updated,
+            observed, f"{stored or '(未知)'} → {observed}\n"
+                      "运营商在 IMS 注册时下发了新号码（通常是携号转网）。线路已重建，"
+                      "主叫身份和短信发信人已同步更新。"))
 
 
 async def learn_msisdn(iid):
@@ -1283,7 +1320,8 @@ async def learn_msisdn(iid):
     in one burst; each registration refresh re-announces the identity in any case.
     """
     try:
-        msisdn = await asyncio.to_thread(extract_msisdn, iid)
+        observed_identity = await asyncio.to_thread(extract_ims_identity, iid)
+        msisdn = str(observed_identity.get("msisdn") or "")
         if not msisdn:
             # Hold this line's learning slot for the interval: the caller's attempt cap is
             # what stops the loop, and spending it in one burst would give up seconds after
@@ -1295,9 +1333,19 @@ async def learn_msisdn(iid):
         # previously learned from ModemManager. Never overwrite a manual value.
         if current.get("msisdn") and current.get("msisdn_source") != "modemmanager":
             return
-        identity_changed = str(current.get("msisdn") or "") != msisdn
-        updated = cfg.upsert_instance({"id": iid, "msisdn": msisdn,
-                                       "msisdn_source": "ims"})
+        home_codes = cfg.carrier_home_local_voice_codes(
+            current.get("mcc", ""), current.get("mnc", ""),
+            current.get("carrier_identity") or {})
+        home_domain = cfg.normalize_ims_home_domain(
+            observed_identity.get("home_domain", "")) if home_codes else ""
+        identity_changed = (str(current.get("msisdn") or "") != msisdn
+                            or bool(home_domain and home_domain !=
+                                    cfg.normalize_ims_home_domain(
+                                        current.get("ims_home_domain", ""))))
+        update = {"id": iid, "msisdn": msisdn, "msisdn_source": "ims"}
+        if home_domain:
+            update["ims_home_domain"] = home_domain
+        updated = cfg.upsert_instance(update)
         c = hub.ami.get(iid)
         if c:
             c.msisdn = msisdn
@@ -3399,7 +3447,8 @@ async def api_provision(body: dict):
                             dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
     _refresh_card_matches()
     await hub.broadcast({"type": "cards", "cards": _client_cards()})
-    safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
+    safe = {k: v for k, v in inst.items()
+            if k not in ("pin", "carrier_identity", "ims_home_domain")}
     return {"ok": True, "instance": safe}
 
 
@@ -4642,7 +4691,8 @@ async def api_instances():
     out = []
     for inst in cfg.list_instances():
         st = _cached_line_status(inst)
-        safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
+        safe = {k: v for k, v in inst.items()
+                if k not in ("pin", "carrier_identity", "ims_home_domain")}
         safe["has_pin"] = bool(inst.get("pin"))
         safe["proxy_country_effective"] = egress.line_country(inst)
         # Report the reader index that PHYSICALLY holds this line's SIM right now (ICCID-matched
@@ -4666,7 +4716,8 @@ async def api_instance_upsert(body: dict):
     if "id" not in body:
         raise HTTPException(400, "id required")
     iid = str(body["id"])
-    body = {key: value for key, value in body.items() if key != "carrier_identity"}
+    body = {key: value for key, value in body.items()
+            if key not in ("carrier_identity", "ims_home_domain")}
     # Reject an explicit rename onto another line's name rather than silently suffixing it:
     # the operator asked for that exact label, and a duplicate makes the name useless as a
     # handle in the UI and audit history.
@@ -4693,7 +4744,8 @@ async def api_instance_upsert(body: dict):
             asyncio.create_task(push_status(iid))
         except Exception as e:  # noqa
             log.warning("apply-on-save restart failed for %s: %r", iid, e)
-    safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
+    safe = {k: v for k, v in inst.items()
+            if k not in ("pin", "carrier_identity", "ims_home_domain")}
     safe["applied"] = applied      # true => config was re-applied to the running engine
     return safe
 
