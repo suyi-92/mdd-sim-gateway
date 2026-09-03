@@ -344,6 +344,12 @@ P-CSCF。缺少这条映射会让显式 URI 绕过认证域已有的 P-CSCF 映�
 `CHANUNAVAIL` 结束。不要手工填写或打印学到的域名。该短号接通的是带音频的客服通话，不是 USSD；
 不要隐藏麦克风/扬声器/DTMF，也不要把相同规则套到普通 EE 或其他 MVNO。
 
+CTExcel 同样使用 EE 的 `234-33`，但普通英国 E.164 去话走另一条号码分析路径。只有同时匹配
+该 PLMN 与 CTExcel SPN 时，Control 才为号码型 SIP Request-URI 启用 `user=phone`；缺少该参数
+时可表现为 IMS 先返回 `100 Trying`，随后立即以无详细原因的 `487 Request Terminated` 结束。
+英国号码应写成 `+44` 加去掉首个国内长途 `0` 后的号码，例如手机使用 `+447…`，不能写成
+`+4407…`。CTExcel 的普通号码路由不得获得 CMLink 专属的 `10086`/`phone-context` 规则。
+
 若浏览器显示“通话已拒接”，先对照通话记录的最终状态。出站 VoWiFi 未接通时，Asterisk 会在
 本地 WebRTC leg 合成 `603 Decline` 来阻止 JsSIP 自动重拨；它不等于运营商真的返回拒接。
 Control 的 `call_result` 才是界面最终结论。需要区分上游响应时，只短暂开启 PJSIP logger，

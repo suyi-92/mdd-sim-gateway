@@ -171,6 +171,15 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertIn("country=GB", profile["pani"])
         self.assertNotIn("ffffffffffff", profile["pani"])
 
+    def test_ctexcel_profile_formats_telephone_requests_for_ee_mvno_ims(self):
+        profile = config.carrier_sip_defaults(
+            "234", "33", "test-ctexcel-card", {"spn": "CTExcel"})
+
+        self.assertEqual(profile["access_type"], "wlan1")
+        self.assertTrue(profile["user_eq_phone"])
+        self.assertIn("country=GB", profile["pani"])
+        self.assertNotIn("ffffffffffff", profile["pani"])
+
     def test_generic_ee_profile_does_not_inherit_mvno_sip_flags(self):
         self.assertEqual(config.carrier_sip_defaults("234", "33", "test-ee-card"), {})
 

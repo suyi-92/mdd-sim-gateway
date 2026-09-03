@@ -958,6 +958,20 @@ CARRIER_SIP_SPN_PROFILES = (
         # carrier_home_local_voice_codes() for why it is qualified separately.
         "home_local_voice_codes": ("10086",),
     },
+    {
+        # CTExcel shares EE's 234-33 PLMN but its originating TAS needs telephone-number
+        # SIP URIs to be marked with user=phone. Without that marker the P-CSCF accepts a
+        # UK E.164 INVITE (100 Trying) and the downstream IMS route terminates it with 487.
+        # Match the SIM-published SPN so generic EE and other hosted brands keep their own
+        # presentation. Unlike CMLink, CTExcel has no 10086 home-local voice-code rule.
+        "plmns": ("234-33", "234-033"),
+        "spns": ("CTExcel",),
+        "profile": {
+            "pani_country": "GB",
+            "access_type": "wlan1",
+            "user_eq_phone": True,
+        },
+    },
 )
 
 # Voice short numbers that are meaningful only inside a specific carrier's home dial plan.

@@ -86,7 +86,8 @@ class CarrierRuleTests(unittest.TestCase):
             )
 
     def test_shared_plmn_without_cmlink_spn_gets_no_local_code(self):
-        for identity in ({}, {"spn": "EE"}, {"spn": "another MVNO"}):
+        for identity in ({}, {"spn": "EE"}, {"spn": "CTExcel"},
+                         {"spn": "another MVNO"}):
             self.assertEqual(
                 config.carrier_home_local_voice_codes("234", "33", identity), ())
 
@@ -118,6 +119,16 @@ class EngineContractTests(unittest.TestCase):
         generic = config.render_instance_json(instance(spn="EE"), {})
         self.assertEqual(generic["sip"]["home_local_voice_codes"], [])
         self.assertEqual(generic["sip"]["home_phone_context"], "")
+        self.assertFalse(generic["sip"]["user_eq_phone"])
+
+    def test_ctexcel_uses_phone_uris_without_inheriting_cmlink_short_codes(self):
+        rendered = config.render_instance_json(instance(spn="CTExcel"), {})
+
+        self.assertTrue(rendered["sip"]["user_eq_phone"])
+        self.assertIn("country=GB", rendered["sip"]["pani"])
+        self.assertEqual(rendered["sip"]["access_type"], "wlan1")
+        self.assertEqual(rendered["sip"]["home_local_voice_codes"], [])
+        self.assertEqual(rendered["sip"]["home_phone_context"], "")
 
     def test_carrier_published_home_domain_overrides_the_authentication_realm(self):
         home_domain = "voice.mvno.example.invalid"
