@@ -100,6 +100,18 @@ transport=volte_ims
 type=resolve
 ip={{ pcscf }}
 transport=volte_ims
+{% if home_local_voice_codes and home_phone_context and home_phone_context != realm and home_phone_context != ('smsoip.' ~ realm) %}
+
+; A home-local voice number keeps the carrier-published identity domain in its Request-URI.
+; Explicit endpoint/URI dialing resolves that host independently of the registration realm,
+; so pin the already-validated domain to the same P-CSCF instead of letting it bypass the IMS
+; next hop through ordinary DNS. The value is learned from this registration's
+; P-Associated-URI and validated before it reaches the Engine contract.
+[{{ home_phone_context }}]
+type=resolve
+ip={{ pcscf }}
+transport=volte_ims
+{% endif %}
 {% endif %}
 
 ; ================= Authenticated browser softphone =================

@@ -9,6 +9,12 @@ APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
 UNIFIED = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
 ALLOWANCE = (ROOT / "webui/src/views/AllowancePanel.jsx").read_text(encoding="utf-8")
 ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
+KEEPALIVE = (ROOT / "webui/src/views/Keepalive.jsx").read_text(encoding="utf-8")
+LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
+MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
+SIM_CONFIG = (ROOT / "webui/src/views/SimConfig.jsx").read_text(encoding="utf-8")
+SIM_SELECTOR = (ROOT / "webui/src/views/SimSelector.jsx").read_text(encoding="utf-8")
+SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
 
 
 def css_rule(selector: str) -> str:
@@ -49,8 +55,41 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn(".u-settings-section { min-width:0; display:grid; gap:16px; }", CSS)
         self.assertIn(".u-settings-section+.u-settings-section { margin-top:20px; padding-top:20px", CSS)
         self.assertIn(".u-form-grid>div>label { min-height:18px; margin:0; }", CSS)
-        self.assertIn(".u-form-grid input,.u-form-grid select { min-height:38px; }", CSS)
+        self.assertIn(".u-form-grid input,.u-form-grid select,.u-form-grid textarea { min-height:38px; }", CSS)
         self.assertIn('className="u-settings-option"', UNIFIED)
+
+    def test_non_settings_pages_share_explicit_field_and_note_rhythm(self):
+        self.assertIn(".u-field-stack { min-width:0; display:grid; align-content:start; gap:6px; }", CSS)
+        self.assertIn(".u-note-stack { display:grid; gap:10px; margin-top:14px; }", CSS)
+        self.assertIn('className="u-note-stack"', UNIFIED)
+        self.assertIn("u-form-card", UNIFIED)
+        self.assertIn('className="u-sim-layout"', SIM_CONFIG)
+        self.assertIn('className="u-field-stack"', SIM_CONFIG)
+        self.assertIn('className="u-field-stack u-keepalive-threshold"', KEEPALIVE)
+        self.assertIn('className="u-form-grid u-allowance-edit-grid"', ALLOWANCE)
+        self.assertIn("u-esim-page", ESIM)
+
+    def test_shared_line_and_transport_selectors_keep_text_and_controls_aligned(self):
+        self.assertIn('className="card u-line-selector"', SIM_SELECTOR)
+        self.assertIn('className="u-inline-field u-call-route-field"', SOFTPHONE)
+        self.assertIn('className="u-inline-field u-message-route-field"', MESSAGES)
+        self.assertIn('className="u-inline-field u-esim-reader-field"', ESIM)
+        self.assertIn("grid-template-columns:max-content minmax(0,1fr)", css_rule(".u-inline-field"))
+
+    def test_sim_forms_follow_their_container_at_medium_and_narrow_widths(self):
+        self.assertIn("container:sim-config / inline-size", CSS)
+        self.assertIn("container:sim-card / inline-size", CSS)
+        self.assertIn("@container sim-config (max-width:720px)", CSS)
+        self.assertIn("@container sim-card (max-width:440px)", CSS)
+
+    def test_calls_messages_keepalive_and_logs_have_narrow_layout_contracts(self):
+        self.assertIn('className="u-call-layout"', SOFTPHONE)
+        self.assertIn('className="u-messages-layout"', MESSAGES)
+        self.assertIn('className="u-keepalive-grid"', KEEPALIVE)
+        self.assertIn('className="u-log-toolbar"', LOGS)
+        self.assertIn("@media(max-width:760px)", CSS)
+        self.assertIn(".u-call-layout,.u-messages-layout { flex:none; grid-template-columns:1fr", CSS)
+        self.assertIn(".u-keepalive-grid { min-width:980px; }", CSS)
 
     def test_other_multi_button_async_controls_reserve_their_width(self):
         for class_name, source in (

@@ -37,8 +37,9 @@ worktree，再推送 `vmware`。
 - 修改端口时同时探测 TCP 与 UDP，并覆盖 `Created` 容器清理；
 - 修改运营商数字语音短号时，同时覆盖严格的 PLMN+SPN 匹配、Engine contract、渲染后的
   Request-URI 和 WebUI 最终状态；home-local 号码必须携带同一注册的 `P-Associated-URI` 中与该号码
-  绑定的、经 DNS 形状校验的 `phone-context`，不能用通用认证 realm 猜测。它仍是有音频的
-  普通通话，不能复用 USSD 的无音频交互；
+  绑定的、经 DNS 形状校验的 `phone-context`，不能用通用认证 realm 猜测。显式 SIP URI 的 host
+  使用该域时，还必须由受管 PJSIP resolve 条目固定到同一注册的 P-CSCF，不能绕过 IMS 下一跳走
+  普通 DNS。它仍是有音频的普通通话，不能复用 USSD 的无音频交互；
 - 修改异步操作界面时，覆盖列表中的单记录 busy 归属、固定反馈槽、按钮宽度，以及宽/中/窄
   容器下的对齐；结果出现时不能让旁边的开关、选项和按钮移位；
 - 不把运行数据、`.venv`、`node_modules`、`webui/dist`、build cache 或备份加入 Git；

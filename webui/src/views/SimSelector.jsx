@@ -36,9 +36,9 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
 
   if (!live.length) return null
   return (
-    <div className="card" style={{ padding: '10px 14px', marginBottom: 14, display: 'flex', alignItems: 'center', gap: 12 }}>
-      <span style={{ fontSize: 12, color: 'var(--text-mute)', whiteSpace: 'nowrap' }}>{t(label)}</span>
-      <select value={id || ''} onChange={(e) => setSelected(e.target.value)} style={{ flex: 1, maxWidth: 460 }}>
+    <div className="card u-line-selector">
+      <span className="u-line-selector-label">{t(label)}</span>
+      <select value={id || ''} onChange={(e) => setSelected(e.target.value)}>
         {!id && <option value="">{t('— select —')}</option>}
         {live.map((i) => {
           const c = sourceFor(i)
@@ -47,7 +47,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
           return <option key={i.id} value={i.id}>{deviceName(c)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}
       </select>
-      {live.length === 1 && <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>{t('only line')}</span>}
+      {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}
     </div>
   )
 }

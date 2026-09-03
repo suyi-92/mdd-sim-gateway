@@ -146,16 +146,16 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
       } : undefined}><span>{t(label)}</span><b style={compact ? { textAlign: 'left' } : undefined}>{value[key] || (key === 'activated_at' ? t('Configure to enable reminders') : '—')}</b></div>)}
     </div>}
     {mode === 'overview' && editing && <div style={{ marginTop: 10 }}>
-      <div className="u-details cols">{FIELDS.map(([key, label]) => <label className="u-detail" key={key}><span>{t(label)}</span><input type={key === 'activated_at' ? 'date' : 'text'} value={draft[key] || ''} maxLength={160} onChange={event => setDraft(current => ({ ...current, [key]: event.target.value }))} /></label>)}</div>
+      <div className="u-form-grid u-allowance-edit-grid">{FIELDS.map(([key, label]) => <div key={key}><label>{t(label)}</label><input type={key === 'activated_at' ? 'date' : 'text'} value={draft[key] || ''} maxLength={160} onChange={event => setDraft(current => ({ ...current, [key]: event.target.value }))} /></div>)}</div>
       <div style={{ marginTop: 10, textAlign: 'right' }}><button className="btn btn-primary" disabled={busy} onClick={saveManual}>{t('Save')}</button></div>
     </div>}
-    {editingRule && <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
-      <p className="u-note" style={{ marginTop: 0 }}>{rule?.known
+    {editingRule && <div className="u-allowance-rule">
+      <p className="u-note">{rule?.known
         ? t('This carrier has a built-in method. Saving below creates an override; you can restore the default later.')
         : t('The carrier is unknown. Enter the service number and exact SMS query text supplied by the carrier.')}</p>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) minmax(180px, 2fr)', gap: 8 }}>
-        <label><span>{t('Service number')}</span><input value={ruleDraft.recipient} maxLength={32} onChange={event => setRuleDraft(current => ({ ...current, recipient: event.target.value }))} /></label>
-        <label><span>{t('Query text')}</span><input value={ruleDraft.body} maxLength={500} onChange={event => setRuleDraft(current => ({ ...current, body: event.target.value }))} /></label>
+      <div className="u-form-grid u-query-rule-grid">
+        <div><label>{t('Service number')}</label><input value={ruleDraft.recipient} maxLength={32} onChange={event => setRuleDraft(current => ({ ...current, recipient: event.target.value }))} /></div>
+        <div><label>{t('Query text')}</label><input value={ruleDraft.body} maxLength={500} onChange={event => setRuleDraft(current => ({ ...current, body: event.target.value }))} /></div>
       </div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
         {rule?.known && rule?.custom && <button className="btn btn-ghost" disabled={busy} onClick={resetRule}>{t('Restore default')}</button>}

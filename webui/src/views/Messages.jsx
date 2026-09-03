@@ -193,12 +193,12 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   )
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div className="u-communication-page">
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
-      <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
+      <div className="u-messages-layout">
+      <div className="card u-message-thread-list" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
         <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false) }}>+ {tr('New message')}</button>
         {threads.length > 0 &&
           <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, color: '#ef4444', fontSize: 12 }}
@@ -220,7 +220,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         <BinaryPayloads payloads={binary} tr={tr} />
       </div>
 
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
+      <div className="card u-message-conversation" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
         <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
           {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
             : <input placeholder={tr('Recipient number e.g. +1...')} value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
@@ -301,13 +301,13 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
           })}
         </div>
         <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border)', flexShrink: 0, flexWrap: 'wrap', alignItems: 'center' }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-mute)', whiteSpace: 'nowrap' }}>
-            {tr('Send via')}
+          <label className="u-inline-field u-message-route-field">
+            <span>{tr('Send via')}</span>
             <select value={transport} disabled={sending}
               onChange={(e) => setTransport(e.target.value)}
               aria-label={tr('Send via')}
               title={!cellularAvailable ? tr('This line does not have an available cellular modem.') : ''}
-              style={{ width: 'auto', minWidth: 150 }}>
+              style={{ minWidth: 150 }}>
               <option value="auto">{tr('Auto (VoWiFi first)')}</option>
               <option value="vowifi">VoWiFi</option>
               <option value="cellular" disabled={!cellularAvailable}>

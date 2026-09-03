@@ -121,8 +121,8 @@ function RenameModal({ profile, busy, onClose, onSave }) {
         <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 14, wordBreak: 'break-all' }}>
           {profile.iccid}
         </div>
-        <label style={{ display: 'block', marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>{t('Nickname')}</div>
+        <label className="u-field-stack u-esim-modal-field">
+          <div>{t('Nickname')}</div>
           <input
             autoFocus
             value={nick}
@@ -288,7 +288,7 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
   return (
     <div style={{ position: 'fixed', inset: 0, background: '#0008', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50 }}
       onClick={onClose}>
-      <div className="card" style={{ width: 480, maxWidth: '92vw', padding: 20 }} onClick={(e) => e.stopPropagation()}
+      <div className="card u-esim-dialog" style={{ width: 480, maxWidth: '92vw', padding: 20 }} onClick={(e) => e.stopPropagation()}
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer?.files?.[0]; if (f?.type?.startsWith('image/')) readQr(f) }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
@@ -336,8 +336,8 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
         </div>
         {mode === 'code' ? (
           <>
-            <label style={{ display: 'block', marginBottom: 6 }}>
-              <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>{t('LPA activation code')}</div>
+            <label className="u-field-stack u-esim-modal-field">
+              <div>{t('LPA activation code')}</div>
               <textarea value={activation} onChange={(e) => setActivation(e.target.value)} rows={3}
                 placeholder="LPA:1$smdp.example.com$MATCHING-ID"
                 style={{ width: '100%', resize: 'vertical' }} />
@@ -353,22 +353,22 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
           </>
         ) : (
           <>
-            <label style={{ display: 'block', marginBottom: 10 }}>
-              <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>SM-DP+</div>
+            <label className="u-field-stack u-esim-modal-field">
+              <div>SM-DP+</div>
               <input value={smdp} onChange={(e) => setSmdp(e.target.value)} placeholder="smdp.example.com" style={{ width: '100%' }} />
             </label>
-            <label style={{ display: 'block', marginBottom: 10 }}>
-              <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>{t('Matching ID')}</div>
+            <label className="u-field-stack u-esim-modal-field">
+              <div>{t('Matching ID')}</div>
               <input value={matchingId} onChange={(e) => setMatchingId(e.target.value)} style={{ width: '100%' }} />
             </label>
           </>
         )}
-        <label style={{ display: 'block', marginBottom: 10 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>{t('Confirmation code (optional)')}</div>
+        <label className="u-field-stack u-esim-modal-field">
+          <div>{t('Confirmation code (optional)')}</div>
           <input value={confirmation} onChange={(e) => setConfirmation(e.target.value)} style={{ width: '100%' }} />
         </label>
-        <label style={{ display: 'block', marginBottom: 10 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 4 }}>
+        <label className="u-field-stack u-esim-modal-field">
+          <div>
             IMEI {t(imeiDefault ? '(from matched line — editable)' : '(optional)')}
           </div>
           <input value={imei} onChange={(e) => setImei(e.target.value)} placeholder={t('15-digit IMEI')} style={{ width: '100%' }} />
@@ -703,10 +703,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 }}>
-          {t('Reader')}
+    <div className="u-page u-esim-page">
+      <div className="u-esim-toolbar">
+        <label className="u-inline-field u-esim-reader-field">
+          <span>{t('Reader')}</span>
           <select value={reader} onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
             {present.map((c) => (
               <option key={c.name} value={c.name}>

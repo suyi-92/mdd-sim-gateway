@@ -576,28 +576,27 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   ) : null
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div className="u-communication-page">
       {/* Persistent remote-audio sink: JsSIP writes the remote MediaStream here. autoPlay +
           a stable DOM element + unlockAudio() on the first click = reliable playback. */}
       <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
+      <div className="u-call-layout">
       {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
-      <div className="card" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
+      <div className="card u-phone-panel" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
         {/* One row in a 380px panel. A <select> sized 'auto' takes its width from the LONGEST
             option, which is long enough here to squeeze both labels until they wrapped one
             character per line. So: labels never wrap and never shrink, and the select absorbs
             whatever width is left. */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-          {cellularAvailable ? <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12,
-            color: 'var(--text-dim)', flex: 1, minWidth: 0 }}>
-            <span style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>{t('Call via')}</span>
+          {cellularAvailable ? <label className="u-inline-field u-call-route-field">
+            <span>{t('Call via')}</span>
             <select value={callTransport} disabled={Boolean(inCall)} onChange={(event) => setCallTransport(event.target.value)}
-              style={{ flex: 1, minWidth: 0, textOverflow: 'ellipsis' }}>
+              style={{ textOverflow: 'ellipsis' }}>
               <option value="vowifi">VoWiFi</option>
               <option value="cellular" disabled={!cellularReady}>{t('Cellular modem (experimental, no audio)')}{!cellularReady ? ` — ${t('4G off')}` : ''}</option>
             </select>
@@ -785,7 +784,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       </div>
 
       {/* ---- Recent calls ---- */}
-      <div className="card" style={{ padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <div className="card u-history-panel" style={{ padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600 }}>{t('Recent calls')}</div>
           {calls.length > 0 && (

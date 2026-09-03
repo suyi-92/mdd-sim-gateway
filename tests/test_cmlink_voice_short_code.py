@@ -48,14 +48,20 @@ def instance(*, spn: str = "CMLink", mnc: str = "33",
     return value
 
 
-def render_dialplan(codes=(), home_phone_context=REALM) -> str:
+def render_engine_template(name, codes=(), home_phone_context=REALM) -> str:
     context = {
         "webrtc_enable": True,
         "webrtc_user": "webrtc",
+        "webrtc_password": "test-password",
         "ring_timeout": 35,
         "msisdn": "+15550000000",
+        "imsi": "234330123456789",
+        "imei": "490154203237518",
         "realm": REALM,
         "home_phone_context": home_phone_context,
+        "pcscf": "192.0.2.40",
+        "pcscf_is_v6": False,
+        "user_eq_phone": True,
         "vm_enabled": False,
         "vm_ring_seconds": 25,
         "vm_max_seconds": 120,
@@ -63,7 +69,11 @@ def render_dialplan(codes=(), home_phone_context=REALM) -> str:
     }
     env = Environment(loader=FileSystemLoader(str(ROOT / "engine" / "templates")),
                       trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True)
-    return env.get_template("extensions.conf.j2").render(**context)
+    return env.get_template(name).render(**context)
+
+
+def render_dialplan(codes=(), home_phone_context=REALM) -> str:
+    return render_engine_template("extensions.conf.j2", codes, home_phone_context)
 
 
 class CarrierRuleTests(unittest.TestCase):
@@ -150,6 +160,27 @@ class EngineContractTests(unittest.TestCase):
         self.assertIn(expected, dialplan)
         self.assertIn('ExecIf($["${EXTEN}"="10086"]?', dialplan)
         self.assertIn("Dial(${DIALDEST},35,b(ims-outbound-headers^s^1))", dialplan)
+
+    def test_carrier_home_domain_resolves_through_the_registered_pcscf(self):
+        home_domain = "voice.mvno.example.invalid"
+        pjsip = render_engine_template("pjsip.conf.j2", (SHORT_CODE,), home_domain)
+        self.assertIn(
+            f"[{home_domain}]\ntype=resolve\nip=192.0.2.40\ntransport=volte_ims",
+            pjsip,
+        )
+
+    def test_auth_realm_does_not_get_a_duplicate_resolve_section(self):
+        pjsip = render_engine_template("pjsip.conf.j2", (SHORT_CODE,), REALM)
+        self.assertEqual(pjsip.count(f"[{REALM}]\ntype=resolve"), 1)
+
+        smsoip = f"smsoip.{REALM}"
+        pjsip = render_engine_template("pjsip.conf.j2", (SHORT_CODE,), smsoip)
+        self.assertEqual(pjsip.count(f"[{smsoip}]\ntype=resolve"), 1)
+
+    def test_non_cmlink_contract_does_not_add_a_home_domain_resolve(self):
+        home_domain = "voice.mvno.example.invalid"
+        pjsip = render_engine_template("pjsip.conf.j2", (), home_domain)
+        self.assertNotIn(f"[{home_domain}]\ntype=resolve", pjsip)
 
     def test_other_numbers_keep_the_existing_endpoint_dial_form(self):
         dialplan = render_dialplan()

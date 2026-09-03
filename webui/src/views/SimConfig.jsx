@@ -10,7 +10,7 @@ const emptyInstance = () => ({
 })
 
 function Field({ label, children }) {
-  return <div><label>{label}</label>{children}</div>
+  return <div className="u-field-stack"><label>{label}</label>{children}</div>
 }
 
 function nextInstanceId(instances) {
@@ -248,7 +248,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const existingLine = instances.some(line => String(line.id) === String(form.id))
 
   return (
-    <div style={{ maxWidth: 1000 }}>
+    <div className="u-sim-config">
       {!!instances.length && <div className="u-saved-lines">
         <div><label>{t('Saved SIM line')}</label><p>{t('Select a saved SIM line to edit or delete it. This list does not depend on whether its former device is connected.')}</p></div>
         <select value={boundLineId || savedLineId} disabled={!!boundLineId} onChange={event => {
@@ -266,10 +266,10 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         {t('Country routing was detected from the SIM. Complete only the missing fields below, then start VoWiFi.')}
         {!!missing.length && <div style={{ marginTop: 6 }}>{t('Missing information')}: {missing.map(key => missingLabels[key] || key).join('、')}</div>}
       </div>}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="u-sim-layout">
       {/* Card / PIN panel */}
-      <div className="card" style={{ padding: 20 }}>
-        <h3 style={{ marginTop: 0 }}>{t('SIM card')}</h3>
+      <div className="card u-panel u-sim-card">
+        <h3>{t('SIM card')}</h3>
         <Field label={t('Reader')}>
           <select value={form.reader_index} disabled={!!targetDevice} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
             {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
@@ -310,9 +310,9 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       </div>
 
       {/* Instance form */}
-      <div className="card" style={{ padding: 20 }}>
-        <h3 style={{ marginTop: 0 }}>{t('Line configuration')}</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+      <div className="card u-panel u-sim-card">
+        <h3>{t('Line configuration')}</h3>
+        <div className="u-form-grid u-sim-form-grid">
           {!creating && <Field label={t('Instance ID')}><input value={form.id} onChange={(e) => upd({ id: e.target.value })} placeholder="1" /></Field>}
           <Field label={t('Name')}><input value={form.name} onChange={(e) => upd({ name: e.target.value })} placeholder="Telus" /></Field>
           <Field label="IMSI"><input className="mono" value={form.imsi} onChange={(e) => upd({ imsi: e.target.value })} /></Field>
@@ -368,11 +368,9 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           : nativeReader
             ? t('A smart-card reader has no hardware IMEI. MDD will omit DEVICE_IDENTITY; configure one only if it truthfully belongs to the equipment and your carrier requires it.')
             : t('Set a 15-digit IMEI on the Hardware tab before starting VoWiFi.')}</p>
-        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-          {t('IDr help')}
-        </div>
-        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-          {t('IMS address family help')}
+        <div className="u-help-stack">
+          <div>{t('IDr help')}</div>
+          <div>{t('IMS address family help')}</div>
         </div>
 
         <h4 style={{ marginBottom: 6 }}>{t('Browser softphone')}</h4>
@@ -389,7 +387,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         {/* Three states, not two: "follow the global default" has to stay distinguishable from
             "off for this line", or turning the global on would silently switch on every line
             that had merely been left alone. */}
-        <select value={form.sip.vm_enabled === undefined || form.sip.vm_enabled === null
+        <select className="u-standalone-control" aria-label={t('Voicemail')} value={form.sip.vm_enabled === undefined || form.sip.vm_enabled === null
           ? 'default' : (form.sip.vm_enabled ? 'on' : 'off')}
           onChange={(e) => updSip({ vm_enabled: e.target.value === 'default' ? undefined
             : e.target.value === 'on' })}>
@@ -402,7 +400,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <details style={{ marginTop: 12 }}>
           <summary>{t('Advanced IMS identity')}</summary>
           <p className="u-note">{t('Carrier defaults are applied automatically. Change these fields only when required by the carrier.')}</p>
-          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10 }}>
+          <div className="u-form-grid u-advanced-ims-grid">
             <Field label="P-Access-Network-Info (PANI)">
               <input className="mono" value={form.sip.pani || ''} onChange={(e) => updSip({ pani: e.target.value })}
                 placeholder={t('Automatic carrier default')} />

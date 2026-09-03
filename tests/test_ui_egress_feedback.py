@@ -43,9 +43,24 @@ class EgressFeedbackLayoutTests(unittest.TestCase):
         self.assertIn("aria-live=\"polite\"", SOURCE)
         self.assertIn("grid-template-columns:minmax(220px,.85fr) minmax(300px,1.6fr) minmax(270px,1fr) 190px", CSS)
         self.assertIn(".u-exit-actions { width:190px", CSS)
-        self.assertIn(".u-exit-test-result { display:block; width:190px", CSS)
+        self.assertIn(".u-exit-test-result { display:block; flex:0 1 104px", CSS)
         self.assertIn(".u-proxy-actions { width:190px", CSS)
         self.assertIn(".u-test-action { width:104px; }", CSS)
+
+    def test_country_result_is_in_the_status_area_not_under_remove(self):
+        actions = SOURCE[SOURCE.index('<div className="u-exit-actions">'):]
+        actions = actions[:actions.index("</div>") + len("</div>")]
+        self.assertNotIn("u-exit-test-result", actions)
+        runtime = SOURCE[SOURCE.index('<div className="u-exit-runtime">'):]
+        runtime = runtime[:runtime.index("</div>")]
+        self.assertIn("u-exit-test-result", runtime)
+
+        exit_row = css_rule(".u-exit-row")
+        self.assertIn(".u-proxy-row { display:grid;", CSS)
+        self.assertIn(".u-proxy-row { display:grid; grid-template-columns:minmax(220px,.9fr) minmax(300px,2fr) minmax(220px,1fr) 190px; align-items:center", CSS)
+        self.assertIn("align-items:center", exit_row)
+        self.assertIn("padding:11px 14px; }", CSS[CSS.index(".u-proxy-row { display:grid;"):])
+        self.assertIn("padding:11px 14px", exit_row)
 
     def test_saved_assignment_is_distinct_from_a_running_node(self):
         self.assertIn("t('Saved · idle')", SOURCE)

@@ -75,7 +75,7 @@ export default function Logs({ selected, instances, cards, devices, setSelected,
   return (
     <div>
       <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} label={t('Show logs for')} />
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center' }}>
+      <div className="u-log-toolbar">
         {['engine', 'charon'].map((t) => (
           <button key={t} className={`btn ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
             {t === 'engine' ? 'Asterisk / engine' : 'SWu tunnel (IKE)'}

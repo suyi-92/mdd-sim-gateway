@@ -126,10 +126,10 @@ function KeepaliveForm({ line, onSaved, showToast }) {
       </label>
       <p className="u-hint">{t('Point this at another line on this gateway when you can: the far end receiving it confirms both send and receive in one go. The SMS is billed at your carrier’s rate.')}</p>
     </> : <>
-      <label style={{ marginTop: 10 }}>{t('Balance threshold (next cycle’s fee)')}</label>
-      <input className="mono" style={{ maxWidth: 180 }} value={draft.threshold}
-        onChange={e => set({ threshold: e.target.value })} />
-      <p className="u-hint">
+      <div className="u-field-stack u-keepalive-threshold"><label>{t('Balance threshold (next cycle’s fee)')}</label>
+        <input className="mono" value={draft.threshold}
+          onChange={e => set({ threshold: e.target.value })} />
+      </div><p className="u-hint">
         {line.has_query_rule
           ? t('The balance is read using this line’s existing query rule. Below the threshold you get a “balance low” notification, repeated every 3 days until it recovers.')
           : t('This line has no balance query rule yet — set one up in the allowance panel first, otherwise there is nothing to read the balance with.')}
@@ -172,7 +172,7 @@ function AbsentLines({ lines, onChanged, showToast }) {
     } catch (error) { showToast?.(error.message) } finally { setBusy('') }
   }
 
-  return <div className="card">
+  return <div className="card u-absent-lines">
     <button onClick={() => setOpen(o => !o)}
       style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '14px 16px',
         border: 0, background: 'transparent', color: 'var(--text)', cursor: 'pointer', textAlign: 'left' }}>
@@ -182,11 +182,11 @@ function AbsentLines({ lines, onChanged, showToast }) {
         {t('These SIMs are not in a reader or modem right now, so number keeping cannot run for them.')}
       </span>
     </button>
-    {open && <div style={{ borderTop: '1px solid var(--border)' }}>
+    {open && <div className="u-absent-lines-body" style={{ borderTop: '1px solid var(--border)' }}>
       {lines.map(line => {
         const expiry = line.days_to_expiry
         const tone = expiry === null ? '' : expiry <= 3 ? 'crit' : expiry <= 7 ? 'warn' : ''
-        return <div key={line.instance} className="hover-row"
+        return <div key={line.instance} className="hover-row u-absent-line-row"
           style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1.4fr) 1fr 1fr 1fr auto',
             gap: 10, alignItems: 'center', padding: '11px 16px', fontSize: 13,
             borderBottom: '1px solid var(--border)', opacity: .75 }}>
@@ -270,8 +270,8 @@ export default function Keepalive({ showToast }) {
       <div className="u-metric"><span>{t('Expiring in 7 days')}</span><strong style={{ color: metrics.expiring ? '#dc2626' : undefined }}>{metrics.expiring}</strong></div>
     </div>
 
-    <div className="card">
-      <div style={{ ...GRID, color: 'var(--text-mute)', fontSize: 11, fontWeight: 700, borderBottom: '1px solid var(--border)' }}>
+    <div className="card u-keepalive-table">
+      <div className="u-keepalive-grid" style={{ ...GRID, color: 'var(--text-mute)', fontSize: 11, fontWeight: 700, borderBottom: '1px solid var(--border)' }}>
         <div>{t('Line')}</div><div>{t('Network')}</div><div>{t('Last online')}</div>
         <div>{t('Balance')}</div><div>{t('Plan expires')}</div><div>{t('Number keeping')}</div><div />
       </div>
@@ -281,7 +281,7 @@ export default function Keepalive({ showToast }) {
         const expiry = line.days_to_expiry
         const expiryTone = expiry === null ? '' : expiry <= 3 ? 'crit' : expiry <= 7 ? 'warn' : ''
         return <React.Fragment key={line.instance}>
-          <div style={{ ...GRID, borderBottom: '1px solid var(--border)', fontSize: 13, cursor: 'pointer', background: isOpen ? 'var(--hover)' : undefined }}
+          <div className="u-keepalive-grid" style={{ ...GRID, borderBottom: '1px solid var(--border)', fontSize: 13, cursor: 'pointer', background: isOpen ? 'var(--hover)' : undefined }}
             onClick={() => setOpen(isOpen ? null : line.instance)}>
             <Cell sub={line.msisdn || t('number unknown')}><b style={{ fontSize: 14 }}>{line.name}</b>
               {line.carrier ? <span style={{ color: 'var(--text-mute)', fontWeight: 400 }}> · {line.carrier}</span> : null}</Cell>
@@ -300,7 +300,7 @@ export default function Keepalive({ showToast }) {
             {statusCell(line)}
             <div style={{ color: 'var(--text-mute)', fontSize: 11, textAlign: 'center' }}>{isOpen ? '▾' : '▸'}</div>
           </div>
-          {isOpen ? <div style={{ borderBottom: '1px solid var(--border)', background: 'var(--hover)', padding: '16px 18px', display: 'grid', gridTemplateColumns: 'minmax(0,1.2fr) minmax(300px,1fr)', gap: 18 }}>
+          {isOpen ? <div className="u-keepalive-detail">
             <div>
               <div className="card u-panel">
                 <h4 style={{ margin: '0 0 8px', fontSize: 14 }}>{t('Balance and allowance')}</h4>

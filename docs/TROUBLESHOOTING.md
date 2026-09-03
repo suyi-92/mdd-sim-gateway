@@ -339,8 +339,10 @@ Request-URI 中保留原短号并附加归属域 `phone-context`。该域从成�
 `P-Associated-URI` 中与当前电话身份对应的 SIP URI 学习，严格校验后内部保存并重建该线路。
 MVNO 可以同时使用标准 3GPP 认证 realm 和另一个电话身份域；若仍用前者作 `phone-context`，
 上游可在 INVITE 后立即拒绝。SIP 形式的 home-local Request-URI 将该受验证域同时用于
-`phone-context` 和 host 部分。不要手工填写或打印学到的域名。该短号接通的是带音频的客服通话，不是
-USSD；不要隐藏麦克风/扬声器/DTMF，也不要把相同规则套到普通 EE 或其他 MVNO。
+`phone-context` 和 host 部分；该 host 还要由 Engine 的受管 resolve 条目固定到本次注册使用的
+P-CSCF。缺少这条映射会让显式 URI 绕过认证域已有的 P-CSCF 映射，并可能在真正送达 IMS 前立即以
+`CHANUNAVAIL` 结束。不要手工填写或打印学到的域名。该短号接通的是带音频的客服通话，不是 USSD；
+不要隐藏麦克风/扬声器/DTMF，也不要把相同规则套到普通 EE 或其他 MVNO。
 
 若浏览器显示“通话已拒接”，先对照通话记录的最终状态。出站 VoWiFi 未接通时，Asterisk 会在
 本地 WebRTC leg 合成 `603 Decline` 来阻止 JsSIP 自动重拨；它不等于运营商真的返回拒接。
