@@ -48,6 +48,7 @@ def run_public_bootstrap(arguments: list[str], *, check: bool) -> subprocess.Com
 class BootstrapContractTests(unittest.TestCase):
     def test_stream_entry_downloads_as_user_then_invokes_a_local_root_script(self):
         self.assertIn('[[ ${EUID:-$(id -u)} -ne 0 ]]', BOOTSTRAP)
+        self.assertIn('sudo -n true 2>/dev/null || sudo -v', BOOTSTRAP)
         self.assertLess(BOOTSTRAP.index("git -c advice.detachedHead=false clone"),
                         BOOTSTRAP.index('sudo -H bash "$stage/repository/install.sh"'))
         self.assertNotIn("curl | sudo", BOOTSTRAP)
@@ -59,6 +60,44 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertLess(BOOTSTRAP.index("clone --single-branch --branch vmware"),
                         BOOTSTRAP.index('sudo -H bash "$stage/repository/scripts/mddctl"'))
         self.assertIn("fsck --full --no-dangling", BOOTSTRAP)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "bootstrap sudo contract runs in Linux")
+    def test_existing_nopasswd_policy_does_not_fall_through_to_sudo_v(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fakebin = root / "bin"
+            fakebin.mkdir()
+            log = root / "sudo.log"
+            bootstrap = root / "bootstrap.sh"
+            shutil.copy2(ROOT / "bootstrap.sh", bootstrap)
+            (fakebin / "mddctl").write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            (fakebin / "sudo").write_text(
+                """#!/bin/sh
+printf '%s\\n' "$*" >> "$SUDO_LOG"
+if [ "${1:-}" = -n ] && [ "${2:-}" = true ]; then exit 0; fi
+if [ "${1:-}" = -v ]; then exit 99; fi
+exit 0
+""",
+                encoding="ascii",
+            )
+            for path in (bootstrap, fakebin / "mddctl", fakebin / "sudo"):
+                path.chmod(0o755)
+            handoff_test_tree_to_bootstrap_user(root)
+            environment = {
+                **os.environ,
+                "PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
+                "SUDO_LOG": str(log),
+            }
+
+            result = run_bootstrap_as_user(
+                ["bash", str(bootstrap), "doctor", "--dry-run"],
+                cwd=root, check=False, env=environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertIn("-n true", calls)
+            self.assertFalse(any(call == "-v" for call in calls))
 
     def test_downloaded_manager_uses_its_verified_archive_helper_for_bootstrap(self):
         self.assertIn('MDDCTL_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', MDDCTL)

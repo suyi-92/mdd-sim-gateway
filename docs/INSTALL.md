@@ -104,7 +104,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmwar
 安全边界：
 
 1. 流式 bootstrap 不接受 root 身份；
-2. 先集中执行一次 `sudo -v`；
+2. 先用 `sudo -n true` 识别已有的 NOPASSWD 策略；仅在不可用时集中执行一次 `sudo -v`；
 3. Git 源码由普通用户克隆到 `mktemp` 目录；
 4. 核对 remote 精确等于 `https://github.com/suyi-92/mdd-sim-gateway.git`；
 5. root 只执行已下载到本地的 `install.sh`。

@@ -107,7 +107,11 @@ fi
 
 command -v sudo >/dev/null 2>&1 || die "sudo is required"
 say "confirming administrator access once"
-sudo -v || die "sudo authorization failed"
+# A host may deliberately have both the distribution's PASSWD sudo-group rule and a later
+# NOPASSWD provisioning rule. A command is passwordless there, while bare `sudo -v` can still
+# prompt because it has no command to select the NOPASSWD tag. Exercise the real command policy
+# non-interactively first; only ask for a password when that policy genuinely requires one.
+sudo -n true 2>/dev/null || sudo -v || die "sudo authorization failed"
 
 if [[ "$action" == doctor ]]; then
   command -v mddctl >/dev/null 2>&1 || die "mddctl is not installed; run install first"
