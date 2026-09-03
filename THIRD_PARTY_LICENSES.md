@@ -75,6 +75,7 @@ cannot be relicensed to GPL-3.0, so these are tracked explicitly:
 |---|---|---|
 | `engine/patches/asterisk/mt_rpack_routing.py` | GPL-2.0-only | Asterisk `send_rpack()` (GPL-2.0-only) |
 | `engine/patches/asterisk/mt_concat_udh.py` | GPL-2.0-only | Asterisk `parse_tpdu()` (GPL-2.0-only) |
+| `engine/patches/asterisk/prefer_dialable_public_identity.py` | GPL-2.0-only | Asterisk `volte_get_p_associated_uri()` (GPL-2.0-only) |
 | `patches/ccid/*.patch` | LGPL-2.1-or-later | LudovicRousseau/CCID (LGPL-2.1-or-later) |
 
 All of them patch the upstream source at build time. The patched Asterisk runs as a separate

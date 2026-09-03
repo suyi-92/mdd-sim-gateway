@@ -347,6 +347,10 @@ P-CSCF。缺少这条映射会让显式 URI 绕过认证域已有的 P-CSCF 映�
 CTExcel 同样使用 EE 的 `234-33`，但普通英国 E.164 去话走另一条号码分析路径。只有同时匹配
 该 PLMN 与 CTExcel SPN 时，Control 才为号码型 SIP Request-URI 启用 `user=phone`；缺少该参数
 时可表现为 IMS 先返回 `100 Trying`，随后立即以无详细原因的 `487 Request Terminated` 结束。
+部分 IMS 注册还会把 IMSI 派生的 IMPU 放在 `P-Associated-URI` 第一项，把号码对应的 `tel:` 与
+`sip:` 公共身份放在后面。Engine 外呼必须从本次注册返回的身份中选择第一个带 E.164 号码的
+公共身份，并在同一号码同时有 SIP 形式时优先保留其归属域；不能照搬第一项或从本地配置猜造
+身份，否则 P-CSCF 虽已接受 INVITE，后续 TAS 仍可能立即终止呼叫。
 英国号码应写成 `+44` 加去掉首个国内长途 `0` 后的号码，例如手机使用 `+447…`，不能写成
 `+4407…`。CTExcel 的普通号码路由不得获得 CMLink 专属的 `10086`/`phone-context` 规则。
 

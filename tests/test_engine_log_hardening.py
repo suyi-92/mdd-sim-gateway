@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -182,6 +183,47 @@ class RegisteredIdentityLogTests(unittest.TestCase):
 
         self.assertEqual(first.returncode, 1)
         self.assertIn("prologue not found", first.stderr)
+
+
+class PreferredRegisteredIdentityTests(unittest.TestCase):
+    """The Engine must originate as a dialable identity returned by this registration."""
+
+    PATCHER = (Path(__file__).resolve().parent.parent / "engine" / "patches" / "asterisk"
+               / "prefer_dialable_public_identity.py")
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("prefer_dialable_public_identity",
+                                                      cls.PATCHER)
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def test_dialable_sip_then_tel_then_original_identity(self):
+        patched = self.module.patch("before\n" + self.module.ORIGINAL_FN + "\nafter\n")
+
+        self.assertIn("PATCH prefer_dialable_public_identity", patched)
+        # Scan every P-Associated-URI header and every <> value, rather than preserving the
+        # IMSI-derived first entry merely because the network listed it first.
+        self.assertIn("pau_hdr ? pau_hdr->next : NULL", patched)
+        self.assertIn("pau_hdr->hvalue.ptr[i] != '<'", patched)
+        self.assertIn('!strncasecmp(uri, "sip:+", 5)', patched)
+        self.assertIn('!strncasecmp(uri, "tel:+", 5)', patched)
+        self.assertIn("number_len == dialable_number_len", patched)
+        self.assertIn(
+            "selected = dialable_sip ? dialable_sip : (dialable ? dialable : fallback);",
+            patched,
+        )
+        # The patch is build-idempotent and never invents an identity from local settings.
+        self.assertEqual(self.module.patch(patched), patched)
+        self.assertNotIn("from_user", patched)
+        self.assertNotIn("from_domain", patched)
+
+    def test_an_upstream_refactor_fails_the_build(self):
+        changed = self.module.ORIGINAL_FN.replace(
+            "pjsip_generic_string_hdr *pau_hdr;", "pjsip_generic_string_hdr *header;")
+
+        with self.assertRaisesRegex(ValueError, "expected one original"):
+            self.module.patch(changed)
 
 
 if __name__ == "__main__":
