@@ -7,6 +7,9 @@ import os
 from collections import deque
 from pathlib import Path
 import re
+import secrets
+import stat
+import threading
 import time
 import zipfile
 
@@ -341,6 +344,147 @@ def service_restart_status() -> dict:
             status["state"] = "stalled"
             status["error_code"] = "restart.error.not_picked_up"
     return status
+
+
+_BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
+_BACKUP_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
+_BACKUP_ACTIVE_STATES = {"requested", "launching", "running"}
+_BACKUP_REQUEST_LOCK = threading.Lock()
+
+
+def _managed_directory(environment: str, default: str) -> Path:
+    """Resolve one installer-owned directory without accepting aliases or symlinks."""
+    raw = os.environ.get(environment, default)
+    if not raw or not os.path.isabs(raw) or raw == "/" or any(ch.isspace() for ch in raw):
+        raise RuntimeError(f"invalid managed directory: {environment}")
+    path = Path(raw)
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"managed directory is unavailable: {environment}") from exc
+    metadata = path.stat(follow_symlinks=False)
+    if (path != canonical or path.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077):
+        raise RuntimeError(f"managed directory is unsafe: {environment}")
+    return path
+
+
+def _backup_operation_paths() -> tuple[Path, Path]:
+    request = Path(cfg.DATA_DIR) / "orchestrator" / "backup-operation-request.json"
+    state = _managed_directory("MDD_STATE_DIR", "/etc/mdd-sim-gateway")
+    return request, state / "backup-operation-status.json"
+
+
+def _backup_pair(name: str) -> tuple[Path, os.stat_result]:
+    """Return one private regular archive from the configured backup directory."""
+    if not _BACKUP_NAME.fullmatch(str(name or "")):
+        raise ValueError("invalid backup name")
+    root = _managed_directory("MDD_BACKUP_DIR", "/var/backups/mdd-sim-gateway")
+    archive = root / name
+    checksum = root / f"{name}.sha256"
+    archive_metadata = None
+    for path in (archive, checksum):
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("backup archive and checksum are both required") from exc
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077):
+            raise ValueError("backup archive permissions are unsafe")
+        if path == archive:
+            archive_metadata = metadata
+    assert archive_metadata is not None
+    return archive, archive_metadata
+
+
+def list_local_backups() -> list[dict]:
+    """List only complete, private backup pairs; never expose an arbitrary host path."""
+    root = _managed_directory("MDD_BACKUP_DIR", "/var/backups/mdd-sim-gateway")
+    result = []
+    for entry in os.scandir(root):
+        if not _BACKUP_NAME.fullmatch(entry.name):
+            continue
+        try:
+            _path, metadata = _backup_pair(entry.name)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        result.append({
+            "name": entry.name,
+            "size_bytes": int(metadata.st_size),
+            "created_at": int(metadata.st_mtime),
+            "kind": "pre-update" if entry.name.startswith("pre-update-") else "manual",
+        })
+    return sorted(result, key=lambda item: (item["created_at"], item["name"]), reverse=True)
+
+
+def backup_operation_status() -> dict:
+    """Return a closed, non-sensitive view of the detached backup/restore worker."""
+    request_path, status_path = _backup_operation_paths()
+    value = _read_json(status_path)
+    state = str(value.get("state") or "idle")
+    operation_id = str(value.get("operation_id") or "")
+    action = str(value.get("action") or "")
+    backup_name = str(value.get("backup_name") or "")
+    if (state not in {"idle", "requested", "launching", "running", "success", "failed"}
+            or (operation_id and not _BACKUP_OPERATION_ID.fullmatch(operation_id))
+            or (action and action not in {"create", "restore"})
+            or (backup_name and not _BACKUP_NAME.fullmatch(backup_name))):
+        return {"state": "failed", "error_code": "backup.error.invalid_status"}
+    result = {key: value[key] for key in ("updated_at",) if isinstance(value.get(key), int)}
+    result.update({"state": state})
+    if operation_id:
+        result["operation_id"] = operation_id
+    if action:
+        result["action"] = action
+    if backup_name:
+        result["backup_name"] = backup_name
+    error_code = str(value.get("error_code") or "")
+    if re.fullmatch(r"backup\.error\.[a-z_]+", error_code):
+        result["error_code"] = error_code
+    requested_at = int(value.get("updated_at") or 0)
+    if state == "requested" and request_path.exists() and time.time() - requested_at > 60:
+        result.update(state="failed", error_code="backup.error.not_picked_up")
+    elif state in {"launching", "running"} and time.time() - requested_at > 4 * 3600:
+        result.update(state="failed", error_code="backup.error.stalled")
+    return result
+
+
+def request_backup_operation(action: str, backup_name: str = "") -> dict:
+    """Publish one fixed local backup or restore request for the host orchestrator."""
+    if action not in {"create", "restore"}:
+        raise ValueError("unknown backup operation")
+    with _BACKUP_REQUEST_LOCK:
+        request_path, status_path = _backup_operation_paths()
+        current = backup_operation_status()
+        if current.get("state") in _BACKUP_ACTIVE_STATES or request_path.exists():
+            raise RuntimeError("another backup or restore operation is already running")
+        operation_id = secrets.token_hex(8)
+        now = int(time.time())
+        if action == "create":
+            backup_name = time.strftime("mdd-data-%Y%m%dT%H%M%SZ", time.gmtime(now)) \
+                + f"-{operation_id}.tar.gz"
+            root = _managed_directory("MDD_BACKUP_DIR", "/var/backups/mdd-sim-gateway")
+            for path in (root / backup_name, root / f"{backup_name}.sha256"):
+                if path.exists() or path.is_symlink():
+                    raise RuntimeError("the generated backup name already exists")
+        else:
+            _backup_pair(backup_name)
+        request = {
+            "operation_id": operation_id,
+            "action": action,
+            "backup_name": backup_name,
+            "requested_at": now,
+        }
+        status = {**request, "state": "requested", "updated_at": now}
+        _write_private_json(status_path, status)
+        try:
+            _write_private_json(request_path, request)
+        except OSError:
+            _write_private_json(status_path, {
+                **status, "state": "failed", "error_code": "backup.error.request_failed",
+            })
+            raise
+        return {"ok": True, **status}
 
 
 def host_diagnostics() -> dict:

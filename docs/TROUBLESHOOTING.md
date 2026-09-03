@@ -277,7 +277,9 @@ ls -l /var/backups/mdd-sim-gateway/pre-update-*
 ## 13. backup 或 restore 被拒绝
 
 - backup 输出不能在运行数据目录内部；
-- backup 不覆盖已有归档或摘要；请换新路径，并且运行数据树不能含 symlink/设备节点；
+- backup 不覆盖已有归档或摘要；请换新路径。每条线路精确的 `instances/<实例>/run/` 是不恢复的
+  进程临时树，其中的 SWu 控制 FIFO 会被排除；其他位置的 symlink、FIFO、socket 或设备节点
+  仍会拒绝；
 - 必须有归档和同名 `.sha256`；
 - manifest 必须为 `format=1`、`kind=mdd-sim-gateway-data`；
 - 归档不能含绝对路径、`..`、symlink、hardlink 或设备节点；
@@ -291,6 +293,14 @@ sha256sum -c /path/to/backup.tar.gz.sha256
 
 恢复失败后，旧数据应仍在 `.pre-restore-<时间>`；不要删除它，先运行 doctor 和查看 unit
 日志。备份含明文凭据，只能放到受控加密介质。
+
+若旧版本更新在切换前报 `unsupported data path type: instances/<实例>/run/swu.ctl`，说明旧归档
+helper 把运行时 FIFO 当成持久数据。不要手工删除 FIFO 或重复运行旧 `mddctl update`；使用最新
+流式 bootstrap `update`，让下载源码中的新版 manager 与新版归档 helper 一起完成事务更新。
+
+设置页的备份/恢复任务会短暂断开 WebUI，因为 `mddctl` 必须停止 Control、orchestrator 和
+Engine。页面恢复后需重新登录。若任务没有被接取或失败，检查有界的
+`mdd-sim-gateway-data-<操作 ID>.service` journal；不要绕过页面去改 `/var/lib` 或伪造摘要。
 
 ## 14. VoWiFi、通话和短信
 

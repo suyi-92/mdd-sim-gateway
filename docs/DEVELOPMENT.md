@@ -82,7 +82,10 @@ Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行�
   非 x86_64 ELF 路径必须在创建容器前拒绝；
 - NetworkManager 默认路由保护；
 - Git 精确 remote、clean、fast-forward-only；
-- backup/restore 校验和与路径安全；
+- backup/restore 校验和与路径安全；精确排除每条线路的 `run/` 临时树，并继续拒绝其他位置的
+  FIFO、socket、symlink 与设备节点；
+- WebUI 数据操作只发布封闭的本地归档名称，由 orchestrator 通过独立 systemd transient unit
+  调用 `mddctl`，动态测试必须证明没有 shell 或任意主机路径注入；
 - doctor JSON 不含用户身份字段；
 - 仓库无 workflows、Release manifest 和 LFS。
 

@@ -356,12 +356,19 @@ sudo mddctl backup --output /mnt/encrypted/mdd-data.tar.gz
 sudo mddctl restore --input /mnt/encrypted/mdd-data.tar.gz
 ```
 
-备份：停止服务和 Engine，SQLite WAL checkpoint + integrity check，拒绝符号链接/特殊文件，排除 cache/update/tmp，
-生成 tar.gz、`.sha256` 和 manifest，然后恢复原运行状态。
+备份：停止服务和 Engine，SQLite WAL checkpoint + integrity check，排除 cache/update/tmp 以及
+精确的 `instances/<实例>/run/` 进程临时树，拒绝其他位置的符号链接和特殊文件，生成 tar.gz、
+`.sha256` 和 manifest，然后恢复原运行状态。
 
 恢复：要求归档与同名 `.sha256`；拒绝绝对路径、`..`、symlink、hardlink、设备节点、错误
 manifest 和损坏 SQLite；现有数据先移动到 `.pre-restore-<时间>`，新数据从临时目录原子替换。
 健康失败会把失败数据另存并恢复旧数据。
+
+WebUI 的“系统设置 → 备份与更新”可创建默认目录中的本地备份，并从通过 owner-only 普通文件、
+同名摘要和安全名称筛选的列表中恢复。页面不会接受任意主机路径；Control 只提交请求，实际事务
+由独立 systemd 任务调用 `mddctl`，所以停止 Control 与 orchestrator 不会杀死正在执行的备份。
+恢复要求二次确认，会中断通话并在完成后要求重新登录。需要直接写入加密移动介质时仍使用上述
+CLI `--output` 命令。
 
 备份含明文凭据，只能放在受控加密介质。跨电脑首选停止 MDD、关闭 VM 后复制/导出整个
 VM，因为 USB 自动连接、VM MAC、DHCP 保留和防火墙属于机器状态，不在数据归档内。

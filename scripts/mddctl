@@ -66,7 +66,19 @@ for ((managed_i = 0; managed_i < ${#managed_paths[@]}; managed_i++)); do
 done
 [[ "$ORIGIN_URL" == https://github.com/suyi-92/mdd-sim-gateway.git ]] || die "managed origin metadata is invalid"
 [[ "$BRANCH" == vmware ]] || die "managed branch metadata is invalid"
-readonly ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"
+MDDCTL_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+MDDCTL_SOURCE_ROOT=$(cd -- "$MDDCTL_SOURCE_DIR/.." && pwd -P)
+# The installed manager is copied to /usr/local/sbin and therefore uses the helper in the
+# managed checkout.  A streamed bootstrap runs scripts/mddctl from its fully verified download;
+# prefer that sibling helper so an old checkout can bootstrap an archive-format safety fix
+# before the checkout itself is fast-forwarded.
+if [[ -e "$MDDCTL_SOURCE_ROOT/.git" && -f "$MDDCTL_SOURCE_DIR/mdd_archive.py" \
+      && ! -L "$MDDCTL_SOURCE_DIR/mdd_archive.py" ]]; then
+  ARCHIVE_TOOL="$MDDCTL_SOURCE_DIR/mdd_archive.py"
+else
+  ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"
+fi
+readonly MDDCTL_SOURCE_DIR MDDCTL_SOURCE_ROOT ARCHIVE_TOOL
 ACTIVE_GENERATION_COMMIT=""
 ACTIVE_GENERATION_BUILD=""
 MANAGED_CHECKOUT_STATUS_KIND=""

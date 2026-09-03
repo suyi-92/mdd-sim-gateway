@@ -28,6 +28,20 @@ class ArchiveError(RuntimeError):
     pass
 
 
+def _excluded_directory(root: Path, path: Path) -> bool:
+    """Whether a real directory is transient rather than restorable data.
+
+    Per-line ``run`` trees are bind-mounted into Engine containers and contain process-owned
+    state such as the SWu control FIFO.  They must never be restored, but a directory named
+    ``run`` anywhere else is not implicitly trusted: keep the exclusion path-qualified so a
+    special file cannot hide behind a broad basename rule.
+    """
+    relative = path.relative_to(root).parts
+    return path.name in EXCLUDED_DIRECTORIES or (
+        len(relative) == 3 and relative[0] == "instances" and relative[2] == "run"
+    )
+
+
 def _data_entries(root: Path):
     """Yield a sorted, non-following walk of regular files and directories."""
     pending = [root]
@@ -47,7 +61,7 @@ def _data_entries(root: Path):
             if stat.S_ISLNK(metadata.st_mode):
                 raise ArchiveError(f"symbolic links are not allowed in backups: {path.relative_to(root)}")
             if stat.S_ISDIR(metadata.st_mode):
-                if entry.name in EXCLUDED_DIRECTORIES:
+                if _excluded_directory(root, path):
                     continue
                 child_directories.append(path)
                 yield path, metadata

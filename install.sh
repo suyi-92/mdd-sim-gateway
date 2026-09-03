@@ -908,6 +908,8 @@ Type=simple
 WorkingDirectory=$source_dir/control
 Environment=MDD_DATA=$data_dir
 Environment=MDD_REPO_DIR=$source_dir
+Environment=MDD_STATE_DIR=$state_dir
+Environment=MDD_BACKUP_DIR=$backup_dir
 Environment=MDD_VENV_DIR=$source_dir/.venv
 Environment=MDD_WEBUI=$source_dir/webui/dist
 Environment=MDD_HTTP_PORT=8443
@@ -938,7 +940,9 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=$source_dir
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$source_dir/.venv/bin/python $source_dir/host/mdd_orchestrator.py --data $data_dir --repo $source_dir
+Environment=MDD_STATE_DIR=$state_dir
+Environment=MDD_BACKUP_DIR=$backup_dir
+ExecStart=$source_dir/.venv/bin/python $source_dir/host/mdd_orchestrator.py --data $data_dir --repo $source_dir --state $state_dir --backup $backup_dir
 Restart=always
 RestartSec=3
 User=root

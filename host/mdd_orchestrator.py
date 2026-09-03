@@ -62,6 +62,8 @@ DISTRO_VPCD_READER = "vpcd"
 DISTRO_VPCD_READER_DISABLED = ".vpcd.mdd-disabled"
 MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
+BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
+BACKUP_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
 
 
 def read_json(path: Path) -> dict:
@@ -717,8 +719,12 @@ def clash_outbound(node: dict, tag: str) -> dict:
 
 
 class Orchestrator:
-    def __init__(self, data: Path, repo: Path, interval: float = 3.0, dry_run=False):
+    def __init__(self, data: Path, repo: Path, interval: float = 3.0, dry_run=False,
+                 state: Path | None = None, backup: Path | None = None):
         self.data, self.repo, self.interval, self.dry_run = data, repo, interval, dry_run
+        self.state = state or Path(os.environ.get("MDD_STATE_DIR", "/etc/mdd-sim-gateway"))
+        self.backup = backup or Path(
+            os.environ.get("MDD_BACKUP_DIR", "/var/backups/mdd-sim-gateway"))
         self.root = data / "orchestrator"
         self.desired_path = self.root / "desired.json"
         self.status_path = self.root / "proxy-status.json"
@@ -728,6 +734,7 @@ class Orchestrator:
         self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
         self.exit_test_request_dir = self.root / "exit-test-requests"
+        self.backup_operation_request_path = self.root / "backup-operation-request.json"
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -1021,6 +1028,58 @@ class Orchestrator:
         if result.returncode:
             publish("failed", error_code="restart.error.launch",
                     error=(result.stderr or result.stdout or "").strip()[:400])
+
+    def process_backup_operation_request(self):
+        """Launch mddctl backup/restore outside both gateway service cgroups."""
+        request = read_json(self.backup_operation_request_path)
+        if not request:
+            return
+        status_path = self.state / "backup-operation-status.json"
+
+        def fail(error_code: str):
+            atomic_json(status_path, {
+                "state": "failed", "error_code": error_code, "updated_at": int(time.time()),
+            })
+
+        try:
+            self.backup_operation_request_path.unlink()
+        except OSError:
+            fail("backup.error.request_failed")
+            return
+        operation_id = str(request.get("operation_id") or "")
+        action = str(request.get("action") or "")
+        backup_name = str(request.get("backup_name") or "")
+        if (set(request) != {"operation_id", "action", "backup_name", "requested_at"}
+                or not BACKUP_OPERATION_ID.fullmatch(operation_id)
+                or action not in {"create", "restore"}
+                or not BACKUP_NAME.fullmatch(backup_name)
+                or not isinstance(request.get("requested_at"), int)):
+            fail("backup.error.invalid_request")
+            return
+        if self.dry_run:
+            fail("backup.error.dry_run")
+            return
+        worker = (self.repo / "scripts" / "mdd_backup_worker.py").resolve()
+        if worker.parent != (self.repo / "scripts").resolve() or not worker.is_file():
+            fail("backup.error.worker_missing")
+            return
+        atomic_json(status_path, {
+            **request, "state": "launching", "updated_at": int(time.time()),
+        })
+        unit = f"mdd-sim-gateway-data-{operation_id}"
+        run(["systemctl", "reset-failed", f"{unit}.service"])
+        result = run([
+            "systemd-run", "--unit", unit, "--collect", "--property=Type=exec",
+            "--description", "MDD Sim Gateway backup or restore",
+            "/usr/bin/python3", str(worker),
+            "--action", action,
+            "--operation-id", operation_id,
+            "--backup-name", backup_name,
+            "--state-dir", str(self.state),
+            "--backup-dir", str(self.backup),
+        ])
+        if result.returncode:
+            fail("backup.error.launch")
 
     def settle_service_restart(self):
         """Close out a restart that could not report its own completion.
@@ -3094,6 +3153,7 @@ class Orchestrator:
         # be completed by the process that comes back.
         self.settle_service_restart()
         while not self.stop:
+            self.process_backup_operation_request()
             self.process_service_restart_request()
             self.process_bridge_restart_requests()
             self.retire_obsolete_services()
@@ -3190,7 +3250,8 @@ class Orchestrator:
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
-                     self.bridge_restart_request_dir, self.exit_test_request_dir):
+                     self.bridge_restart_request_dir, self.exit_test_request_dir,
+                     self.backup_operation_request_path):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:
@@ -3257,10 +3318,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--repo", required=True, type=Path)
+    parser.add_argument("--state", type=Path,
+                        default=Path(os.environ.get("MDD_STATE_DIR", "/etc/mdd-sim-gateway")))
+    parser.add_argument("--backup", type=Path,
+                        default=Path(os.environ.get(
+                            "MDD_BACKUP_DIR", "/var/backups/mdd-sim-gateway")))
     parser.add_argument("--interval", type=float, default=3)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    app = Orchestrator(args.data.resolve(), args.repo.resolve(), args.interval, args.dry_run)
+    app = Orchestrator(args.data.resolve(), args.repo.resolve(), args.interval, args.dry_run,
+                       state=args.state.resolve(), backup=args.backup.resolve())
     signal.signal(signal.SIGTERM, lambda *_: app.request_stop())
     signal.signal(signal.SIGINT, lambda *_: app.request_stop())
     try: app.loop()

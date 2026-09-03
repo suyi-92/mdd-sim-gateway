@@ -60,6 +60,12 @@ class BootstrapContractTests(unittest.TestCase):
                         BOOTSTRAP.index('sudo -H bash "$stage/repository/scripts/mddctl"'))
         self.assertIn("fsck --full --no-dangling", BOOTSTRAP)
 
+    def test_downloaded_manager_uses_its_verified_archive_helper_for_bootstrap(self):
+        self.assertIn('MDDCTL_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', MDDCTL)
+        self.assertIn('[[ -e "$MDDCTL_SOURCE_ROOT/.git"', MDDCTL)
+        self.assertIn('ARCHIVE_TOOL="$MDDCTL_SOURCE_DIR/mdd_archive.py"', MDDCTL)
+        self.assertIn('ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"', MDDCTL)
+
     def test_bootstrap_checkout_is_complete_for_the_local_git_transport(self):
         self.assertIn("clone --single-branch --branch vmware", BOOTSTRAP)
         self.assertNotIn("--filter=blob:none", BOOTSTRAP)
@@ -119,6 +125,15 @@ class InstallerContractTests(unittest.TestCase):
         self.assertNotIn("mdd-sim-gateway/control", INSTALL)
         self.assertIn('mdd-sim-gateway/engine:$sha', INSTALL)
         self.assertNotIn("HOST_DATA_DIR", (ROOT / "control/app/engine.py").read_text(encoding="utf-8"))
+
+    def test_backup_control_path_receives_only_installer_managed_directories(self):
+        self.assertEqual(INSTALL.count("Environment=MDD_STATE_DIR=$state_dir"), 2)
+        self.assertEqual(INSTALL.count("Environment=MDD_BACKUP_DIR=$backup_dir"), 2)
+        self.assertIn("--state $state_dir --backup $backup_dir", INSTALL)
+        worker = (ROOT / "scripts/mdd_backup_worker.py").read_text(encoding="utf-8")
+        self.assertIn('[mddctl, "backup", "--output", str(archive)]', worker)
+        self.assertIn('[mddctl, "restore", "--input", str(archive)]', worker)
+        self.assertNotIn("shell=True", worker)
 
     def test_webui_and_venv_are_staged_before_atomic_symlink_switch(self):
         self.assertIn('NODE_BUILD_IMAGE="node:22.14.0-bookworm-slim@sha256:', INSTALL)

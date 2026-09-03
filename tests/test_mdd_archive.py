@@ -112,6 +112,59 @@ class ArchiveRoundTripTests(unittest.TestCase):
             self.assertEqual(restored.execute("SELECT value FROM state").fetchone(), (13,))
             restored.close()
 
+    @unittest.skipIf(os.name == "nt", "Windows test accounts cannot create FIFOs")
+    def test_per_instance_runtime_tree_and_its_live_fifo_are_not_backed_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "source"
+            runtime = data / "instances" / "1" / "run"
+            runtime.mkdir(parents=True)
+            (data / "instances" / "1" / "config.json").write_text(
+                '{"enabled": true}\n', encoding="utf-8")
+            (runtime / "status.json").write_text("transient\n", encoding="utf-8")
+            os.mkfifo(runtime / "swu.ctl")
+            archive = root / "backup.tar.gz"
+
+            mdd_archive.create_backup(
+                data, archive, version="1.7.0-vmware.1",
+                source_commit=COMMIT, created_at=CREATED_AT)
+
+            with tarfile.open(archive, "r:gz") as handle:
+                names = handle.getnames()
+            self.assertIn("data/instances/1/config.json", names)
+            self.assertFalse(any(name.startswith("data/instances/1/run") for name in names))
+
+    @unittest.skipIf(os.name == "nt", "Windows test accounts cannot create FIFOs")
+    def test_fifo_outside_the_exact_per_instance_runtime_tree_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "source"
+            misleading = data / "other" / "run"
+            misleading.mkdir(parents=True)
+            os.mkfifo(misleading / "swu.ctl")
+
+            with self.assertRaisesRegex(mdd_archive.ArchiveError,
+                                        "unsupported data path type"):
+                mdd_archive.create_backup(
+                    data, root / "backup.tar.gz", version="1.7.0-vmware.1",
+                    source_commit=COMMIT, created_at=CREATED_AT)
+
+    @unittest.skipIf(os.name == "nt", "Windows test accounts cannot reliably create symlinks")
+    def test_runtime_exclusion_does_not_accept_a_symlink_in_place_of_the_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "source"
+            instance = data / "instances" / "1"
+            target = data / "elsewhere"
+            instance.mkdir(parents=True)
+            target.mkdir()
+            (instance / "run").symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(mdd_archive.ArchiveError, "symbolic links"):
+                mdd_archive.create_backup(
+                    data, root / "backup.tar.gz", version="1.7.0-vmware.1",
+                    source_commit=COMMIT, created_at=CREATED_AT)
+
     @unittest.skipIf(os.name == "nt", "Windows test accounts cannot reliably create symlinks")
     def test_backup_rejects_symbolic_links(self):
         with tempfile.TemporaryDirectory() as temporary:

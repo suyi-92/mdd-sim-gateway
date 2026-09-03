@@ -4453,6 +4453,51 @@ def api_system_status():
     }
 
 
+@app.get("/api/system/backups")
+def api_system_backups():
+    try:
+        return {
+            "backups": operations.list_local_backups(),
+            "operation": operations.backup_operation_status(),
+        }
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/system/backups/operation")
+def api_system_backup_operation():
+    try:
+        return operations.backup_operation_status()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/system/backups")
+def api_system_backup_create():
+    try:
+        return operations.request_backup_operation("create")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503, "could not publish the backup request") from exc
+
+
+@app.post("/api/system/backups/{backup_name}/restore")
+def api_system_backup_restore(backup_name: str, body: dict):
+    if body.get("confirm") != "RESTORE":
+        raise HTTPException(400, "restore confirmation is required")
+    try:
+        return operations.request_backup_operation("restore", backup_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503, "could not publish the restore request") from exc
+
+
 @app.delete("/api/system/host-alerts")
 def api_host_alerts_clear():
     """Acknowledge active host alerts until each condition genuinely clears."""

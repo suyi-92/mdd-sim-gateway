@@ -91,6 +91,11 @@ export const api = {
   notificationDeliveries: (limit = 100) => j('GET', `/api/notifications/deliveries?limit=${limit}`),
   clearNotificationDeliveries: () => j('DELETE', '/api/notifications/deliveries'),
   systemStatus: () => j('GET', '/api/system/status'),
+  backups: () => j('GET', '/api/system/backups'),
+  backupOperation: () => j('GET', '/api/system/backups/operation'),
+  createBackup: () => j('POST', '/api/system/backups', {}),
+  restoreBackup: (name) => j(
+    'POST', `/api/system/backups/${encodeURIComponent(name)}/restore`, { confirm: 'RESTORE' }),
   clearHostAlerts: () => j('DELETE', '/api/system/host-alerts'),
   maintenance: (action) => j('POST', '/api/system/maintenance', { action }),
   restartProgress: () => j('GET', '/api/system/maintenance/restart-progress'),

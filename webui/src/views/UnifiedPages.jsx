@@ -753,9 +753,11 @@ export function NotificationsPage({ showToast }) {
 }
 
 export function SystemPage({ showToast }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState('')
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [backups,setBackups]=useState(null); const [backupsError,setBackupsError]=useState(false); const [backupOperation,setBackupOperation]=useState(null); const [backupBusy,setBackupBusy]=useState('')
   const loadStatus = () => api.systemStatus().then(value => { setStatus(value); setStatusError(false) }).catch(() => setStatusError(true)).finally(() => setStatusLoaded(true))
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadStatus() }, [])
+  const loadBackups = () => api.backups().then(value => { setBackups(value.backups || []); setBackupOperation(value.operation || { state: 'idle' }); setBackupsError(false) }).catch(() => setBackupsError(true))
+  useEffect(() => { if (tab === 'backup') loadBackups() }, [tab])
   useEffect(() => {
     if (!restarting) return
     let stop = false, wentDown = false
@@ -776,6 +778,29 @@ export function SystemPage({ showToast }) {
     const timer = setTimeout(tick, 2000)
     return () => { stop = true; clearTimeout(timer) }
   }, [restarting, showToast, t])
+  useEffect(() => {
+    if (!['requested', 'launching', 'running'].includes(backupOperation?.state)) return
+    let stop = false, wentDown = false, timer
+    const tick = async () => {
+      if (stop) return
+      try {
+        // mddctl deliberately stops this API while it snapshots or switches data. Once it has
+        // disappeared, its successful return is best observed by the fresh Control process.
+        if (wentDown) { await api.authStatus(); window.location.reload(); return }
+        const progress = await api.backupOperation()
+        setBackupOperation(progress)
+        if (progress.state === 'failed') {
+          setBackupBusy(''); showToast(t(progress.error_code || 'backup.error.failed')); return
+        }
+        if (progress.state === 'success') {
+          setBackupBusy(''); showToast(t(progress.action === 'restore' ? 'Restore completed' : 'Backup completed')); loadBackups(); return
+        }
+      } catch { wentDown = true }
+      timer = setTimeout(tick, 2000)
+    }
+    timer = setTimeout(tick, 1000)
+    return () => { stop = true; clearTimeout(timer) }
+  }, [backupOperation?.operation_id, backupOperation?.state, showToast, t])
   if (!s || !statusLoaded) return <p className={loadError || statusError ? 'u-error' : ''}>{t(loadError || statusError ? 'Loading failed' : 'Loading')}{!loadError && !statusError && '…'}</p>
   const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backup & updates')], ['maintenance', t('Maintenance')]]
   const maxSimLines = Number(s.max_sim_lines ?? 13)
@@ -813,6 +838,26 @@ export function SystemPage({ showToast }) {
       setRestarting(scope)
     } catch (e) { showToast(e.message) }
   }
+  const createBackup = async () => {
+    if (!window.confirm(t('Create a local backup now? Gateway services and active calls are interrupted briefly while SQLite and runtime data are snapshotted.'))) return
+    setBackupBusy('create')
+    try {
+      const result = await api.createBackup()
+      setBackupOperation(result)
+      showToast(t('Backup requested; the page will reconnect after services restart.'))
+    } catch (e) { setBackupBusy(''); showToast(e.message) }
+  }
+  const restoreBackup = async name => {
+    if (!window.confirm(t('Restore “{name}”? Current data is preserved for rollback, but all gateway services and active calls will stop.', { name }))) return
+    const phrase = window.prompt(t('Type RESTORE to confirm replacing the active data with this backup.'))
+    if (phrase !== 'RESTORE') { if (phrase !== null) showToast(t('Restore confirmation did not match.')); return }
+    setBackupBusy('restore')
+    try {
+      const result = await api.restoreBackup(name)
+      setBackupOperation(result)
+      showToast(t('Restore requested; the page will reconnect after health checks.'))
+    } catch (e) { setBackupBusy(''); showToast(e.message) }
+  }
   const changePassword=async()=>{if(passwordForm.next!==passwordForm.confirm){showToast(t('Passwords do not match'));return}try{await api.authPassword(passwordForm.current,passwordForm.next);window.location.reload()}catch(e){showToast(e.message)}}
   return <div className="u-page"><div className="u-tabs">{tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}</div><div className={['backup', 'maintenance'].includes(tab) ? 'u-settings-shell' : 'card u-panel'}>
     {tab === 'general' && <><h2>{t('General')}</h2><div className="u-form-grid"><div><label>{t('Language')}</label><select value={language} onChange={e => setLanguage(e.target.value)}><option value="zh">中文</option><option value="en">English</option></select></div><div><label>{t('Timezone')}</label><input list="timezones" value={s.timezone || ''} onChange={e => setS({ ...s, timezone: e.target.value })} /><datalist id="timezones"><option>Asia/Shanghai</option><option>Europe/London</option><option>America/New_York</option><option>America/Los_Angeles</option><option>Asia/Tokyo</option><option>UTC</option></datalist></div></div><h3>{t('SIM capacity')}</h3><div className="u-compact-field"><label htmlFor="max-sim-lines">{t('Maximum SIM lines')}</label><input id="max-sim-lines" type="number" min="1" max="32" step="1" inputMode="numeric" aria-invalid={!maxSimLinesValid} aria-describedby="max-sim-lines-help" value={s.max_sim_lines ?? 13} onChange={e => setS({ ...s, max_sim_lines: e.target.value === '' ? '' : Number(e.target.value) })} /><p id="max-sim-lines-help" className={maxSimLinesValid ? 'u-hint' : 'u-field-warning'} aria-live="polite">{t(maxSimLinesValid ? 'Controls how many SIM line records can be saved and started. Existing records above a lowered limit are kept but cannot start. Range: 1–32.' : 'SIM line limit must be an integer from 1 to 32.')}</p></div><h3>{t('New device defaults')}</h3><label><input type="checkbox" className="u-toggle" checked={!!s.device_defaults?.cellular_enabled} onChange={e => setS({ ...s, device_defaults: { ...s.device_defaults, cellular_enabled: e.target.checked } })} />{t('Enable 4G for newly detected modems')}</label><label><input type="checkbox" className="u-toggle" checked={s.device_defaults?.vowifi_enabled !== false} onChange={e => setS({ ...s, device_defaults: { ...s.device_defaults, vowifi_enabled: e.target.checked } })} />{t('Enable VoWiFi for newly detected modems')}</label><h3>{t('Hardware')}</h3><label><input type="checkbox" className="u-toggle" checked={s.hardware?.modem_backend === 'serial'} onChange={e => {
@@ -835,9 +880,15 @@ export function SystemPage({ showToast }) {
     {tab === 'backup' && <div className="u-settings-stack">
       <div className="u-settings-grid">
         <section className="card u-panel u-settings-card">
-          <div className="u-settings-card-head"><div><h2>{t('Local backups')}</h2><p>{t('Backups are created only through mddctl so services, Engine containers and SQLite are handled transactionally.')}</p></div></div>
+          <div className="u-settings-card-head"><div><h2>{t('Local backups')}</h2><p>{t('Backups are created only through mddctl so services, Engine containers and SQLite are handled transactionally.')}</p></div><button className="btn btn-primary" disabled={!!backupBusy || ['requested', 'launching', 'running'].includes(backupOperation?.state)} onClick={createBackup}>{t(backupBusy === 'create' ? 'Creating backup…' : 'Create backup')}</button></div>
           <p className="u-note">{t('The archive contains plaintext credentials. Store it only on encrypted, access-controlled media.')}</p>
-          <pre className="u-command"><code>sudo mddctl backup</code></pre>
+          {backupsError && <p className="u-error">{t('Could not load local backups.')}</p>}
+          {!backupsError && backups === null && <p className="u-muted">{t('Loading…')}</p>}
+          {!backupsError && backups?.length === 0 && <p className="u-muted">{t('No local backups yet.')}</p>}
+          {!!backups?.length && <div className="u-backup-list">{backups.map(item => <div className="u-backup-row" key={item.name}><div className="u-backup-copy"><b className="mono" title={item.name}>{item.name}</b><span>{new Date(item.created_at * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB')} · {formatBytes(item.size_bytes)} · {t(item.kind === 'pre-update' ? 'Before update' : 'Manual backup')}</span></div><button className="btn btn-ghost" disabled={!!backupBusy || ['requested', 'launching', 'running'].includes(backupOperation?.state)} onClick={() => restoreBackup(item.name)}>{t(backupBusy === 'restore' ? 'Restoring…' : 'Restore')}</button></div>)}</div>}
+          {['requested', 'launching', 'running'].includes(backupOperation?.state) && <p className="u-note u-backup-progress">{t(backupOperation.action === 'restore' ? 'Restoring data; services will restart and this page will reconnect.' : 'Creating backup; services will restart and this page will reconnect.')}</p>}
+          {backupOperation?.state === 'failed' && <p className="u-error">{t(backupOperation.error_code || 'backup.error.failed')}</p>}
+          <p className="u-hint">{t('For an offline copy, use mddctl to write the archive directly to encrypted removable media.')}</p>
         </section>
         <section className="card u-panel u-settings-card">
           <div className="u-settings-card-head"><div><h2>{t('Source updates')}</h2><p>{t('This VMware edition is updated from the managed local Git checkout, not from GitHub Releases.')}</p></div></div>

@@ -238,8 +238,14 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
   快进源码并切换已验证产物。健康失败时恢复旧源码、venv/WebUI、Engine tag、数据快照和更新前
   的服务运行状态。
 - 自动回滚期间不要手工切换源码或重启部分服务，避免留下“新源码 + 旧服务”的混合状态。
-- backup/restore 必须校验 SHA-256、manifest、归档路径安全和 SQLite；备份含明文凭据，只能存放
-  在 BitLocker、加密移动盘或其他受控介质。
+- backup/restore 必须校验 SHA-256、manifest、归档路径安全和 SQLite；只排除精确的
+  `instances/<实例>/run/` 进程临时树，其他位置的 FIFO、socket、symlink 和设备节点仍须
+  fail closed。备份含明文凭据，只能存放在 BitLocker、加密移动盘或其他受控介质。
+- WebUI 的本地备份/恢复只能选择受管备份目录中的 owner-only 普通归档及同名摘要，不接受任意
+  主机路径。Control 只发布固定请求，由 orchestrator 在独立 transient unit 中运行 `mddctl`；
+  恢复需要明确二次确认，不能在服务自身 cgroup 中直接执行会停止自己的事务。
+- 若旧正式 `mddctl` 的归档 helper 无法处理新的安全兼容修复，必须使用最新流式 bootstrap
+  `update`；下载源码中的新版 manager 也必须使用同一已验证源码树里的新版归档 helper。
 - 不删除最后一代已验证 build、Engine 镜像或更新前数据快照来换取临时磁盘空间；清理必须通过
   明确的管理操作并先确认当前运行身份。
 
