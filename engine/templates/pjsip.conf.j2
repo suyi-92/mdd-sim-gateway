@@ -69,6 +69,10 @@ volte=yes
 dedicated_bearer_up=yes
 100rel=peer_supported
 moh_passthrough=yes
+; Some IMS media relays send RTP from a different address/port than the tuple advertised in
+; SDP. The downlink packet proves the relay's actual tuple, so return the browser microphone
+; uplink there instead of leaving a connected call with one-way audio.
+rtp_symmetric=yes
 direct_media=no
 {% if smsc %}smsc_uri=sip:{{ smsc }}@{{ realm }}
 {% endif %}

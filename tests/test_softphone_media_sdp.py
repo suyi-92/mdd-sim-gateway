@@ -15,6 +15,7 @@ except ImportError:  # control-plane deps absent in source-only environments
 
 ROOT = Path(__file__).resolve().parent.parent
 NODE = shutil.which("node")
+PJSIP = (ROOT / "engine/templates/pjsip.conf.j2").read_text(encoding="utf-8")
 
 
 def rewrite_sdp(sdp: str, media_host: str) -> str:
@@ -105,6 +106,16 @@ class BrowserMediaSdpTests(unittest.TestCase):
 
     def test_wrapper_owned_fallback_audio_sink_is_removed(self):
         self.assertEqual(release_audio_sink(True), ["pause", "remove", "cleared"])
+
+
+class EngineMediaRoutingTests(unittest.TestCase):
+    def test_ims_endpoint_anchors_media_and_returns_uplink_to_the_actual_rtp_source(self):
+        start = PJSIP.index("[volte_ims]\ntype=endpoint")
+        end = PJSIP.index("\n[volte_ims]\ntype=auth", start)
+        endpoint = PJSIP[start:end]
+
+        self.assertIn("direct_media=no", endpoint)
+        self.assertIn("rtp_symmetric=yes", endpoint)
 
 
 @unittest.skipIf(main is None, "control plane dependencies are not installed")

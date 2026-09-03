@@ -8,7 +8,7 @@ import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
 
 const GREEN = '#22c55e', RED = '#ef4444'
 const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
-  ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', '+'], ['#', '']]
+  ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', ''], ['#', '']]
 
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
@@ -436,7 +436,9 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
 
   const dialKey = (k) => {
     if (call?.state === 'active') { phone.current?.sendDTMF(k); setNum((n) => n + k) }
-    else setNum((n) => n + k)
+    // '+' is an international-number prefix, not an in-call DTMF tone. Its dedicated idle
+    // key keeps it at the beginning and makes a second tap harmless.
+    else setNum((n) => k === '+' ? (n.startsWith('+') ? n : `+${n}`) : n + k)
   }
   // In-call DTMF: send the tone and echo it into the keypad's display strip.
   const pressDTMF = (k) => { phone.current?.sendDTMF(k); setDtmfSeq((s) => (s + k).slice(-32)) }
@@ -769,7 +771,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
               ))}
             </div>
             <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16 }}>
-              <div style={{ width: 58 }} />
+              <button type="button" className="u-dial-plus" onClick={() => dialKey('+')}
+                aria-label={t('Plus')} title={t('Plus')}>+</button>
               <button onClick={() => placeCall()} disabled={cellularBusy || !num || (callTransport === 'vowifi' ? reg !== 'registered' : !cellularReady)} style={{
                 width: 64, height: 64, borderRadius: '50%', border: 'none', cursor: 'pointer', fontSize: 26,
                 background: (num && (callTransport === 'cellular' ? cellularReady : reg === 'registered')) ? GREEN : 'var(--border-strong)', color: '#fff',

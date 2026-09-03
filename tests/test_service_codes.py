@@ -65,6 +65,15 @@ class BrowserDiallerServiceCodeTests(unittest.TestCase):
         # The E.164 guard is what stops a number being sent without its country code.
         self.assertIn(r"return /^\+[1-9]\d{6,14}$/.test(number) ? number : ''", self.view)
 
+    def test_idle_dialler_has_a_real_international_prefix_key(self):
+        # The old '+' was only a tiny caption under zero: it looked available but clicking
+        # that key entered 0. Keep '+' out of the shared DTMF grid and give the idle dialler
+        # one explicit control instead.
+        self.assertNotIn("['0', '+']", self.view)
+        self.assertIn('className="u-dial-plus"', self.view)
+        self.assertIn("onClick={() => dialKey('+')}", self.view)
+        self.assertIn("k === '+' ? (n.startsWith('+') ? n : `+${n}`)", self.view)
+
     def test_local_mmi_codes_are_answered_instead_of_dialled(self):
         self.assertIn("export const LOCAL_MMI = { '*#06#': 'imei' }", self.view)
         self.assertIn("const localField = LOCAL_MMI[target]", self.view)

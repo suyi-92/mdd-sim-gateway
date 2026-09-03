@@ -365,6 +365,13 @@ Engine；如果日志仍显示 Fake-IP，检查 sing-box/Xray 出口状态和 DN
 - VM 桥接地址是否与 Control 的 advertise address 一致；
 - 是否有 VPN/安全软件改写浏览器路由。
 
+“浏览器听得到对端，但对端听不到浏览器”只证明 IMS 下行、Asterisk 转码和浏览器播放链路
+可用，不能证明麦克风上行已经到达运营商。先确认浏览器为当前站点选择了正确且未静音的输入
+设备；Engine 的 IMS endpoint 同时必须保持 `direct_media=no` 与 `rtp_symmetric=yes`。前者让
+Asterisk 留在 WebRTC/AMR 两条媒体腿之间，后者从已收到的下行 RTP 学习运营商媒体中继实际使用的
+地址与端口，并将浏览器麦克风的上行媒体送回同一位置。运营商 SDP 声明值与实际发包位置不一致时，
+缺少对称 RTP 会形成“本端能听、对端静音”的已接通通话。
+
 ## 16. 重启恢复
 
 分别测试：
