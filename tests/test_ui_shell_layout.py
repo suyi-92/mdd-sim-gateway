@@ -45,9 +45,10 @@ class SidebarLayoutTests(unittest.TestCase):
 class PageRhythmTests(unittest.TestCase):
     def test_compliance_notice_has_its_own_spacing_before_every_page(self):
         self.assertIn('className="u-note u-compliance-note" role="note"', APP)
-        rule = css_rule(".u-compliance-note")
+        rule = css_rule(".u-content>.u-compliance-note")
         self.assertIn("margin:0 0 26px", rule)
         self.assertIn("line-height:1.7", rule)
+        self.assertGreater(CSS.count(".u-content>.u-compliance-note"), 0)
 
     def test_settings_use_explicit_equal_rhythm_sections_and_aligned_fields(self):
         self.assertIn("line-height: 1.5", css_rule("body"))
@@ -75,6 +76,22 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn('className="u-inline-field u-message-route-field"', MESSAGES)
         self.assertIn('className="u-inline-field u-esim-reader-field"', ESIM)
         self.assertIn("grid-template-columns:max-content minmax(0,1fr)", css_rule(".u-inline-field"))
+        self.assertIn("minmax(0,680px)", css_rule(".u-line-selector"))
+
+    def test_timezone_is_a_single_choice_of_common_regions_and_preserves_custom_values(self):
+        self.assertIn("const COMMON_TIMEZONES = [", UNIFIED)
+        self.assertIn('<select id="system-timezone"', UNIFIED)
+        self.assertNotIn('<input list="timezones"', UNIFIED)
+        self.assertIn("!timezoneIsCommon && <option value={selectedTimezone}>{selectedTimezone}</option>", UNIFIED)
+        for timezone in ("Asia/Shanghai", "Europe/London", "America/New_York",
+                         "America/Los_Angeles", "Asia/Tokyo", "UTC"):
+            self.assertIn(f"['{timezone}',", UNIFIED)
+
+    def test_diagnostics_separate_the_action_from_capability_rows(self):
+        self.assertIn('className="u-page u-diagnostics-page"', UNIFIED)
+        self.assertIn('className="card u-panel u-diagnostic-card"', UNIFIED)
+        self.assertIn('className="btn btn-ghost u-diagnostic-action"', UNIFIED)
+        self.assertIn("margin-top:14px", css_rule(".u-diagnostic-action"))
 
     def test_sim_forms_follow_their_container_at_medium_and_narrow_widths(self):
         self.assertIn("container:sim-config / inline-size", CSS)

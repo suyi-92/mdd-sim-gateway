@@ -7,6 +7,19 @@ import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
+const COMMON_TIMEZONES = [
+  ['Asia/Shanghai', 'China · Shanghai'],
+  ['Asia/Hong_Kong', 'China · Hong Kong'],
+  ['Europe/London', 'United Kingdom · London'],
+  ['America/New_York', 'United States · New York'],
+  ['America/Los_Angeles', 'United States · Los Angeles'],
+  ['Europe/Berlin', 'Germany · Berlin'],
+  ['Europe/Paris', 'France · Paris'],
+  ['Asia/Tokyo', 'Japan · Tokyo'],
+  ['Asia/Singapore', 'Singapore'],
+  ['Australia/Sydney', 'Australia · Sydney'],
+  ['UTC', 'Coordinated Universal Time'],
+]
 
 function normalizeState(value, desired) {
   const raw = typeof value === 'object' ? (value.actual || value.state) : value
@@ -835,6 +848,8 @@ export function SystemPage({ showToast }) {
   const oldImagesReclaimable = status?.host?.project_storage?.mdd_old_images_reclaimable_bytes
   const backupActive = backupOperationRunning(backupOperation)
   const activeBackup = activeBackupOperation(backupBusy, backupOperation)
+  const selectedTimezone = String(s.timezone || 'Asia/Shanghai')
+  const timezoneIsCommon = COMMON_TIMEZONES.some(([value]) => value === selectedTimezone)
   const save = async () => {
     if (!maxSimLinesValid) { showToast(t('SIM line limit must be an integer from 1 to 32.')); return }
     try { const saved = await api.saveSettings(s); setS(saved); showToast(t('Saved')) } catch (e) { showToast(e.message) }
@@ -891,7 +906,13 @@ export function SystemPage({ showToast }) {
     {tab === 'general' && <div className="u-settings-form">
       <section className="u-settings-section">
         <h2>{t('General')}</h2>
-        <div className="u-form-grid"><div><label>{t('Language')}</label><select value={language} onChange={e => setLanguage(e.target.value)}><option value="zh">中文</option><option value="en">English</option></select></div><div><label>{t('Timezone')}</label><input list="timezones" value={s.timezone || ''} onChange={e => setS({ ...s, timezone: e.target.value })} /><datalist id="timezones"><option>Asia/Shanghai</option><option>Europe/London</option><option>America/New_York</option><option>America/Los_Angeles</option><option>Asia/Tokyo</option><option>UTC</option></datalist></div></div>
+        <div className="u-form-grid">
+          <div><label>{t('Language')}</label><select value={language} onChange={e => setLanguage(e.target.value)}><option value="zh">中文</option><option value="en">English</option></select></div>
+          <div><label htmlFor="system-timezone">{t('Timezone')}</label><select id="system-timezone" value={selectedTimezone} onChange={e => setS({ ...s, timezone: e.target.value })}>
+            {!timezoneIsCommon && <option value={selectedTimezone}>{selectedTimezone}</option>}
+            {COMMON_TIMEZONES.map(([value, label]) => <option key={value} value={value}>{t(label)} · {value}</option>)}
+          </select></div>
+        </div>
       </section>
       <section className="u-settings-section">
         <h3>{t('SIM capacity')}</h3>
@@ -1056,8 +1077,8 @@ export function DiagnosticsPage(props) {
   const issueUrl = `${(system?.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`
   const clearHostAlerts = async () => { try { setClearingAlerts(true); await api.clearHostAlerts(); const next = { ...(system || {}), host_alerts: [] }; setSystem(next); props.setSystemMeta?.(s => ({ ...s, host_alerts: [] })); props.showToast(t('Host alerts cleared')) } catch (e) { props.showToast(e.message) } finally { setClearingAlerts(false) } }
   const run = async d => { try { const result = await api.deviceDiagnostics(d.id); setResults(x => ({ ...x, [d.id]: result })); props.showToast(result.ok ? t('Diagnostics passed') : t('Diagnostics found problems')) } catch (e) { props.showToast(e.message) } }
-  return <div className="u-page"><div className="u-tabs"><button className={tab === 'health' ? 'active' : ''} onClick={() => setTab('health')}>{t('Health')}</button><button className={tab === 'host' ? 'active' : ''} onClick={() => setTab('host')}>{t('Host')}{!!hostAlerts.length && <i className={`u-nav-dot ${hostAlerts.some(a => a.severity === 'critical') ? 'critical' : 'warning'}`} />}</button><button className={tab === 'logs' ? 'active' : ''} onClick={() => setTab('logs')}>{t('Live logs')}</button><button className={tab === 'bundle' ? 'active' : ''} onClick={() => setTab('bundle')}>{t('Support bundle')}</button></div>
-    {tab === 'health' && props.initialLoading ? <p role="status">{t('Loading')}…</p> : tab === 'health' && props.loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : tab === 'health' && <div className="u-device-grid">{devices.map((d, i) => <div className="card u-panel" key={d.id}><h3>{deviceTitle(d, i)}</h3><div className="u-detail"><span>{t('4G network')}</span><Badge state={capability(d, 'cellular').actual} /></div><div className="u-detail"><span>VoWiFi / IMS</span><Badge state={capability(d, 'vowifi').actual} /></div><button className="btn btn-ghost" onClick={() => run(d)}>{t('Run diagnostics')}</button>{results[d.id]?.checks?.map(check => <div className="u-detail" key={check.name}><span>{check.name}</span><b>{check.ok ? '✓' : '✕'} {check.detail}</b></div>)}</div>)}</div>}
+  return <div className="u-page u-diagnostics-page"><div className="u-tabs"><button className={tab === 'health' ? 'active' : ''} onClick={() => setTab('health')}>{t('Health')}</button><button className={tab === 'host' ? 'active' : ''} onClick={() => setTab('host')}>{t('Host')}{!!hostAlerts.length && <i className={`u-nav-dot ${hostAlerts.some(a => a.severity === 'critical') ? 'critical' : 'warning'}`} />}</button><button className={tab === 'logs' ? 'active' : ''} onClick={() => setTab('logs')}>{t('Live logs')}</button><button className={tab === 'bundle' ? 'active' : ''} onClick={() => setTab('bundle')}>{t('Support bundle')}</button></div>
+    {tab === 'health' && props.initialLoading ? <p role="status">{t('Loading')}…</p> : tab === 'health' && props.loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : tab === 'health' && <div className="u-device-grid">{devices.map((d, i) => <div className="card u-panel u-diagnostic-card" key={d.id}><h3>{deviceTitle(d, i)}</h3><div className="u-detail"><span>{t('4G network')}</span><Badge state={capability(d, 'cellular').actual} /></div><div className="u-detail"><span>VoWiFi / IMS</span><Badge state={capability(d, 'vowifi').actual} /></div><button className="btn btn-ghost u-diagnostic-action" onClick={() => run(d)}>{t('Run diagnostics')}</button>{results[d.id]?.checks?.map(check => <div className="u-detail" key={check.name}><span>{check.name}</span><b>{check.ok ? '✓' : '✕'} {check.detail}</b></div>)}</div>)}</div>}
     {tab === 'host' && <HostPanel host={host} alerts={hostAlerts} loading={hostLoading} clearing={clearingAlerts} onClear={clearHostAlerts} t={t} />}
     {tab === 'logs' && <Logs {...props} />}
     {tab === 'bundle' && <div className="card u-panel"><h2>{t('Redacted support bundle')}</h2><p>{t('Contains status, configuration shape and bounded logs. SIM identities, phone numbers, credentials and cryptographic material are removed.')}</p><div className="u-support-actions"><a className="btn btn-primary" href={api.supportBundleUrl}>{t('Download support bundle')}</a><div><b>{t('Found a problem or have a suggestion?')}</b><p>{t('Open a GitHub Issue. For faults, attach the redacted support bundle when appropriate.')}</p><a href={issueUrl} target="_blank" rel="noreferrer">{t('Submit an Issue')} ↗</a></div></div></div>}
