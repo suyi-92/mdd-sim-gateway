@@ -12,6 +12,7 @@ Env overrides (used by entrypoint / keeper / ami_usim after render): USIM_PIN, U
 import ipaddress
 import json
 import os
+import re
 import shutil
 import shlex
 import socket
@@ -146,6 +147,15 @@ def build_context(cfg):
     default_esp = ("aes128-sha1,aes256-sha256,aes128-sha256,aes256-sha1,"
                    "aes128-sha1-modp2048,aes256-sha256-modp2048,"
                    "aes128-sha256-modp2048,aes256-sha1-modp2048")
+    raw_home_local_voice_codes = sip.get("home_local_voice_codes") or []
+    if not isinstance(raw_home_local_voice_codes, (list, tuple)):
+        raw_home_local_voice_codes = []
+    # The control plane derives these from an exact carrier profile, but instance.json is also
+    # a documented Engine boundary. Fail closed against a hand-authored value becoming Jinja /
+    # Asterisk syntax: only bounded numeric dial strings can enter the generated dialplan.
+    home_local_voice_codes = tuple(dict.fromkeys(
+        str(value) for value in raw_home_local_voice_codes
+        if re.fullmatch(r"[0-9]{2,6}", str(value))))
     ctx = {
         "id": str(cfg.get("id", "1")),
         "imsi": imsi,
@@ -174,6 +184,7 @@ def build_context(cfg):
         # Use a transparent product identity rather than impersonating a phone.
         "user_agent": "MDD-Sim-Gateway",
         "user_eq_phone": bool(sip.get("user_eq_phone", False)),
+        "home_local_voice_codes": home_local_voice_codes,
         # SDP identity (s=/o= lines) — Asterisk defaults s=Asterisk which fingerprints it.
         "sdp_session": (sip.get("sdp_session") or "-"),
         "sdp_owner": (sip.get("sdp_owner") or "-"),

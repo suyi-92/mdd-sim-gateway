@@ -35,6 +35,9 @@ worktree，再推送 `vmware`。
 - 修改 UICC 时同时验证 PIN、IKE 和 SIP 三条路径；
 - 修改线路上限时同时验证 API、自动建线和所有 Engine 启动入口；
 - 修改端口时同时探测 TCP 与 UDP，并覆盖 `Created` 容器清理；
+- 修改运营商数字语音短号时，同时覆盖严格的 PLMN+SPN 匹配、Engine contract、渲染后的
+  Request-URI 和 WebUI 最终状态；home-local 号码必须携带归属 IMS 域 `phone-context`，但仍是
+  有音频的普通通话，不能复用 USSD 的无音频交互；
 - 不把运行数据、`.venv`、`node_modules`、`webui/dist`、build cache 或备份加入 Git；
 - 正式 `.venv` 与 `webui/dist` 是指向提交专属 build cache 的激活 symlink；忽略规则必须限定
   仓库位置并同时匹配真实目录和 symlink，不能写成只匹配目录的尾随 `/` 形式；

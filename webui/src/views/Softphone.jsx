@@ -3,6 +3,8 @@ import { api } from '../api.js'
 import { Softphone as Phone } from '../softphone.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
+import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
+  ordinaryCallEndIsFailure, ordinaryCallEndLabel } from '../call-status.js'
 
 const GREEN = '#22c55e', RED = '#ef4444'
 const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
@@ -10,8 +12,6 @@ const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
 
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
-// Call-history dispositions as recorded by the backend (_call_disposition), mapped to
-// translatable labels.
 function VoicemailRow({ instanceId, voicemail, open, onOpen, onHeard, onDelete, t }) {
   // The recording is fetched only when the user asks for it: rendering an <audio src> per row
   // would make opening the call log download every message on the line.
@@ -36,16 +36,6 @@ function VoicemailRow({ instanceId, voicemail, open, onOpen, onHeard, onDelete, 
   )
 }
 
-const CALL_STATUS_LABEL = {
-  answered: 'Answered', missed: 'Missed', rejected: 'Declined', busy: 'Busy',
-  'no answer': 'No answer', cancelled: 'Cancelled', failed: 'Failed',
-  ringing: 'Ringing', dialing: 'Dialing', unknown: 'Unknown',
-  // Service codes are scored on their own scale by the control plane: whether the carrier
-  // acted on the request, not whether a conversation happened.
-  'code accepted': 'Carrier accepted', 'code unsupported': 'Not supported by carrier',
-  'code rejected': 'Carrier refused', 'code failed': 'Carrier could not handle it',
-}
-
 // A service code is answered and torn down immediately, so every call-shaped ending would
 // misdescribe it. JsSIP's cause carries the SIP response that decided the outcome, which is
 // the only place the carrier says whether it serves the code at all. A cause listed here is a
@@ -62,10 +52,6 @@ const SERVICE_CODE_END_LABEL = {
 // The service-code outcomes that are VERDICTS. 'dialing'/'ringing' are the call still being
 // in progress, not a conclusion — quoting one as the result printed "Dialing" on the screen
 // that reports how the call ended.
-const SETTLED_CODE_STATUS = new Set([
-  'code accepted', 'code unsupported', 'code rejected', 'code failed',
-])
-
 // A privacy extension that blocks WebRTC does not remove RTCPeerConnection — it replaces it
 // with something that is not a constructor. JsSIP then stalls inside connect() without ever
 // emitting an error: no SDP is generated, no INVITE is sent, and the call screen runs its full
@@ -239,6 +225,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   }, [call?.state])
   useEffect(() => { if (seenVerdict) setStickyVerdict(seenVerdict) }, [seenVerdict])
   const backendVerdict = stickyVerdict || seenVerdict
+  // For an ordinary live call, accept only the status grafted from its websocket event. A
+  // history lookup by peer can select an older attempt when the same destination is retried;
+  // showing that stale failure during the new call is worse than briefly waiting for call_result.
+  const ordinaryBackendStatus = call?.backendStatus || ''
+  const synthesizedDecline = call?.dir === 'out' && call?.transport === 'vowifi'
+  const awaitingOrdinaryVerdict = call?.state === 'ended' && !call?.serviceCode
+    && synthesizedDecline && !hasSettledCallStatus(ordinaryBackendStatus)
 
   const toast = (m) => (showToast ? showToast(m) : null)
   const toggleCallSel = (cid) => setCallSel((s) => { const n = new Set(s); n.has(cid) ? n.delete(cid) : n.add(cid); return n })
@@ -318,9 +311,12 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // An ordinary call has nothing to read, so it clears itself as before.
   useEffect(() => {
     if (call?.state !== 'ended' || call.serviceCode) return
-    const t = setTimeout(() => setCall(null), 2500)
+    // call_result is fired by a backgrounded process and can arrive after the browser's local
+    // 603. Give that authoritative verdict its bounded ordering window; once it lands, retain
+    // the final label for the usual 2.5 seconds.
+    const t = setTimeout(() => setCall(null), awaitingOrdinaryVerdict ? 4000 : 2500)
     return () => clearTimeout(t)
-  }, [call?.state, call?.serviceCode])
+  }, [call?.state, call?.serviceCode, awaitingOrdinaryVerdict])
   // A settled service code carries text the user has to READ. Vanishing on a timer can take
   // the answer away mid-sentence, so count down visibly on a Back button they can also just
   // press — the wait becomes theirs to end, not the UI's to impose.
@@ -542,9 +538,15 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
 
   const regColor = reg === 'registered' ? GREEN : reg === 'failed' || reg === 'disconnected' ? RED : '#eab308'
   const inCall = call && (call.state === 'active' || call.state === 'calling' || call.state === 'ringing' || call.state === 'incoming' || call.state === 'ended')
-  const endLabel = (c, isCode) => (isCode
-    ? t(SERVICE_CODE_END_LABEL[c] || 'The carrier gave no usable answer to this code.')
-    : t(c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended'))
+  const endLabel = (c) => t(SERVICE_CODE_END_LABEL[c]
+    || 'The carrier gave no usable answer to this code.')
+  const ordinaryEndLabel = ordinaryCallEndLabel(
+    ordinaryBackendStatus, call?.endCause, synthesizedDecline)
+  const ordinaryEndFailed = ordinaryCallEndIsFailure(
+    ordinaryBackendStatus, call?.endCause, synthesizedDecline)
+  const displayedEndFailed = call?.serviceCode
+    ? Boolean(backendVerdict && backendVerdict !== 'code accepted')
+    : ordinaryEndFailed
 
   // Google-Voice-style incoming-call overlay (prominent, full-panel)
   const IncomingOverlay = call?.state === 'incoming' ? (
@@ -689,7 +691,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
         {/* ===== ENDED (brief) ===== */}
         {call?.state === 'ended' && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
-            <Avatar label={call.number} color={call.endCause === 'Rejected' ? RED : 'var(--text-mute)'} />
+            <Avatar label={call.number} color={displayedEndFailed ? RED : 'var(--text-mute)'} />
             <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
             {call.ussdText && (
               <div style={{ maxWidth: 320, margin: '0 auto', padding: '12px 14px', borderRadius: 10,
@@ -699,7 +701,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             )}
             {(() => {
               if (!call.serviceCode) {
-                return <div style={{ fontSize: 14, color: call.endCause === 'Rejected' ? RED : 'var(--text-mute)' }}>{endLabel(call.endCause, false)}</div>
+                return <div style={{ fontSize: 14, color: ordinaryEndFailed ? RED : 'var(--text-mute)' }}>{t(ordinaryEndLabel)}</div>
               }
               // A service code's verdict comes from the manager, which reads the Q.850 cause.
               // JsSIP's SIP cause is coarser — it reports a network failure (cause 38) as
@@ -739,7 +741,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   {t('The gateway did not send this code. Its engine image may be older than service-code support — reload the installation to update it.')}
                 </div>
               }
-              return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause, true)}</div>
+              return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause)}</div>
             })()}
             {dismissIn !== null && (
               <button onClick={() => setCall(null)} style={{ margin: '4px auto 0', padding: '9px 22px',

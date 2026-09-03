@@ -319,8 +319,15 @@ SIM/PCSC → UICC 选择与 AKA → 国家出口 UDP → ePDG/IKE → IMS/SIP �
 Q.850 127 是未明确映射的互通失败，不能据此声称“本地未发送”或“运营商确定不支持”。
 失败后的 `Return without Gosub` 通常是挂断处理噪声，不是 INVITE 未发出的证据。
 
-CMLink UK 的 `10086` 是其官方短号，保持原样拨打；不要改写成 `+4410086`。判断短号时按
-SIM 品牌自己的规则，不只看底层宿主网络。
+CMLink UK 的 `10086` 是其官方语音短号，保持原样拨打；不要改写成 `+4410086`。它属于
+home-local number：只有 SIM 的 CMLink SPN 与共享 PLMN 同时匹配时，Engine 才在 IMS
+Request-URI 中保留原短号并附加归属域 `phone-context`。它接通的是带音频的客服通话，不是
+USSD；不要隐藏麦克风/扬声器/DTMF，也不要把相同规则套到普通 EE 或其他 MVNO。
+
+若浏览器显示“通话已拒接”，先对照通话记录的最终状态。出站 VoWiFi 未接通时，Asterisk 会在
+本地 WebRTC leg 合成 `603 Decline` 来阻止 JsSIP 自动重拨；它不等于运营商真的返回拒接。
+Control 的 `call_result` 才是界面最终结论。需要区分上游响应时，只短暂开启 PJSIP logger，
+复现一次后立即关闭，并且只保留脱敏的消息方向、状态码和 URI 形状。
 
 普通 PC/SC reader 没有 IMEI 时允许注册，Engine 会省略 DEVICE_IDENTITY；若运营商强制
 要求，WebUI 会提示风险。读不到 SMSC 时 VoWiFi 通话仍可启动，只禁用主动 VoWiFi 短信。

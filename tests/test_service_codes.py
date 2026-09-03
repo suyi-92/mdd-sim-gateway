@@ -43,7 +43,8 @@ class DialplanServiceCodeTests(unittest.TestCase):
     def test_hash_is_escaped_before_the_outbound_invite(self):
         # An unescaped '#' truncates the user part of the outgoing request URI.
         self.assertIn("Set(DIALTARGET=${STRREPLACE(EXTEN,#,%23)})", self.dialplan)
-        self.assertIn("Dial(PJSIP/${DIALTARGET}@volte_ims", self.dialplan)
+        self.assertIn("Set(DIALDEST=PJSIP/${DIALTARGET}@volte_ims)", self.dialplan)
+        self.assertIn("Dial(${DIALDEST}", self.dialplan)
         self.assertNotIn("Dial(PJSIP/${EXTEN}@volte_ims", self.dialplan)
 
     def test_call_log_records_the_code_the_user_dialled(self):
@@ -82,7 +83,7 @@ class BrowserDiallerServiceCodeTests(unittest.TestCase):
         self.assertIn("The gateway did not send this code.", self.view)
         # It must be checked before the SIP-cause fallback, which is what used to answer here.
         self.assertLess(self.view.index("if (!rawVerdict) {"),
-                        self.view.index("return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause, true)}"))
+                        self.view.index("return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause)}"))
 
     def test_blocked_webrtc_is_reported_instead_of_timing_out(self):
         # A privacy extension replaces RTCPeerConnection with a non-constructor rather than

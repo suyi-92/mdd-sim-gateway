@@ -923,8 +923,36 @@ CARRIER_SIP_SPN_PROFILES = (
             "access_type": "wlan1",
             "user_eq_phone": True,
         },
+        # An ordinary audio call inside CMLink's home dial plan, not USSD. See
+        # carrier_home_local_voice_codes() for why it is qualified separately.
+        "home_local_voice_codes": ("10086",),
     },
 )
+
+# Voice short numbers that are meaningful only inside a specific carrier's home dial plan.
+# They are not supplementary-service/USSD codes: when accepted they establish an ordinary
+# audio call, so the browser must keep its microphone, speaker, keypad and recording controls.
+# The distinction here is only URI construction. RFC 3966 and 3GPP TS 24.229 require a local
+# telephone number to carry its home context; without it CMLink UK's EE-hosted TAS acknowledges
+# the INVITE and immediately terminates it with 487.
+def carrier_home_local_voice_codes(mcc: str, mnc: str,
+                                   carrier_identity: dict | None = None) -> tuple[str, ...]:
+    """Return exact numeric voice short codes for one positively identified carrier.
+
+    A PLMN-only match is deliberately insufficient because hosted brands share the EE PLMN.
+    Values are code constants, never inferred from arbitrary short input or user configuration.
+    """
+    keys = {
+        "%s-%s" % (mcc, mnc),
+        "%s-%s" % (str(mcc).zfill(3), str(mnc).zfill(3)),
+        "%s-%s" % (mcc, str(mnc).lstrip("0") or mnc),
+    }
+    spn = str((carrier_identity or {}).get("spn") or "").strip().casefold()
+    for rule in CARRIER_SIP_SPN_PROFILES:
+        if keys.intersection(rule["plmns"]) and spn in {
+                value.casefold() for value in rule["spns"]}:
+            return tuple(rule.get("home_local_voice_codes") or ())
+    return ()
 
 
 def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "",
@@ -1006,6 +1034,9 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         inst.get("iccid") or inst.get("imsi") or inst.get("imei"), inst.get("sip"),
         inst.get("carrier_identity") or {})
     webrtc = sip.get("webrtc", {}) or {}
+    home_local_voice_codes = carrier_home_local_voice_codes(
+        inst.get("mcc", ""), inst.get("mnc", ""),
+        inst.get("carrier_identity") or {})
     ami_secret = str(inst.get("ami_secret") or "")
     webrtc_password = str(webrtc.get("password") or "")
     if not ami_secret:
@@ -1088,6 +1119,10 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             # they will route an originating voice INVITE. Keep this carrier-configurable because
             # other networks reject SMS MESSAGE request URIs when the parameter is present.
             "user_eq_phone": bool(sip.get("user_eq_phone", False)),
+            # Carrier-owned numeric short numbers are ordinary voice calls, but they are local
+            # rather than E.164 identities. The Engine qualifies only this exact derived list
+            # with the home IMS domain as phone-context; arbitrary short inputs stay untouched.
+            "home_local_voice_codes": list(home_local_voice_codes),
             "pani": sip.get("pani", ""),
             "access_type": sip.get("access_type", ""),
             "webrtc": {

@@ -91,7 +91,9 @@ git remote -v
 - eSIM profile 首次启用时继续等待陈旧 `disabled` 出口状态刷新。
 - Fake-IP 环境下，ePDG 必须在选定国家出口内解析并固定真实地址；浏览器 SDP 必须过滤
   Fake-IP ICE candidate。
-- CMLink UK 的 `10086` 保持原样，不改写为 `+4410086`；短号判断以 SIM 品牌自身规则为准。
+- CMLink UK 的 `10086` 保持原样，不改写为 `+4410086`；它是带音频的 home-local 语音短号，
+  只在 SIM 的 CMLink SPN 与共享 PLMN 同时匹配时为 IMS Request-URI 加归属域
+  `phone-context`。不得把它泛化到普通 EE/其他 MVNO，也不得误归入无音频的 USSD 路径。
 - 保留 Feishu 通知、IKE SA rekey、原生 reader recovery、Xray 错误反馈和通知代理路由。
 - 不重新引入 WSL/usbipd/PowerShell、Docker Control、Release API、网页自动更新、工作流或
   项目预编译资产。
@@ -252,6 +254,8 @@ sudo journalctl -u mdd-sim-gateway-control -u mdd-sim-gateway-orchestrator \
 - 诊断拨号失败时按 SIM 品牌/MCC-MNC、SWu、IKE 重传、IMS Registration、Asterisk/AMI、
   `call_result` 的 `DIALSTATUS + Q.850` 顺序取证。Q.850 127 只是未明确映射的互通失败；
   `Return without Gosub` 通常是挂断噪声，不能据此宣称 INVITE 未发送。
+- 出站 VoWiFi 失败会在本地 WebRTC leg 上合成 `603` 以阻止 JsSIP 自动重拨；界面必须优先采用
+  Control 根据 `call_result` 得出的最终状态，不能把这个本地 `603` 显示成运营商拒接。
 
 ## 完成标准
 
