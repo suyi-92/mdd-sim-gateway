@@ -1216,6 +1216,13 @@ class OutageDetailTests(unittest.TestCase):
         self.assertEqual(evidence, {"code": "tunnel_cause_not_captured",
                                     "peer": "epdg.example"})
 
+    def test_missing_eap_challenge_names_the_responding_epdg(self):
+        st = {"reason_code": "tunnel_no_eap",
+              "detail": {"epdg_fqdn": "epdg.example"}}
+        evidence = __import__("json").loads(main._outage_detail(st))
+        self.assertEqual(evidence, {"code": "server_epdg_eap_request_missing",
+                                    "peer": "epdg.example"})
+
     def test_codes_without_useful_evidence_stay_quiet(self):
         self.assertEqual(main._outage_detail({"reason_code": "no_card", "detail": {}}), "")
 

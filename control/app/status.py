@@ -48,6 +48,10 @@ REASONS = {
     "tunnel_not_authorized": "Can't establish the VoWiFi tunnel — the carrier's ePDG refused the "
                              "identity before checking the SIM. The line is likely not provisioned "
                              "for Wi-Fi Calling, or the ePDG blocks connections from this network/region.",
+    "tunnel_no_eap": "Can't establish the VoWiFi tunnel — the carrier's ePDG answered IKE_AUTH "
+                     "but did not provide a supported EAP authentication request. The SIM may not "
+                     "be provisioned for Wi-Fi Calling, or this carrier requires a different "
+                     "identity exchange.",
     "tunnel_proposal": "Can't establish the VoWiFi tunnel — the carrier rejected the encryption "
                        "settings (IKE proposal).",
     "tunnel_setup": "Establishing the VoWiFi (IPsec/ePDG) tunnel…",
@@ -108,6 +112,10 @@ def classify_ike(iid: str) -> tuple[str, str]:
     if "before any eap-aka challenge" in low or "authentication_failed before" in low or \
             "not provisioned for vowifi" in low:
         return "tunnel_not_authorized", REASONS["tunnel_not_authorized"]
+    if terminal == "no_eap_challenge" or \
+            "ike_auth (1) cannot continue" in low or \
+            "ike_auth (2) cannot continue" in low:
+        return "tunnel_no_eap", REASONS["tunnel_no_eap"]
     # SIM auth failure (EAP-AKA)
     if usim.get("state") in ("AUTH_FAIL", "PIN_FAIL", "NO_CARD") or \
             "eap_aka failed" in low or "eap-aka failed" in low or \

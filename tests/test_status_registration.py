@@ -91,6 +91,17 @@ class RegistrationStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, "tunnel_child_rekey_timeout")
         self.assertIn("CHILD_SA", reason)
 
+    async def test_missing_eap_challenge_has_an_actionable_tunnel_reason(self):
+        with patch.multiple(
+                status.engine,
+                charon_log=lambda _iid, _tail=400: "received IKE_AUTH (1)",
+                usim_status=lambda _iid: {},
+                read_run_json=lambda _iid, _name: {
+                    "state": "DOWN", "reason_code": "no_eap_challenge"}):
+            code, reason = status.classify_ike("1")
+        self.assertEqual(code, "tunnel_no_eap")
+        self.assertIn("supported EAP", reason)
+
     async def test_a_resolver_blip_does_not_mark_an_established_tunnel_down(self):
         # An established tunnel talks to an address, not a name. A DNS outage must surface
         # only on lines that actually need a lookup — those still to build their tunnel.

@@ -1446,6 +1446,8 @@ def _outage_detail(st: dict) -> str:
         return evidence("client_sim_auth_failed", peer=fqdn)
     if code == "tunnel_not_authorized":
         return evidence("server_epdg_identity_rejected", peer=fqdn)
+    if code == "tunnel_no_eap":
+        return evidence("server_epdg_eap_request_missing", peer=fqdn)
     if code == "tunnel_proposal":
         return evidence("server_epdg_proposal_rejected", peer=fqdn)
     if code == "tunnel_setup":

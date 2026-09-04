@@ -752,7 +752,30 @@ EAP_SUCCESS  = 3
 EAP_FAILURE  = 4
 
 #IANA EAP Type
+EAP_IDENTITY = 1
 EAP_AKA = 23
+
+
+def permanent_eap_identity(imsi, mcc, mnc):
+    """Return the permanent EAP-AKA NAI without ever logging the subscriber value."""
+    return ('0' + str(imsi) + '@nai.epc.mnc' + str(mnc).zfill(3)
+            + '.mcc' + str(mcc).zfill(3) + '.3gppnetwork.org')
+
+
+def build_eap_identity_response(identifier, identity):
+    """Build a generic EAP-Response/Identity for an ePDG that asks despite IKE IDi.
+
+    RFC 7296 says an EAP responder SHOULD use the IKE IDi instead of asking again, but the
+    initiator is still required to tolerate an EAP-Request/Identity. Some carrier AAA paths do
+    ask, before selecting EAP-AKA. Keep the identity bytes out of diagnostics and echo only the
+    request identifier on the wire.
+    """
+    identity_bytes = str(identity).encode('utf-8')
+    length = 5 + len(identity_bytes)
+    if not 0 <= int(identifier) <= 255 or length > 65535:
+        raise ValueError('invalid EAP Identity response size')
+    return (bytes([EAP_RESPONSE, int(identifier)]) + struct.pack('!H', length)
+            + bytes([EAP_IDENTITY]) + identity_bytes)
 
 #EAP-AKA/EAP-SIM Subtypes:
 AKA_Challenge = 1
@@ -4201,6 +4224,7 @@ class swu():
             return TIMEOUT,'TIMEOUT'
 
         eap_received = False
+        eap_payload_seen = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (1)')             
             for i in self.decoded_payload[0][1]:
@@ -4228,7 +4252,26 @@ class swu():
                         return OTHER_ERROR,str(code)
 
                 elif i[0] == EAP:
-                    if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
+                    eap_payload_seen = True
+                    eap_code = i[1][0] if len(i[1]) > 0 else None
+                    eap_type = i[1][2] if len(i[1]) > 2 else None
+                    eap_subtype = i[1][3] if eap_type == EAP_AKA and len(i[1]) > 3 else None
+                    swu_log("received IKE_AUTH (1) EAP payload code=%s type=%s subtype=%s"
+                            % (eap_code, eap_type, eap_subtype))
+                    # RFC 7296 says the responder SHOULD reuse IKE IDi, but it explicitly
+                    # permits a generic EAP-Request/Identity and requires the initiator to
+                    # answer it. Some carrier AAA paths ask this before selecting EAP-AKA.
+                    # The old code accepted only Type 23 and misreported Type 1 as
+                    # "NO EAP PAYLOAD RECEIVED", so the SIM was never challenged.
+                    if eap_code == EAP_REQUEST and eap_type == EAP_IDENTITY:
+                        self.eap_identifier = i[1][1]
+                        identity = permanent_eap_identity(self.imsi, self.mcc, self.mnc)
+                        self.eap_payload_response = build_eap_identity_response(
+                                self.eap_identifier, identity)
+                        swu_log("answering EAP-Request/Identity with permanent NAI "
+                                "(value redacted)")
+                        return REPEAT_STATE, 'EAP IDENTITY REQUESTED'
+                    if eap_code == EAP_REQUEST and eap_type == EAP_AKA:
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
                             
                             eap_received = True
@@ -4338,15 +4381,13 @@ class swu():
                         elif i[1][3] in (AKA_Identity,):
                             
                       
-                            if i[1][4][0][0] in (AT_ANY_ID_REQ, AT_IDENTITY):
+                            if any(attribute and attribute[0] in (
+                                    AT_ANY_ID_REQ, AT_FULLAUTH_ID_REQ,
+                                    AT_PERMANENT_ID_REQ, AT_IDENTITY)
+                                   for attribute in i[1][4]):
                                 self.eap_identifier = i[1][1]
-                                identity = (
-                                        '0'
-                                        + self.imsi
-                                        + '@nai.epc.mnc' + self.mnc
-                                        + '.mcc' + self.mcc
-                                        + '.3gppnetwork.org'
-                                )
+                                identity = permanent_eap_identity(
+                                        self.imsi, self.mcc, self.mnc)
                                 self.eap_payload_response = (
                                         bytes([2])
                                         + bytes([self.eap_identifier])
@@ -4366,7 +4407,12 @@ class swu():
             if eap_received == True:
                 return OK,''               
             else:
-                return MANDATORY_INFORMATION_MISSING,'NO EAP PAYLOAD RECEIVED'              
+                detail = ('UNSUPPORTED EAP REQUEST RECEIVED' if eap_payload_seen
+                          else 'NO EAP PAYLOAD RECEIVED')
+                swu_log("IKE_AUTH (1) cannot continue: %s" % detail)
+                self.reject_reason_code = "no_eap_challenge"
+                self.reject_reason_policy = "backoff"
+                return MANDATORY_INFORMATION_MISSING,detail
             
         
     def state_3(self):
@@ -4379,6 +4425,7 @@ class swu():
 
         
         eap_received = False
+        eap_payload_seen = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (2)')              
             for i in self.decoded_payload[0][1]:
@@ -4390,8 +4437,22 @@ class swu():
                         return OTHER_ERROR,str(i[1][1])
 
                 elif i[0] == EAP:
+                    eap_payload_seen = True
+                    eap_code = i[1][0] if len(i[1]) > 0 else None
+                    eap_type = i[1][2] if len(i[1]) > 2 else None
+                    eap_subtype = i[1][3] if eap_type == EAP_AKA and len(i[1]) > 3 else None
+                    swu_log("received IKE_AUTH (2) EAP payload code=%s type=%s subtype=%s"
+                            % (eap_code, eap_type, eap_subtype))
+                    if eap_code == EAP_REQUEST and eap_type == EAP_IDENTITY:
+                        self.eap_identifier = i[1][1]
+                        identity = permanent_eap_identity(self.imsi, self.mcc, self.mnc)
+                        self.eap_payload_response = build_eap_identity_response(
+                                self.eap_identifier, identity)
+                        swu_log("answering EAP-Request/Identity with permanent NAI "
+                                "(value redacted)")
+                        return REPEAT_STATE, 'EAP IDENTITY REQUESTED'
                     eap_received = True
-                    if i[1][0] in (EAP_SUCCESS,):
+                    if eap_code == EAP_SUCCESS:
                     
                         hash = self.prf_function.get(self.negotiated_prf) 
                         h = hmac.HMAC(self.SK_PI,hash)
@@ -4407,7 +4468,7 @@ class swu():
                         h.update(self.AUTH_SA_INIT_packet)
                         self.AUTH_payload = h.finalize()                        
                         
-                    elif i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
+                    elif eap_code == EAP_REQUEST and eap_type == EAP_AKA:
                         if i[1][3] in (AKA_Challenge,):
                             
                             RAND = self.get_eap_aka_attribute_value(i[1][4],AT_RAND)
@@ -4468,7 +4529,7 @@ class swu():
                                 self.eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('0008170c0000') 
                                 return REPEAT_STATE, 'General_Failure'
                      
-                    elif i[1][0] in (EAP_FAILURE,):
+                    elif eap_code == EAP_FAILURE:
                         return OTHER_ERROR,'EAP FAILURE'                     
                      
                      
@@ -4479,7 +4540,12 @@ class swu():
             if eap_received == True:
                 return OK,''               
             else:
-                return MANDATORY_INFORMATION_MISSING,'NO EAP PAYLOAD RECEIVED'
+                detail = ('UNSUPPORTED EAP REQUEST RECEIVED' if eap_payload_seen
+                          else 'NO EAP PAYLOAD RECEIVED')
+                swu_log("IKE_AUTH (2) cannot continue: %s" % detail)
+                self.reject_reason_code = "no_eap_challenge"
+                self.reject_reason_policy = "backoff"
+                return MANDATORY_INFORMATION_MISSING,detail
         
 
 

@@ -21,6 +21,7 @@ const REASON_LABEL = {
   tunnel_rekey_send_error: 'Client failed to send IPsec rekey',
   tunnel_sim_auth: 'Client SIM authentication failed',
   tunnel_not_authorized: 'Server ePDG rejected client network/identity',
+  tunnel_no_eap: 'Server ePDG did not start a supported EAP exchange',
   tunnel_proposal: 'Server ePDG rejected client IKE proposal',
   tunnel_setup: 'Tunnel unavailable — exact cause not captured',
   registering: 'Client has not completed IMS registration',
@@ -39,6 +40,7 @@ const EVIDENCE_LABEL = {
   server_epdg_ike_unanswered: 'Server ePDG {peer} did not answer the client IKE request',
   client_sim_auth_failed: 'Client SIM did not complete EAP-AKA authentication with ePDG {peer}',
   server_epdg_identity_rejected: 'Server ePDG {peer} rejected the client network or identity',
+  server_epdg_eap_request_missing: 'Server ePDG {peer} answered IKE_AUTH without a supported EAP request',
   server_epdg_proposal_rejected: 'Server ePDG {peer} rejected the client IKE proposal',
   tunnel_cause_not_captured: 'The IPsec tunnel to ePDG {peer} was unavailable; no earlier failure evidence was captured',
   // Compatibility for records written before recovery actions stopped being used as causes.
