@@ -18,6 +18,9 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Changed
 
+- Replaced full-screen incoming-call overlays with an in-page Calls surface and a compact,
+  non-blocking cross-page call dock. Browser SIP sessions now stay mounted across navigation,
+  and active calls expose a responsive click/keyboard DTMF keypad without hiding the sidebar.
 - Based the VMware product on upstream v1.7.0 while retaining Feishu, IKE-SA rekey, native-reader
   recovery, Xray error reporting and notification routing. Migrated the platform-neutral UICC,
   identity, SMSC, egress, Fake-IP, CMLink UK, port-probing and shutdown fixes from the Windows fork.

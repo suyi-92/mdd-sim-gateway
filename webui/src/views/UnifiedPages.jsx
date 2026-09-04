@@ -365,7 +365,7 @@ function Discovering({ t }) {
     <p>{t('The gateway is reading the connected readers and modems. This takes a few seconds after a restart.')}</p></div>
 }
 
-export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevices, setView, showToast, instances, setSelectedDeviceId, setSelected, subscribe }) {
+export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevices, setView, showToast, instances, setSelectedDeviceId, setSelected, setCallSelected, subscribe }) {
   const { t } = useI18n()
   // The backend may already know the physical devices while its first card scan is still in
   // progress. Do not render those partial rows as authoritative "No SIM" results.
@@ -386,7 +386,7 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
         <div className="u-card-head"><div><h2>{deviceTitle(d, i)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
         <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
           <div className="u-details"><div className="u-detail"><span>{t('Carrier')}</span><b>{carrierLabel(d, t)}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t) || d.proxy_node || t('Not connected')} /></b></div></div>
-        </div><div className="u-card-foot"><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('calls') }}>{t('Call')}</button><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('messages') }}>{t('Message')}</button><button className="btn btn-primary" onClick={() => { setSelectedDeviceId(d.id); setView('devices') }}>{t('Details')}</button></div>
+        </div><div className="u-card-foot"><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setCallSelected(String(d.instance_id)); setView('calls') }}>{t('Call')}</button><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('messages') }}>{t('Message')}</button><button className="btn btn-primary" onClick={() => { setSelectedDeviceId(d.id); setView('devices') }}>{t('Details')}</button></div>
       </div>)}</div>}
   </div>
 }

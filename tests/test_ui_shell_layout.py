@@ -9,6 +9,8 @@ APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
 UNIFIED = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
 ALLOWANCE = (ROOT / "webui/src/views/AllowancePanel.jsx").read_text(encoding="utf-8")
 ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
+GLOBAL_PHONE = (ROOT / "webui/src/GlobalSoftphone.jsx").read_text(encoding="utf-8")
+CALL_SURFACE = (ROOT / "webui/src/CallSurface.jsx").read_text(encoding="utf-8")
 KEEPALIVE = (ROOT / "webui/src/views/Keepalive.jsx").read_text(encoding="utf-8")
 LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
 MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
@@ -134,7 +136,8 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("display:flex", content)
         self.assertIn("flex-direction:column", content)
         self.assertIn("overflow:hidden", content)
-        page = css_rule(".u-content-communication>.u-communication-page")
+        page = css_rule(
+            ".u-content-communication>.u-communication-page,.u-content-communication>.u-persistent-call-page")
         self.assertIn("min-height:0", page)
         self.assertIn("height:auto", page)
         self.assertIn("flex:1", page)
@@ -148,8 +151,33 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn(
             ".u-content.u-content-communication { display:block; overflow:auto; }", narrow)
         self.assertIn(
-            ".u-content-communication>.u-communication-page,.u-communication-page { height:auto; }",
+            ".u-content-communication>.u-communication-page,.u-content-communication>.u-persistent-call-page,.u-communication-page { height:auto; }",
             narrow)
+
+    def test_calls_stay_mounted_and_never_block_navigation_with_a_fullscreen_overlay(self):
+        self.assertIn("u-persistent-call-page", APP)
+        self.assertIn("pageVisible={view === 'calls'}", APP)
+        self.assertIn("excludedId={callSel?.id ?? null}", APP)
+        self.assertIn("const [callSelected, setCallSelected]", APP)
+        self.assertIn("selected={callSel} setSelected={setCallSelected}", APP)
+        self.assertIn('id="u-global-call-slot"', SOFTPHONE)
+        self.assertIn("createPortal", SOFTPHONE)
+        self.assertIn("setView?.('calls')", SOFTPHONE)
+        self.assertIn("createPortal", GLOBAL_PHONE)
+        self.assertNotIn("IncomingOverlay", SOFTPHONE)
+        self.assertNotIn('aria-modal="true"', GLOBAL_PHONE)
+        self.assertNotIn("position: 'fixed', inset: 0", GLOBAL_PHONE)
+        dock = css_rule(".u-call-dock-shell")
+        self.assertIn("pointer-events:none", dock)
+
+    def test_active_call_surface_has_click_and_keyboard_dtmf_at_all_widths(self):
+        self.assertIn("export const CALL_KEYS", CALL_SURFACE)
+        self.assertIn('className="u-call-dtmf-grid"', CALL_SURFACE)
+        self.assertIn("phone?.sendDTMF(tone)", GLOBAL_PHONE)
+        self.assertIn("window.addEventListener('keydown', onKey)", GLOBAL_PHONE)
+        self.assertIn("setKeypad(true)", SOFTPHONE)
+        self.assertIn("@container call-panel (max-width:340px)", CSS)
+        self.assertIn(".u-call-dock-shell { right:10px", CSS)
 
     def test_other_multi_button_async_controls_reserve_their_width(self):
         for class_name, source in (

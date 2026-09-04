@@ -1,16 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from './api.js'
 import { Softphone as Phone } from './softphone.js'
+import CallSurface from './CallSurface.jsx'
 import { useI18n } from './i18n.jsx'
-
-const GREEN = '#22c55e'
-const RED = '#ef4444'
 
 // Keep incoming-call registration independent of the page the administrator happens to be
 // viewing. The Calls page owns its selected line (it needs the same Phone for outbound calls),
 // while this hub owns every other enabled line. That gives every line exactly one browser
 // Contact and makes a call that was held by the engine appear immediately after sign-in.
-export default function GlobalSoftphone({ instances, excludedId, showToast }) {
+export default function GlobalSoftphone({
+  instances,
+  excludedId,
+  showToast,
+  embedded = false,
+  onIncoming,
+  onCallChange,
+  onOpenCalls,
+}) {
   const { t } = useI18n()
   const phones = useRef(new Map())
   const wanted = useRef(new Set())
@@ -18,11 +25,26 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
   const clearTimer = useRef(null)
   const [call, setCallState] = useState(null)
   const [muted, setMuted] = useState(false)
+  const [keypad, setKeypad] = useState(false)
+  const [dtmfSeq, setDtmfSeq] = useState('')
   const [duration, setDuration] = useState(0)
 
   const setCall = (next) => {
     callRef.current = typeof next === 'function' ? next(callRef.current) : next
     setCallState(callRef.current)
+  }
+  const finishCall = (id, endCause) => {
+    setCall((current) => current?.id === id
+      ? { ...current, state: 'ended', endCause: endCause || current.endCause } : current)
+    setMuted(false)
+    setKeypad(false)
+    setDtmfSeq('')
+    // JsSIP normally emits ended after a local reject/hangup, but the UI must also recover
+    // when that terminal event is lost during a websocket transition.
+    clearTimeout(clearTimer.current)
+    clearTimer.current = setTimeout(() => {
+      setCall((current) => current?.id === id && current.state === 'ended' ? null : current)
+    }, 1800)
   }
 
   // Only identity and display name matter here. Periodic status refreshes replace the instance
@@ -58,15 +80,18 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
             }
             clearTimeout(clearTimer.current)
             setMuted(false)
+            setKeypad(false)
+            setDtmfSeq('')
             setCall({ id, line: line.name || id, number: data?.from || t('Unknown'), state: 'incoming' })
+            onIncoming?.(id)
           } else if (type === 'active') {
+            setKeypad(true)
+            setDtmfSeq('')
             setCall((current) => current?.id === id
               ? { ...current, state: 'active', startedAt: current.startedAt || Date.now() } : current)
           } else if (type === 'ended' || type === 'failed') {
             if (callRef.current?.id !== id) return
-            setCall((current) => current ? { ...current, state: 'ended', endCause: data?.cause } : current)
-            setMuted(false)
-            clearTimer.current = setTimeout(() => setCall(null), 1800)
+            finishCall(id, data?.cause)
           } else if (type === 'audioblocked') {
             showToast?.(t('Browser blocked call audio. Click the page once and try again.'))
           }
@@ -84,17 +109,46 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
     phones.current.clear()
   }, [])
 
+  useEffect(() => { onCallChange?.(call) }, [call, onCallChange])
+
+  // Once a global call handed its line to the persistent Calls page, retain its Phone only
+  // for the lifetime of that call. Afterwards the page resumes sole ownership of the line.
+  useEffect(() => {
+    if (call) return
+    for (const [id, phone] of phones.current.entries()) {
+      if (!wanted.current.has(id)) {
+        phone.stop()
+        phones.current.delete(id)
+      }
+    }
+  }, [call, excludedId, lineKey])
+
   useEffect(() => {
     if (call?.state !== 'active' || !call.startedAt) { setDuration(0); return }
     const timer = setInterval(() => setDuration(Math.floor((Date.now() - call.startedAt) / 1000)), 500)
     return () => clearInterval(timer)
   }, [call?.state, call?.startedAt])
 
+  useEffect(() => {
+    if (!(keypad && call?.state === 'active')) return undefined
+    const onKey = (event) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || !/^[0-9*#]$/.test(event.key)) return
+      event.preventDefault()
+      const phone = phones.current.get(call.id)
+      phone?.sendDTMF(event.key)
+      setDtmfSeq((value) => (value + event.key).slice(-32))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [keypad, call?.state, call?.id])
+
   if (!call) return null
   const phone = phones.current.get(call.id)
   const answer = () => { phone?.unlockAudio(); phone?.answer() }
-  const decline = () => { phone?.reject(); setCall({ ...call, state: 'ended', endCause: 'Rejected' }) }
-  const hangup = () => { phone?.hangup(); setCall({ ...call, state: 'ended' }) }
+  const decline = () => {
+    phone?.reject(); finishCall(call.id, 'Rejected')
+  }
+  const hangup = () => { phone?.hangup(); finishCall(call.id) }
   const toggleMute = () => {
     const next = !muted
     setMuted(next)
@@ -102,40 +156,15 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
   }
   const clock = `${String(Math.floor(duration / 60)).padStart(2, '0')}:${String(duration % 60).padStart(2, '0')}`
 
-  return <div style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(6,10,20,0.86)',
-    backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-    <div className="card" role="dialog" aria-modal="true" style={{ padding: 40, width: 390, textAlign: 'center',
-      boxShadow: '0 20px 60px rgba(0,0,0,.65)' }}>
-      <div style={{ fontSize: 13, color: 'var(--text-mute)', letterSpacing: 1, textTransform: 'uppercase' }}>
-        {t(call.state === 'incoming' ? 'Incoming call' : call.state === 'active' ? 'Connected' : 'Call ended')}
-      </div>
-      <div style={{ margin: '24px auto', width: 104, height: 104, borderRadius: '50%', display: 'grid',
-        placeItems: 'center', background: `${call.state === 'active' ? GREEN : '#3b82f6'}22`,
-        color: call.state === 'active' ? GREEN : '#60a5fa', fontSize: 38, fontWeight: 800 }}>
-        {(call.number || '?').replace(/\D/g, '').slice(-2) || '?'}
-      </div>
-      <div className="mono" style={{ fontSize: 26, fontWeight: 800 }}>{call.number}</div>
-      <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 7 }}>{call.line}</div>
-      {call.state === 'active' && <div className="mono" style={{ color: GREEN, marginTop: 12 }}>{clock}</div>}
-
-      {call.state === 'incoming' && <div style={{ display: 'flex', justifyContent: 'center', gap: 56, marginTop: 34 }}>
-        <ActionButton label={t('Decline')} icon="✕" color={RED} onClick={decline} />
-        <ActionButton label={t('Answer')} icon="✆" color={GREEN} onClick={answer} pulse />
-      </div>}
-      {call.state === 'active' && <div style={{ display: 'flex', justifyContent: 'center', gap: 42, marginTop: 34 }}>
-        <ActionButton label={t(muted ? 'Unmute' : 'Mute')} icon={muted ? '🔇' : '🎙'} color="#3b82f6" onClick={toggleMute} />
-        <ActionButton label={t('Hangup')} icon="✕" color={RED} onClick={hangup} />
-      </div>}
-      {call.state === 'ended' && <div style={{ color: 'var(--text-mute)', marginTop: 28 }}>{t('Call ended')}</div>}
-    </div>
-    <style>{`@keyframes global-ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
-  </div>
-}
-
-function ActionButton({ label, icon, color, onClick, pulse = false }) {
-  return <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
-    <button onClick={onClick} style={{ width: 68, height: 68, borderRadius: '50%', border: 'none', cursor: 'pointer',
-      fontSize: 26, background: color, color: '#fff', animation: pulse ? 'global-ringpulse 1.4s infinite' : 'none' }}>{icon}</button>
-    <span style={{ fontSize: 13, color: 'var(--text-soft)' }}>{label}</span>
-  </div>
+  const pressTone = (tone) => {
+    phone?.sendDTMF(tone)
+    setDtmfSeq((value) => (value + tone).slice(-32))
+  }
+  const surface = <CallSurface call={call} line={call.line} duration={clock} muted={muted}
+    keypad={keypad} dtmfSeq={dtmfSeq} embedded={embedded}
+    onAnswer={answer} onDecline={decline} onHangup={hangup} onToggleMute={toggleMute}
+    onToggleKeypad={() => setKeypad((value) => !value)} onTone={pressTone}
+    onOpenCalls={onOpenCalls} t={t} />
+  const slot = embedded ? document.getElementById('u-global-call-slot') : null
+  return slot ? createPortal(surface, slot) : <div className="u-call-dock-shell">{surface}</div>
 }

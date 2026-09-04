@@ -3,7 +3,8 @@ import { useI18n } from '../i18n.jsx'
 
 // Per-page SIM/line picker for multi-SIM setups. Labels each line with the physical reader
 // it currently occupies (from the detected-cards state) so it's clear which reader's engine
-// (docker container) will handle calls/SMS/logs. Switches the global `selected` instance.
+// (docker container) will handle calls/SMS/logs. Calls and Messages provide independent
+// selected-line state so switching a messaging line cannot tear down an active phone session.
 //
 // Only lines whose physical reader is currently PRESENT are listed — a provisioned line
 // whose reader/card is unplugged is dropped from the dropdown (its config stays under SIM

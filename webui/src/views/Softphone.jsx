@@ -1,15 +1,14 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from '../api.js'
 import { Softphone as Phone } from '../softphone.js'
+import CallSurface, { CALL_KEYS } from '../CallSurface.jsx'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
   ordinaryCallEndIsFailure, ordinaryCallEndLabel } from '../call-status.js'
 
 const GREEN = '#22c55e', RED = '#ef4444'
-const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
-  ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', ''], ['#', '']]
-
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
 function VoicemailRow({ instanceId, voicemail, open, onOpen, onHeard, onDelete, t }) {
@@ -110,7 +109,20 @@ function RoundBtn({ icon, label, color, bg, onClick, active }) {
   )
 }
 
-export default function Softphone({ selected, subscribe, instances, cards, devices, setSelected, showToast, initialLoading, loadErrors }) {
+export default function Softphone({
+  selected,
+  subscribe,
+  instances,
+  cards,
+  devices,
+  setSelected,
+  showToast,
+  initialLoading,
+  loadErrors,
+  pageVisible = true,
+  globalCallLineId = null,
+  setView,
+}) {
   const { t } = useI18n()
   const id = selected?.id
   const [prov, setProv] = useState(null)
@@ -139,6 +151,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // Persistent, DOM-rendered <audio> sink. One stable element (primed on the first click via
   // unlockAudio) is what makes remote WebRTC audio play under Chrome/Edge autoplay policy.
   const audioRef = useRef(null)
+  const externallyOwnedCall = Boolean(id && globalCallLineId !== null
+    && String(globalCallLineId) === String(id))
   const selectedDevice = devices.find((device) => device.present === true
     && device.device_type === 'modem'
     && String(device.instance_id || '') === String(id || ''))
@@ -260,9 +274,14 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     catch (e) { toast('Delete failed: ' + e.message) }
   }
 
-  // provisioning + connect (only while this page is mounted => only listens for incoming here)
+  // This component stays mounted across navigation so its selected-line SIP session and active
+  // call survive page switches. A call first received by GlobalSoftphone temporarily owns that
+  // line; do not create a second browser Contact until the handed-off call ends.
   useEffect(() => {
-    if (!id) return
+    if (!id || externallyOwnedCall) {
+      setProv(null); setReg(externallyOwnedCall ? 'idle' : 'loading'); setCall(null)
+      return undefined
+    }
     let alive = true
     registeredOnce.current = false
     setProv(null); setReg('loading'); setCall(null)
@@ -272,7 +291,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       if (!p?.enabled) setReg('idle')
     }).catch(() => { if (alive) setReg('failed') })
     return () => { alive = false; if (phone.current) { phone.current.stop(); phone.current = null } }
-  }, [id])
+  }, [id, externallyOwnedCall])
 
   const clearCallSoon = (endCause) => {
     setCall((c) => c ? { ...c, state: 'ended', endCause } : null)
@@ -339,14 +358,20 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       }
       else if (type === 'ws') setReg((r) => data === 'connected' ? (r === 'registered' ? r : 'connecting') : 'disconnected')
       else if (type === 'regfail') setReg('failed')
-      else if (type === 'incoming') setCall({ dir: 'in', number: data.from || 'Unknown', state: 'incoming', transport: 'vowifi' })
+      else if (type === 'incoming') {
+        setCall({ dir: 'in', number: data.from || 'Unknown', state: 'incoming', transport: 'vowifi' })
+        setView?.('calls')
+      }
       else if (type === 'calling') setCall({ dir: 'out', number: data.to, state: 'calling', transport: 'vowifi', serviceCode: isServiceCode(data.to) })
       // 'progress' fires for BOTH directions. On an incoming call JsSIP auto-sends 180 and
       // emits progress('local'); mapping that to 'ringing' would blow away the 'incoming'
-      // state and hide the Answer/Decline overlay. Only an OUTGOING call still in the
+      // state and hide the embedded Answer/Decline controls. Only an OUTGOING call still in the
       // dialing/ringing phase should advance to 'ringing' — leave incoming/active/ended alone.
       else if (type === 'progress') setCall((c) => (c && c.dir === 'out' && (c.state === 'calling' || c.state === 'ringing')) ? { ...c, state: 'ringing' } : c)
-      else if (type === 'active') setCall((c) => c ? { ...c, state: 'active', startedAt: Date.now() } : c)
+      else if (type === 'active') {
+        setKeypad(true); setDtmfSeq('')
+        setCall((c) => c ? { ...c, state: 'active', startedAt: Date.now() } : c)
+      }
       else if (type === 'ended') clearCallSoon(data && data.cause)
       else if (type === 'failed') clearCallSoon(data && data.cause)
     }, audioRef.current)
@@ -549,35 +574,21 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const displayedEndFailed = call?.serviceCode
     ? Boolean(backendVerdict && backendVerdict !== 'code accepted')
     : ordinaryEndFailed
-
-  // Google-Voice-style incoming-call overlay (prominent, full-panel)
-  const IncomingOverlay = call?.state === 'incoming' ? (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(6,10,20,0.82)',
-      backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div className="card" style={{ padding: 40, width: 380, textAlign: 'center',
-        boxShadow: '0 20px 60px rgba(0,0,0,.6)', animation: 'none' }}>
-        <div style={{ fontSize: 13, color: 'var(--text-mute)', letterSpacing: 1, textTransform: 'uppercase' }}>{t('Incoming call')}</div>
-        <div style={{ margin: '22px 0' }}><Avatar label={call.number} color={GREEN} size={110} /></div>
-        <div className="mono" style={{ fontSize: 26, fontWeight: 800 }}>{call.number || 'Unknown'}</div>
-        <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 6 }}>{selected?.name || 'VoWiFi line'}</div>
-        <div style={{ display: 'flex', justifyContent: 'center', gap: 56, marginTop: 34 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
-            <button onClick={decline} style={{ width: 68, height: 68, borderRadius: '50%', border: 'none',
-              cursor: 'pointer', fontSize: 26, background: RED, color: '#fff' }}>✕</button>
-            <span style={{ fontSize: 13, color: 'var(--text-soft)' }}>{t('Decline')}</span>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
-            <button onClick={answer} style={{ width: 68, height: 68, borderRadius: '50%', border: 'none',
-              cursor: 'pointer', fontSize: 26, background: GREEN, color: '#fff',
-              boxShadow: `0 0 0 0 ${GREEN}`, animation: 'ringpulse 1.4s infinite' }}>✆</button>
-            <span style={{ fontSize: 13, color: 'var(--text-soft)' }}>{t('Answer')}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  ) : null
+  const floatingCall = !pageVisible && call && call.state !== 'ended'
+    ? createPortal(
+      <div className="u-call-dock-shell">
+        <CallSurface call={call} line={selected?.name} duration={fmtDur(dur)} muted={muted}
+          keypad={keypad} dtmfSeq={dtmfSeq}
+          canDtmf={call.transport !== 'cellular' && !call.serviceCode}
+          onAnswer={answer} onDecline={decline} onHangup={hangup} onToggleMute={toggleMute}
+          onToggleKeypad={() => setKeypad((value) => !value)} onTone={pressDTMF}
+          onOpenCalls={() => setView?.('calls')} t={t} />
+      </div>,
+      document.body,
+    ) : null
 
   return (
+    <>
     <div className="u-communication-page">
       {/* Persistent remote-audio sink: JsSIP writes the remote MediaStream here. autoPlay +
           a stable DOM element + unlockAudio() on the first click = reliable playback. */}
@@ -586,7 +597,6 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
       <div className="u-call-layout">
-      {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
       <div className="card u-phone-panel" style={{ padding: 24, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
@@ -611,6 +621,9 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           </div>
         </div>
 
+        <div id="u-global-call-slot"
+          className={`u-global-call-slot${externallyOwnedCall ? ' is-active' : ''}`} />
+        {!externallyOwnedCall && <>
         {/* Say it before a call is attempted, not after one silently fails: the failure mode
             is a screen that runs its full course and then blames the carrier. */}
         {callTransport === 'vowifi' && !WEBRTC_AVAILABLE && (
@@ -628,7 +641,11 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           {t('Experimental signalling only: the modem can dial and hang up, but browser audio, microphone, DTMF and recording are unavailable. The called party may still answer and charges may apply.')}
         </div>}
 
-        {/* ===== INCOMING handled by full-screen overlay above ===== */}
+        {/* ===== INCOMING, kept inside the phone panel so navigation remains available ===== */}
+        {call?.state === 'incoming' && (
+          <CallSurface call={call} line={selected?.name} embedded t={t}
+            onAnswer={answer} onDecline={decline} onHangup={hangup} />
+        )}
 
         {/* ===== OUTGOING RINGING ===== */}
         {(call?.state === 'calling' || call?.state === 'ringing') && (
@@ -665,10 +682,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   background: 'var(--surface-2, rgba(255,255,255,0.06))', border: '1px solid var(--border, rgba(255,255,255,0.12))',
                   fontSize: 20, letterSpacing: 2, textAlign: 'center', overflow: 'hidden', whiteSpace: 'nowrap',
                   direction: 'rtl', color: dtmfSeq ? 'var(--text)' : 'var(--text-mute)' }}>
-                  {dtmfSeq || 'Type or tap keys'}
+                  {dtmfSeq || t('Type or tap keys')}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
-                  {KEYS.map(([k]) => (
+                  {CALL_KEYS.map(([k]) => (
                     <button key={k} className="btn btn-ghost" style={{ padding: 12, fontSize: 18 }}
                       onClick={() => pressDTMF(k)}>{k}</button>
                   ))}
@@ -760,7 +777,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             <input value={num} onChange={(e) => setNum(e.target.value)} placeholder={t('Enter a number')}
               className="mono" style={{ fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1, border: 'none', background: 'transparent' }} />
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
-              {KEYS.map(([k, sub]) => (
+              {CALL_KEYS.map(([k, sub]) => (
                 <button key={k} onClick={() => dialKey(k)} style={{
                   padding: '10px 0', borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
                   border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column', alignItems: 'center',
@@ -784,6 +801,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             </div>
           </div>
         )}
+        </>}
       </div>
 
       {/* ---- Recent calls ---- */}
@@ -860,5 +878,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       </div>
       </div>
     </div>
+    {floatingCall}
+    </>
   )
 }

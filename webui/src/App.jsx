@@ -104,6 +104,8 @@ export default function App() {
   const [initialLoading, setInitialLoading] = useState(true)
   const [loadErrors, setLoadErrors] = useState({})
   const [selected, setSelected] = useState(null); const [toast, setToast] = useState(null)
+  const [callSelected, setCallSelected] = useState(null)
+  const [globalCallLineId, setGlobalCallLineId] = useState(null)
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'auto')
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
@@ -125,6 +127,16 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
   const showToast = useCallback((message) => { clearTimeout(toastTimer.current); setToast({ message, id: Date.now() }); toastTimer.current=setTimeout(()=>setToast(null),5000) }, [])
+  const openGlobalCall = useCallback((id) => {
+    if (id !== null && id !== undefined) {
+      setGlobalCallLineId(String(id))
+      setCallSelected(String(id))
+    }
+    setView('calls')
+  }, [])
+  const trackGlobalCall = useCallback((call) => {
+    setGlobalCallLineId(call?.id ?? null)
+  }, [])
   const expireAuth=useCallback(()=>{
     setCsrf('')
     setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))
@@ -151,6 +163,7 @@ export default function App() {
         // device must never silently put the first unrelated saved SIM into its edit/delete
         // form. Calls and Messages select their first live line in SimSelector instead.
         setSelected(s => s && nextInstances.some(item => String(item.id) === String(s)) ? s : null)
+        setCallSelected(s => s && nextInstances.some(item => String(item.id) === String(s)) ? s : null)
       }
       if (nextCards) setCards(nextCards)
       if (devicesResult.status === 'fulfilled') {
@@ -199,10 +212,11 @@ export default function App() {
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>
   if (!authState.authenticated) return <AuthScreen configured={authState.configured} accountUsername={authState.username} t={t} onDone={result=>{setCsrf(result.csrf);setAuthState(s=>({...s,configured:true,authenticated:true,csrf:result.csrf}))}} />
-  const sel=instances.find(i=>i.id===selected)
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,setSystemMeta}
+  const sel=instances.find(i=>String(i.id)===String(selected))
+  const callSel=instances.find(i=>String(i.id)===String(callSelected))
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,setSystemMeta}
   const content={
-    overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
+    overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>,
     messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,
     egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
@@ -210,7 +224,10 @@ export default function App() {
   const communicationView = view === 'calls' || view === 'messages'
   const issueUrl = `${(systemMeta.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`
   return <div className="u-shell">
-    <GlobalSoftphone instances={instances} excludedId={view === 'calls' ? sel?.id : null} showToast={showToast} />
+    <GlobalSoftphone instances={instances} excludedId={callSel?.id ?? null} showToast={showToast}
+      embedded={view === 'calls' && String(globalCallLineId) === String(callSel?.id)}
+      onIncoming={openGlobalCall} onOpenCalls={() => openGlobalCall(globalCallLineId)}
+      onCallChange={trackGlobalCall} />
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
       <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}</button>)}</nav>
@@ -218,7 +235,7 @@ export default function App() {
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div>{content}</div></main>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>{view !== 'calls' && content}</div></main>
     {toast&&<div className="u-toast" key={toast.id} role="status">{toast.message}</div>}
   </div>
 }
