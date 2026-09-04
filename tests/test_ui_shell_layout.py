@@ -43,6 +43,14 @@ class SidebarLayoutTests(unittest.TestCase):
         rule = CSS[sidebar:CSS.index("}", sidebar)]
         self.assertIn("height:100dvh", rule)
 
+    def test_unplugged_hardware_is_not_counted_as_a_live_device(self):
+        self.assertIn("export const physicallyPresentDevices", UNIFIED)
+        self.assertIn("device?.present !== false", UNIFIED)
+        self.assertIn("visibleDevices.map", UNIFIED)
+        self.assertIn("devices: visibleDevices.length", UNIFIED)
+        self.assertIn("const presentDeviceCount=physicallyPresentDevices(devices).length", APP)
+        self.assertIn("`${presentDeviceCount} ${t(presentDeviceCount === 1", APP)
+
 
 class PageRhythmTests(unittest.TestCase):
     def test_compliance_notice_has_its_own_spacing_before_every_page(self):

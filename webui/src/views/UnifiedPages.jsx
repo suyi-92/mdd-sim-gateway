@@ -300,6 +300,14 @@ function deviceIdentityLine(d, t) {
   return `${simName(d, t)} · ${number || t('SIM detected')}`
 }
 
+// The unified endpoint also returns remembered hardware so the Devices page can restore or
+// forget it safely. Operational surfaces must only count hardware that this scan actually
+// sees; otherwise an unplugged modem remains on the Overview indefinitely and inflates the
+// sidebar device count.
+export const physicallyPresentDevices = (devices = []) => devices.filter(
+  (device) => device?.present !== false,
+)
+
 function HardwarePanel({ device, refreshDevices, showToast }) {
   const { t } = useI18n()
   const [imei, setImei] = useState(device.imei || '')
@@ -370,19 +378,20 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
   // The backend may already know the physical devices while its first card scan is still in
   // progress. Do not render those partial rows as authoritative "No SIM" results.
   const pending = discovering
+  const visibleDevices = useMemo(() => physicallyPresentDevices(devices), [devices])
   const counts = useMemo(() => ({
-    devices: devices.length,
-    cellular: devices.filter(d => capability(d, 'cellular').actual === 'on').length,
-    vowifi: devices.filter(d => capability(d, 'vowifi').actual === 'on').length,
-    attention: devices.filter(d => ['error', 'degraded'].includes(capability(d, 'cellular').actual) || ['error', 'degraded'].includes(capability(d, 'vowifi').actual)).length,
-  }), [devices])
+    devices: visibleDevices.length,
+    cellular: visibleDevices.filter(d => capability(d, 'cellular').actual === 'on').length,
+    vowifi: visibleDevices.filter(d => capability(d, 'vowifi').actual === 'on').length,
+    attention: visibleDevices.filter(d => ['error', 'degraded'].includes(capability(d, 'cellular').actual) || ['error', 'degraded'].includes(capability(d, 'vowifi').actual)).length,
+  }), [visibleDevices])
   return <div className="u-page">
     <div className="u-metrics">
       {[[t('Devices'), counts.devices], [t('Cellular data online'), counts.cellular], [t('VoWiFi online'), counts.vowifi], [t('Needs attention'), counts.attention]].map(([l,v]) => <div className="u-metric" key={l}><span>{l}</span><strong>{pending ? '—' : v}</strong></div>)}
     </div>
-    {loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : pending ? <Discovering t={t} /> :
-      !devices.length ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> :
-      <div className="u-device-grid">{devices.map((d, i) => <div className="card u-device-card" key={d.id}>
+    {loadErrors?.devices && !visibleDevices.length ? <p className="u-error">{t('Loading failed')}</p> : pending ? <Discovering t={t} /> :
+      !visibleDevices.length ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> :
+      <div className="u-device-grid">{visibleDevices.map((d, i) => <div className="card u-device-card" key={d.id}>
         <div className="u-card-head"><div><h2>{deviceTitle(d, i)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
         <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
           <div className="u-details"><div className="u-detail"><span>{t('Carrier')}</span><b>{carrierLabel(d, t)}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t) || d.proxy_node || t('Not connected')} /></b></div></div>

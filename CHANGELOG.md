@@ -18,6 +18,9 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Changed
 
+- Overview cards and sidebar device totals now include only physically present hardware;
+  remembered unplugged devices remain available solely in device management for safe removal
+  or automatic restoration after reconnecting.
 - Replaced full-screen incoming-call overlays with an in-page Calls surface and a compact,
   non-blocking cross-page call dock. Browser SIP sessions now stay mounted across navigation,
   and active calls expose a responsive click/keyboard DTMF keypad without hiding the sidebar.
