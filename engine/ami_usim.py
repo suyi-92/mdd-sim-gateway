@@ -440,6 +440,7 @@ def verify_pin(connection):
 
 
 def read_res_ck_ik(reader_spec, rand, autn):
+    started = time.monotonic()
     res = ck = ik = auts = None
     conn = open_usim(reader_spec)
     if conn is None:
@@ -482,10 +483,12 @@ def read_res_ck_ik(reader_spec, rand, autn):
                     ik_length = data[2 + res_length + 1 + ck_length]
                     ik = result[(8 + res_length * 2 + ck_length * 2):
                                 (8 + res_length * 2 + ck_length * 2 + ik_length * 2)]
-                    write_status(state="AUTH_OK")
+                    write_status(state="AUTH_OK",
+                                 duration_ms=round((time.monotonic() - started) * 1000))
                 elif rc == "DC":  # sync failure -> AUTS
                     auts = result[4:32]
-                    write_status(state="AUTH_SYNC")
+                    write_status(state="AUTH_SYNC",
+                                 duration_ms=round((time.monotonic() - started) * 1000))
             else:
                 print(f"Authentication failed sw={sw1:02x}{sw2:02x}", flush=True)
                 write_status(state="AUTH_FAIL", detail=f"sw={sw1:02x}{sw2:02x}")
@@ -532,7 +535,10 @@ def main():
         rand = message.RAND
         autn = message.AUTN
         print(f"AuthRequest: Algorithm={algo}")
+        started = time.monotonic()
         res, ck, ik, auts = read_res_ck_ik(cfg_reader, rand, autn)
+        print("SIM authentication response prepared in %d ms" %
+              round((time.monotonic() - started) * 1000), flush=True)
         if res is not None:
             manager.send_action({"Action": "AuthResponse", "Registration": cfg_endpoint,
                                  "RES": res, "CK": ck, "IK": ik})

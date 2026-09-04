@@ -120,6 +120,41 @@ class AsteriskModulePolicyTests(unittest.TestCase):
         self.assertIn('multiprocessing.set_start_method("fork", force=True)', swu)
 
 
+class SimAuthenticationTimeoutPatchTests(unittest.TestCase):
+    PATCHER = (Path(__file__).resolve().parent.parent / "engine" / "patches" / "asterisk"
+               / "sim_auth_timeout.py")
+
+    def _apply(self, source):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "res" / "res_pjsip_outbound_registration.c"
+            target.parent.mkdir(parents=True)
+            target.write_text(source)
+            first = subprocess.run(
+                [sys.executable, str(self.PATCHER)],
+                env={**os.environ, "AST_SRC": temp}, capture_output=True, text=True)
+            patched = target.read_text()
+            second = subprocess.run(
+                [sys.executable, str(self.PATCHER)],
+                env={**os.environ, "AST_SRC": temp}, capture_output=True, text=True)
+            return first, patched, second, target.read_text()
+
+    def test_serial_euicc_gets_a_bounded_eight_second_window(self):
+        first, patched, second, twice = self._apply(
+            "before\n#define SIM_TIMEOUT 3\nafter\n")
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("#define SIM_TIMEOUT 8 /* PATCH sim_auth_timeout */", patched)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(twice, patched)
+
+    def test_upstream_timeout_change_fails_the_engine_build(self):
+        first, _patched, _second, _twice = self._apply(
+            "before\n#define SIM_TIMEOUT 5\nafter\n")
+
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("expected one unpatched SIM_TIMEOUT", first.stderr)
+
+
 class RegisteredIdentityLogTests(unittest.TestCase):
     """Reading a line's phone number must not require SIP tracing or an extra REGISTER.
 

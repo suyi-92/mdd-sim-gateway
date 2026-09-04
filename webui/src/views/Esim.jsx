@@ -37,6 +37,27 @@ function isNoCardError(msg) {
   return /SCARD_E_NO_SMARTCARD|SCARD_W_REMOVED_CARD|no smart ?card|card (is )?(absent|removed|not present)|SCardConnect/i.test(s)
 }
 
+function modemReaderGroup(name) {
+  const match = String(name || '').match(/^(VoWiFi Modem .+?)\s+\d{2}\s+\d{2}$/)
+  return match?.[1] || ''
+}
+
+/** One modem exposes three active VPCD readers plus a driver spare. They all address one
+ * physical eUICC, so offering each as a separate download target invites duplicate installs. */
+function collapseEsimReaders(cards) {
+  const groups = new Map()
+  for (const card of cards.filter((c) => c.present)) {
+    const modem = modemReaderGroup(card.name)
+    const key = modem ? `modem:${modem}` : `reader:${card.name}`
+    const current = groups.get(key)
+    if (!current || (!current.iccid && card.iccid)
+      || (!!current.iccid === !!card.iccid && (card.index ?? 0) < (current.index ?? 0))) {
+      groups.set(key, card)
+    }
+  }
+  return [...groups.values()].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+}
+
 function copyText(text, showToast, t) {
   if (!text) return
   navigator.clipboard?.writeText(text).then(
@@ -405,7 +426,7 @@ function isLineRunning(inst) {
 export default function Esim({ cards, instances, refresh, subscribe, showToast, initialLoading, loadErrors }) {
   const { t } = useI18n()
   const present = useMemo(
-    () => [...cards].filter((c) => c.present).sort((a, b) => (a.index ?? 0) - (b.index ?? 0)),
+    () => collapseEsimReaders(cards),
     [cards],
   )
   const [reader, setReader] = useState('')
@@ -710,7 +731,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
           <select value={reader} onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
             {present.map((c) => (
               <option key={c.name} value={c.name}>
-                #{c.index} · {c.name}{c.iccid ? ` · ${c.iccid}` : ''}
+                #{c.index} · {modemReaderGroup(c.name) || c.name}{c.iccid ? ` · ${c.iccid}` : ''}
               </option>
             ))}
           </select>

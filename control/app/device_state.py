@@ -23,13 +23,19 @@ DEVICE_STATE_VERSION = 3
 DEFAULT_CAPABILITIES = {"cellular_enabled": False, "vowifi_enabled": True,
                         "flight_mode": True}
 
-_VPCD_MODEM_RE = re.compile(r"^VoWiFi Modem (.+?)\s+\d{2}\s+\d{2}$")
+_VPCD_MODEM_RE = re.compile(r"^VoWiFi Modem (.+?)\s+(\d{2})\s+(\d{2})$")
 
 
 def vpcd_modem_hardware_id(reader_name: str | None) -> str:
     """Extract the physical modem id embedded in an orchestrator VPCD reader name."""
     match = _VPCD_MODEM_RE.fullmatch(str(reader_name or "").strip())
     return match.group(1) if match else ""
+
+
+def vpcd_modem_reader_slot(reader_name: str | None) -> int | None:
+    """Return the VPCD slot suffix for one generated modem reader."""
+    match = _VPCD_MODEM_RE.fullmatch(str(reader_name or "").strip())
+    return int(match.group(3)) if match else None
 
 
 def native_reader_devices(cards: list[dict]) -> dict[str, dict]:

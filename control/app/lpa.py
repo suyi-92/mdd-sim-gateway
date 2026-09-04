@@ -51,6 +51,9 @@ class LpaError(Exception):
             return "Operation cancelled."
         if "timed out" in msg:
             return "eSIM operation timed out. Try again."
+        if "install_failed_due_to_iccid_already_exists_on_euicc" in detail_s.lower():
+            return ("This eSIM profile is already installed on this eUICC. "
+                    "Refresh the profile list instead of downloading it again.")
         if detail_s:
             return f"{self.message}: {detail_s}"
         return f"eUICC operation failed ({self.message})."

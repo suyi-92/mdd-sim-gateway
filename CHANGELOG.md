@@ -35,6 +35,12 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Fixed
 
+- Fixed modem eSIM switches falsely failing on libifdvpcd's unbacked spare reader, collapsed
+  one modem's logical VPCD readers into a single download target, and explained duplicate ICCIDs
+  as an already-installed profile instead of a generic package-load failure.
+- Increased the bounded IMS-AKA response window for serial-backed eUICCs and retained each
+  authentication duration, preventing EC25 AT+CSIM latency from intermittently missing the
+  original three-second Asterisk deadline.
 - Fixed UICC `61xx`/`9Fxx` continuation and `6Cxx` length correction, nested EF_DIR handling and
   strict shared USIM AID selection across PIN, IKE and SIP paths.
 - Fixed stale-disabled eSIM activation, Fake-IP ePDG pinning and browser SDP filtering, real

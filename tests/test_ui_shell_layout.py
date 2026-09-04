@@ -78,6 +78,11 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("grid-template-columns:max-content minmax(0,1fr)", css_rule(".u-inline-field"))
         self.assertIn("minmax(0,680px)", css_rule(".u-line-selector"))
 
+    def test_esim_reader_selector_collapses_one_modems_logical_slots(self):
+        self.assertIn("function collapseEsimReaders(cards)", ESIM)
+        self.assertIn("const key = modem ? `modem:${modem}`", ESIM)
+        self.assertIn("() => collapseEsimReaders(cards)", ESIM)
+
     def test_timezone_is_a_single_choice_of_common_regions_and_preserves_custom_values(self):
         self.assertIn("const COMMON_TIMEZONES = [", UNIFIED)
         self.assertIn('<select id="system-timezone"', UNIFIED)

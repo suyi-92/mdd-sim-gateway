@@ -2909,20 +2909,57 @@ def _esim_switch_identity(name: str) -> tuple[str, str]:
     return (hardware_id or f"reader:{name}", hardware_id)
 
 
-def _esim_modem_reader_names(name: str, hardware_id: str) -> list[str]:
-    """All generated VPCD readers for one physical modem, in current PC/SC order."""
+def _esim_modem_reader_names(
+    name: str,
+    hardware_id: str,
+    available: list[str] | None = None,
+) -> list[str]:
+    """Active generated VPCD readers for one physical modem, in PC/SC order.
+
+    libifdvpcd is deliberately built with one spare slot, while the EC25 bridge allocates
+    only the three logical channels published in its identity document.  pcscd still lists
+    that spare reader (``00 03``), but it has no bridge socket/card behind it and must not
+    make a completed profile switch fail its all-channel identity check.
+    """
     if not hardware_id:
         return [name]
-    names = []
-    try:
-        names = [reader for reader in sim.list_readers()
-                 if device_state.vpcd_modem_hardware_id(reader) == hardware_id]
-    except Exception:  # noqa
-        pass
-    for reader in hub.cards:
-        if (device_state.vpcd_modem_hardware_id(reader) == hardware_id
-                and reader not in names):
-            names.append(reader)
+    identity = _modem_identity_for_reader(name) or {}
+    active_slots = set()
+    for item in identity.get("logical_channels") or []:
+        try:
+            slot = int(item.get("slot"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if 0 <= slot < 3:
+            active_slots.add(slot)
+    if not active_slots:
+        try:
+            # A generated reader name can survive briefly before its bridge identity file.
+            # _modem_identity_for_reader then returns the conservative UI fallback slots=1;
+            # it is not an observed bridge limit, so keep all three possible live readers.
+            observed = identity.get("channel_allocated")
+            if observed is None and identity.get("channel_status"):
+                observed = identity.get("slots")
+            count = int(observed or 3)
+        except (TypeError, ValueError):
+            count = 3
+        active_slots = set(range(max(1, min(3, count))))
+
+    def active(reader: str) -> bool:
+        return (device_state.vpcd_modem_hardware_id(reader) == hardware_id
+                and device_state.vpcd_modem_reader_slot(reader) in active_slots)
+
+    if available is None:
+        names = []
+        try:
+            names = [reader for reader in sim.list_readers() if active(reader)]
+        except Exception:  # noqa
+            pass
+        for reader in hub.cards:
+            if active(reader) and reader not in names:
+                names.append(reader)
+    else:
+        names = [reader for reader in available if active(reader)]
     return names or [name]
 
 
@@ -3061,8 +3098,9 @@ async def _esim_refresh_modem_readers(
     for _attempt in range(max(1, ESIM_CARD_REFRESH_ATTEMPTS)):
         try:
             readers = await asyncio.to_thread(sim.list_readers)
-            siblings = [reader for reader in readers
-                        if device_state.vpcd_modem_hardware_id(reader) == hardware_id]
+            active_names = set(await asyncio.to_thread(
+                _esim_modem_reader_names, name, hardware_id, readers))
+            siblings = [reader for reader in readers if reader in active_names]
             if not siblings:
                 raise RuntimeError("replacement VPCD readers are not enumerated")
             refreshed = []

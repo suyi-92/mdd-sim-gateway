@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from control.app import main
+from control.app import device_state, main
 from host import mdd_orchestrator, vpcd_modem_bridge
 from host.mdd_orchestrator import Orchestrator
 
@@ -96,6 +96,30 @@ class BridgeRestartHandshakeTests(unittest.TestCase):
 
 
 class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
+    def test_modem_reader_list_ignores_the_driver_spare_slot(self):
+        readers = [
+            "VoWiFi Modem modem-1 00 00",
+            "VoWiFi Modem modem-1 00 01",
+            "VoWiFi Modem modem-1 00 02",
+            "VoWiFi Modem modem-1 00 03",
+        ]
+        identity = {
+            "hardware_id": "modem-1", "channel_allocated": 3,
+            "logical_channels": [
+                {"slot": 0, "channel": 1, "role": "pin"},
+                {"slot": 1, "channel": 2, "role": "swu"},
+                {"slot": 2, "channel": 3, "role": "ims"},
+            ],
+        }
+        with patch.object(main, "_modem_identity_for_reader", return_value=identity), \
+                patch.object(main.sim, "list_readers", return_value=readers), \
+                patch.object(main.hub, "cards", {}):
+            active = main._esim_modem_reader_names(readers[0], "modem-1")
+
+        self.assertEqual(active, readers[:3])
+        self.assertEqual(device_state.vpcd_modem_reader_slot(readers[2]), 2)
+        self.assertEqual(device_state.vpcd_modem_reader_slot("SCR Prime 00 00"), None)
+
     def test_legacy_line_is_scoped_from_its_live_modem_match(self):
         reader = "VoWiFi Modem modem-1 00 00"
         with patch.object(main.hub, "cards", {
@@ -129,6 +153,44 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["iccid"], "profile-target")
         self.assertEqual(refreshed, readers)
         self.assertEqual({card["iccid"] for card in cards.values()}, {"profile-target"})
+
+    async def test_refresh_does_not_probe_the_unbacked_driver_spare(self):
+        readers = [
+            "VoWiFi Modem modem-1 00 00",
+            "VoWiFi Modem modem-1 00 01",
+            "VoWiFi Modem modem-1 00 02",
+            "VoWiFi Modem modem-1 00 03",
+        ]
+        target = SimpleNamespace(
+            iccid="profile-target", imsi="imsi-target", mcc="234", mnc="15",
+            mnc_len=2, pin_enabled=False, pin_tries=3, smsc="",
+            carrier_identity={})
+        cards = {reader: {"name": reader, "index": index, "present": index < 3,
+                          "iccid": "profile-old" if index < 3 else None}
+                 for index, reader in enumerate(readers)}
+        identity = {
+            "hardware_id": "modem-1", "channel_allocated": 3,
+            "logical_channels": [{"slot": slot, "channel": slot + 1}
+                                 for slot in range(3)],
+        }
+        instance = {"id": "2", "iccid": "profile-target"}
+
+        def read_card(index):
+            self.assertLess(index, 3, "the unbacked 00 03 reader must never be probed")
+            return target
+
+        with patch.object(main, "_modem_identity_for_reader", return_value=identity), \
+                patch.object(main.sim, "list_readers", return_value=readers), \
+                patch.object(main.sim, "read_card", side_effect=read_card), \
+                patch.object(main, "_match_instance_by_iccid", return_value=instance), \
+                patch.object(main, "_carrier_identity_update", return_value={}), \
+                patch.object(main.hub, "cards", cards), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            _info, refreshed = await main._esim_refresh_modem_readers(
+                readers[0], "modem-1", "profile-target")
+
+        self.assertEqual(refreshed, readers[:3])
+        self.assertIsNone(cards[readers[3]]["iccid"])
 
     async def test_prepare_and_restore_preserve_the_exact_running_snapshot(self):
         lines = {
