@@ -355,6 +355,32 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StatusActivityTests(unittest.TestCase):
+    def test_identity_settling_preserves_operational_ok_but_presents_starting(self):
+        status = main._with_ims_identity_settling({
+            "state": "OK", "label": "Working", "reason_code": "ok",
+            "reason": "Working.", "detail": {"registration": "Registered"},
+            "activity": {"current": "Registered", "next": "Monitor"},
+        })
+
+        self.assertEqual(status["state"], "OK")
+        self.assertEqual(status["detail"]["registration"], "Registered")
+        self.assertEqual(status["presentation"]["actual"], "starting")
+        self.assertIn("identity", status["activity"]["current"].lower())
+        self.assertIn("re-register", status["activity"]["next"].lower())
+
+    def test_modem_capability_uses_identity_presentation_before_operational_ok(self):
+        capability = main._vowifi_capability(
+            True,
+            {"actual": {"vowifi_bridge_active": True}},
+            True,
+            {"state": "OK", "presentation": {
+                "actual": "starting", "reason": "Finalizing identity",
+            }},
+        )
+
+        self.assertEqual(capability["actual"], "starting")
+        self.assertEqual(capability["reason"], "Finalizing identity")
+
     def test_frozen_status_explains_countdown_and_next_action(self):
         main.hub.health["activity-test"] = {
             "auto_retrying": False, "fail_start": None, "retry_count": 3,
@@ -400,6 +426,47 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         main.hub.status_cache["starting"] = {"state": "REGISTERING"}
         self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_FAST_SECONDS)
         main.hub.status_cache.pop("starting", None)
+
+    def test_identity_settling_line_keeps_fast_polling_without_faking_an_outage(self):
+        instances = [{"id": "identity", "enabled": True}]
+        main.hub.status_cache["identity"] = {
+            "state": "OK", "presentation": {"actual": "starting"},
+        }
+        self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_FAST_SECONDS)
+        main.hub.status_cache.pop("identity", None)
+
+    async def test_first_registered_sample_is_presented_as_identity_settling(self):
+        iid = "identity-first"
+        inst = {"id": iid, "enabled": True, "msisdn": "", "msisdn_source": ""}
+        registered = {
+            "state": "OK", "label": "Working", "reason_code": "ok",
+            "reason": "Working.", "detail": {"registration": "Registered"},
+        }
+        main.hub._learning.discard(iid)
+        main.hub._msisdn_tries.pop(iid, None)
+        with patch.object(main.hub.runtime, "get", new=AsyncMock(return_value={
+                    "running": True, "ip": "172.17.0.2", "container_id": "identity"})), \
+                patch.object(main.hub, "ami_for", new=AsyncMock(return_value=object())), \
+                patch.object(main.status_mod, "compute",
+                             new=AsyncMock(return_value=registered)), \
+                patch.object(main, "learn_msisdn", new=AsyncMock()) as learn, \
+                patch.object(main, "_verify_ims_msisdn", new=AsyncMock()) as verify, \
+                patch.object(main, "_maybe_run_keepalive", new=AsyncMock()), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            await main._poll_instance_status(inst)
+            await __import__("asyncio").sleep(0)
+
+        cached = main.hub.status_cache[iid]
+        published = broadcast.await_args.args[0]
+        self.assertEqual(cached["state"], "OK")
+        self.assertEqual(cached["presentation"]["actual"], "starting")
+        self.assertEqual(published["presentation"]["actual"], "starting")
+        self.assertEqual(main._line_state_kind(cached), "up")
+        learn.assert_awaited_once_with(iid)
+        verify.assert_not_awaited()
+        main.hub._learning.discard(iid)
+        main.hub._msisdn_tries.pop(iid, None)
+        main.hub.reset_health(iid)
 
     async def test_ims_rejection_uses_retry_budget_before_cooldown_rebuild(self):
         main.hub.health.pop("3", None)

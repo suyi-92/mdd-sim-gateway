@@ -131,21 +131,22 @@ function LineActivity({ device, compact = false }) {
   const status = device?.status
   if (!status) return null
   const activity = status.activity || {}
+  const presentation = status.presentation || {}
   const draft = device?.provisioning?.state === 'draft'
   const missing = provisioningMissingText(device, t, language)
   const current = draft
     ? t('VoWiFi is paused until line setup is complete.')
-    : (activity.current || status.label || t('Checking line status'))
+    : (presentation.current || activity.current || presentation.label || status.label || t('Checking line status'))
   const next = draft
     ? t('Complete the missing information, then enable VoWiFi.')
-    : (activity.next || '')
+    : (presentation.next || activity.next || '')
   const actual = capability(device, 'vowifi').actual
   const retryCount = Number(activity.retry_count || status.retry?.count || 0)
   const retryMax = Number(activity.retry_max || status.retry?.max || 0)
   return <div className={`u-line-activity ${compact ? 'compact' : ''}`}>
-    <div className="u-line-activity-head"><b>{t('Backend activity')}</b><Badge state={draft ? 'off' : actual}>{draft ? t('Setup required') : t(status.label || `cap.${actual}`)}</Badge></div>
+    <div className="u-line-activity-head"><b>{t('Backend activity')}</b><Badge state={draft ? 'off' : actual}>{draft ? t('Setup required') : t(presentation.label || status.label || `cap.${actual}`)}</Badge></div>
     {!compact && draft && <p className="u-line-reason"><b>{t('Missing information')}:</b> {missing || t('SIM or hardware identity')}</p>}
-    {!compact && !draft && status.reason && status.state !== 'OK' && <p className="u-line-reason"><b>{t('Reason')}:</b> {t(status.reason)}</p>}
+    {!compact && !draft && (presentation.reason || (status.reason && status.state !== 'OK')) && <p className="u-line-reason"><b>{t('Reason')}:</b> {t(presentation.reason || status.reason)}</p>}
     <div className="u-line-step"><span>{t('Now')}</span><b>{t(current)}</b></div>
     {next && <div className="u-line-step"><span>{t('Next')}</span><b>{t(next, { seconds: activity.seconds || status.automatic_retry_in || 0 })}</b></div>}
     {retryMax > 0 && status.state !== 'OK' && <div className="u-line-retry">

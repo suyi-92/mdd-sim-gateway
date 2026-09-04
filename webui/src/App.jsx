@@ -23,6 +23,8 @@ const viewFromHash = () => {
 }
 
 function lineCapabilityState(status, desired = true) {
+  const presented = status?.presentation?.actual
+  if (['off', 'starting', 'on', 'stopping', 'degraded', 'error'].includes(presented)) return presented
   const state = String(status?.state || '').toUpperCase()
   if (state === 'OK') return 'on'
   if (state === 'STOPPED') return desired ? 'degraded' : 'off'
@@ -33,6 +35,7 @@ function lineCapabilityState(status, desired = true) {
 function mergeLiveLineStatus(device, status) {
   const currentCapability = device.capabilities?.vowifi || {}
   const isDraft = device.provisioning?.state === 'draft'
+  const presentation = status?.presentation || {}
   // A draft has two simultaneously true backend facts: its engine is stopped and automatic
   // setup is waiting for required SIM/hardware fields.  The periodic device snapshot exposes
   // the useful provisioning explanation, while a generic live STOPPED event only describes
@@ -43,14 +46,14 @@ function mergeLiveLineStatus(device, status) {
     : lineCapabilityState(status, currentCapability.desired !== false)
   const reason = isDraft
     ? (currentCapability.reason || 'Automatic setup is waiting for SIM or hardware information')
-    : (status.reason || '')
+    : (presentation.reason || status.reason || '')
   return {
     ...device,
     status,
     vowifi: {
       ...(device.vowifi || {}),
       epdg: status.detail || {},
-      ims: isDraft ? (device.vowifi?.ims || '') : (status.label || ''),
+      ims: isDraft ? (device.vowifi?.ims || '') : (presentation.label || status.label || ''),
     },
     capabilities: {
       ...(device.capabilities || {}),
@@ -66,6 +69,8 @@ function legacyDevices(instances, cards) {
     if (reader) used.add(reader)
     const state = String(inst.status?.state || '').toUpperCase()
     const running = ['OK', 'WORKING', 'REGISTERED'].includes(state) || inst.status?.label === 'Working'
+    const presentation = inst.status?.presentation || {}
+    const actual = presentation.actual || (running ? 'on' : (state === 'ERROR' ? 'error' : 'off'))
     return {
       id: inst.device_id || inst.id,
       name: inst.name || inst.id,
@@ -76,7 +81,7 @@ function legacyDevices(instances, cards) {
       compatibilityOnly: true,
       capabilities: {
         cellular: { desired: false, actual: 'unsupported', reason: 'Unified cellular status has not been exposed by this backend.' },
-        vowifi: { desired: running, actual: running ? 'on' : (state === 'ERROR' ? 'error' : 'off'), reason: inst.status?.reason || '' },
+        vowifi: { desired: running, actual, reason: presentation.reason || inst.status?.reason || '' },
       },
     }
   })

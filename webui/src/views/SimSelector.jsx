@@ -43,7 +43,8 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
         {live.map((i) => {
           const c = sourceFor(i)
           const tail = numberTail(i)
-          const st = i.status?.label ? ` — ${t(i.status.label)}` : ''
+          const statusLabel = i.status?.presentation?.label || i.status?.label
+          const st = statusLabel ? ` — ${t(statusLabel)}` : ''
           return <option key={i.id} value={i.id}>{deviceName(c)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}
       </select>

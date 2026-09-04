@@ -1525,9 +1525,12 @@ def _status_poll_delay(instances: list[dict]) -> float:
     for inst in instances:
         if not inst.get("enabled", True):
             continue
-        active.append((hub.status_cache.get(str(inst["id"])) or {}).get("state"))
+        cached = hub.status_cache.get(str(inst["id"])) or {}
+        active.append((cached.get("state"),
+                       (cached.get("presentation") or {}).get("actual")))
     return (STATUS_POLL_FAST_SECONDS
-            if any(state in {"REGISTERING", "TUNNEL_DOWN"} for state in active)
+            if any(state in {"REGISTERING", "TUNNEL_DOWN"} or presented == "starting"
+                   for state, presented in active)
             else STATUS_POLL_HEALTHY_SECONDS)
 
 
@@ -2004,17 +2007,30 @@ async def _poll_instance_status(inst: dict) -> None:
                 and runtime["running"]):
             st = previous
             held_previous = True
-        if st["state"] == "OK" and _needs_ims_msisdn_learning(inst) \
-                and iid not in hub._learning and hub._msisdn_tries.get(iid, 0) < 4:
+        identity_unresolved = (st["state"] == "OK"
+                               and _needs_ims_msisdn_learning(inst))
+        identity_settling = (identity_unresolved
+                             and (iid in hub._learning
+                                  or hub._msisdn_tries.get(iid, 0) < 4))
+        if identity_unresolved and iid not in hub._learning \
+                and hub._msisdn_tries.get(iid, 0) < 4:
             hub._learning.add(iid)
             hub._msisdn_tries[iid] = hub._msisdn_tries.get(iid, 0) + 1
             asyncio.create_task(learn_msisdn(iid))
-        elif st["state"] == "OK":
+            identity_settling = True
+        elif st["state"] == "OK" and not identity_settling:
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
         if st["state"] == "OK":
             asyncio.create_task(_maybe_run_keepalive(iid, inst))
         st = _with_status_activity(
             iid, apply_health(iid, inst, st, runtime.get("container_id")))
+        if identity_settling:
+            # The first IMS registration is operationally healthy, but it may reveal the
+            # authoritative telephone identity only after Asterisk is already online. The
+            # resulting one-time Engine rebuild is intentional. Keep health/history as OK
+            # while preventing the UI from flashing "On" before that final identity has been
+            # applied and the replacement registration has settled.
+            st = _with_ims_identity_settling(st)
         hub.status_cache[iid] = st
         if held_previous and previous_sampled_at is not None:
             # apply_health(OK) clears health and its related cache bookkeeping. Restore the
@@ -2104,6 +2120,26 @@ def _with_status_activity(iid: str, st: dict) -> dict:
         "retry_count": int(retry.get("count") or 0),
         "retry_max": int(retry.get("max") or 0),
         "seconds": int(remaining or 0),
+    }
+    return st
+
+
+def _with_ims_identity_settling(st: dict) -> dict:
+    """Overlay the intentional first-registration identity step for UI consumers only."""
+    st = dict(st)
+    activity = dict(st.get("activity") or {})
+    activity.update({
+        "current": "Confirming the carrier-provided IMS identity",
+        "next": "If the identity must be applied, VoWiFi will re-register once automatically.",
+    })
+    st["activity"] = activity
+    st["presentation"] = {
+        "actual": "starting",
+        "label": "Finalizing IMS identity",
+        "reason": ("IMS is registered; confirming the carrier-provided line identity before "
+                   "marking VoWiFi ready."),
+        "current": activity["current"],
+        "next": activity["next"],
     }
     return st
 
@@ -3616,8 +3652,11 @@ def _vowifi_capability(desired: bool, observed: dict, running: bool,
     elif not running:
         actual, error = "degraded", "VoWiFi is enabled but no configured line is running"
     else:
+        presented = device_state.vowifi_presentation(line_status)
         raw = str((line_status or {}).get("state") or (line_status or {}).get("label") or "").lower()
-        if raw in {"ok", "working", "registered"}:
+        if presented:
+            actual, error = presented["actual"], presented["reason"]
+        elif raw in {"ok", "working", "registered"}:
             actual = "on"
         elif raw in {"error", "failed", "stopped"}:
             actual = "error"
@@ -3850,7 +3889,8 @@ async def _unified_devices() -> list[dict]:
                     "carrier": carrier},
             "cellular": cellular_view,
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
-                       "ims": (line_status or {}).get("label") or "",
+                       "ims": ((line_status or {}).get("presentation") or {}).get("label")
+                              or (line_status or {}).get("label") or "",
                        "rekey_minutes": (inst or {}).get("rekey_minutes",
                            (cfg.get_settings().get("rekey") or {}).get("minutes", 30)),
                        "ike_rekey_minutes": (inst or {}).get("ike_rekey_minutes",

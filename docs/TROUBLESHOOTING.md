@@ -146,6 +146,11 @@ MDD 安装后哈希不一致。遇到拒绝先保留现场，不要手工覆盖�
 `Card absent or mute`，先在 VMware 中重新连接该 reader 恢复现场，再更新到包含有序停止保护的
 版本；不要反复保存或重启 pcscd。
 
+新卡第一次完成 IMS 注册后，运营商可能才在 `P-Associated-URI` 中下发可拨号码。Control 需要
+有序重建一次 Engine，使最终注册、主叫身份与拨号计划使用该权威身份。这不是掉卡或自动恢复；
+WebUI 在整个收敛窗口内应显示“正在确认 IMS 身份”，只在重注册稳定后显示“已开启”。同一张卡若
+连续发生两次以上身份重建，才按异常重连检查 Control 日志。
+
 若主机 `pcsc_scan` 正常，而 Engine 的 `pin_status.json` 只报告
 `Failed to establish context` / `Service was stopped`，检查容器是否同时只读挂载宿主
 `libpcsclite.so.1`。这通常是容器 client 与宿主 pcscd 私有 IPC 版本不兼容，不是 SIM 或 CCID

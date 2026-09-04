@@ -31,6 +31,28 @@ class DeviceStateTests(unittest.TestCase):
         self.assertEqual(device_state.native_vowifi_capability(True, True, {"state": "OK"})["actual"], "on")
         self.assertEqual(device_state.native_vowifi_capability(True, False, None)["actual"], "degraded")
 
+    def test_native_reader_honours_ui_only_identity_settling_without_losing_ok(self):
+        status = {
+            "state": "OK",
+            "presentation": {
+                "actual": "starting",
+                "reason": "Finalizing the carrier identity",
+            },
+        }
+
+        capability = device_state.native_vowifi_capability(True, True, status)
+
+        self.assertEqual(capability, {
+            "desired": True,
+            "actual": "starting",
+            "reason": "Finalizing the carrier identity",
+        })
+
+    def test_invalid_status_presentation_cannot_invent_a_capability_state(self):
+        self.assertEqual(device_state.vowifi_presentation({
+            "presentation": {"actual": "private-state", "reason": "ignored"},
+        }), {})
+
     def test_logical_channel_view_is_bounded_and_preserves_roles(self):
         value = device_state.logical_channel_view({
             "channel_capacity": 3, "channel_allocated": 3, "channel_status": "ready",

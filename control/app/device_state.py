@@ -60,6 +60,9 @@ def native_vowifi_capability(desired: bool, running: bool, line_status: dict | N
     if not running:
         return {"desired": True, "actual": "degraded",
                 "reason": "VoWiFi is configured but the line is not running"}
+    presented = vowifi_presentation(line_status)
+    if presented:
+        return {"desired": True, **presented}
     raw = str((line_status or {}).get("state") or (line_status or {}).get("label") or "").lower()
     if raw in {"ok", "working", "registered"}:
         return {"desired": True, "actual": "on", "reason": ""}
@@ -67,6 +70,20 @@ def native_vowifi_capability(desired: bool, running: bool, line_status: dict | N
         return {"desired": True, "actual": "error",
                 "reason": str((line_status or {}).get("reason") or "VoWiFi failed")}
     return {"desired": True, "actual": "starting", "reason": ""}
+
+
+def vowifi_presentation(line_status: dict | None) -> dict:
+    """Return a bounded UI-only capability override from a live line status.
+
+    Operational status remains authoritative for recovery and connectivity history. The
+    presentation layer is for short, intentional convergence steps that must not be charted as
+    outages, such as applying the telephone identity learned from the first IMS registration.
+    """
+    presentation = ((line_status or {}).get("presentation") or {})
+    actual = str(presentation.get("actual") or "")
+    if actual not in {"off", "starting", "on", "stopping", "degraded", "error"}:
+        return {}
+    return {"actual": actual, "reason": str(presentation.get("reason") or "")}
 
 
 def logical_channel_view(identity: dict | None, bridge_active: bool) -> dict:

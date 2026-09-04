@@ -258,7 +258,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           setSelected(value || null)
         }}>
           <option value="">{t('Choose a saved line')}</option>
-          {instances.map(line => <option value={line.id} key={line.id}>{line.name || `${line.mcc || ''}-${line.mnc || ''}`} · {t(line.status?.label || 'Stopped')}</option>)}
+          {instances.map(line => <option value={line.id} key={line.id}>{line.name || `${line.mcc || ''}-${line.mnc || ''}`} · {t(line.status?.presentation?.label || line.status?.label || 'Stopped')}</option>)}
         </select>
       </div>}
       {creating && <div className="u-note" style={{ marginBottom: 14 }}>
