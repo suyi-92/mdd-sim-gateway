@@ -589,7 +589,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
-      <div className="card u-phone-panel" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
+      <div className="card u-phone-panel" style={{ padding: 24, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
         {/* One row in a 380px panel. A <select> sized 'auto' takes its width from the LONGEST
             option, which is long enough here to squeeze both labels until they wrapped one
             character per line. So: labels never wrap and never shrink, and the select absorbs

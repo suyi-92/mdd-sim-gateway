@@ -113,6 +113,30 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn(".u-call-layout,.u-messages-layout { flex:none; grid-template-columns:1fr", CSS)
         self.assertIn(".u-keepalive-grid { min-width:980px; }", CSS)
 
+    def test_communication_pages_fill_only_the_remaining_desktop_viewport(self):
+        self.assertIn("const communicationView = view === 'calls' || view === 'messages'", APP)
+        self.assertIn("communicationView ? ' u-content-communication' : ''", APP)
+        content = css_rule(".u-content.u-content-communication")
+        self.assertIn("display:flex", content)
+        self.assertIn("flex-direction:column", content)
+        self.assertIn("overflow:hidden", content)
+        page = css_rule(".u-content-communication>.u-communication-page")
+        self.assertIn("min-height:0", page)
+        self.assertIn("height:auto", page)
+        self.assertIn("flex:1", page)
+        panels = css_rule(
+            ".u-phone-panel,.u-history-panel,.u-message-thread-list,.u-message-conversation")
+        self.assertIn("min-height:0", panels)
+        self.assertNotIn("minHeight: 520", SOFTPHONE)
+
+    def test_communication_pages_restore_document_scrolling_on_narrow_screens(self):
+        narrow = CSS[CSS.index("@media(max-width:760px)"):]
+        self.assertIn(
+            ".u-content.u-content-communication { display:block; overflow:auto; }", narrow)
+        self.assertIn(
+            ".u-content-communication>.u-communication-page,.u-communication-page { height:auto; }",
+            narrow)
+
     def test_other_multi_button_async_controls_reserve_their_width(self):
         for class_name, source in (
                 ("u-refresh-action", UNIFIED),
