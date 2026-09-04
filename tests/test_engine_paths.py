@@ -224,6 +224,105 @@ class EnginePathTests(unittest.TestCase):
 
         self.assertEqual(removed, [True])
 
+    def test_rebuild_gracefully_stops_before_removal_and_pcsc_reuse(self):
+        engine = self.engine_module()
+        order = []
+
+        class _OldContainer:
+            id = "old-id"
+            name = "mdd-sim-gateway-engine-sim1"
+            attrs = {"Config": {"Labels": {engine.MANAGED_LABEL: "true"}}}
+
+            def stop(self, timeout):
+                order.append(("stop", timeout))
+
+            def remove(self, force=False):
+                order.append(("remove", force))
+
+        class _NewContainer:
+            id = "new-id"
+            name = "mdd-sim-gateway-engine-sim1"
+
+            def start(self):
+                order.append(("start",))
+
+        class _Containers:
+            def get(self, name):
+                return _OldContainer()
+
+            def create(self, image, **kwargs):
+                order.append(("create",))
+                return _NewContainer()
+
+        client = SimpleNamespace(containers=_Containers())
+        inst = {"id": "sim1", "ports": {"webrtc": 8089, "rtp_start": 10000,
+                                            "rtp_span": 12}}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "_client", lambda: client), \
+                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
+                patch.object(engine, "_clear_runtime_state", lambda base: None), \
+                patch.object(engine, "_host_pcsclite_library",
+                             return_value="/usr/lib/libpcsclite.so.1"), \
+                patch.object(engine, "capture_diagnostics"), \
+                patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine.cfg, "write_instance_json", lambda i, s: None), \
+                patch.object(engine.time, "sleep",
+                             side_effect=lambda seconds: order.append(("settle", seconds))):
+            engine.start(inst, {})
+
+        self.assertEqual(order, [
+            ("stop", engine.ENGINE_STOP_TIMEOUT_SECONDS),
+            ("remove", False),
+            ("settle", engine.PCSC_RELEASE_SETTLE_SECONDS),
+            ("create",),
+            ("start",),
+        ])
+
+    def test_wedged_engine_uses_forced_removal_only_as_fallback(self):
+        engine = self.engine_module()
+        removed = []
+
+        class _Container:
+            name = "mdd-sim-gateway-engine-sim1"
+
+            def stop(self, timeout):
+                raise RuntimeError("daemon did not stop the container")
+
+            def remove(self, force=False):
+                removed.append(force)
+
+        with patch.object(engine.time, "sleep") as settle:
+            self.assertTrue(engine._retire_container(_Container(), settle_pcsc=True))
+
+        self.assertEqual(removed, [True])
+        settle.assert_called_once_with(engine.PCSC_RELEASE_SETTLE_SECONDS)
+
+    def test_plain_stop_is_graceful_without_a_replacement_delay(self):
+        engine = self.engine_module()
+        calls = []
+
+        class _Container:
+            id = "current-id"
+            name = "mdd-sim-gateway-engine-sim1"
+            attrs = {"Config": {"Labels": {engine.MANAGED_LABEL: "true"}}}
+
+            def stop(self, timeout):
+                calls.append(("stop", timeout))
+
+            def remove(self, force=False):
+                calls.append(("remove", force))
+
+        client = SimpleNamespace(containers=SimpleNamespace(get=lambda name: _Container()))
+        with patch.object(engine, "_client", lambda: client), \
+                patch.object(engine.time, "sleep") as settle:
+            self.assertTrue(engine.stop("sim1"))
+
+        self.assertEqual(calls, [
+            ("stop", engine.ENGINE_STOP_TIMEOUT_SECONDS),
+            ("remove", False),
+        ])
+        settle.assert_not_called()
+
     def test_engine_recreation_clears_stale_runtime_observations(self):
         engine = self.engine_module()
         with tempfile.TemporaryDirectory() as temp:

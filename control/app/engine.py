@@ -69,6 +69,15 @@ _ASTERISK_TIMESTAMP = re.compile(r"^\[[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2
 # Enough to cover a full REGISTER exchange plus the failures around it.
 SIP_EVIDENCE_LINES = 40
 
+# Engine processes share one physical USIM through host pcscd.  Replacing a running container
+# with ``remove(force=True)`` kills PIN keeping / IKE / IMS-AKA in the middle of an APDU and then
+# lets the replacement reopen the reader immediately.  SCR Prime can report "card absent or
+# mute" in that window and VMware users then have to detach and reattach the whole USB device.
+# Give the old generation a normal TERM window and, once all of its PC/SC sockets are gone, a
+# short reader quiet period before the next generation starts.
+ENGINE_STOP_TIMEOUT_SECONDS = 8
+PCSC_RELEASE_SETTLE_SECONDS = 2.0
+
 DATA_DIR = cfg.DATA_DIR
 IMAGE = os.environ.get("MDD_ENGINE_IMAGE", "mdd-sim-gateway/engine")
 PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
@@ -377,6 +386,32 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
         log.warning("diagnostic capture failed for instance %s: %s", iid, exc)
 
 
+def _retire_container(container, *, settle_pcsc: bool = False) -> bool:
+    """Stop and remove one Engine generation, optionally waiting before USIM reuse.
+
+    Docker's stop call waits for the container namespace to exit, which closes every inherited
+    pcscd socket even when a worker does not have its own signal handler.  A forced removal is
+    retained only as a bounded recovery path when Docker cannot complete the normal stop.  The
+    quiet interval belongs only to replacement: a plain stop has no next reader client to race.
+    """
+    try:
+        container.stop(timeout=ENGINE_STOP_TIMEOUT_SECONDS)
+    except docker.errors.NotFound:
+        return False
+    except Exception as exc:  # noqa - force is the last way to retire a wedged generation
+        log.warning("graceful stop failed for engine container %s: %s; forcing removal",
+                    container.name, exc)
+        container.remove(force=True)
+    else:
+        try:
+            container.remove()
+        except docker.errors.NotFound:
+            pass
+    if settle_pcsc:
+        time.sleep(PCSC_RELEASE_SETTLE_SECONDS)
+    return True
+
+
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
     """(Re)create and start the engine container for an instance."""
     iid = str(inst["id"])
@@ -407,14 +442,16 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
     client = _client()
-    # remove any existing container
+    # Retire any existing generation before reusing its host PC/SC reader.  Do not force-delete
+    # the normal replacement path: a second config save can arrive while the first generation is
+    # still authenticating and an abrupt kill leaves some USB readers mute.
     try:
         old = client.containers.get(container_name(iid))
         if not _owned(old):
             raise RuntimeError(f"refusing to replace foreign container {old.name}")
         # Only a replacement destroys evidence; a first start has none to keep.
         capture_diagnostics(iid, inst, base, reason)
-        old.remove(force=True)
+        _retire_container(old, settle_pcsc=True)
     except docker.errors.NotFound:
         pass
 
@@ -535,8 +572,7 @@ def stop(iid: str, expected_container_id: str | None = None):
             log.info("not stopping replacement engine %s (expected generation %s, found %s)",
                      iid, expected_container_id, c.id)
             return False
-        c.remove(force=True)
-        return True
+        return _retire_container(c)
     except docker.errors.NotFound:
         return False
 

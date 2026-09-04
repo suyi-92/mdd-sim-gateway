@@ -140,6 +140,12 @@ MDD 安装后哈希不一致。遇到拒绝先保留现场，不要手工覆盖�
 会失败。首次安装显式使用 `--require-scr-prime` 时会继续强制 ATR 和真实拔插，`--yes` 不能
 跳过这项。
 
+在 WebUI 连续保存同一条原生 reader 线路时，Control 会重建该线路的 Engine。正常重建必须先
+有序停止旧容器、等待其 PC/SC 连接全部关闭，并经过短暂的 reader 静默窗口后再启动新容器；不得
+直接强制删除正在执行 PIN、IKE 或 IMS-AKA APDU 的旧容器。若旧版本在保存后出现
+`Card absent or mute`，先在 VMware 中重新连接该 reader 恢复现场，再更新到包含有序停止保护的
+版本；不要反复保存或重启 pcscd。
+
 若主机 `pcsc_scan` 正常，而 Engine 的 `pin_status.json` 只报告
 `Failed to establish context` / `Service was stopped`，检查容器是否同时只读挂载宿主
 `libpcsclite.so.1`。这通常是容器 client 与宿主 pcscd 私有 IPC 版本不兼容，不是 SIM 或 CCID
