@@ -1,7 +1,7 @@
 {
   "name": "mdd-sim-gateway-webui",
   "private": true,
-  "version": "1.7.0-vmware.3",
+  "version": "1.7.0-vmware.4",
   "type": "module",
   "scripts": {
     "dev": "vite",

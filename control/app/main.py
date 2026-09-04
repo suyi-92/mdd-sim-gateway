@@ -3152,8 +3152,11 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     Engine startup therefore runs in the bounded background worker below; keeping it out of
     this request also lets the UI confirm the physical profile switch as soon as it is true.
     """
+    started_at = time.monotonic()
     bridge = await _esim_restart_modem_bridge(hardware_id, iccid)
+    bridge_ready_at = time.monotonic()
     info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
+    refreshed_at = time.monotonic()
     target = _match_instance_by_iccid(iccid)
     if not target:
         raise HTTPException(409, "the active eSIM profile could not be provisioned as a line")
@@ -3167,8 +3170,18 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     target = await asyncio.to_thread(
         cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
     egress.publish()
+    log.info(
+        "eSIM profile recovery complete bridge_ms=%d card_refresh_ms=%d",
+        round((bridge_ready_at - started_at) * 1000),
+        round((refreshed_at - bridge_ready_at) * 1000),
+    )
     return {"card": info, "readers": readers, "instance_id": str(target["id"]),
-            "bridge": bridge}
+            "bridge": bridge,
+            "pin_preflight_verified": bool(
+                info.get("present")
+                and str(info.get("iccid") or "") == str(iccid)
+                and info.get("pin_enabled") is False),
+            }
 
 
 async def _esim_profile_event(
@@ -3214,6 +3227,8 @@ async def _esim_start_profile_line(
     switch_key: str,
     iccid: str,
     iid: str,
+    *,
+    pin_preflight_verified: bool = False,
 ) -> None:
     """Start a switched profile with bounded retries for transient country-egress startup."""
     iid = str(iid)
@@ -3245,7 +3260,15 @@ async def _esim_start_profile_line(
                         reader, iccid, "line_started", profile_state="enabled")
                     return
                 try:
-                    await api_instance_start(iid)
+                    if pin_preflight_verified and attempt == 0:
+                        await _start_instance(
+                            iid,
+                            pin_preflight_verified=True,
+                            health_reason="esim_profile_switch",
+                            engine_reason="esim_profile_switch",
+                        )
+                    else:
+                        await api_instance_start(iid)
                 except Exception as exc:  # noqa - reduce arbitrary start detail to a safe code
                     code = _recovery_failure_code(exc)
                     if code == "egress_unavailable" and attempt + 1 < attempts:
@@ -3529,6 +3552,24 @@ async def _preflight_pin(inst: dict) -> dict:
         return await asyncio.to_thread(_preflight_pin_locked, inst, idx)
     finally:
         lock.release()
+
+
+def _verified_pin_disabled_card_matches(inst: dict) -> bool:
+    """Whether the just-refreshed card view proves this exact SIM has PIN disabled.
+
+    The modem eSIM switch path has already completed one authoritative full card read before
+    it schedules Engine startup. Repeating the same multi-file scan immediately afterwards
+    costs several seconds on serial AT+CSIM readers. Only reuse the proof for a present,
+    ICCID-matched card with an explicit ``pin_enabled=False``; unknown/locked states retain the
+    normal active PIN preflight.
+    """
+    iccid = str(inst.get("iccid") or "")
+    return bool(iccid) and any(
+        card_info.get("present")
+        and str(card_info.get("iccid") or "") == iccid
+        and card_info.get("pin_enabled") is False
+        for card_info in hub.cards.values()
+    )
 
 
 @app.post("/api/provision")
@@ -5043,12 +5084,19 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
             "deleted_messages": deleted_messages, "deleted_calls": deleted_calls}
 
 
-@app.post("/api/instances/{iid}/start")
-async def api_instance_start(iid: str, body: dict | None = None):
+async def _start_instance(
+    iid: str,
+    body: dict | None = None,
+    *,
+    pin_preflight_verified: bool = False,
+    health_reason: str = "user_requested",
+    engine_reason: str = "manual",
+):
     """Start (or restart) a line. Actively checks the SIM PIN state first: if the card
     requires a PIN and we have no valid saved one, the start is refused with a structured
     error so the UI can prompt for the PIN — we never bring up the IPsec/IMS engine against
-    a locked card. A PIN supplied in the body (re-entry) is verified, saved, and used."""
+    a locked card. The eSIM recovery path may reuse its immediately preceding full-card read,
+    but only while the live card view still proves the same ICCID has PIN disabled."""
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
@@ -5071,7 +5119,11 @@ async def api_instance_start(iid: str, body: dict | None = None):
                                          + (f" ({chk.pin_tries} tries left)" if chk.pin_tries is not None else ""))
         inst = cfg.upsert_instance({"id": str(iid), "pin": supplied})
 
-    pf = await _preflight_pin(inst)
+    reuse_pin_proof = (pin_preflight_verified
+                       and not supplied
+                       and _verified_pin_disabled_card_matches(inst))
+    pf = ({"ok": True, "need_pin": False}
+          if reuse_pin_proof else await _preflight_pin(inst))
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))     # stale saved PIN — force re-entry next time
@@ -5104,11 +5156,18 @@ async def api_instance_start(iid: str, body: dict | None = None):
     if updates:
         inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
-    hub.reset_health(iid, "user_requested")
+    hub.reset_health(iid, health_reason)
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
-    cid = await asyncio.to_thread(_start_engine_checked, inst, settings, dev_mounts=dev)
+    cid = await asyncio.to_thread(
+        _start_engine_checked, inst, settings, dev_mounts=dev, reason=engine_reason)
     asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "container": cid}
+
+
+@app.post("/api/instances/{iid}/start")
+async def api_instance_start(iid: str, body: dict | None = None):
+    """Public line start always performs the active SIM/PIN preflight."""
+    return await _start_instance(iid, body)
 
 
 @app.post("/api/instances/{iid}/reprovision")
@@ -6665,7 +6724,12 @@ def _esim_cache_store(ses: list, imei: str):
     if not eid or any(se.get("error") for se in ses):
         return
     data = _esim_cache_load()
-    data[eid] = {"ses": ses, "imei": imei or "", "ts": int(time.time())}
+    # Profiles/chip metadata remain useful while a line owns the reader, but the pending
+    # notification list is transient: automatic delivery can remove it moments after this
+    # snapshot. Persisting it made an already-sent installation result reappear after every
+    # page load, so notifications are live-read/WS state only.
+    cached_ses = [{**se, "notifications": []} for se in ses]
+    data[eid] = {"ses": cached_ses, "imei": imei or "", "ts": int(time.time())}
     _esim_cache_write(data)
 
 
@@ -6685,6 +6749,7 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
     data = _esim_cache_load()
     changed = False
     for entry in data.values():
+        entry_changed = False
         for se in entry.get("ses") or []:
             profiles = se.get("profiles") or []
             hit = next((p for p in profiles if p.get("iccid") == iccid), None)
@@ -6702,8 +6767,88 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
                 if nickname is not None:
                     hit["profileNickname"] = nickname
             changed = True
+            entry_changed = True
+        if entry_changed:
+            entry["ts"] = int(time.time())
     if changed:
         _esim_cache_write(data)
+
+
+def _esim_cache_remove_notifications(
+    iccid: str,
+    se_id: str | None,
+    seq: int | None = None,
+) -> bool:
+    """Mirror a confirmed eUICC notification removal onto the persisted cached view.
+
+    The cache is located through a profile ICCID from the same physical eUICC.  ``seq=None``
+    means lpac processed every pending notification for the selected SE; otherwise only the
+    one sequence number is removed.  No notification address or subscriber identity is ever
+    published in the live update.
+    """
+    if not iccid:
+        return False
+    data = _esim_cache_load()
+    changed = False
+    for entry in data.values():
+        ses = entry.get("ses") or []
+        if not any(
+            profile.get("iccid") == iccid
+            for se in ses
+            for profile in (se.get("profiles") or [])
+        ):
+            continue
+        touched = False
+        for se in ses:
+            if se_id and str(se.get("id") or "") != str(se_id):
+                continue
+            current = se.get("notifications") or []
+            if seq is None:
+                remaining = []
+            else:
+                remaining = [
+                    item for item in current
+                    if str(item.get("seqNumber", item.get("seq", ""))) != str(seq)
+                ]
+            if remaining != current:
+                se["notifications"] = remaining
+                changed = True
+            touched = True
+        if touched:
+            entry["ts"] = int(time.time())
+            changed = True
+    if changed:
+        _esim_cache_write(data)
+    return changed
+
+
+async def _esim_notifications_changed(
+    reader: str,
+    cache_iccid: str,
+    se_id: str | None,
+    seq: int | None = None,
+    *,
+    event: str = "processed",
+) -> None:
+    """Update the server cache and remove the same notification from open browser views."""
+    await asyncio.to_thread(_esim_cache_remove_notifications, cache_iccid, se_id, seq)
+    payload = {"type": "esim_notifications", "reader": reader,
+               "se_id": str(se_id or ""), "event": event}
+    if seq is not None:
+        payload["seq"] = int(seq)
+    await hub.broadcast(payload)
+
+
+def _esim_notifications_processed_callback(
+    reader: str,
+    cache_iccid: str,
+    se_id: str | None,
+):
+    """Return a callback lpac invokes only after send-and-autoremove succeeds."""
+    async def processed():
+        await _esim_notifications_changed(reader, cache_iccid, se_id)
+
+    return processed
 
 
 @app.get("/api/esim/chip/cached")
@@ -6715,8 +6860,11 @@ async def api_esim_chip_cached(reader_index: int = 0, reader: str | None = None)
     entry = await asyncio.to_thread(_esim_cache_for_iccid, iccid)
     if not entry:
         return {"ok": True, "cached": False, "reader": name, "reader_index": idx}
+    # Also sanitize caches written by an older release. Pending notifications cannot be
+    # confirmed without touching the card and must never be presented as current cached state.
+    cached_ses = [{**se, "notifications": []} for se in (entry.get("ses") or [])]
     return {"ok": True, "cached": True, "reader": name, "reader_index": idx,
-            "ses": entry.get("ses") or [], "imei": entry.get("imei") or "",
+            "ses": cached_ses, "imei": entry.get("imei") or "",
             "ts": entry.get("ts") or 0}
 
 
@@ -6783,7 +6931,10 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
             try:
                 await _esim_profile_event(name, iccid, "switching")
                 await _esim_run(
-                    name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
+                    name, idx, lpa.profile_enable(
+                        name, iccid, aid=se.get("aid"),
+                        on_notifications_processed=_esim_notifications_processed_callback(
+                            name, iccid, se.get("id"))),
                     refresh=True, refresh_expect_iccid=iccid)
             except Exception:
                 await _esim_restore_profile_switch(previous)
@@ -6807,7 +6958,10 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
                 body.get("aid"), require=True)
             await _esim_run(
-                name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
+                name, idx, lpa.profile_enable(
+                    name, iccid, aid=se.get("aid"),
+                    on_notifications_processed=_esim_notifications_processed_callback(
+                        name, iccid, se.get("id"))),
                 keep_busy=True)
             lpa_succeeded = True
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
@@ -6838,7 +6992,8 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                         "card": hub.cards.get(name),
                         "recovery_error": str(detail) or "line recovery failed"}
             asyncio.create_task(_esim_start_profile_line(
-                name, switch_key, iccid, str(recovery["instance_id"])))
+                name, switch_key, iccid, str(recovery["instance_id"]),
+                pin_preflight_verified=bool(recovery.get("pin_preflight_verified"))))
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],
@@ -6864,7 +7019,11 @@ async def api_esim_disable(iccid: str, body: dict | None = None):
         _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
         require=True)
     await _esim_run(
-        name, idx, lpa.profile_disable(name, iccid, aid=se.get("aid")), refresh=True)
+        name, idx, lpa.profile_disable(
+            name, iccid, aid=se.get("aid"),
+            on_notifications_processed=_esim_notifications_processed_callback(
+                name, iccid, se.get("id"))),
+        refresh=True)
     await asyncio.to_thread(_esim_cache_update_profile, iccid, state="disabled")
     return {"ok": True, "iccid": iccid, "se_id": se["id"], "card": hub.cards.get(name)}
 
@@ -6877,7 +7036,11 @@ async def api_esim_delete(
     name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
     se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
     await _esim_run(
-        name, idx, lpa.profile_delete(name, iccid, aid=se.get("aid")), refresh=True)
+        name, idx, lpa.profile_delete(
+            name, iccid, aid=se.get("aid"),
+            on_notifications_processed=_esim_notifications_processed_callback(
+                name, iccid, se.get("id"))),
+        refresh=True)
     await asyncio.to_thread(_esim_cache_update_profile, iccid, remove=True)
     return {"ok": True, "iccid": iccid, "se_id": se["id"]}
 
@@ -6908,6 +7071,7 @@ async def api_esim_download(body: dict):
         raise HTTPException(409, "an eSIM operation is already running on this reader")
     await asyncio.to_thread(_esim_guard_engine, name)
     imei = _esim_imei_for_reader(name, body.get("imei"))
+    notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
     # Claim busy before returning so a second concurrent POST cannot start another job.
     hub.lpa_busy[name] = True
     se_id = se["id"]
@@ -6948,6 +7112,8 @@ async def api_esim_download(body: dict):
                         imei=imei or None,
                         aid=aid,
                         on_progress=on_progress,
+                        on_notifications_processed=_esim_notifications_processed_callback(
+                            name, notification_cache_iccid, se_id),
                     )
                     await _esim_refresh_card(name, idx)
                     await hub.broadcast({
@@ -7036,6 +7202,7 @@ async def api_esim_notifications_process(body: dict | None = None):
         require=True)
     seq = body.get("seq")
     remove = bool(body.get("remove", True))
+    notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
     if seq is None:
         coro = lpa.notification_process(
             name, all_notifications=True, autoremove=remove, aid=se.get("aid"))
@@ -7043,6 +7210,10 @@ async def api_esim_notifications_process(body: dict | None = None):
         coro = lpa.notification_process(
             name, int(seq), autoremove=remove, aid=se.get("aid"))
     await _esim_run(name, idx, coro)
+    if remove:
+        await _esim_notifications_changed(
+            name, notification_cache_iccid, se.get("id"),
+            None if seq is None else int(seq))
     return {"ok": True, "se_id": se["id"]}
 
 
@@ -7053,7 +7224,10 @@ async def api_esim_notification_remove(
 ):
     name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
     se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
+    notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
     await _esim_run(name, idx, lpa.notification_remove(name, seq, aid=se.get("aid")))
+    await _esim_notifications_changed(
+        name, notification_cache_iccid, se.get("id"), seq, event="removed")
     return {"ok": True, "seq": seq, "se_id": se["id"]}
 
 

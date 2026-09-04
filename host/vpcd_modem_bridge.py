@@ -107,6 +107,29 @@ def allocate_logical_channels(card, count):
             (len(channels), LOGICAL_CHANNEL_CAPACITY, exc)) from exc
 
 
+def allocate_logical_channels_with_recovery(card, count):
+    """Allocate normally, clearing stale channels only after the first attempt proves it must.
+
+    A graceful bridge shutdown already closes every channel it owned. Closing channels 1-3
+    again on every profile switch added three slow AT+CSIM exchanges to the healthy path. A
+    crashed or interrupted predecessor can still leak channels, so retain the same cleanup as
+    a bounded recovery step and retry the full allocation once.
+    """
+    try:
+        return allocate_logical_channels(card, count)
+    except ModemError as first_error:
+        print("[bridge] initial logical channel allocation failed; clearing stale channels "
+              "and retrying once: %s" % first_error, flush=True)
+        for channel in range(1, LOGICAL_CHANNEL_CAPACITY + 1):
+            card.close_channel(channel)
+        try:
+            return allocate_logical_channels(card, count)
+        except ModemError as retry_error:
+            raise ModemError(
+                "SIM logical channel allocation still failed after stale-channel cleanup: %s"
+                % retry_error) from retry_error
+
+
 class ATSerial(serial.Serial if serial else object):
     """A Serial that tolerates absent modem control lines.
 
@@ -527,12 +550,8 @@ def main():
     print("[bridge] modem identity refreshed (imei=%s iccid=%s)" %
           ("available" if identity["imei"] else "unavailable",
            "available" if identity["iccid"] else "unavailable"), flush=True)
-    # Clear channels left behind by an interrupted prior bridge.
-    for channel in (1, 2, 3):
-        card.close_channel(channel)
-
     try:
-        channels = allocate_logical_channels(card, args.slots)
+        channels = allocate_logical_channels_with_recovery(card, args.slots)
     except ModemError as exc:
         static_metadata.update(logical_channel_metadata([], args.slots, "error", str(exc)))
         write_metadata(args.metadata_file, {**static_metadata, **identity,

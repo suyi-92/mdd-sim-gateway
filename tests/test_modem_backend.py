@@ -7,6 +7,7 @@ from host import mdd_orchestrator
 from host.mdd_orchestrator import Orchestrator
 from host.vpcd_modem_bridge import (ModemCard, ModemError, ModemManagerCard,
                                     allocate_logical_channels,
+                                    allocate_logical_channels_with_recovery,
                                     logical_channel_metadata, serve_slot)
 
 
@@ -111,6 +112,18 @@ class ModemBackendTests(unittest.TestCase):
         self.assertEqual(card.settled, 1)
         self.assertEqual(card.closed, [])
 
+    def test_clean_bridge_start_does_not_repeat_stale_channel_cleanup(self):
+        card = self.FakeCard((1, 2, 3))
+
+        self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 3])
+        self.assertEqual(card.closed, [])
+
+    def test_failed_bridge_start_clears_stale_channels_and_retries_once(self):
+        card = self.FakeCard((ModemError("no channel available"), 1, 2, 3))
+
+        self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 3])
+        self.assertEqual(card.closed, [1, 2, 3])
+
     class FakeCard:
         def __init__(self, values):
             self.values = iter(values)
@@ -118,7 +131,10 @@ class ModemBackendTests(unittest.TestCase):
             self.settled = 0
 
         def open_channel(self):
-            return next(self.values)
+            value = next(self.values)
+            if isinstance(value, Exception):
+                raise value
+            return value
 
         def close_channel(self, channel):
             self.closed.append(channel)

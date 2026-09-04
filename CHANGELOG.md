@@ -35,6 +35,14 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Fixed
 
+- Kept processed eUICC notifications in sync across the persistent cache and connected WebUI
+  sessions, so an already-delivered installation result no longer remains visible until the
+  operator changes pages or performs another exclusive chip read.
+- Reused the freshly verified PIN-disabled card result when starting a switched profile and made
+  stale logical-channel cleanup conditional on an actual allocation failure. Bridge restart
+  requests now wake the orchestrator on a short stat-only poll, avoiding duplicate serial card
+  scans, healthy-path AT exchanges and most of the reconcile-queue delay while retaining
+  fail-closed recovery.
 - Reduced serial-modem eSIM switch latency by fully reading one logical channel and verifying
   sibling ICCIDs with a minimal APDU path, while preserving the all-channel identity gate.
 - Published confirmed profile changes to the WebUI immediately, prewarmed the target country

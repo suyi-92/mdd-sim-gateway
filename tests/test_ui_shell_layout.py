@@ -86,6 +86,8 @@ class PageRhythmTests(unittest.TestCase):
     def test_esim_switch_has_live_profile_events_and_a_fixed_feedback_slot(self):
         self.assertIn("function withEnabledProfile(list, iccid)", ESIM)
         self.assertIn("msg.type === 'esim_profile'", ESIM)
+        self.assertIn("msg.type === 'esim_notifications'", ESIM)
+        self.assertIn("se.notifications || []", ESIM)
         self.assertIn('className="u-esim-switch-feedback" role="status"', ESIM)
         rule = css_rule(".u-esim-switch-feedback")
         self.assertIn("min-height:20px", rule)

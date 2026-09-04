@@ -238,6 +238,124 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
             [call.args[2] for call in events.await_args_list],
             ["recovery_retry", "line_started"])
 
+    async def test_verified_pin_disabled_switch_skips_the_duplicate_full_card_preflight(self):
+        target = {"id": "2", "iccid": "profile-target", "enabled": True,
+                  "reader_index": 1}
+        scheduled = []
+
+        def capture(coro):
+            scheduled.append(coro)
+            coro.close()
+            return Mock()
+
+        preflight = AsyncMock(return_value={"ok": True})
+        with patch.object(main.cfg, "get_instance", return_value=target), \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main, "_card_identity_mismatch", return_value=None), \
+                patch.object(main, "_preflight_pin", new=preflight), \
+                patch.object(main, "_reader_port_for_instance", return_value=None), \
+                patch.object(main, "_reader_index_for_instance", return_value=1), \
+                patch.object(main, "_start_engine_checked", return_value="container") as start, \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "iccid": "profile-target",
+                               "pin_enabled": False},
+                }), patch.object(main.hub, "reset_health"), \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(main.asyncio, "create_task", side_effect=capture):
+            result = await main._start_instance(
+                "2", pin_preflight_verified=True,
+                health_reason="esim_profile_switch",
+                engine_reason="esim_profile_switch")
+
+        self.assertTrue(result["ok"])
+        preflight.assert_not_awaited()
+        self.assertEqual(start.call_args.kwargs["reason"], "esim_profile_switch")
+        self.assertEqual(len(scheduled), 1)
+
+    async def test_changed_or_pin_locked_card_does_not_reuse_the_switch_preflight(self):
+        target = {"id": "2", "iccid": "profile-target", "enabled": True,
+                  "reader_index": 1}
+        scheduled = []
+
+        def capture(coro):
+            scheduled.append(coro)
+            coro.close()
+            return Mock()
+
+        preflight = AsyncMock(return_value={"ok": True})
+        with patch.object(main.cfg, "get_instance", return_value=target), \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main, "_card_identity_mismatch", return_value=None), \
+                patch.object(main, "_preflight_pin", new=preflight), \
+                patch.object(main, "_reader_port_for_instance", return_value=None), \
+                patch.object(main, "_reader_index_for_instance", return_value=1), \
+                patch.object(main, "_start_engine_checked", return_value="container"), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "iccid": "profile-target",
+                               "pin_enabled": True},
+                }), patch.object(main.hub, "reset_health"), \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(main.asyncio, "create_task", side_effect=capture):
+            await main._start_instance("2", pin_preflight_verified=True)
+
+        preflight.assert_awaited_once_with(target)
+        self.assertEqual(len(scheduled), 1)
+
+    def test_processed_notification_is_removed_from_only_the_selected_cached_se(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(main, "_ESIM_CACHE_PATH", str(Path(temp, "esim-cache.json"))), \
+                patch.object(main.time, "time", return_value=200):
+            main._esim_cache_write({
+                "eid-one": {"ts": 100, "ses": [
+                    {"id": "first", "profiles": [{"iccid": "profile-target"}],
+                     "notifications": [{"seqNumber": 73}, {"seqNumber": 74}]},
+                    {"id": "second", "profiles": [{"iccid": "profile-other"}],
+                     "notifications": [{"seqNumber": 75}]},
+                ]},
+                "eid-two": {"ts": 100, "ses": [
+                    {"id": "first", "profiles": [{"iccid": "profile-unrelated"}],
+                     "notifications": [{"seqNumber": 76}]},
+                ]},
+            })
+
+            self.assertTrue(main._esim_cache_remove_notifications(
+                "profile-target", "first"))
+            cached = main._esim_cache_load()
+
+        self.assertEqual(cached["eid-one"]["ses"][0]["notifications"], [])
+        self.assertEqual(
+            cached["eid-one"]["ses"][1]["notifications"], [{"seqNumber": 75}])
+        self.assertEqual(
+            cached["eid-two"]["ses"][0]["notifications"], [{"seqNumber": 76}])
+        self.assertEqual(cached["eid-one"]["ts"], 200)
+
+    def test_chip_cache_never_persists_transient_notifications(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(main, "_ESIM_CACHE_PATH", str(Path(temp, "esim-cache.json"))):
+            main._esim_cache_store([{
+                "id": "default", "eid": "eid-one",
+                "profiles": [{"iccid": "profile-target"}],
+                "notifications": [{"seqNumber": 73}],
+            }], "")
+            cached = main._esim_cache_load()
+
+        self.assertEqual(cached["eid-one"]["ses"][0]["notifications"], [])
+
+    async def test_legacy_cached_notifications_are_not_reported_as_live(self):
+        cached = {"ts": 100, "imei": "", "ses": [{
+            "id": "default", "profiles": [{"iccid": "profile-target"}],
+            "notifications": [{"seqNumber": 73}],
+        }]}
+        with patch.object(main, "_esim_resolve_reader", return_value=("reader", 0)), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "iccid": "profile-target"},
+                }), patch.object(main, "_esim_cache_for_iccid", return_value=cached):
+            result = await main.api_esim_chip_cached(reader="reader")
+
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["ses"][0]["notifications"], [])
+        self.assertEqual(cached["ses"][0]["notifications"], [{"seqNumber": 73}])
+
     async def test_prepare_and_restore_preserve_the_exact_running_snapshot(self):
         lines = {
             "1": {"id": "1", "enabled": True, "imei_source_device_id": "modem-1"},

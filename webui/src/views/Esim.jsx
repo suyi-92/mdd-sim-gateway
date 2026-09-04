@@ -677,6 +677,20 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   useEffect(() => {
     if (!subscribe) return undefined
     return subscribe((msg) => {
+      if (msg.type === 'esim_notifications') {
+        if (reader && msg.reader && msg.reader !== reader) return
+        setSes((list) => list.map((se) => {
+          if (msg.se_id && `${se.id || ''}` !== `${msg.se_id}`) return se
+          const current = se.notifications || []
+          const notifications = msg.seq == null
+            ? []
+            : current.filter((item) => `${item.seqNumber ?? item.seq ?? ''}` !== `${msg.seq}`)
+          return notifications.length === current.length
+            ? se
+            : { ...se, notifications }
+        }))
+        return
+      }
       if (msg.type === 'esim_profile') {
         if (reader && msg.reader && msg.reader !== reader) return
         if (msg.profile_state === 'enabled' && msg.iccid) {

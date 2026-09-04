@@ -337,9 +337,11 @@ EXIT_TEST_MAX_AGE_SECONDS = 90.0
 # A full reconcile shells out to mmcli and ip about fifteen times. At the base interval that
 # was the largest source of process creation on the box, and almost all of it re-derived a
 # state that had not changed. When a cycle finds nothing to do the loop backs off, while still
-# waking on the base interval to stat the input documents so an operator action is never
-# delayed by more than one base tick.
+# waking on a short stat-only interval so a profile-switch bridge request is not delayed by
+# the three-second full-reconcile cadence. This path launches no subprocesses.
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
+INPUT_WAKE_POLL_SECONDS = max(
+    0.1, float(os.environ.get("MDD_INPUT_WAKE_POLL_INTERVAL", "0.5")))
 # How long a tty may stay unclaimed before the bridge stops waiting for ModemManager and talks
 # to the serial port itself. ModemManager needs on the order of ten to thirty seconds to probe
 # an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
@@ -3336,11 +3338,12 @@ class Orchestrator:
         """
         watched = self._input_mtimes()
         deadline = time.time() + seconds
+        poll_interval = min(self.interval, INPUT_WAKE_POLL_SECONDS)
         while not self.stop:
             remaining = deadline - time.time()
             if remaining <= 0:
                 return
-            if self._stop_event.wait(min(self.interval, max(0.1, remaining))):
+            if self._stop_event.wait(min(poll_interval, max(0.1, remaining))):
                 return
             if self._input_mtimes() != watched:
                 return

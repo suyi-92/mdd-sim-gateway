@@ -24,6 +24,7 @@ from . import config as cfg
 log = logging.getLogger("vowifi.lpa")
 
 ProgressCb = Callable[[dict], Awaitable[None] | None]
+NotificationProcessedCb = Callable[[], Awaitable[None] | None]
 
 
 class LpaError(Exception):
@@ -137,6 +138,7 @@ async def run_lpac(
 
     Raises LpaError on non-zero payload code, missing binary, timeout, or cancel.
     """
+    started_at = asyncio.get_running_loop().time()
     binary = lpac_bin()
     if not os.path.isfile(binary):
         raise LpaError(
@@ -262,6 +264,8 @@ async def run_lpac(
         raise LpaError(str(message), detail=detail, code=code)
 
     result.data = data
+    log.info("lpac complete operation=%s duration_ms=%d",
+             operation, round((asyncio.get_running_loop().time() - started_at) * 1000))
     return result
 
 
@@ -325,24 +329,45 @@ async def profile_list(reader_name: str, *, aid: str | None = None) -> list[dict
     return []
 
 
-async def profile_enable(reader_name: str, iccid: str, *, aid: str | None = None) -> Any:
+async def profile_enable(
+    reader_name: str,
+    iccid: str,
+    *,
+    aid: str | None = None,
+    on_notifications_processed: NotificationProcessedCb | None = None,
+) -> Any:
     r = await run_lpac(
         "profile", "enable", iccid, reader_name=reader_name, aid=aid, timeout=90)
-    await maybe_process_notifications(reader_name, aid=aid)
+    await maybe_process_notifications(
+        reader_name, aid=aid, on_processed=on_notifications_processed)
     return r.data
 
 
-async def profile_disable(reader_name: str, iccid: str, *, aid: str | None = None) -> Any:
+async def profile_disable(
+    reader_name: str,
+    iccid: str,
+    *,
+    aid: str | None = None,
+    on_notifications_processed: NotificationProcessedCb | None = None,
+) -> Any:
     r = await run_lpac(
         "profile", "disable", iccid, reader_name=reader_name, aid=aid, timeout=90)
-    await maybe_process_notifications(reader_name, aid=aid)
+    await maybe_process_notifications(
+        reader_name, aid=aid, on_processed=on_notifications_processed)
     return r.data
 
 
-async def profile_delete(reader_name: str, iccid: str, *, aid: str | None = None) -> Any:
+async def profile_delete(
+    reader_name: str,
+    iccid: str,
+    *,
+    aid: str | None = None,
+    on_notifications_processed: NotificationProcessedCb | None = None,
+) -> Any:
     r = await run_lpac(
         "profile", "delete", iccid, reader_name=reader_name, aid=aid, timeout=90)
-    await maybe_process_notifications(reader_name, aid=aid)
+    await maybe_process_notifications(
+        reader_name, aid=aid, on_processed=on_notifications_processed)
     return r.data
 
 
@@ -366,6 +391,7 @@ async def download(
     imei: str | None = None,
     aid: str | None = None,
     on_progress: ProgressCb | None = None,
+    on_notifications_processed: NotificationProcessedCb | None = None,
     interactive_preview: bool = False,
     stdin_data: str | None = None,
 ) -> Any:
@@ -392,7 +418,8 @@ async def download(
         stdin_data=stdin_data,
         track_key=reader_name,
     )
-    await maybe_process_notifications(reader_name, aid=aid)
+    await maybe_process_notifications(
+        reader_name, aid=aid, on_processed=on_notifications_processed)
     return r.data
 
 
@@ -456,18 +483,34 @@ async def notification_remove(
     return r.data
 
 
-async def maybe_process_notifications(reader_name: str, *, aid: str | None = None) -> None:
+async def maybe_process_notifications(
+    reader_name: str,
+    *,
+    aid: str | None = None,
+    on_processed: NotificationProcessedCb | None = None,
+) -> bool:
     """Best-effort SGP.22 notification delivery after profile mutations."""
     if not auto_process_notifications():
-        return
+        return False
     try:
         await notification_process(
             reader_name, all_notifications=True, autoremove=True, aid=aid)
     except LpaError as e:
         log.warning("auto notification process failed reader=%s: %s (%s)",
                     reader_name, e.message, e.detail)
+        return False
     except Exception as e:  # noqa
         log.warning("auto notification process error reader=%s: %r", reader_name, e)
+        return False
+    if on_processed:
+        try:
+            result = on_processed()
+            if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
+                await result
+        except Exception as e:  # noqa - delivery succeeded; cache/UI refresh is best effort
+            log.warning("notification post-process hook failed reader=%s error=%s",
+                        reader_name, type(e).__name__)
+    return True
 
 
 async def load_all_ses(reader_name: str, reader_index: int = 0) -> dict:

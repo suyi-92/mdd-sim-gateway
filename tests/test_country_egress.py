@@ -941,7 +941,7 @@ class IdleBackoffTests(unittest.TestCase):
             self.assertLess(sum(slept), 60.0)
             self.assertEqual(len(slept), 2)
 
-    def test_each_wait_slice_is_at_most_one_base_interval(self):
+    def test_each_wait_slice_uses_the_short_input_poll_interval(self):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             slept = []
@@ -955,10 +955,11 @@ class IdleBackoffTests(unittest.TestCase):
             with patch.object(app._stop_event, "wait", side_effect=fake_sleep), \
                     patch("host.mdd_orchestrator.time.time", lambda: clock[0]):
                 app._sleep_for_work(15.0)
-            self.assertTrue(all(x <= app.interval + 0.001 for x in slept),
+            self.assertTrue(all(
+                x <= orch.INPUT_WAKE_POLL_SECONDS + 0.001 for x in slept),
                             "a long slice would delay noticing an operator action")
             self.assertAlmostEqual(sum(slept), 15.0, places=3)
-            self.assertEqual(len(slept), 5)          # 15s in 3s slices
+            self.assertEqual(len(slept), 30)         # 15s in 0.5s stat-only slices
 
     def test_a_stop_request_is_not_ignored_while_backing_off(self):
         with tempfile.TemporaryDirectory() as temp:
