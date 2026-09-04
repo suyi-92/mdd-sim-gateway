@@ -1634,6 +1634,31 @@ class Orchestrator:
                     profiles.append((parts[0].replace(r"\:", ":"), parts[2]))
         return profiles
 
+    def _set_cellular_profile_autoconnect(self, profile: str, enabled: bool) -> bool:
+        """Persist whether NetworkManager may recreate this managed data bearer.
+
+        ``nmcli connection down`` blocks autoconnect only for the current device lifetime.  A
+        reboot or USB replug clears that transient block, so leaving the profile itself at
+        ``autoconnect=yes`` can briefly consume mobile data before the orchestrator reconciles
+        the saved OFF request.  Read before writing to avoid rewriting the profile every cycle.
+        """
+        target = "yes" if enabled else "no"
+        current = run(["nmcli", "-g", "connection.autoconnect",
+                       "connection", "show", profile])
+        if current.returncode:
+            self.log(f"could not read cellular profile autoconnect for {profile}: "
+                     f"{(current.stderr or current.stdout).strip()}")
+            return False
+        if (current.stdout or "").strip().lower() == target:
+            return True
+        result = run(["nmcli", "connection", "modify", profile,
+                      "connection.autoconnect", target])
+        if result.returncode:
+            self.log(f"could not set cellular profile autoconnect={target} for {profile}: "
+                     f"{(result.stderr or result.stdout).strip()}")
+            return False
+        return True
+
     def ensure_modem_data(self, modem: dict, snapshot: dict) -> None:
         """Give each modem its own NetworkManager GSM profile and bearer."""
         if not snapshot.get("powered") or snapshot.get("data_active"):
@@ -1667,20 +1692,30 @@ class Orchestrator:
                 self.log(f"could not create cellular profile for {device_id}: "
                          f"{(result.stderr or result.stdout).strip()}")
                 return
-        elif apn:
-            # A profile may have been created before the retained bearer APN became visible.
-            result = run(["nmcli", "connection", "modify", profile,
-                          "gsm.apn", apn, "gsm.auto-config", "no"])
-            if result.returncode:
-                self.log(f"could not update cellular APN for {device_id}: "
-                         f"{(result.stderr or result.stdout).strip()}")
+        else:
+            # Re-enable persistent activation before bringing up a profile that an earlier
+            # explicit OFF request made non-autoconnecting.
+            if not self._set_cellular_profile_autoconnect(profile, True):
                 return
+            if apn:
+                # A profile may have been created before the retained bearer APN became visible.
+                result = run(["nmcli", "connection", "modify", profile,
+                              "gsm.apn", apn, "gsm.auto-config", "no"])
+                if result.returncode:
+                    self.log(f"could not update cellular APN for {device_id}: "
+                             f"{(result.stderr or result.stdout).strip()}")
+                    return
         result = run(["nmcli", "connection", "up", profile])
         if result.returncode:
             self.log(f"could not activate cellular profile for {device_id}: "
                      f"{(result.stderr or result.stdout).strip()}")
 
-    def disconnect_modem_data(self, snapshot: dict) -> None:
+    def disconnect_modem_data(self, modem: dict, snapshot: dict) -> None:
+        profile = self.cellular_profile_name(modem["id"])
+        if run(["nmcli", "connection", "show", profile]).returncode == 0:
+            # Persist OFF before dropping the live bearer. Otherwise NetworkManager can race
+            # the next boot/replug and recreate a billable data session on its own.
+            self._set_cellular_profile_autoconnect(profile, False)
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
         for name, device in self._active_gsm_profiles():
             if primary and device == primary:
@@ -1930,11 +1965,11 @@ class Orchestrator:
                     if radio_enabled and data_enabled:
                         self.ensure_modem_data(modem, snapshot)
                     else:
-                        self.disconnect_modem_data(snapshot)
+                        self.disconnect_modem_data(modem, snapshot)
                     self.cellular_states[device_id] = self.modem_snapshot(modem)
                     continue
                 if not radio_enabled:
-                    self.disconnect_modem_data(snapshot)
+                    self.disconnect_modem_data(modem, snapshot)
                 result = run(["mmcli", "-m", obj,
                               "--enable" if radio_enabled else "--disable"])
                 # ModemManager may report 'already enabled/disabled' as an error; verify by
@@ -1964,7 +1999,7 @@ class Orchestrator:
                 if radio_enabled and data_enabled:
                     self.ensure_modem_data(modem, fresh)
                 else:
-                    self.disconnect_modem_data(fresh)
+                    self.disconnect_modem_data(modem, fresh)
                 self.cellular_states[device_id] = self.modem_snapshot(modem)
 
     def log(self, message):

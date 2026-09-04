@@ -184,6 +184,10 @@ ExecStartPost 失败，检查 `busctl` 与 D-Bus 服务名。
 
 ## 8. ModemManager 有对象，但 4G 没有 bearer/IP
 
+界面中的“蜂窝数据（4G）”只控制 NetworkManager 数据 bearer，不控制基站注册。若只需模块保持
+注册到蜂窝网络而不使用移动数据，应关闭飞行模式并关闭蜂窝数据；模块射频保持开启，但受管
+数据 profile 会持久设为 `autoconnect=no`，重启或重新插拔模块后也不得抢先自动建立数据连接。
+
 ```bash
 mmcli -m <n>
 mmcli -m <n> --simple-status

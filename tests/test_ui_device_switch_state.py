@@ -30,6 +30,15 @@ class CapabilitySwitchStateTests(unittest.TestCase):
         self.assertIn("vowifi: 'Working — connected to the carrier over Wi-Fi.'", SOURCE)
         self.assertIn("'运行正常：已通过蜂窝网络连接运营商。'", I18N)
 
+    def test_cellular_control_is_named_as_data_not_base_station_registration(self):
+        self.assertIn("t('Cellular data (4G)')", SOURCE)
+        self.assertNotIn("t('4G network')", SOURCE)
+        self.assertIn(
+            "cellular: 'Mobile data is disconnected; the modem radio can remain registered",
+            SOURCE)
+        self.assertIn("'蜂窝数据（4G）'", I18N)
+        self.assertIn("模块仍可保持注册到蜂窝网络", I18N)
+
     def test_device_badge_combines_cellular_and_vowifi_state(self):
         self.assertIn("const capabilities = ['cellular', 'vowifi']", SOURCE)
         self.assertIn("<Badge state={deviceConnectivityState(x)} />", SOURCE)

@@ -266,6 +266,95 @@ class DeviceStateTests(unittest.TestCase):
         self.assertNotEqual(first, Orchestrator.cellular_profile_name("2c7c-0125-1-1.3"))
         self.assertTrue(first.startswith("mdd-cell-"))
 
+    def test_disabling_cellular_data_persists_no_autoconnect_before_bearer_down(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            modem = {"id": "modem-a"}
+            profile = app.cellular_profile_name(modem["id"])
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                if args == ["nmcli", "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if args == ["nmcli", "-g", "connection.autoconnect",
+                            "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="yes\n", stderr="")
+                if args == ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE",
+                            "connection", "show", "--active"]:
+                    return SimpleNamespace(
+                        returncode=0, stdout=f"{profile}:gsm:cdc-wdm0\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                app.disconnect_modem_data(
+                    modem, {"primary_port": "cdc-wdm0", "network_interface": "wwan0"})
+
+            persist = ["nmcli", "connection", "modify", profile,
+                       "connection.autoconnect", "no"]
+            down = ["nmcli", "connection", "down", profile]
+            self.assertIn(persist, calls)
+            self.assertIn(down, calls)
+            self.assertLess(calls.index(persist), calls.index(down))
+
+    def test_enabling_cellular_data_restores_autoconnect_before_bearer_up(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            modem = {"id": "modem-a"}
+            profile = app.cellular_profile_name(modem["id"])
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                if args == ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE",
+                            "connection", "show", "--active"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if args == ["nmcli", "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if args == ["nmcli", "-g", "connection.autoconnect",
+                            "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="no\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                app.ensure_modem_data(modem, {
+                    "powered": True, "data_active": False, "registration": "home",
+                    "primary_port": "cdc-wdm0", "network_interface": "wwan0", "apn": "",
+                })
+
+            persist = ["nmcli", "connection", "modify", profile,
+                       "connection.autoconnect", "yes"]
+            up = ["nmcli", "connection", "up", profile]
+            self.assertIn(persist, calls)
+            self.assertIn(up, calls)
+            self.assertLess(calls.index(persist), calls.index(up))
+
+    def test_already_disabled_cellular_profile_is_not_rewritten_each_cycle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            modem = {"id": "modem-a"}
+            profile = app.cellular_profile_name(modem["id"])
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                if args == ["nmcli", "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if args == ["nmcli", "-g", "connection.autoconnect",
+                            "connection", "show", profile]:
+                    return SimpleNamespace(returncode=0, stdout="no\n", stderr="")
+                if args == ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE",
+                            "connection", "show", "--active"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                app.disconnect_modem_data(
+                    modem, {"primary_port": "cdc-wdm0", "network_interface": "wwan0"})
+
+            self.assertNotIn(["nmcli", "connection", "modify", profile,
+                              "connection.autoconnect", "no"], calls)
+
     def test_native_cellular_plan_scales_per_physical_modem(self):
         plan = Orchestrator.capability_plan({
             "modem-a": {"cellular_enabled": True, "vowifi_enabled": False},
