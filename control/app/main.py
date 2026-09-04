@@ -3639,14 +3639,15 @@ def _vowifi_capability(desired: bool, observed: dict, running: bool,
     transitioning = bool(observed.get("transitioning"))
     bridge = bool((observed.get("actual") or {}).get("vowifi_bridge_active"))
     error = str(observed.get("error") or "")
-    if error:
+    if not desired:
+        # A modem-wide transition/error may belong only to cellular data or flight mode.  Once
+        # the VoWiFi line is stopped, neither that shared state nor the always-on SIM bridge may
+        # turn an explicit operator choice back into a misleading "stopping"/"error" state.
+        actual, error = ("stopping", "") if running else ("off", "")
+    elif error:
         actual = "error"
     elif transitioning:
-        actual = "starting" if desired else "stopping"
-    elif not desired:
-        # The bridge stays up for every present modem so the card remains readable, so it
-        # says nothing about VoWiFi here — only a still-running line means "stopping".
-        actual = "stopping" if running else "off"
+        actual = "starting"
     elif not bridge:
         actual = "starting"
     elif not running:

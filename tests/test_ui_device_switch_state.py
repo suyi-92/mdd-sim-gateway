@@ -6,6 +6,8 @@ from pathlib import Path
 
 SOURCE = (Path(__file__).resolve().parent.parent
           / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
+I18N = (Path(__file__).resolve().parent.parent
+        / "webui/src/i18n.jsx").read_text(encoding="utf-8")
 
 
 class CapabilitySwitchStateTests(unittest.TestCase):
@@ -18,6 +20,19 @@ class CapabilitySwitchStateTests(unittest.TestCase):
             self.assertIsNotNone(kind, switch)
             self.assertIsNotNone(key, switch)
             self.assertEqual(key.group(1), kind.group(1), switch)
+
+    def test_enabled_help_text_is_specific_to_each_capability(self):
+        self.assertIn(
+            "cellular: 'Working — connected to the carrier over the cellular network.'",
+            SOURCE)
+        self.assertIn(
+            "flight: 'Flight mode is active; the cellular radio is disabled.'", SOURCE)
+        self.assertIn("vowifi: 'Working — connected to the carrier over Wi-Fi.'", SOURCE)
+        self.assertIn("'运行正常：已通过蜂窝网络连接运营商。'", I18N)
+
+    def test_device_badge_combines_cellular_and_vowifi_state(self):
+        self.assertIn("const capabilities = ['cellular', 'vowifi']", SOURCE)
+        self.assertIn("<Badge state={deviceConnectivityState(x)} />", SOURCE)
 
 
 if __name__ == "__main__":

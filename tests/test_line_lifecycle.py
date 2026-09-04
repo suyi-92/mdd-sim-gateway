@@ -381,6 +381,24 @@ class StatusActivityTests(unittest.TestCase):
         self.assertEqual(capability["actual"], "starting")
         self.assertEqual(capability["reason"], "Finalizing identity")
 
+    def test_disabled_modem_vowifi_ignores_unrelated_device_transition(self):
+        stopped = main._vowifi_capability(
+            False,
+            {"transitioning": True, "error": "cellular backend is changing",
+             "actual": {"vowifi_bridge_active": True}},
+            False,
+            {"state": "STOPPED"},
+        )
+        still_running = main._vowifi_capability(
+            False,
+            {"transitioning": True, "actual": {"vowifi_bridge_active": True}},
+            True,
+            {"state": "OK"},
+        )
+
+        self.assertEqual(stopped, {"desired": False, "actual": "off", "reason": ""})
+        self.assertEqual(still_running["actual"], "stopping")
+
     def test_frozen_status_explains_countdown_and_next_action(self):
         main.hub.health["activity-test"] = {
             "auto_retrying": False, "fail_start": None, "retry_count": 3,

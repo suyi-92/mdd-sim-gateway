@@ -7,6 +7,11 @@ import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
+const CAPABILITY_ON_DETAILS = {
+  cellular: 'Working — connected to the carrier over the cellular network.',
+  flight: 'Flight mode is active; the cellular radio is disabled.',
+  vowifi: 'Working — connected to the carrier over Wi-Fi.',
+}
 const COMMON_TIMEZONES = [
   ['Asia/Shanghai', 'China · Shanghai'],
   ['Asia/Hong_Kong', 'China · Hong Kong'],
@@ -35,6 +40,17 @@ function capability(device, key) {
 
 function supportsCellular(device) {
   return device?.device_type !== 'reader' && capability(device, 'cellular').actual !== 'unsupported'
+}
+
+function deviceConnectivityState(device) {
+  if (device?.present === false) return 'error'
+  const capabilities = ['cellular', 'vowifi']
+    .map(key => capability(device, key))
+    .filter(item => item.actual !== 'unsupported')
+  const desired = capabilities.filter(item => item.desired)
+  const relevant = desired.length ? desired : capabilities
+  return ['error', 'degraded', 'starting', 'stopping', 'on']
+    .find(state => relevant.some(item => item.actual === state)) || 'off'
 }
 
 function exitNodeLabel(device, t) {
@@ -219,7 +235,7 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   const detail = draft
     ? t('Complete SIM and hardware setup before enabling VoWiFi. Missing: {items}.', { items: missing || t('SIM or hardware identity') })
     : c.actual === 'on'
-      ? t('Working — connected to the carrier over Wi-Fi.')
+      ? t(CAPABILITY_ON_DETAILS[kind] || 'cap.help.on')
       : (c.reason ? t(c.reason) : t(`cap.help.${c.actual}`))
   return <div className={`u-capability ${compact ? 'compact' : ''}`}>
     <div><b>{title}</b><div className="u-cap-detail">{detail}</div></div>
@@ -363,7 +379,7 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
   if (discovering) return <Discovering t={t} />
   if (!d) return discovering ? <Discovering t={t} /> : <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} />
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('4G network')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
-  return <div className="u-split"><aside className="card u-device-list">{devices.map((x,i)=><button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={x.present === false ? 'error' : capability(x,'vowifi').actual} /></span></button>)}</aside>
+  return <div className="u-split"><aside className="card u-device-list">{devices.map((x,i)=><button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={deviceConnectivityState(x)} /></span></button>)}</aside>
     <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, devices.indexOf(d))}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the 4G switch only connects or disconnects mobile data.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}

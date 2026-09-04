@@ -446,6 +446,8 @@ const zh = {
   "Reader holds another line's SIM": '读卡器里是另一条线路的 SIM',
   'Refreshing line status…': '正在刷新线路状态…', 'The line was rebuilt successfully.': '线路已完成重建。',
   "VoWiFi tunnel is up — registering to the carrier's IMS…": 'VoWiFi 隧道已连接，正在注册运营商 IMS…',
+  'Working — connected to the carrier over the cellular network.': '运行正常：已通过蜂窝网络连接运营商。',
+  'Flight mode is active; the cellular radio is disabled.': '飞行模式已开启：蜂窝射频已关闭。',
   'Working — connected to the carrier over Wi-Fi.': '运行正常：已通过 Wi‑Fi 连接运营商。',
   'No SIM card detected in the reader.': '读卡器中未检测到 SIM 卡。', 'SIM PIN is incorrect.': 'SIM PIN 不正确。',
   'SIM PIN is blocked — PUK required.': 'SIM PIN 已锁定，需要 PUK。',
