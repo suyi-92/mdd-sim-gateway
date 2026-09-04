@@ -41,7 +41,14 @@ class CapabilitySwitchStateTests(unittest.TestCase):
 
     def test_device_badge_combines_cellular_and_vowifi_state(self):
         self.assertIn("const capabilities = ['cellular', 'vowifi']", SOURCE)
-        self.assertIn("<Badge state={deviceConnectivityState(x)} />", SOURCE)
+        self.assertIn("const badge=deviceStatusBadge(x)", SOURCE)
+        self.assertIn("<Badge state={badge.state}>", SOURCE)
+
+    def test_registered_modem_is_not_described_as_closed_when_data_is_off(self):
+        self.assertIn("function deviceStatusBadge(device)", SOURCE)
+        self.assertIn("['home', 'roaming', 'registered'].includes(registration)", SOURCE)
+        self.assertIn("return { state: 'on', label: 'Cellular network registered' }", SOURCE)
+        self.assertIn("'Cellular network registered': '蜂窝网络已注册'", I18N)
 
 
 if __name__ == "__main__":
