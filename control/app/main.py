@@ -3745,7 +3745,7 @@ async def _unified_devices() -> list[dict]:
                   if is_native_reader else desired_devices.get(device_id)
                   or desired_doc.get("defaults") or {
                       "cellular_enabled": False, "vowifi_enabled": True,
-                      "flight_mode": False})
+                      "flight_mode": True})
         cell_desired = bool(wanted.get("cellular_enabled"))
         vowifi_desired = bool(wanted.get("vowifi_enabled"))
         flight_desired = bool(wanted.get("flight_mode"))
@@ -4130,7 +4130,7 @@ async def api_device_capabilities(device_id: str, body: dict):
         present = sorted(key for key in known if (observed_doc.get("devices") or {}).get(
             key, {}).get("present", key in assignments))
         previous = (desired_doc.get("devices") or {}).get(device_id) or desired_doc.get("defaults") or {
-            "cellular_enabled": False, "vowifi_enabled": True, "flight_mode": False}
+            "cellular_enabled": False, "vowifi_enabled": True, "flight_mode": True}
         wanted = {**previous, **body}
         cellular_changed = wanted["cellular_enabled"] != bool(previous.get("cellular_enabled"))
         vowifi_changed = wanted["vowifi_enabled"] != bool(previous.get("vowifi_enabled"))

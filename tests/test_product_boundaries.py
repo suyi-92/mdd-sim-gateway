@@ -52,6 +52,15 @@ class ProductBoundaryTests(unittest.TestCase):
             config.save({"settings": {"max_sim_lines": 99}, "instances": {}})
             self.assertEqual(config.get_settings()["max_sim_lines"], 13)
 
+    def test_new_cellular_modems_default_to_flight_mode_but_operator_can_disable_it(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            self.assertTrue(config.get_settings()["device_defaults"]["flight_mode"])
+            saved = config.update_settings({"device_defaults": {"flight_mode": False}})
+            self.assertFalse(saved["device_defaults"]["flight_mode"])
+            self.assertFalse(saved["device_defaults"]["cellular_enabled"])
+            self.assertTrue(saved["device_defaults"]["vowifi_enabled"])
+
     def test_stale_remote_controls_are_removed_on_load_and_save(self):
         temp, paths = self.temp_config()
         with temp, paths:

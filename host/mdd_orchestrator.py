@@ -64,6 +64,12 @@ MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
 BACKUP_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
+DEVICE_STATE_VERSION = 3
+DEFAULT_DEVICE_CAPABILITIES = {
+    "cellular_enabled": False,
+    "vowifi_enabled": True,
+    "flight_mode": True,
+}
 
 
 def read_json(path: Path) -> dict:
@@ -1101,9 +1107,7 @@ class Orchestrator:
         devices = {}
         for device_id in sorted(set(desired_devices) | set(assignments)):
             assignment = assignments.get(device_id) or {}
-            wanted = desired_devices.get(device_id) or {
-                "cellular_enabled": False, "vowifi_enabled": True,
-                "flight_mode": False}
+            wanted = desired_devices.get(device_id) or DEFAULT_DEVICE_CAPABILITIES
             bridge = self.bridges.get(device_id)
             bridge_failure = self._bridge_failures.get(device_id)
             bridge_alive = bool(bridge and bridge.poll() is None)
@@ -1752,11 +1756,11 @@ class Orchestrator:
         self.obsolete_services_retired = True
 
     @staticmethod
-    def normalize_capabilities(value: dict | None) -> dict:
+    def normalize_capabilities(value: dict | None, *, flight_mode_default=False) -> dict:
         value = value or {}
         return {"cellular_enabled": bool(value.get("cellular_enabled", False)),
                 "vowifi_enabled": bool(value.get("vowifi_enabled", True)),
-                "flight_mode": bool(value.get("flight_mode", False))}
+                "flight_mode": bool(value.get("flight_mode", flight_mode_default))}
 
     @staticmethod
     def device_capability_plan(value: dict | None) -> dict:
@@ -1858,23 +1862,39 @@ class Orchestrator:
         return scoped
 
     def desired_devices(self, discovered: list[dict]) -> tuple[dict, bool]:
-        """Load per-device state, creating safe defaults once when necessary."""
+        """Load per-device state and snapshot defaults on first discovery."""
         document = read_json(self.device_desired_path)
-        migrated = False
+        changed = False
         if not document:
-            defaults = {"cellular_enabled": False, "vowifi_enabled": True,
-                        "flight_mode": False}
-            document = {"version": 2, "defaults": defaults, "devices": {},
-                        "updated_at": int(time.time())}
-            atomic_json(self.device_desired_path, document)
-            migrated = True
-        defaults = self.normalize_capabilities(document.get("defaults"))
+            document = {"version": DEVICE_STATE_VERSION,
+                        "defaults": dict(DEFAULT_DEVICE_CAPABILITIES), "devices": {}}
+            changed = True
+        try:
+            legacy = int(document.get("version") or 0) < DEVICE_STATE_VERSION
+        except (TypeError, ValueError):
+            legacy = True
+        raw_defaults = dict(document.get("defaults") or {})
+        if legacy:
+            # v2 always wrote flight_mode=false before this policy was exposed. Promote
+            # only the global default; normalized saved device choices remain untouched.
+            raw_defaults["flight_mode"] = True
+            changed = True
+        defaults = self.normalize_capabilities(raw_defaults, flight_mode_default=True)
         configured = document.get("devices") or {}
         devices = {str(device_id): self.normalize_capabilities(state)
                    for device_id, state in configured.items() if str(device_id)}
         for modem in discovered:
-            devices.setdefault(modem["id"], defaults.copy())
-        return devices, migrated
+            if modem["id"] not in devices:
+                devices[modem["id"]] = defaults.copy()
+                changed = True
+        if changed:
+            # Persist the first-seen decision. Later edits to the global defaults must not
+            # rewrite hardware that the gateway already knows.
+            atomic_json(self.device_desired_path, {
+                "version": DEVICE_STATE_VERSION, "defaults": defaults, "devices": devices,
+                "updated_at": int(time.time()),
+            })
+        return devices, changed
 
     def apply_device_radios(self, discovered: list[dict], desired_devices: dict,
                             through_modemmanager: bool):

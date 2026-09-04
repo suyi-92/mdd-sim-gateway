@@ -95,10 +95,10 @@ class DeviceStateTests(unittest.TestCase):
                 value = device_state.desired()["devices"]
                 self.assertEqual(value["modem-a"], {
                     "cellular_enabled": True, "vowifi_enabled": False,
-                    "flight_mode": False})
+                    "flight_mode": True})
                 self.assertEqual(value["modem-b"], {
                     "cellular_enabled": False, "vowifi_enabled": True,
-                    "flight_mode": False})
+                    "flight_mode": True})
 
     def test_new_device_defaults_are_persisted_without_changing_existing_devices(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -106,15 +106,37 @@ class DeviceStateTests(unittest.TestCase):
             with patch.multiple(device_state, ROOT=str(root),
                                 DESIRED=str(root / "desired.json"),
                                 STATUS=str(root / "status.json")):
-                device_state.set_desired("existing", cellular_enabled=False, vowifi_enabled=True)
-                device_state.set_defaults(cellular_enabled=True, vowifi_enabled=False)
+                device_state.set_desired("existing", cellular_enabled=False,
+                                         vowifi_enabled=True, flight_mode=False)
+                device_state.set_defaults(cellular_enabled=True, vowifi_enabled=False,
+                                          flight_mode=True)
                 value = device_state.desired()
                 self.assertEqual(value["defaults"], {
                     "cellular_enabled": True, "vowifi_enabled": False,
-                    "flight_mode": False})
+                    "flight_mode": True})
                 self.assertEqual(value["devices"]["existing"], {
                     "cellular_enabled": False, "vowifi_enabled": True,
                     "flight_mode": False})
+
+    def test_control_migrates_only_the_v2_global_flight_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            desired_path = root / "desired.json"
+            desired_path.write_text(json.dumps({
+                "version": 2,
+                "defaults": {"cellular_enabled": False, "vowifi_enabled": True,
+                             "flight_mode": False},
+                "devices": {"known": {"cellular_enabled": True,
+                                       "vowifi_enabled": True,
+                                       "flight_mode": False}},
+            }), encoding="utf-8")
+            with patch.multiple(device_state, ROOT=str(root), DESIRED=str(desired_path),
+                                STATUS=str(root / "status.json")):
+                value = device_state.desired()
+
+            self.assertEqual(value["version"], 3)
+            self.assertTrue(value["defaults"]["flight_mode"])
+            self.assertFalse(value["devices"]["known"]["flight_mode"])
 
     def test_hardware_imei_is_stored_per_device_and_never_in_capability_state(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -348,10 +370,37 @@ modem.3gpp.registration-state : unknown
             self.assertTrue(created)
             self.assertEqual(devices["modem-a"], {
                 "cellular_enabled": False, "vowifi_enabled": True,
-                "flight_mode": False})
+                "flight_mode": True})
+            plan = Orchestrator.capability_plan(devices)
+            self.assertFalse(app.cellular_backend_needed(plan, {"modem-a"}, {}))
             document = device_state._read(str(app.device_desired_path), {})
-            self.assertEqual(document["version"], 2)
+            self.assertEqual(document["version"], 3)
+            self.assertEqual(document["devices"]["modem-a"], devices["modem-a"])
             self.assertNotIn("mode", document)
+
+    def test_v2_default_migration_preserves_known_device_and_snapshots_new_modem(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.root.mkdir(parents=True)
+            app.device_desired_path.write_text(json.dumps({
+                "version": 2,
+                "defaults": {"cellular_enabled": False, "vowifi_enabled": True,
+                             "flight_mode": False},
+                "devices": {"known": {"cellular_enabled": False,
+                                       "vowifi_enabled": True,
+                                       "flight_mode": False}},
+            }), encoding="utf-8")
+
+            devices, migrated = app.desired_devices([{"id": "known"}, {"id": "new"}])
+
+            self.assertTrue(migrated)
+            self.assertFalse(devices["known"]["flight_mode"])
+            self.assertTrue(devices["new"]["flight_mode"])
+            document = json.loads(app.device_desired_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["version"], 3)
+            self.assertTrue(document["defaults"]["flight_mode"])
+            self.assertEqual(document["devices"], devices)
 
     class Process:
         def __init__(self, command):

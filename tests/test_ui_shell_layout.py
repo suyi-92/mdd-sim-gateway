@@ -87,6 +87,11 @@ class PageRhythmTests(unittest.TestCase):
                          "America/Los_Angeles", "Asia/Tokyo", "UTC"):
             self.assertIn(f"['{timezone}',", UNIFIED)
 
+    def test_new_cellular_modems_default_to_flight_mode_once(self):
+        self.assertIn("Enable flight mode for newly detected modems", UNIFIED)
+        self.assertIn("checked={s.device_defaults?.flight_mode !== false}", UNIFIED)
+        self.assertIn("changing these defaults never rewrites known devices", UNIFIED)
+
     def test_diagnostics_separate_the_action_from_capability_rows(self):
         self.assertIn('className="u-page u-diagnostics-page"', UNIFIED)
         self.assertIn('className="card u-panel u-diagnostic-card"', UNIFIED)

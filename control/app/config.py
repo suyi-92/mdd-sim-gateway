@@ -75,7 +75,8 @@ DEFAULTS = {
     "settings": {
         "timezone": "Asia/Shanghai",
         "max_sim_lines": DEFAULT_SIM_LINE_LIMIT,
-        "device_defaults": {"cellular_enabled": False, "vowifi_enabled": True},
+        "device_defaults": {"cellular_enabled": False, "vowifi_enabled": True,
+                            "flight_mode": True},
         "http_port": 8443,
         "bind": "0.0.0.0",
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},

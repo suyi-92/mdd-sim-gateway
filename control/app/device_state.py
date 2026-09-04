@@ -19,8 +19,9 @@ DESIRED = os.path.join(ROOT, "devices-desired.json")
 STATUS = os.path.join(ROOT, "devices-status.json")
 HARDWARE = os.path.join(ROOT, "devices-hardware.json")
 
+DEVICE_STATE_VERSION = 3
 DEFAULT_CAPABILITIES = {"cellular_enabled": False, "vowifi_enabled": True,
-                        "flight_mode": False}
+                        "flight_mode": True}
 
 _VPCD_MODEM_RE = re.compile(r"^VoWiFi Modem (.+?)\s+\d{2}\s+\d{2}$")
 
@@ -143,12 +144,12 @@ def _write(path: str, value):
     os.replace(temporary, path)
 
 
-def _capabilities(value: dict | None) -> dict:
+def _capabilities(value: dict | None, *, flight_mode_default: bool = False) -> dict:
     value = value or {}
     return {
         "cellular_enabled": bool(value.get("cellular_enabled", False)),
         "vowifi_enabled": bool(value.get("vowifi_enabled", True)),
-        "flight_mode": bool(value.get("flight_mode", False)),
+        "flight_mode": bool(value.get("flight_mode", flight_mode_default)),
     }
 
 
@@ -156,10 +157,23 @@ def desired() -> dict:
     """Return normalized desired state keyed by stable physical hardware id."""
     value = _read(DESIRED, {})
     devices = value.get("devices") or {}
+    defaults = dict(value.get("defaults") or {})
+    try:
+        legacy = int(value.get("version") or 0) < DEVICE_STATE_VERSION
+    except (TypeError, ValueError):
+        legacy = True
+    if legacy:
+        # Flight mode was not configurable as a new-device policy in v2. Its persisted
+        # false was therefore the old product default, not an operator choice. Move
+        # that global default forward while keeping every per-device value below intact.
+        defaults["flight_mode"] = True
     return {
-        "version": 2,
-        "defaults": _capabilities(value.get("defaults") or DEFAULT_CAPABILITIES),
-        "devices": {str(device_id): _capabilities(state)
+        "version": DEVICE_STATE_VERSION,
+        "defaults": _capabilities(defaults or DEFAULT_CAPABILITIES,
+                                  flight_mode_default=True),
+        # A partial legacy device record predates the new default. Missing flight mode
+        # remains off for that known device rather than silently changing its radio.
+        "devices": {str(device_id): _capabilities(state, flight_mode_default=False)
                     for device_id, state in devices.items() if str(device_id)},
         "updated_at": value.get("updated_at"),
     }
