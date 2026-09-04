@@ -46,6 +46,10 @@ ESIM_CARD_REFRESH_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_CARD_REFRESH_ATTEMPTS", "12"))
 ESIM_CARD_REFRESH_INTERVAL = float(
     os.environ.get("MDD_ESIM_CARD_REFRESH_INTERVAL", "0.75"))
+ESIM_LINE_RECOVERY_ATTEMPTS = int(
+    os.environ.get("MDD_ESIM_LINE_RECOVERY_ATTEMPTS", "3"))
+ESIM_LINE_RECOVERY_RETRY_DELAY = float(
+    os.environ.get("MDD_ESIM_LINE_RECOVERY_RETRY_DELAY", "4"))
 # Once Asterisk has completed its own bounded REGISTER transaction and explicitly reports no
 # response, another two minutes of same-session retries cannot repair the stale carrier-side
 # P-CSCF/ESP state.  Rebuild promptly, but leave enough time for the diagnostic worker to capture
@@ -469,6 +473,7 @@ class Hub:
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
+        self.esim_line_recoveries: set[str] = set()  # one post-switch starter per line
         # When each line last became healthy, so a failure can be attributed. A line that
         # carried IMS for a long time and then broke is not evidence against its exit node.
         self.ok_since: dict[str, float] = {}
@@ -3103,15 +3108,29 @@ async def _esim_refresh_modem_readers(
             siblings = [reader for reader in readers if reader in active_names]
             if not siblings:
                 raise RuntimeError("replacement VPCD readers are not enumerated")
+            primary_name = name if name in siblings else siblings[0]
+            primary_idx = readers.index(primary_name)
+            card_data = await asyncio.to_thread(sim.read_card, primary_idx)
+            actual = str(card_data.iccid or "")
+            if actual != str(iccid):
+                raise RuntimeError(
+                    f"{primary_name} reports ICCID {actual or 'unknown'}, expected {iccid}")
+            # All logical readers terminate at channels opened by the same freshly spawned
+            # bridge.  Keep proving every slot's ICCID, but avoid repeating the full IMSI,
+            # carrier-files and SMSC scan on each serial channel: field measurements were
+            # 7.7-8.7s per full scan versus about 1.4s for EF_ICCID alone.
+            for sibling in siblings:
+                if sibling == primary_name:
+                    continue
+                idx = readers.index(sibling)
+                actual = str(await asyncio.to_thread(sim.read_iccid, idx) or "")
+                if actual != str(iccid):
+                    raise RuntimeError(
+                        f"{sibling} reports ICCID {actual or 'unknown'}, expected {iccid}")
             refreshed = []
             primary = None
             for sibling in siblings:
                 idx = readers.index(sibling)
-                card_data = await asyncio.to_thread(sim.read_card, idx)
-                actual = str(card_data.iccid or "")
-                if actual != str(iccid):
-                    raise RuntimeError(
-                        f"{sibling} reports ICCID {actual or 'unknown'}, expected {iccid}")
                 info = await _esim_refresh_card(
                     sibling, idx, card_data=card_data, auto_start=False, broadcast=False)
                 refreshed.append(sibling)
@@ -3127,6 +3146,12 @@ async def _esim_refresh_modem_readers(
 
 
 async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) -> dict:
+    """Rebuild the modem bridge, publish the new line, and return before Engine startup.
+
+    Country egress can need longer than one startup attempt to resolve and route a new ePDG.
+    Engine startup therefore runs in the bounded background worker below; keeping it out of
+    this request also lets the UI confirm the physical profile switch as soon as it is true.
+    """
     bridge = await _esim_restart_modem_bridge(hardware_id, iccid)
     info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
     target = _match_instance_by_iccid(iccid)
@@ -3142,9 +3167,120 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     target = await asyncio.to_thread(
         cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
     egress.publish()
-    await api_instance_start(str(target["id"]))
     return {"card": info, "readers": readers, "instance_id": str(target["id"]),
             "bridge": bridge}
+
+
+async def _esim_profile_event(
+    reader: str,
+    iccid: str,
+    event: str,
+    *,
+    profile_state: str = "",
+    reason_code: str = "",
+) -> None:
+    """Publish a profile-scoped update to authenticated clients already allowed its ICCID."""
+    payload = {"type": "esim_profile", "reader": reader, "iccid": iccid, "event": event}
+    if profile_state:
+        payload["profile_state"] = profile_state
+    if reason_code:
+        payload["reason_code"] = reason_code
+    await hub.broadcast(payload)
+
+
+def _esim_prewarm_target_egress(iccid: str) -> bool:
+    """Publish a non-persistent enabled preview so the target ePDG resolves during LPA work.
+
+    The real line remains disabled in config until the new profile is proven active.  This
+    preview only gives the host orchestrator a head start on the target country route; a later
+    ordinary ``egress.publish()`` always restores the durable configuration view.
+    """
+    target = _match_instance_by_iccid(iccid)
+    if not target or target.get("provisioning_state") == "draft":
+        return False
+    iid = str(target.get("id") or "")
+    instances = [({**inst, "enabled": True} if str(inst.get("id") or "") == iid else inst)
+                 for inst in cfg.list_instances()]
+    try:
+        egress.publish(instances=instances)
+        return True
+    except Exception as exc:  # noqa - prewarming is an optimization, never switch authority
+        log.warning("could not prewarm eSIM target egress (%s)", type(exc).__name__)
+        return False
+
+
+async def _esim_start_profile_line(
+    reader: str,
+    switch_key: str,
+    iccid: str,
+    iid: str,
+) -> None:
+    """Start a switched profile with bounded retries for transient country-egress startup."""
+    iid = str(iid)
+    if not iid or iid in hub.esim_line_recoveries:
+        return
+    hub.esim_line_recoveries.add(iid)
+    attempts = max(1, ESIM_LINE_RECOVERY_ATTEMPTS)
+    try:
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(max(0.0, ESIM_LINE_RECOVERY_RETRY_DELAY))
+            # A later switch on the same eUICC wins. Holding the physical switch lock only
+            # around one start attempt prevents this background worker from reopening the old
+            # profile while lpac/bridge recovery owns the card; retry sleeps remain unlocked.
+            async with hub.esim_switch_lock(switch_key):
+                inst = cfg.get_instance(iid)
+                current = any(
+                    card_info.get("present")
+                    and str(card_info.get("iccid") or "") == str(iccid)
+                    for card_info in hub.cards.values())
+                if (not inst or not inst.get("enabled", True)
+                        or str(inst.get("iccid") or "") != str(iccid) or not current):
+                    _record_lifecycle(
+                        iid, "recovery_cancelled", "profile_changed",
+                        retry_count=attempt, card_present=current)
+                    return
+                if await asyncio.to_thread(engine.is_running, iid):
+                    await _esim_profile_event(
+                        reader, iccid, "line_started", profile_state="enabled")
+                    return
+                try:
+                    await api_instance_start(iid)
+                except Exception as exc:  # noqa - reduce arbitrary start detail to a safe code
+                    code = _recovery_failure_code(exc)
+                    if code == "egress_unavailable" and attempt + 1 < attempts:
+                        _record_lifecycle(
+                            iid, "recovery_scheduled", code, retry_count=attempt + 1,
+                            delay_seconds=max(0, int(ESIM_LINE_RECOVERY_RETRY_DELAY)),
+                            card_present=True)
+                        await _esim_profile_event(
+                            reader, iccid, "recovery_retry", profile_state="enabled",
+                            reason_code=code)
+                        continue
+                    _record_lifecycle(
+                        iid, "recovery_failed", code, retry_count=attempt + 1,
+                        card_present=True)
+                    await _esim_profile_event(
+                        reader, iccid, "recovery_error", profile_state="enabled",
+                        reason_code=code)
+                    return
+                _record_lifecycle(
+                    iid, "recovery_succeeded", "esim_profile_switch",
+                    retry_count=attempt + 1, card_present=True)
+                await _esim_profile_event(
+                    reader, iccid, "line_started", profile_state="enabled")
+                return
+    except Exception as exc:  # noqa - background tasks must never leak an unhandled failure
+        code = _recovery_failure_code(exc)
+        _record_lifecycle(iid, "recovery_failed", code, card_present=True)
+        try:
+            await _esim_profile_event(
+                reader, iccid, "recovery_error", profile_state="enabled",
+                reason_code=code)
+        except Exception:  # noqa - no connected browser is required for safe recovery
+            pass
+    finally:
+        hub.esim_line_recoveries.discard(iid)
 
 
 async def _esim_run(
@@ -6645,13 +6781,17 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 body.get("aid"), require=True)
             previous = await _esim_prepare_reader_profile_switch(name)
             try:
+                await _esim_profile_event(name, iccid, "switching")
                 await _esim_run(
                     name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
                     refresh=True, refresh_expect_iccid=iccid)
             except Exception:
                 await _esim_restore_profile_switch(previous)
+                await _esim_profile_event(name, iccid, "switch_failed")
                 raise
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
+            await _esim_profile_event(
+                name, iccid, "enabled", profile_state="enabled")
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": hub.cards.get(name)}
 
@@ -6661,6 +6801,8 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
             hub.lpa_busy[reader] = True
         lpa_succeeded = False
         try:
+            await _esim_profile_event(name, iccid, "switching")
+            await asyncio.to_thread(_esim_prewarm_target_egress, iccid)
             se = await asyncio.to_thread(
                 _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
                 body.get("aid"), require=True)
@@ -6669,6 +6811,8 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 keep_busy=True)
             lpa_succeeded = True
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
+            await _esim_profile_event(
+                name, iccid, "enabled", profile_state="enabled")
             try:
                 recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
             except Exception as exc:  # noqa
@@ -6680,18 +6824,31 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                 log.warning("eSIM profile switched but line recovery failed "
                             "reader=%s hardware=%s: %s", name, hardware_id, detail)
+                # Clear any transient prewarm preview. If recovery already enabled the target
+                # line this republishes that durable state; otherwise every line stays stopped.
+                try:
+                    egress.publish()
+                except Exception as publish_exc:  # noqa - retain the original recovery result
+                    log.warning("could not clear eSIM egress prewarm (%s)",
+                                type(publish_exc).__name__)
+                await _esim_profile_event(
+                    name, iccid, "recovery_error", profile_state="enabled",
+                    reason_code=_recovery_failure_code(exc))
                 return {"ok": True, "iccid": iccid, "se_id": se["id"],
                         "card": hub.cards.get(name),
                         "recovery_error": str(detail) or "line recovery failed"}
+            asyncio.create_task(_esim_start_profile_line(
+                name, switch_key, iccid, str(recovery["instance_id"])))
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],
                         "readers": recovery["readers"],
                         "bridge_state": recovery["bridge"].get("state"),
-                    }}
+                    }, "recovery_pending": True}
         except Exception:
             if not lpa_succeeded:
                 await _esim_restore_profile_switch(previous)
+                await _esim_profile_event(name, iccid, "switch_failed")
             raise
         finally:
             for reader in set(busy_readers) | set(_esim_modem_reader_names(name, hardware_id)):

@@ -83,6 +83,13 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("const key = modem ? `modem:${modem}`", ESIM)
         self.assertIn("() => collapseEsimReaders(cards)", ESIM)
 
+    def test_esim_switch_has_live_profile_events_and_a_fixed_feedback_slot(self):
+        self.assertIn("function withEnabledProfile(list, iccid)", ESIM)
+        self.assertIn("msg.type === 'esim_profile'", ESIM)
+        self.assertIn('className="u-esim-switch-feedback" role="status"', ESIM)
+        rule = css_rule(".u-esim-switch-feedback")
+        self.assertIn("min-height:20px", rule)
+
     def test_timezone_is_a_single_choice_of_common_regions_and_preserves_custom_values(self):
         self.assertIn("const COMMON_TIMEZONES = [", UNIFIED)
         self.assertIn('<select id="system-timezone"', UNIFIED)

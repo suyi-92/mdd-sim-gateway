@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 # Pure decoder tests should remain runnable on development hosts without libpcsclite/pyscard.
@@ -24,6 +25,37 @@ except ModuleNotFoundError as exc:
 
 
 class SimCarrierIdentityTests(unittest.TestCase):
+    def test_lightweight_iccid_read_does_not_scan_the_usim_application(self):
+        expected = "8900000000000000001"
+        digits = expected + "F" * (len(expected) % 2)
+        encoded = [int(digits[index], 16) | (int(digits[index + 1], 16) << 4)
+                   for index in range(0, len(digits), 2)]
+
+        class Connection:
+            def __init__(self):
+                self.commands = []
+                self.disconnected = False
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                self.disconnected = True
+
+            def transmit(self, command):
+                self.commands.append(command)
+                if len(self.commands) < 3:
+                    return [], 0x90, 0x00
+                return encoded, 0x90, 0x00
+
+        connection = Connection()
+        reader = types.SimpleNamespace(createConnection=lambda: connection)
+        with patch.object(sim, "readers", return_value=[reader]):
+            self.assertEqual(sim.read_iccid(0), expected)
+
+        self.assertEqual(len(connection.commands), 3)
+        self.assertTrue(connection.disconnected)
+
     def test_gsm_spn_decoding(self):
         self.assertEqual(sim.decode_alpha_identifier(
             [ord(value) for value in "giffgaff"] + [0xFF]), "giffgaff")

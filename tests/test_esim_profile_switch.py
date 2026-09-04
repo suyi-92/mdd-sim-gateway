@@ -142,7 +142,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                  for index, reader in enumerate(readers)}
         instance = {"id": "2", "iccid": "profile-target"}
         with patch.object(main.sim, "list_readers", return_value=readers), \
-                patch.object(main.sim, "read_card", return_value=target), \
+                patch.object(main.sim, "read_card", return_value=target) as full_read, \
+                patch.object(main.sim, "read_iccid",
+                             return_value="profile-target") as iccid_read, \
                 patch.object(main, "_match_instance_by_iccid", return_value=instance), \
                 patch.object(main, "_carrier_identity_update", return_value={}), \
                 patch.object(main.hub, "cards", cards), \
@@ -153,6 +155,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["iccid"], "profile-target")
         self.assertEqual(refreshed, readers)
         self.assertEqual({card["iccid"] for card in cards.values()}, {"profile-target"})
+        full_read.assert_called_once_with(0)
+        self.assertEqual([call.args[0] for call in iccid_read.call_args_list], [1, 2])
 
     async def test_refresh_does_not_probe_the_unbacked_driver_spare(self):
         readers = [
@@ -179,9 +183,14 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(index, 3, "the unbacked 00 03 reader must never be probed")
             return target
 
+        def read_iccid(index):
+            self.assertLess(index, 3, "the unbacked 00 03 reader must never be probed")
+            return "profile-target"
+
         with patch.object(main, "_modem_identity_for_reader", return_value=identity), \
                 patch.object(main.sim, "list_readers", return_value=readers), \
                 patch.object(main.sim, "read_card", side_effect=read_card), \
+                patch.object(main.sim, "read_iccid", side_effect=read_iccid), \
                 patch.object(main, "_match_instance_by_iccid", return_value=instance), \
                 patch.object(main, "_carrier_identity_update", return_value={}), \
                 patch.object(main.hub, "cards", cards), \
@@ -191,6 +200,43 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(refreshed, readers[:3])
         self.assertIsNone(cards[readers[3]]["iccid"])
+
+    def test_target_egress_is_prewarmed_without_persisting_enabled_state(self):
+        target = {"id": "2", "iccid": "profile-target", "enabled": False,
+                  "provisioning_state": "ready"}
+        other = {"id": "3", "iccid": "profile-other", "enabled": False}
+        with patch.object(main, "_match_instance_by_iccid", return_value=target), \
+                patch.object(main.cfg, "list_instances", return_value=[target, other]), \
+                patch.object(main.egress, "publish") as publish:
+            self.assertTrue(main._esim_prewarm_target_egress("profile-target"))
+
+        preview = publish.call_args.kwargs["instances"]
+        self.assertTrue(preview[0]["enabled"])
+        self.assertFalse(preview[1]["enabled"])
+        self.assertFalse(target["enabled"])
+
+    async def test_post_switch_line_retries_a_transient_country_exit(self):
+        target = {"id": "2", "iccid": "profile-target", "enabled": True}
+        error = main.HTTPException(503, {
+            "code": "egress_unavailable", "message": "country exit is starting"})
+        events = AsyncMock()
+        with patch.object(main.cfg, "get_instance", return_value=target), \
+                patch.object(main.engine, "is_running", return_value=False), \
+                patch.object(main, "api_instance_start",
+                             new=AsyncMock(side_effect=[error, {"ok": True}])) as start, \
+                patch.object(main, "_esim_profile_event", new=events), \
+                patch.object(main, "_record_lifecycle"), \
+                patch.object(main, "ESIM_LINE_RECOVERY_RETRY_DELAY", 0), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "iccid": "profile-target"},
+                }), patch.object(main.hub, "esim_line_recoveries", set()):
+            await main._esim_start_profile_line(
+                "reader", "modem-1", "profile-target", "2")
+
+        self.assertEqual(start.await_count, 2)
+        self.assertEqual(
+            [call.args[2] for call in events.await_args_list],
+            ["recovery_retry", "line_started"])
 
     async def test_prepare_and_restore_preserve_the_exact_running_snapshot(self):
         lines = {
@@ -244,12 +290,15 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                              new=AsyncMock(return_value={"1": {"enabled": True,
                                                                 "running": True}})), \
                 patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
+                patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
+                patch.object(main, "_esim_profile_event", new=AsyncMock()), \
                 patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
                 patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock()), \
                 patch.object(main, "_esim_cache_update_profile"), \
                 patch.object(main, "_esim_recover_profile_switch",
                              new=AsyncMock(side_effect=error)), \
+                patch.object(main.egress, "publish"), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:
             result = await main.api_esim_enable("profile-target", {})
@@ -258,6 +307,46 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["iccid"], "profile-target")
         self.assertEqual(result["recovery_error"], "bridge failed")
         restore.assert_not_awaited()
+        self.assertNotIn("reader", main.hub.lpa_busy)
+
+    async def test_successful_modem_switch_returns_while_line_starts_in_background(self):
+        recovery = {
+            "card": {"iccid": "profile-target"},
+            "readers": ["reader"],
+            "instance_id": "2",
+            "bridge": {"state": "channels_ready"},
+        }
+        scheduled = []
+
+        def capture(coro):
+            scheduled.append(coro)
+            coro.close()
+            return Mock()
+
+        events = AsyncMock()
+        with patch.object(main, "_esim_resolve_reader", return_value=("reader", 0)), \
+                patch.object(main, "_esim_switch_identity",
+                             return_value=("modem-1", "modem-1")), \
+                patch.object(main, "_esim_prepare_profile_switch",
+                             new=AsyncMock(return_value={})), \
+                patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
+                patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
+                patch.object(main, "_esim_profile_event", new=events), \
+                patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
+                patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_run", new=AsyncMock()), \
+                patch.object(main, "_esim_cache_update_profile"), \
+                patch.object(main, "_esim_recover_profile_switch",
+                             new=AsyncMock(return_value=recovery)), \
+                patch.object(main.asyncio, "create_task", side_effect=capture):
+            result = await main.api_esim_enable("profile-target", {})
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recovery_pending"])
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(
+            [call.args[2] for call in events.await_args_list],
+            ["switching", "enabled"])
         self.assertNotIn("reader", main.hub.lpa_busy)
 
     async def test_post_switch_probe_retries_through_the_refresh_window(self):
@@ -331,6 +420,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_prepare_profile_switch",
                              new=AsyncMock(return_value=previous)), \
                 patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
+                patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
+                patch.object(main, "_esim_profile_event", new=AsyncMock()), \
                 patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
                 patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock(side_effect=error)), \

@@ -364,6 +364,40 @@ def list_readers(attempts: int = 3, retry_delay: float = 0.12):
     raise last_error
 
 
+def read_iccid(reader_index: int = 0) -> str:
+    """Read only EF_ICCID from one reader, without the full USIM identity scan.
+
+    A modem profile switch needs to prove that every logical VPCD slot belongs to the
+    replacement profile.  Reading IMSI, EF_AD, SPN, GIDs and SMSC from every slot adds more
+    than twenty seconds on serial AT+CSIM bridges even though EF_ICCID alone is sufficient for
+    the sibling-slot proof.  The caller still performs one full ``read_card`` on the primary
+    slot and uses this bounded three-APDU path only for the remaining slots.
+    """
+    rlist = readers()
+    if reader_index < 0 or reader_index >= len(rlist):
+        return ""
+    conn = None
+    try:
+        conn = rlist[reader_index].createConnection()
+        conn.connect()
+    except (NoCardException, CardConnectionException):
+        return ""
+    try:
+        with _Tx(conn):
+            _data, s1, s2 = _transmit(conn, _hx("00a4000c023f00"))
+            if (s1, s2) != (0x90, 0x00):
+                return ""
+            data, s1, _s2 = _read_binary(conn, "2fe2", 10)
+            if s1 != 0x90:
+                return ""
+            return dec_iccid("".join(f"{value:02x}" for value in data))
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
 def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
     """Read card identity. If `pin` is given, verify CHV1 in the SAME connection before
     reading IMSI (PIN state does not survive a disconnect when no other handle holds the

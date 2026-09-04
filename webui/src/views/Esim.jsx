@@ -106,16 +106,32 @@ async function decodeQrImage(file) {
   return null
 }
 
-function StatePill({ state }) {
+function withEnabledProfile(list, iccid) {
+  return list.map((se) => {
+    const profiles = se.profiles || []
+    if (!profiles.some((profile) => profile.iccid === iccid)) return se
+    return {
+      ...se,
+      profiles: profiles.map((profile) => ({
+        ...profile,
+        profileState: profile.iccid === iccid ? 'enabled'
+          : String(profile.profileState || '').toLowerCase() === 'enabled'
+            ? 'disabled' : profile.profileState,
+      })),
+    }
+  })
+}
+
+function StatePill({ state, pending = false }) {
   const { t } = useI18n()
   const enabled = String(state || '').toLowerCase() === 'enabled'
   return (
     <span style={{
       fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 999,
-      background: enabled ? '#dcfce7' : 'var(--hover)',
-      color: enabled ? '#166534' : 'var(--text-dim)',
+      background: pending ? '#fef3c7' : enabled ? '#dcfce7' : 'var(--hover)',
+      color: pending ? '#92400e' : enabled ? '#166534' : 'var(--text-dim)',
     }}>
-      {t(enabled ? 'Enabled' : 'Disabled')}
+      {t(pending ? 'Switching…' : enabled ? 'Enabled' : 'Disabled')}
     </span>
   )
 }
@@ -444,6 +460,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   const [dl, setDl] = useState(null) // {step, event, metadata, error, done}
   const [renameTarget, setRenameTarget] = useState(null) // { se, profile }
   const [busyOp, setBusyOp] = useState('')
+  const [profileSwitch, setProfileSwitch] = useState(null) // { iccid, phase }
 
   useEffect(() => {
     if (!reader && present[0]) setReader(present[0].name)
@@ -467,6 +484,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     [ses],
   )
   const hasEuicc = ses.some((se) => se.eid || se.chip || (se.profiles || []).length)
+  const switchActive = ['switching', 'recovering', 'starting', 'retrying'].includes(profileSwitch?.phase)
+
+  useEffect(() => {
+    if (switchActive && lineRunning && selectedCard?.iccid === profileSwitch?.iccid) {
+      setProfileSwitch((current) => ({ ...current, phase: 'started' }))
+    }
+  }, [switchActive, lineRunning, selectedCard?.iccid, profileSwitch?.iccid])
 
   // Lightweight: lpac presence only — never touch the card on page enter / reader switch.
   useEffect(() => {
@@ -487,6 +511,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     setErr('')
     setDl(null)
     setRenameTarget(null)
+    setProfileSwitch(null)
   }, [reader])
 
   // Without a fresh read, show the gateway's persisted last read for this card (matched
@@ -561,34 +586,37 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (!ok) return
     }
     setBusyOp('Enable')
+    setProfileSwitch({ iccid: p.iccid, phase: 'switching' })
     setErr('')
     try {
       if (lineRunning && matchedInst) {
         await api.stop(matchedInst.id)
       }
       const res = await api.esimEnable(p.iccid, target)
-      // Optimistic view: enabling implicitly disables the previously enabled profile. A
-      // fresh read here would race the auto-provisioned line that re-grabs the reader.
-      setSes((list) => list.map((s) => (s.id !== se.id ? s : {
-        ...s,
-        profiles: (s.profiles || []).map((x) => ({
-          ...x,
-          profileState: x.iccid === p.iccid ? 'enabled'
-            : String(x.profileState || '').toLowerCase() === 'enabled' ? 'disabled' : x.profileState,
-        })),
-      })))
+      // The confirmed WebSocket event normally updates this as soon as lpac succeeds. Keep
+      // the response path as a fallback for a reconnecting browser.
+      setSes((list) => withEnabledProfile(list, p.iccid))
       if (res?.recovery_error) {
         // The eUICC switched but the line did not come back on its own — say exactly
         // that, so the user starts the line instead of retrying an already-done switch.
         setErr(t('Switched to {name}, but its line could not start automatically: {error}', { name: title, error: res.recovery_error }))
+        setProfileSwitch({ iccid: p.iccid, phase: 'error' })
         showToast?.(t('Profile switched — check the line for {name}', { name: title }))
+      } else if (res?.recovery_pending) {
+        setProfileSwitch((current) => (
+          current?.iccid === p.iccid && ['retrying', 'started', 'error'].includes(current.phase)
+            ? current : { iccid: p.iccid, phase: 'starting' }
+        ))
+        showToast?.(t('Profile switched — its line is starting automatically'))
       } else {
+        setProfileSwitch({ iccid: p.iccid, phase: 'started' })
         showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
       }
       await refresh?.()
     } catch (e) {
       showToast?.(e.message)
       setErr(e.message)
+      setProfileSwitch({ iccid: p.iccid, phase: 'error' })
       // The request can fail after the card already switched; resync from the gateway's
       // persisted view instead of leaving the stale optimistic-free state on screen.
       api.esimChipCached(reader).then((r) => {
@@ -603,7 +631,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }
 
   const requestLoad = useCallback(async () => {
-    if (!reader || loading || busyOp) return
+    if (!reader || loading || busyOp || switchActive) return
     if (lineRunning && matchedInst) {
       const label = matchedInst.name
         ? `${t('line')} ${matchedInst.id} (${matchedInst.name})`
@@ -625,10 +653,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setBusyOp('')
     }
     await loadAll()
-  }, [reader, loading, busyOp, lineRunning, matchedInst, loadAll, refresh, showToast, t])
+  }, [reader, loading, busyOp, switchActive, lineRunning, matchedInst, loadAll, refresh, showToast, t])
 
   const requestDownload = useCallback(async () => {
-    if (!reader || busyOp) return
+    if (!reader || busyOp || switchActive) return
     if (lineRunning && matchedInst) {
       const ok = confirm(t('Downloading an eSIM needs exclusive access and will stop VoWiFi line {id}. Continue?', { id: matchedInst.id }))
       if (!ok) return
@@ -644,11 +672,34 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setBusyOp('')
     }
     setShowDl(true)
-  }, [reader, busyOp, lineRunning, matchedInst, refresh, showToast, t])
+  }, [reader, busyOp, switchActive, lineRunning, matchedInst, refresh, showToast, t])
 
   useEffect(() => {
     if (!subscribe) return undefined
     return subscribe((msg) => {
+      if (msg.type === 'esim_profile') {
+        if (reader && msg.reader && msg.reader !== reader) return
+        if (msg.profile_state === 'enabled' && msg.iccid) {
+          setSes((list) => withEnabledProfile(list, msg.iccid))
+        }
+        if (msg.event === 'switching') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'switching' })
+        } else if (msg.event === 'enabled') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'recovering' })
+        } else if (msg.event === 'recovery_retry') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'retrying' })
+        } else if (msg.event === 'line_started') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'started' })
+          refresh?.()
+        } else if (msg.event === 'recovery_error') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'error' })
+          setErr(t('The profile is enabled, but automatic line recovery failed. Start the line from Devices.'))
+          refresh?.()
+        } else if (msg.event === 'switch_failed' || msg.event === 'recovery_cancelled') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'error' })
+        }
+        return
+      }
       if (msg.type !== 'esim_download') return
       if (reader && msg.reader && msg.reader !== reader) return
       if (msg.event === 'started') {
@@ -700,6 +751,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }
 
   const runProfileOp = async (label, fn) => {
+    if (switchActive) return
     setBusyOp(label)
     try {
       await fn()
@@ -736,11 +788,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
             ))}
           </select>
         </label>
-        <button className="btn btn-ghost u-load-action" onClick={requestLoad} disabled={loading || !!busyOp}>
+        <button className="btn btn-ghost u-load-action" onClick={requestLoad} disabled={loading || !!busyOp || switchActive}>
           {t(loading ? 'Loading…' : 'Load')}
         </button>
         <button className="btn btn-primary" onClick={requestDownload}
-          disabled={!status?.available || !hasEuicc || !!busyOp || !!dl && !dl.done && !dl.error}
+          disabled={!status?.available || !hasEuicc || !!busyOp || switchActive || !!dl && !dl.done && !dl.error}
           title={!hasEuicc ? t('Read this eSIM once before downloading a new one.') : ''}>
           {t('Download eSIM')}
         </button>
@@ -881,6 +933,21 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
             {t('Cached view from {time} — switching works from here; click Load for a live read.', { time: new Date(cachedAt).toLocaleString() })}
           </div>
         )}
+        <div className="u-esim-switch-feedback" role="status" aria-live="polite">
+          {profileSwitch?.phase === 'switching'
+            ? t('Enabling the eSIM profile…')
+            : profileSwitch?.phase === 'recovering'
+              ? t('Profile enabled; rebuilding the modem SIM bridge…')
+              : profileSwitch?.phase === 'starting'
+                ? t('SIM bridge ready; starting the VoWiFi line…')
+                : profileSwitch?.phase === 'retrying'
+                  ? t('Profile enabled; waiting for the country exit, then retrying automatically…')
+                  : profileSwitch?.phase === 'started'
+                    ? t('Profile switched; the VoWiFi line has started.')
+                    : profileSwitch?.phase === 'error'
+                      ? t('Profile switching needs attention; see the message above.')
+                      : '\u00a0'}
+        </div>
         {!profiles.length ? (
           <div style={{ color: 'var(--text-mute)', fontSize: 13 }}>
             {loading
@@ -930,7 +997,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                 }}>
                                   {title}
                                 </span>
-                                <StatePill state={p.profileState} />
+                                <StatePill state={p.profileState}
+                                  pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div style={{
                                 marginTop: 4, fontSize: 12, color: 'var(--text-mute)',
@@ -942,22 +1010,22 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                             </div>
                             <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {!enabled && (
-                                <button className="btn btn-primary" disabled={!!busyOp}
+                                <button className="btn btn-primary" disabled={!!busyOp || switchActive}
                                   onClick={() => switchProfile(p, se)}>
                                   {t('Enable')}
                                 </button>
                               )}
                               {enabled && (
-                                <button className="btn btn-ghost" disabled={!!busyOp || lineRunning}
+                                <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
                                   onClick={() => runProfileOp('Disable', () => api.esimDisable(p.iccid, target))}>
                                   {t('Disable')}
                                 </button>
                               )}
-                              <button className="btn btn-ghost" disabled={!!busyOp || lineRunning}
+                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
                                 onClick={() => setRenameTarget({ se, profile: p })}>
                                 {t('Rename')}
                               </button>
-                              <button className="btn btn-ghost" disabled={!!busyOp || lineRunning}
+                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
                                 onClick={() => {
                                   if (!confirm(t('Delete profile {iccid}?', { iccid: p.iccid }))) return
                                   runProfileOp('Delete', () => api.esimDelete(p.iccid, target))
@@ -980,7 +1048,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       <div className="card" style={{ padding: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <div style={{ fontWeight: 700 }}>{t('Notifications')}</div>
-          <button className="btn btn-ghost" disabled={!!busyOp || lineRunning || !notifications.length}
+          <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning || !notifications.length}
             onClick={() => runProfileOp('Process notifications', async () => {
               for (const se of ses) {
                 if (!(se.notifications || []).length) continue
@@ -1027,11 +1095,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                             </div>
                           </div>
                           <div style={{ display: 'flex', gap: 6 }}>
-                            <button className="btn btn-ghost" disabled={!!busyOp || lineRunning}
+                            <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
                               onClick={() => runProfileOp('Process', () => api.esimNotificationsProcess(target))}>
                               {t('Send')}
                             </button>
-                            <button className="btn btn-ghost" disabled={!!busyOp || lineRunning}
+                            <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
                               onClick={() => runProfileOp('Remove', () => api.esimNotificationRemove(n.seqNumber ?? n.seq, seTarget(reader, se)))}>
                               {t('Remove')}
                             </button>

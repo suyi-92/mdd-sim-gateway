@@ -35,6 +35,10 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ### Fixed
 
+- Reduced serial-modem eSIM switch latency by fully reading one logical channel and verifying
+  sibling ICCIDs with a minimal APDU path, while preserving the all-channel identity gate.
+- Published confirmed profile changes to the WebUI immediately, prewarmed the target country
+  route and added bounded background line-start retries when ePDG routing converges late.
 - Fixed modem eSIM switches falsely failing on libifdvpcd's unbacked spare reader, collapsed
   one modem's logical VPCD readers into a single download target, and explained duplicate ICCIDs
   as an already-installed profile instead of a generic package-load failure.
