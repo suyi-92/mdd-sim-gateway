@@ -34,10 +34,11 @@ class EnginePathTests(unittest.TestCase):
     def test_normal_docker_calls_reuse_one_client(self):
         engine = self.engine_module()
         client = SimpleNamespace(close=lambda: None)
-        with patch.object(engine.docker, "from_env", return_value=client) as factory:
+        with patch.dict(os.environ, {"DOCKER_HOST": "tcp://remote.invalid:2376", "DOCKER_CONTEXT": "rootless", "DOCKER_TLS_VERIFY": "1"}), \
+                patch.object(engine.docker, "from_env", return_value=client) as factory:
             self.assertIs(engine._client(), client)
             self.assertIs(engine._client(), client)
-            factory.assert_called_once_with(timeout=30)
+            factory.assert_called_once_with(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=30)
             engine.close_client()
 
     @unittest.skipUnless(os.name == "posix" and Path("/usr/bin/dpkg-query").exists(),

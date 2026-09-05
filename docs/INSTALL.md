@@ -148,7 +148,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmwar
 使用 apt 安装发行版版本的：
 
 ```text
-docker.io
 modemmanager
 network-manager
 pcscd / pcsc-tools / libccid
@@ -157,8 +156,13 @@ Git / curl / wget / jq
 PCSC、USB、OpenSSL、libcurl、autotools、Meson、Ninja 编译依赖
 ```
 
-安装器不会写 `/etc/docker/daemon.json`，不会切换 Docker 数据目录，不会删除非 MDD 容器、
-镜像或卷。rootless Docker 会停止，因为 Engine 需要 TUN、NET_ADMIN 和主机 PC/SC socket。
+Docker 在通用依赖之外单独判断：健康的本机 rootful CE/docker.io 直接复用，不安装、升级、降级或替换已有 Docker 包，不重启运行中的 daemon。正常停止的服务只尝试有界启动；masked、failed、残留或不完整安装停止并输出诊断。只有确认没有 Docker、CLI、rootless、Desktop、Podman 或不明容器运行时/数据残留时，才允许首次安装发行版 `docker.io`。APT 先模拟并拒绝移除包；通用依赖计划若改变已有 Docker/runtime 也会拒绝。
+
+构建、mddctl、Control 与 Engine 生命周期统一使用 `unix:///var/run/docker.sock`；socket 必须是本机 root 所有的常规路径，API 必须确认 Linux rootful Engine。仅 CLI、rootless、远程或 Docker Desktop 不符合要求；rootless 与健康 rootful 共存可以复用后者。调用者的 `DOCKER_HOST`/`DOCKER_CONTEXT`/TLS 或已选 context 不改变目标，用户全局 context 和 HTTP 代理保持原样。参见 [Docker CLI 优先级](https://docs.docker.com/reference/cli/docker/) 与 [rootless 共存说明](https://docs.docker.com/engine/security/rootless/)。
+
+安装器不会写 `/etc/docker/daemon.json`、覆盖 systemd drop-in、放宽 socket 权限、移动或清理 Docker 数据。也不会 prune 或删除其他项目容器、镜像、卷、网络。Engine 的源码身份、TUN、NET_ADMIN 和其他健康门禁继续独立执行。
+
+与新版 vmware-ubuntu-bootstrap 的顺序兼容：bootstrap → CE → MDD 复用；MDD → docker.io → bootstrap 保留。重复运行不会来回切换。已有 MDD 安装仍走 `sudo mddctl update` 的受管更新流程；开发修改未提交推送前不能被正式更新获取，不要通过重跑 install 绕过 Git/clean/分支/校验和门禁。两个 VM 使用独立 MAC 和由管理员分配/保留的地址，不共享固定 IP。
 
 ModemManager drop-in 使用 `--debug` 开启受保护的 command interface，启动后立即通过 D-Bus
 把运行日志降回 INFO：

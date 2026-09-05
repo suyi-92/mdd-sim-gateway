@@ -191,7 +191,7 @@ def prune_old_mdd_images() -> dict:
     image ID with ``force=True`` drops historical aliases together, but only after the ID has
     been excluded from every container and every stable current/base tag.
     """
-    client = docker.from_env(timeout=30)
+    client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=30)
     try:
         before = _image_layer_bytes(client.df())
         protected_ids = {
@@ -227,7 +227,7 @@ def prune_dangling_build_cache() -> dict:
     ``docker builder prune`` without ``--all``: images, containers, volumes, and reusable
     cache records remain untouched.
     """
-    client = docker.from_env(timeout=30)
+    client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=30)
     try:
         # ``all=False`` is Docker's dangling-only builder prune. Unlike image prune, the
         # build/prune API does not accept a ``dangling`` filter (Docker 28 returns HTTP 400).

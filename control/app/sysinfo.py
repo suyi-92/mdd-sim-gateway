@@ -226,7 +226,7 @@ def _docker_storage() -> dict:
     """
     try:
         import docker
-        client = docker.from_env(timeout=10)
+        client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=10)
     except Exception:
         return {}
     try:

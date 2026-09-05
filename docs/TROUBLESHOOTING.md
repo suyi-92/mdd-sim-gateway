@@ -409,3 +409,24 @@ Asterisk 留在 WebRTC/AMR 两条媒体腿之间，后者从已收到的下行 R
 
 USB 未自动连接属于 VMware 配置，不要通过放宽成“所有新 USB 自动连接”规避；只修复两个
 确定设备的连接规则。
+
+## 已有 Docker 异常时停止安装
+
+先查看已有安装，而不是默认卸载重装：
+
+```bash
+sudo systemctl status docker.service --no-pager
+sudo journalctl -u docker.service -n 60 --no-pager
+dpkg-query -W docker-ce docker-ce-cli docker.io containerd.io containerd
+sudo env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --host unix:///var/run/docker.sock info
+```
+
+若 ExecStart 使用 `-H fd://`，还需检查 `docker.socket`；健康的其他监听布局不强制采用相同 socket unit。masked/failed 必须先查明原因；CLI-only、rootless-only、远程、Desktop、Podman 或遗留数据不能当成空白系统。安装器不会自动卸载、迁移、unmask、reset-failed 或重启健康 daemon。无需更改用户默认 context，HTTP 代理仍可保留。
+
+本次兼容修复仅经隔离命令 mock、静态检查与仓库回归验证。真实双 VMware 安装顺序、已有容器持续运行、CE/docker.io 停启与重启恢复，以及 Engine 镜像构建/TUN/NET_ADMIN 验收须在专用 VM 执行；不得把单测当作实机证据。
+
+## 已拔出的设备仍显示
+
+默认设备列表只显示 `present` 未被明确标记为 false 的设备。后端保留历史记录用于重连恢复，不表示物理设备仍在线；勾选“显示已断开的设备”后才显示这些记录。取消勾选后应隐藏离线记录，全部拔出时应显示空状态。若更新后仍显示旧界面，刷新页面，必要时重新登录。
+
+`1.7.0-vmware.7` 修复了此前仅在概览和侧栏过滤离线设备、设备页仍显示旧卡片的问题。回归包含当前设备拔出后的选择切换、全部拔出、重新接入、显式查看历史记录，以及 1440/900/390px 浏览器检查。浏览器测试使用虚构 API 数据，不替代真实 USB 拔插验收。

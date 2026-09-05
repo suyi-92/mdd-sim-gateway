@@ -27,6 +27,10 @@ warn() { printf '!!  %s\n' "$*" >&2; }
 die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# shellcheck source=scripts/docker-local.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/scripts/docker-local.sh"
+docker() { docker_local "$@"; }
+
 usage() {
   cat <<'EOF'
 Internal VMware installer. Use bootstrap.sh for normal installation.
@@ -269,19 +273,15 @@ install_packages() {
   info "installing ${distro_key} packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y \
+  docker_safe_apt_install preserve \
     ca-certificates curl wget git jq openssl coreutils util-linux iproute2 usbutils \
-    docker.io modemmanager network-manager dbus pcscd pcsc-tools libccid \
+    modemmanager network-manager dbus pcscd pcsc-tools libccid \
     python3 python3-dev python3-venv python3-pip build-essential pkg-config swig \
     libpcsclite-dev libcurl4-openssl-dev libssl-dev libffi-dev \
     autoconf automake libtool help2man flex meson ninja-build patch perl \
     libusb-1.0-0-dev zlib1g-dev unzip cmake nftables
-  systemctl enable --now docker.service ModemManager.service NetworkManager.service
+  systemctl enable --now ModemManager.service NetworkManager.service
   systemctl enable --now pcscd.socket >/dev/null 2>&1 || systemctl start pcscd.service
-  docker info >/dev/null
-  if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -qi rootless; then
-    die "rootless Docker is not supported; install the distro rootful docker.io daemon"
-  fi
 }
 
 install_modemmanager_dropin() {
@@ -1137,6 +1137,7 @@ case "$action" in
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    ensure_local_docker || die "local rootful Docker validation failed"
     install_packages
     verify_network_guard
     network_guard_armed=0

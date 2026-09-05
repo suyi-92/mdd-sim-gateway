@@ -15,6 +15,13 @@ warn() { printf '!!  %s\n' "$*" >&2; }
 die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Always use the same local endpoint as install.sh and the Python runtime.
+docker() {
+  env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY \
+    -u DOCKER_CERT_PATH -u DOCKER_API_VERSION -u BUILDKIT_HOST \
+    BUILDX_BUILDER=default docker --host unix:///var/run/docker.sock "$@"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -81,7 +88,6 @@ fi
 readonly MDDCTL_SOURCE_DIR MDDCTL_SOURCE_ROOT ARCHIVE_TOOL
 ACTIVE_GENERATION_COMMIT=""
 ACTIVE_GENERATION_BUILD=""
-MANAGED_CHECKOUT_STATUS_KIND=""
 UPDATE_OLD=""
 UPDATE_OLD_BUILD=""
 UPDATE_WORKTREE=""
@@ -440,7 +446,7 @@ validate_managed_checkout() {
   [[ $(git -C "$INSTALL_DIR" remote get-url origin) == "$ORIGIN_URL" ]] || die "origin URL does not exactly match $ORIGIN_URL"
   [[ $(git -C "$INSTALL_DIR" branch --show-current) == "$BRANCH" ]] || die "managed checkout is not on $BRANCH"
   git_operation_in_progress && die "a Git operation is in progress"
-  MANAGED_CHECKOUT_STATUS_KIND=$(managed_checkout_status_kind) || \
+  managed_checkout_status_kind >/dev/null || \
     die "managed checkout has staged, tracked, conflicted or unexpected untracked changes"
 }
 

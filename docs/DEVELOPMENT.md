@@ -122,3 +122,17 @@ lsusb、pcsc_scan、mmcli 和网络输出。测试不得真实修改开发机 sy
 本仓库在 Server 超级项目中是独立子模块。先在 `vmware` 分支提交并推送子项目，确认提交在
 团队可访问的 origin 后，再在父项目提交 gitlink。提交信息遵守父项目 `AGENTS.md` 的
 `【苏忆】` 署名规则。永不强推。
+
+## 设备显示回归
+
+`tests/test_ui_device_presence.py` 在 Node.js 可用时运行 `tests/webui_device_presence.mjs`，直接执行 React 页面引用的 `webui/src/devicePresence.js`。测试不会删除已保存设备或配置。
+
+构建 WebUI 后，可在临时目录安装 Playwright 并运行浏览器回归：
+
+```bash
+npm install --prefix /tmp/mdd-device-ui-check --no-audit --no-fund playwright
+PLAYWRIGHT_BROWSERS_PATH=/tmp/mdd-device-ui-check/browsers /tmp/mdd-device-ui-check/node_modules/.bin/playwright install chromium
+NODE_PATH=/tmp/mdd-device-ui-check/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/mdd-device-ui-check/browsers node tests/webui_device_presence_browser.cjs
+```
+
+该脚本只服务本地构建资产与虚构 API 响应，不连接生产服务；覆盖拔出、剩余设备选择、空状态、历史记录、重连、无写请求和宽/中/窄视口。截图默认位于 `/tmp/mdd-device-ui-check/results`。

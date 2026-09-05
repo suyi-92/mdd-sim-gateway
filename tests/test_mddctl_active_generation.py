@@ -196,10 +196,9 @@ BRANCH=vmware
 ENGINE_STABLE_IMAGE=mdd-sim-gateway/engine:latest
 ACTIVE_GENERATION_COMMIT=
 ACTIVE_GENERATION_BUILD=
-MANAGED_CHECKOUT_STATUS_KIND=
 validate_managed_checkout
 validate_active_generation
-printf '%s|%s|%s\\n' "$MANAGED_CHECKOUT_STATUS_KIND" "$ACTIVE_GENERATION_COMMIT" "$ACTIVE_GENERATION_BUILD"
+printf '%s|%s|%s\\n' "$(managed_checkout_status_kind)" "$ACTIVE_GENERATION_COMMIT" "$ACTIVE_GENERATION_BUILD"
 """
         return run(
             ["bash", "-c", script, "active-generation", str(self.repo), str(self.state),

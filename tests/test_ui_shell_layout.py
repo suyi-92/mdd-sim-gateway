@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CSS = (ROOT / "webui/src/index.css").read_text(encoding="utf-8")
 APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
 UNIFIED = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
+PRESENCE = (ROOT / "webui/src/devicePresence.js").read_text(encoding="utf-8")
 ALLOWANCE = (ROOT / "webui/src/views/AllowancePanel.jsx").read_text(encoding="utf-8")
 ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
 GLOBAL_PHONE = (ROOT / "webui/src/GlobalSoftphone.jsx").read_text(encoding="utf-8")
@@ -44,8 +45,8 @@ class SidebarLayoutTests(unittest.TestCase):
         self.assertIn("height:100dvh", rule)
 
     def test_unplugged_hardware_is_not_counted_as_a_live_device(self):
-        self.assertIn("export const physicallyPresentDevices", UNIFIED)
-        self.assertIn("device?.present !== false", UNIFIED)
+        self.assertIn("export const physicallyPresentDevices", PRESENCE)
+        self.assertIn("device?.present !== false", PRESENCE)
         self.assertIn("visibleDevices.map", UNIFIED)
         self.assertIn("devices: visibleDevices.length", UNIFIED)
         self.assertIn("const presentDeviceCount=physicallyPresentDevices(devices).length", APP)

@@ -136,8 +136,8 @@ install | update | doctor
    `/dev/net/tun` 和 8443 端口；低于 4 GiB RAM、12 GiB 可用空间或 20 GiB 根文件系统会停止。
 2. 在安装 NetworkManager 前记录默认路由、管理网卡、源地址和现有网络后端。若主网卡原本不由
    NetworkManager 管理，只允许它管理 GSM 设备；安装后路由或 SSH 地址变化会回滚并停止。
-3. 从发行版安装 `docker.io`、ModemManager、NetworkManager、pcscd、libccid 和编译依赖；
-   不替换 Docker daemon 配置，不清理或操作其他项目容器。
+3. 复用已有健康的本机 rootful Docker CE 或 docker.io；正常停止的服务只尝试启动。只有确认无本机 Docker 或冲突安装时才经 APT 模拟和禁止移除包保护首次安装 docker.io。
+   通用依赖单独安装，不升级或替换已有 Docker，不重启健康 daemon，也不改写 Docker 配置或清理其他项目容器。
 4. 固定版本并校验 SHA-256 后安装 sing-box、Xray-core，编译 vsmartcard VPCD 与 lpac。
 5. 先检测 SCR Prime 是否已被系统 libccid 原生识别；只有 USB 可见而 PC/SC 不可见时，
    才构建 CCID 1.6.2 并且只应用 `03_scr_prime_reader.patch`。安装器不会对 SCR Prime 使用
@@ -149,6 +149,8 @@ install | update | doctor
 
 安装器不会下载项目的 Engine/Control tar 包，不会读取 GitHub Release API，也不会把
 `webui/dist`、venv、Node 模块、运行数据或构建缓存提交到 Git。
+
+两个安装器可任意先后运行：bootstrap 首次安装 CE 后 MDD 复用 CE；MDD 首次安装 docker.io 后新版 bootstrap 保留 docker.io。MDD 的构建、管理和运行统一使用 `unix:///var/run/docker.sock`，忽略调用者选择的远程/rootless context，但保留正常 HTTP 代理。不修改用户全局 context。异常状态诊断与升级操作见 [安装文档](docs/INSTALL.md#62-发行版软件包)。
 
 ## SCR Prime 驱动策略
 
@@ -177,6 +179,12 @@ sudo mddctl driver status
 sudo mddctl driver install
 sudo mddctl driver restore
 ```
+
+## 设备拔出与历史记录
+
+概览、设备页默认列表和侧栏计数只显示当前物理连接的设备。拔出当前设备后，详情立即跟随剩余设备；全部拔出时显示“未发现通信设备”。飞行模式、蜂窝数据关闭或未插 SIM 不等于设备拔出。
+
+后端保留已知硬件及 SIM/线路设置，重新接入后自动恢复。需要查看或删除离线硬件记录时，在设备页勾选“显示已断开的设备”，再进入对应设备的“硬件”页；隐藏设备不会自动删除配置。
 
 ## 日常管理
 

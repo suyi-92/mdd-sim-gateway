@@ -337,7 +337,6 @@ BRANCH=vmware
 ENGINE_STABLE_IMAGE=mdd-sim-gateway/engine:latest
 ACTIVE_GENERATION_COMMIT=
 ACTIVE_GENERATION_BUILD=
-MANAGED_CHECKOUT_STATUS_KIND=
 shift 7
 cmd_update "$@"
 """

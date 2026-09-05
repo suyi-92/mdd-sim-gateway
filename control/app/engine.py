@@ -143,7 +143,7 @@ def _client():
     if _docker_client is None:
         with _docker_client_lock:
             if _docker_client is None:
-                _docker_client = docker.from_env(timeout=30)
+                _docker_client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=30)
     return _docker_client
 
 
@@ -687,7 +687,7 @@ def registration_state(iid: str) -> str:
         # Use a short-lived client with an HTTP read timeout. Asterisk's remote CLI can block
         # behind an IMS TCP connect; the normal shared helper intentionally has no global Docker
         # timeout, so using it here would leave one worker thread behind on every status poll.
-        client = docker.from_env(timeout=5)
+        client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=5)
         container = client.containers.get(container_name(iid))
         rc, raw = container.exec_run(["asterisk", "-rx", "pjsip show registrations"])
         output = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)

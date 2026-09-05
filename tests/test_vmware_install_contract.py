@@ -627,7 +627,7 @@ class MddctlContractTests(unittest.TestCase):
 class VersionContractTests(unittest.TestCase):
     def test_vmware_version_suffix(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version, "1.7.0-vmware.6")
+        self.assertEqual(version, "1.7.0-vmware.7")
         for path in (ROOT / "webui/package.json", ROOT / "webui/package-lock.json"):
             self.assertIn(f'"version": "{version}"', path.read_text(encoding="utf-8"))
 

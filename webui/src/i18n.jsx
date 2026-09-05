@@ -406,7 +406,7 @@ const zh = {
   'Device name': '设备名称', 'Smart-card reader': '智能读卡器', 'Cellular modem': '蜂窝通信模块',
   'Firmware version': '固件版本', 'Hardware did not report': '硬件未上报',
   'The device name identifies this hardware in the interface. Model and firmware appear only when the hardware reports them.': '设备名称是界面中的硬件标识；型号和固件版本仅在硬件主动上报时显示。',
-  'Remove device record': '删除设备记录', 'Only disconnected devices can be removed; SIM and line configurations are preserved.': '仅可删除已断开的设备；SIM 和线路配置会保留。',
+  'Show disconnected devices': '显示已断开的设备', 'Remove device record': '删除设备记录', 'Only disconnected devices can be removed; SIM and line configurations are preserved.': '仅可删除已断开的设备；SIM 和线路配置会保留。',
   'Remove device': '删除设备', 'Disconnect this device before removing it': '删除前请先拔掉该设备',
   'Forget this device? SIM and line configurations will be preserved.': '确定删除该设备吗？SIM 和线路配置会保留。',
   'Device removed; SIM and line configurations were preserved': '设备已删除，SIM 和线路配置已保留',

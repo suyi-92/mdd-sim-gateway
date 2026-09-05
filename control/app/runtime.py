@@ -126,7 +126,7 @@ class RuntimeRegistry:
             try:
                 # This is a deliberately idle streaming request; a finite HTTP read timeout
                 # would tear down a perfectly healthy connection whenever no container changed.
-                client = docker.from_env(timeout=None)
+                client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=None)
                 stream = client.events(decode=True, filters={
                     "type": "container", "label": f"{engine.MANAGED_LABEL}=true"})
                 with self._stream_lock:
