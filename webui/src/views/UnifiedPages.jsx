@@ -7,6 +7,7 @@ import { activeBackupOperation, backupOperationRunning } from '../backup-operati
 import SimConfig from './SimConfig.jsx'
 import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
+import { BackupImport, BackupRecord } from './BackupTransfer.jsx'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
 const CAPABILITY_ON_DETAILS = {
@@ -1169,19 +1170,21 @@ export function SystemPage({ showToast }) {
     </div>}
     {tab === 'backup' && <div className="u-settings-stack">
       <div className="u-settings-grid">
-        <section className="card u-panel u-settings-card">
+        <section className="card u-panel u-settings-card u-backup-card">
           <div className="u-settings-card-head"><div><h2>{t('Local backups')}</h2><p>{t('Backups are created only through mddctl so services, Engine containers and SQLite are handled transactionally.')}</p></div><button className="btn btn-primary u-backup-create" disabled={!!backupBusy || backupActive} onClick={createBackup}>{t(activeBackup.action === 'create' ? 'Creating backup…' : 'Create backup')}</button></div>
           <p className="u-note">{t('The archive contains plaintext credentials. Store it only on encrypted, access-controlled media.')}</p>
+          <p className="u-note">{t('Export a backup as one migration package. On another host, install the same or a newer VMware version, import the package, then confirm Restore. Importing does not replace active data. Limit: 1 GiB.')}</p>
+          <BackupImport disabled={!!backupBusy || backupActive} onImported={loadBackups} />
           {backupsError && <p className="u-error">{t('Could not load local backups.')}</p>}
           {!backupsError && backups === null && <p className="u-muted">{t('Loading…')}</p>}
           {!backupsError && backups?.length === 0 && <p className="u-muted">{t('No local backups yet.')}</p>}
           {!!backups?.length && <div className="u-backup-list">{backups.map(item => {
             const restoringThis = activeBackup.action === 'restore' && activeBackup.backupName === item.name
-            return <div className="u-backup-row" key={item.name}><div className="u-backup-copy"><b className="mono" title={item.name}>{item.name}</b><span>{new Date(item.created_at * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB')} · {formatBytes(item.size_bytes)} · {t(item.kind === 'pre-update' ? 'Before update' : 'Manual backup')}</span></div><button className="btn btn-ghost u-backup-restore" disabled={!!backupBusy || backupActive} onClick={() => restoreBackup(item.name)}>{t(restoringThis ? 'Restoring…' : 'Restore')}</button></div>
+            return <BackupRecord key={item.name} item={item} details={`${new Date(item.created_at * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB')} · ${formatBytes(item.size_bytes)} · ${t(item.kind === 'pre-update' ? 'Before update' : item.name.startsWith('imported-') ? 'Imported backup' : 'Manual backup')}`} disabled={!!backupBusy || backupActive} restoring={restoringThis} onRestore={() => restoreBackup(item.name)} />
           })}</div>}
           {backupActive && <p className="u-note u-backup-progress">{t(backupOperation.action === 'restore' ? 'Restoring data; services will restart and this page will reconnect.' : 'Creating backup; services will restart and this page will reconnect.')}</p>}
           {backupOperation?.state === 'failed' && <p className="u-error">{t(backupOperation.error_code || 'backup.error.failed')}</p>}
-          <p className="u-hint">{t('For an offline copy, use mddctl to write the archive directly to encrypted removable media.')}</p>
+          <p className="u-hint">{t('After migration, use the source administrator password. Reconnect the USB devices and review the destination host network; host drivers and network configuration are not included.')}</p>
         </section>
         <section className="card u-panel u-settings-card">
           <div className="u-settings-card-head"><div><h2>{t('Source updates')}</h2><p>{t('This VMware edition is updated from the managed local Git checkout, not from GitHub Releases.')}</p></div></div>

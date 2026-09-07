@@ -146,6 +146,12 @@ NODE_PATH=/tmp/mdd-device-ui-check/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/md
 
 ## 上游 1.9.1 集成回归
 
+管理员恢复与迁移包的行为测试位于 `tests/test_admin_recovery_transfer.py`，覆盖认证回滚、
+会话撤销、两个隔离数据目录之间的 SQLite 迁移、导入不触发恢复、鉴权/CSRF 和传输中断清理。
+复用上节的 Playwright 环境运行 `tests/webui_backup_transfer_browser.cjs`，检查导出下载、导入、
+二次恢复确认，以及 1440/900/390px 下的记录反馈和按钮位置。浏览器测试使用虚构数据，
+不替代第二台真实主机的恢复与硬件验收。
+
 读卡同时覆盖直接 9000、61xx/9Fxx、保留命令数据的 6Cxx 重试与 SELECT 响应体失败；PIN、IKE、SIP
 共享严格 USIM 选择器。eSIM 读取证明只用于该次恢复的首次启动，并在 reader 锁内重新核对 ICCID；
 过期、读卡器绑定改变或无法读取时回到完整预检。

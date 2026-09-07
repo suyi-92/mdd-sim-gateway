@@ -492,3 +492,20 @@ label:has(>.u-toggle) { display:flex; align-items:center; gap:10px; min-height:3
 .u-feishu-lines { min-width:0; margin:16px 0; padding:12px; border:1px solid var(--border); border-radius:8px; }.u-feishu-lines>label { display:flex; align-items:center; gap:8px; min-width:0; overflow-wrap:anywhere; }
 @media(max-width:900px) { .u-notifications-page>.u-tabs+.u-device-grid { grid-template-columns:1fr; } }
 @media(max-width:560px) { .u-country-picker { min-width:0; } }
+
+/* Backup transfer feedback occupies a fixed slot at every container width. */
+.u-backup-card { grid-column:1 / -1; container:backup / inline-size; }
+.u-backup-card .u-backup-copy { flex:1; }
+.u-backup-card .u-backup-copy b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.u-backup-actions { display:grid; grid-template-columns:160px 88px 102px; align-items:center; gap:10px; flex:none; min-width:0; }
+.u-backup-actions .btn { width:100%; }
+.u-backup-feedback { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; min-width:0; height:2.8em; line-height:1.4; font-size:12px; overflow-wrap:anywhere; }
+.u-backup-import { display:grid; grid-template-columns:minmax(180px,1fr) minmax(120px,220px) auto; gap:14px; align-items:center; margin:16px 0; padding:14px 0; border-block:1px solid var(--border); }
+.u-backup-import label { display:grid; gap:8px; min-width:0; font-size:13px; }
+.u-backup-import input { min-width:0; max-width:100%; width:100%; overflow:hidden; }
+@container backup (max-width:720px) {
+  .u-backup-row { flex-direction:column; align-items:stretch; }
+  .u-backup-actions { grid-template-columns:minmax(0,1fr) 88px 102px; }
+  .u-backup-import { grid-template-columns:minmax(0,1fr) auto; }
+  .u-backup-import label { grid-column:1 / -1; }
+}

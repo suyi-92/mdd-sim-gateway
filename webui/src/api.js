@@ -4,6 +4,22 @@ let csrfToken = ''
 
 export function setCsrf(token) { csrfToken = token || '' }
 
+async function transfer(path, file) {
+  const opt = file ? { method: 'POST', body: file, headers: {
+    'Content-Type': 'application/octet-stream', 'X-MDD-CSRF-Token': csrfToken,
+  } } : { cache: 'no-store' }
+  const response = await fetch(base + path, opt)
+  if (!response.ok) {
+    if (response.status === 401 && csrfToken) {
+      csrfToken = ''
+      window.dispatchEvent(new CustomEvent('mdd-auth-expired'))
+    }
+    const data = await response.json().catch(() => ({}))
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'backup.transfer.failed')
+  }
+  return file ? response.json() : response.blob()
+}
+
 async function j(method, path, body) {
   const opt = { method, headers: {} }
   if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) opt.headers['X-MDD-CSRF-Token'] = csrfToken
@@ -94,6 +110,8 @@ export const api = {
   backups: () => j('GET', '/api/system/backups'),
   backupOperation: () => j('GET', '/api/system/backups/operation'),
   createBackup: () => j('POST', '/api/system/backups', {}),
+  exportBackup: name => transfer(`/api/system/backups/${encodeURIComponent(name)}/export`),
+  importBackup: file => transfer('/api/system/backups/import', file),
   restoreBackup: (name) => j(
     'POST', `/api/system/backups/${encodeURIComponent(name)}/restore`, { confirm: 'RESTORE' }),
   clearHostAlerts: () => j('DELETE', '/api/system/host-alerts'),

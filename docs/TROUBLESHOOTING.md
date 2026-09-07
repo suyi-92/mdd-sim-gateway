@@ -202,6 +202,11 @@ ip route
 
 ## 9. WebUI 8443 无法访问
 
+网页能打开但忘记管理员密码时，在客户机终端运行 `sudo mddctl reset-admin`，按隐藏提示
+输入两次新密码。`--dry-run` 可先核验受管安装及认证文件，不改变密码或服务。
+此操作保留业务数据并撤销旧会话，不需要删除数据库或重装。若命令不存在，先将 VMware
+版本更新至 `1.9.1-vmware.3` 或更新版本。
+
 ```bash
 sudo systemctl status mdd-sim-gateway-control --no-pager
 sudo journalctl -u mdd-sim-gateway-control -n 150 --no-pager
@@ -290,6 +295,12 @@ ls -l /var/backups/mdd-sim-gateway/pre-update-*
 不要在自动回滚中途手工把源码切到新提交，否则会产生“新源码 + 旧服务”的混合状态。
 
 ## 13. backup 或 restore 被拒绝
+
+迁移包导入/导出在“系统设置 → 备份与更新”操作。导入失败时核对文件是否为完整
+`.mddbackup`、是否超过 1 GiB，以及目标主机剩余空间；解包上限为 4 GiB / 100,000 项。
+失败信息不会回显归档成员名称或内容。CLI 提示权限不安全时，只把传入的迁移包设置为
+owner-only（例如 `chmod 600` 自己的文件），不要放宽受管目录权限。导入成功只增加备份记录，
+必须另行确认恢复才会替换当前数据。
 
 - backup 输出不能在运行数据目录内部；
 - backup 不覆盖已有归档或摘要；请换新路径。每条线路精确的 `instances/<实例>/run/` 是不恢复的

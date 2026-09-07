@@ -9,19 +9,29 @@ must be checked before any data is written.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
 import stat
+import struct
 import tarfile
+import tempfile
+import time
+import secrets
+import zipfile
 
 
 DATABASE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 EXCLUDED_DIRECTORIES = {"cache", "update", "tmp", "backups"}
 MANIFEST_FIELDS = {"format", "kind", "version", "source_commit", "created_at"}
+TRANSFER_MAX_BYTES = 1024 ** 3
+TRANSFER_DATA_MAX_BYTES = 4 * 1024 ** 3
+TRANSFER_MAX_MEMBERS = 100_000
 
 
 class ArchiveError(RuntimeError):
@@ -230,7 +240,8 @@ def _safe_member_path(destination: Path, member: tarfile.TarInfo) -> Path:
     return target
 
 
-def safe_extract(archive_path: Path, destination: Path) -> dict:
+def safe_extract(archive_path: Path, destination: Path, *, max_bytes: int | None = None,
+                 max_members: int | None = None) -> dict:
     """Extract regular files/directories only, then validate manifest and SQLite."""
     if destination.is_symlink():
         raise ArchiveError("archive destination may not be a symbolic link")
@@ -239,7 +250,14 @@ def safe_extract(archive_path: Path, destination: Path) -> dict:
     if any(destination.iterdir()):
         raise ArchiveError("archive destination must be empty")
     with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
+        members = []
+        expanded = 0
+        for member in archive:
+            members.append(member)
+            expanded += member.size
+            if ((max_members is not None and len(members) > max_members)
+                    or (max_bytes is not None and expanded > max_bytes)):
+                raise ArchiveError("backup exceeds the import expansion limit")
         names: set[str] = set()
         for member in members:
             name = member.name.rstrip("/")
@@ -252,6 +270,8 @@ def safe_extract(archive_path: Path, destination: Path) -> dict:
         data_member = next(member for member in members if member.name.rstrip("/") == "data")
         if not manifest_member.isfile() or not data_member.isdir():
             raise ArchiveError("backup manifest/data has an invalid type")
+        if manifest_member.size > 16384:
+            raise ArchiveError("backup manifest exceeds the size limit")
         directory_modes: list[tuple[Path, int]] = []
         for member in members:
             name = member.name.rstrip("/")
@@ -278,6 +298,133 @@ def safe_extract(archive_path: Path, destination: Path) -> dict:
     return manifest
 
 
+def private_file(path: Path, *, allow_sudo_user: bool = False):
+    """Open a stable, owner-only regular file, never a link or a blocking FIFO."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        owners = {os.geteuid()}
+        if allow_sudo_user and os.geteuid() == 0 and os.environ.get("SUDO_UID", "").isdigit():
+            owners.add(int(os.environ["SUDO_UID"]))
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid not in owners or metadata.st_mode & 0o077):
+            raise ArchiveError("backup file must be an owner-only regular file")
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return stream
+
+
+def export_bundle(archive_path: Path, output: Path) -> None:
+    """Package an immutable managed backup and its digest into one portable file."""
+    try:
+        with private_file(archive_path) as source, private_file(
+                Path(str(archive_path) + ".sha256")) as sidecar:
+            expected = sidecar.read(4097).decode("ascii").split()
+            if (len(expected) != 2 or not re.fullmatch(r"[0-9a-f]{64}", expected[0])
+                    or expected[1] != archive_path.name):
+                raise ArchiveError("backup checksum is invalid")
+            size = os.fstat(source.fileno()).st_size
+            if size > TRANSFER_MAX_BYTES - 4096:
+                raise ArchiveError("backup exceeds the 1 GiB transfer limit")
+            digest = hashlib.sha256()
+            # Exclusive creation and owner-only mode apply from the first byte, even when
+            # this helper is called by a web process with a permissive inherited umask.
+            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as target:
+                    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as bundle:
+                        with bundle.open("data.tar.gz", "w", force_zip64=True) as entry:
+                            copied = 0
+                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                copied += len(chunk)
+                                if copied > TRANSFER_MAX_BYTES - 4096:
+                                    raise ArchiveError("backup exceeds the 1 GiB transfer limit")
+                                digest.update(chunk)
+                                entry.write(chunk)
+                        if digest.hexdigest() != expected[0]:
+                            raise ArchiveError("backup SHA-256 verification failed")
+                        bundle.writestr("data.tar.gz.sha256", expected[0] + "  data.tar.gz\n")
+                    target.flush()
+                    os.fsync(target.fileno())
+            except BaseException:
+                output.unlink(missing_ok=True)
+                raise
+    except UnicodeError as exc:
+        raise ArchiveError("backup checksum is invalid") from exc
+
+
+def import_bundle(bundle_path: Path, backup_root: Path, *, staging_root: Path | None = None) -> str:
+    """Validate in private staging, then publish a new pair without restoring data."""
+    metadata = backup_root.stat(follow_symlinks=False)
+    if (backup_root != backup_root.resolve(strict=True) or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077):
+        raise ArchiveError("unsafe managed backup directory")
+    with private_file(bundle_path, allow_sudo_user=True) as source:
+        size = os.fstat(source.fileno()).st_size
+        if size > TRANSFER_MAX_BYTES:
+            raise ArchiveError("backup exceeds the 1 GiB transfer limit")
+        # Our two-entry, sub-GiB ZIP uses the ordinary 22-byte end record. Check its
+        # directory size before ZipFile allocates entries from untrusted input.
+        if size < 22:
+            raise ArchiveError("invalid migration package")
+        source.seek(-22, os.SEEK_END)
+        end = struct.unpack("<4s4H2LH", source.read(22))
+        if (end[:5] != (b"PK\x05\x06", 0, 0, 2, 2) or end[5] > 512
+                or end[6] + end[5] + 22 != size or end[7] != 0):
+            raise ArchiveError("invalid migration package directory")
+        source.seek(0)
+        with zipfile.ZipFile(source) as bundle, tempfile.TemporaryDirectory(
+                prefix=".mdd-import-", dir=staging_root or backup_root) as temporary:
+            entries = bundle.infolist()
+            if (len(entries) != 2 or {entry.filename for entry in entries}
+                    != {"data.tar.gz", "data.tar.gz.sha256"}):
+                raise ArchiveError("invalid migration package contents")
+            for entry in entries:
+                mode = entry.external_attr >> 16
+                if (entry.is_dir() or entry.flag_bits & 1
+                        or (stat.S_IFMT(mode) and not stat.S_ISREG(mode))
+                        or entry.compress_type != zipfile.ZIP_STORED):
+                    raise ArchiveError("unsupported migration package entry")
+            if (bundle.getinfo("data.tar.gz").file_size > TRANSFER_MAX_BYTES - 4096
+                    or bundle.getinfo("data.tar.gz.sha256").file_size > 128):
+                raise ArchiveError("migration package exceeds size limits")
+            expected = bundle.read("data.tar.gz.sha256").decode("ascii").split()
+            if (len(expected) != 2 or not re.fullmatch(r"[0-9a-f]{64}", expected[0])
+                    or expected[1] != "data.tar.gz"):
+                raise ArchiveError("invalid migration package checksum")
+            stage = Path(temporary)
+            archive = stage / "data.tar.gz"
+            if shutil.disk_usage(stage).free < bundle.getinfo("data.tar.gz").file_size + 1024 ** 3:
+                raise ArchiveError("insufficient free space to import the backup")
+            digest = hashlib.sha256()
+            with bundle.open("data.tar.gz") as entry, archive.open("xb") as target:
+                for chunk in iter(lambda: entry.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    target.write(chunk)
+            archive.chmod(0o600)
+            if digest.hexdigest() != expected[0]:
+                raise ArchiveError("backup SHA-256 verification failed")
+            # Reserve room for validation and leave the host a GiB of working space.
+            available = max(0, shutil.disk_usage(stage).free - 1024 ** 3)
+            safe_extract(archive, stage / "verified", max_bytes=min(
+                TRANSFER_DATA_MAX_BYTES, available), max_members=TRANSFER_MAX_MEMBERS)
+            name = f"imported-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(8)}.tar.gz"
+            checksum = stage / "checksum"
+            checksum.write_text(expected[0] + f"  {name}\n", encoding="ascii")
+            checksum.chmod(0o600)
+            published = backup_root / name
+            # link() is no-clobber; the staging links disappear before callers can list it.
+            os.link(archive, published)
+            try:
+                os.link(checksum, backup_root / f"{name}.sha256")
+            except BaseException:
+                published.unlink()
+                raise
+    return name
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -297,6 +444,13 @@ def main() -> int:
     extract_parser = subparsers.add_parser("verify-extract")
     extract_parser.add_argument("archive", type=Path)
     extract_parser.add_argument("destination", type=Path)
+    export_parser = subparsers.add_parser("export-bundle")
+    export_parser.add_argument("archive", type=Path)
+    export_parser.add_argument("output", type=Path)
+    import_parser = subparsers.add_parser("import-bundle")
+    import_parser.add_argument("bundle", type=Path)
+    import_parser.add_argument("backup_root", type=Path)
+    import_parser.add_argument("--staging-root", type=Path)
     arguments = parser.parse_args()
 
     try:
@@ -309,10 +463,21 @@ def main() -> int:
         elif arguments.command == "create":
             create_backup(arguments.data_root, arguments.archive, version=arguments.version,
                           source_commit=arguments.source_commit, created_at=arguments.created_at)
+        elif arguments.command == "export-bundle":
+            export_bundle(arguments.archive, arguments.output)
+        elif arguments.command == "import-bundle":
+            # Bound parser memory too: malformed gzip/PAX or SQLite metadata can allocate
+            # before ordinary entry-count and expanded-data checks get a chance to run.
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 ** 2, 512 * 1024 ** 2))
+            print(import_bundle(arguments.bundle, arguments.backup_root, staging_root=arguments.staging_root))
         else:
             safe_extract(arguments.archive, arguments.destination)
-    except (ArchiveError, OSError, sqlite3.Error, tarfile.TarError) as exc:
-        parser.exit(1, f"mdd archive error: {exc}\n")
+    except (ArchiveError, OSError, sqlite3.Error, tarfile.TarError, zipfile.BadZipFile,
+            UnicodeError, ValueError, MemoryError, OverflowError) as exc:
+        # Imported member names can contain private data or terminal escapes.
+        message = "migration package validation failed" if arguments.command == "import-bundle" else str(exc)
+        parser.exit(1, f"mdd archive error: {message}\n")
     return 0
 
 

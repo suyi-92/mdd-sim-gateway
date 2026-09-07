@@ -31,6 +31,9 @@ Usage:
   mddctl update [--no-cache] [--dry-run] [--yes]
   mddctl backup [--output PATH]
   mddctl restore --input PATH
+  mddctl reset-admin [--dry-run]
+  mddctl export-backup --input PATH --output PATH.mddbackup
+  mddctl import-backup --input PATH.mddbackup
   mddctl driver status | install | restore
   mddctl uninstall [--purge]
 EOF
@@ -402,6 +405,50 @@ cmd_restore() {
   [[ -n "$input" ]] || die "restore requires --input PATH"
   acquire_lock
   restore_archive "$input" 1
+}
+
+cmd_reset_admin() {
+  local -a options=()
+  while (($#)); do
+    case "$1" in --dry-run) options+=(--dry-run) ;; *) die "reset-admin accepts only --dry-run; enter passwords at the hidden terminal prompt" ;; esac
+    shift
+  done
+  acquire_lock
+  validate_managed_checkout
+  validate_active_generation
+  env MDD_DATA="$DATA_DIR" PYTHONPATH="$INSTALL_DIR/control" \
+    "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/mdd_admin.py" \
+    --data-dir "$DATA_DIR" --state-dir "$STATE_DIR" "${options[@]}"
+}
+
+cmd_transfer_backup() {
+  local action=$1 input="" output=""
+  shift
+  while (($#)); do
+    case "$1" in
+      --input) (($# >= 2)) || die "--input requires PATH"; input=$2; shift 2 ;;
+      --output) (($# >= 2)) || die "--output requires PATH"; output=$2; shift 2 ;;
+      *) die "unknown backup transfer option: $1" ;;
+    esac
+  done
+  [[ -n "$input" ]] || die "backup transfer requires --input PATH"
+  acquire_lock
+  validate_managed_checkout
+  validate_active_generation
+  input=$(realpath -e -- "$input")
+  if [[ "$action" == export ]]; then
+    [[ -n "$output" ]] || die "export-backup requires --output PATH.mddbackup"
+    output=$(realpath -m -- "$output")
+    case "$output" in "$DATA_DIR"|"$DATA_DIR"/*|"$INSTALL_DIR"|"$INSTALL_DIR"/*|"$STATE_DIR"|"$STATE_DIR"/*|"$CACHE_DIR"|"$CACHE_DIR"/*)
+      die "export output must be outside managed source, state, cache and active data" ;;
+    esac
+    archive_tool export-bundle "$input" "$output"
+    info "portable backup exported; store it on encrypted, controlled media"
+  else
+    [[ -z "$output" ]] || die "import-backup does not accept --output"
+    archive_tool import-bundle "$input" "$BACKUP_DIR"
+    info "backup imported and verified; active data is unchanged. Restore it explicitly when ready."
+  fi
 }
 
 git_operation_in_progress() {
@@ -955,6 +1002,9 @@ case "$command" in
   update) cmd_update "$@" ;;
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
+  reset-admin) cmd_reset_admin "$@" ;;
+  export-backup) cmd_transfer_backup export "$@" ;;
+  import-backup) cmd_transfer_backup import "$@" ;;
   driver) cmd_driver "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   -h|--help|help) usage ;;

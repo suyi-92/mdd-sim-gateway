@@ -196,6 +196,9 @@ mddctl start|stop|restart|logs
 mddctl update [--no-cache]
 mddctl backup [--output PATH]
 mddctl restore --input PATH
+mddctl reset-admin [--dry-run]
+mddctl export-backup --input PATH --output PATH.mddbackup
+mddctl import-backup --input PATH.mddbackup
 mddctl driver status|install|restore
 mddctl uninstall [--purge]
 ```
@@ -216,6 +219,17 @@ READY/manifest、venv/WebUI 和 Engine 身份。只有当前 HEAD 是远端祖�
 必需硬件门禁失败时，工具恢复旧提交、旧 venv/WebUI/Engine 和更新前数据快照，再启动旧版。
 
 ### 备份与整机迁移
+
+忘记网页管理员密码时，在客户机终端运行 `sudo mddctl reset-admin`，按隐藏提示输入两次
+10–256 字符的新密码。该命令核验受管安装，保留管理员名称和网关数据，短暂停止管理服务后
+重设密码并撤销旧会话；写入或 HTTPS 健康失败会尝试恢复原认证数据及服务状态。可先运行
+`sudo mddctl reset-admin --dry-run`，仅检查恢复前提。
+
+“系统设置 → 备份与更新”中的每个备份现在可以**导出**为单个 `.mddbackup` 迁移包。
+在另一台已安装相同或更新 VMware 版本的主机上**导入备份**，通过摘要、manifest、归档安全
+及 SQLite 校验后进入本地备份列表，再明确确认**恢复**。导入阶段不会修改活动数据。
+迁移包上限为 1 GiB，解包校验上限为 4 GiB / 100,000 项，同时保留至少 1 GiB 主机可用空间。
+迁移后使用原主机的管理员密码；USB 直通、主机驱动、桥接网络和 DHCP 保留仍需在目标主机配置。
 
 `mddctl backup` 会停止 MDD，确认 Engine 全停，对 SQLite 执行 WAL checkpoint 与 integrity
 check，再生成 root-only `tar.gz`、SHA-256 和不含秘密的 manifest；随后恢复此前运行状态。

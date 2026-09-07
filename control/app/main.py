@@ -34,6 +34,7 @@ from . import (store, engine, status as status_mod, sim, card, notify_push, lpa,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
 from .version import VERSION
+from .backup_transfer import router as backup_transfer_router
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
 
@@ -2477,6 +2478,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
+app.include_router(backup_transfer_router)
 
 _AUTH_PUBLIC = {"/api/auth/status", "/api/auth/setup", "/api/auth/login"}
 

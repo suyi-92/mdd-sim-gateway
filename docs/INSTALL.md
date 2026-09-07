@@ -354,6 +354,46 @@ bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmwar
 
 ## 10. 备份、恢复和整机迁移
 
+### 管理员密码恢复
+
+在客户机的交互式终端执行：
+
+```bash
+sudo mddctl reset-admin --dry-run
+sudo mddctl reset-admin
+```
+
+输入两次 10–256 字符的新密码，输入不会回显，也不接受密码命令行参数。命令只更改管理员
+密码并撤销旧登录会话，保留用户名、SIM、线路、短信和代理配置。认证原件保存在 root-only 的
+管理状态目录中；短暂停止 Control/orchestrator 后原子写入，按原 active/inactive 状态恢复服务。
+写入或 HTTPS 健康检查失败时尝试回滚认证文件和服务状态。不要在备份或更新事务期间执行。
+
+### 跨主机迁移包
+
+1. 在“系统设置 → 备份与更新”创建备份，完成后点击该记录的“导出”，得到单个 `.mddbackup`。
+2. 将文件保存在访问受控的加密介质。在目标主机安装相同或更新的 VMware 版本。
+3. 登录目标主机，在同一页面选择迁移包并点击“导入备份”。通过校验后只新增备份记录。
+4. 选择导入记录，点击“恢复”并输入 `RESTORE`。此时才停止服务并事务替换数据，失败自动回滚。
+5. 使用原主机管理员密码登录。核对目标主机网络、USB 设备和线路映射，再验收 IMS、通话及音频。
+
+迁移包内包含原始数据归档和 SHA-256，不能当作脱敏支持包公开分享。上传上限为 1 GiB，
+解包上限为 4 GiB / 100,000 项，还受可用磁盘空间约束。导入拒绝路径穿越、重复条目、链接、
+特殊文件、错误摘要/manifest 和损坏 SQLite；不会运行归档内容或自动触发恢复。
+
+也可在终端导出和导入已有备份：
+
+```bash
+sudo mddctl export-backup --input '/var/backups/mdd-sim-gateway/mdd-data-<时间>.tar.gz' --output /mnt/encrypted/gateway.mddbackup
+sudo mddctl import-backup --input /mnt/encrypted/gateway.mddbackup
+```
+
+最后一条命令输出新归档名称，之后在网页列表选择恢复，或将该名称传给现有的
+`sudo mddctl restore --input /var/backups/mdd-sim-gateway/<导入归档名称>`。
+CLI 导入文件必须为 root 或当前 sudo 用户所有的 owner-only 普通文件。导出不会覆盖已有文件。
+浏览器下载的迁移包由当前用户拥有时，可先对该文件运行 `chmod 600` 再通过 CLI 导入。
+
+### 原始归档与整机迁移
+
 ```bash
 sudo mddctl backup
 sudo mddctl backup --output /mnt/encrypted/mdd-data.tar.gz

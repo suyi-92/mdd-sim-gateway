@@ -3,6 +3,17 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Export': '导出', 'Import backup': '导入备份', 'Imported backup': '导入的备份',
+  'Migration package': '迁移备份包', 'Preparing download…': '正在准备下载…',
+  'Download started': '已开始下载', 'Uploading and checking…': '正在上传并校验…',
+  'Imported. Select Restore below to apply it.': '已导入，点击下方“恢复”后才会生效。',
+  'Export a backup as one migration package. On another host, install the same or a newer VMware version, import the package, then confirm Restore. Importing does not replace active data. Limit: 1 GiB.': '可将备份导出为单个迁移包。在另一台主机安装相同或更新的 VMware 版本，导入迁移包后再确认恢复。导入不会替换当前数据，迁移包上限为 1 GiB。',
+  'After migration, use the source administrator password. Reconnect the USB devices and review the destination host network; host drivers and network configuration are not included.': '迁移后使用原主机的管理员密码登录。请重新连接 USB 设备并核对新主机网络；备份不包含主机驱动和网络配置。',
+  'Forgot your password? Run sudo mddctl reset-admin in the VM terminal.': '忘记密码？请在虚拟机终端运行 sudo mddctl reset-admin。',
+  'backup.transfer.invalid': '备份包无效、损坏、权限不安全或超出校验限制。',
+  'backup.transfer.failed': '备份传输失败，请重试并检查主机可用空间。',
+  'backup.transfer.busy': '另一个备份传输正在进行，请稍后重试。',
+  'backup.transfer.too_large': '迁移备份包不能超过 1 GiB。',
   'Bot {number}': '机器人 {number}',
   'Line {number}': '线路 {number}',
   'Test failed': '测试失败，请查看投递日志',
@@ -512,7 +523,7 @@ const zh = {
   'Insert a readable SIM before enabling VoWiFi': '请插入可读取的 SIM 卡后再开启 VoWiFi',
   'Saved SIM line': '已保存的 SIM 线路', 'Choose a saved line': '请选择已保存线路',
   'Select a saved SIM line to edit or delete it. This list does not depend on whether its former device is connected.': '选择已保存的 SIM 线路进行编辑或删除；此列表不依赖原设备当前是否连接。',
-  'Sign in to manage the gateway': '登录后管理网关', 'Create the administrator account': '创建管理员账号', Username: '用户名', Password: '密码', 'Confirm password': '确认密码', 'Passwords do not match': '两次输入的密码不一致', 'Sign in': '登录', 'Keep me signed in for 30 days': '保持登录 30 天', 'Sign out': '退出登录', 'Create account': '创建账号', 'Please wait…': '请稍候…', 'Login is sent only when you click the button.': '只有明确点击按钮后才会发送登录请求。', 'Too many attempts. Try again in {seconds} seconds.': '尝试次数过多，请在 {seconds} 秒后重试。', 'Try again in {seconds}s': '{seconds} 秒后重试', 'Use at least 10 characters. Reset it from the host if it is lost.': '请至少使用 10 个字符；遗忘后可在主机运行 reset-admin 重置。', 'Change administrator password': '修改管理员密码', 'Change password': '修改密码', 'Current password': '当前密码', 'New password (at least 10 characters)': '新密码（至少 10 个字符）', 'self-signed': '自签名证书', custom: '自定义证书',
+  'Sign in to manage the gateway': '登录后管理网关', 'Create the administrator account': '创建管理员账号', Username: '用户名', Password: '密码', 'Confirm password': '确认密码', 'Passwords do not match': '两次输入的密码不一致', 'Sign in': '登录', 'Keep me signed in for 30 days': '保持登录 30 天', 'Sign out': '退出登录', 'Create account': '创建账号', 'Please wait…': '请稍候…', 'Login is sent only when you click the button.': '只有明确点击按钮后才会发送登录请求。', 'Too many attempts. Try again in {seconds} seconds.': '尝试次数过多，请在 {seconds} 秒后重试。', 'Try again in {seconds}s': '{seconds} 秒后重试', 'Use at least 10 characters. Reset it from the host if it is lost.': '请至少使用 10 个字符；遗忘后可在虚拟机终端运行 sudo mddctl reset-admin 重置。', 'Change administrator password': '修改管理员密码', 'Change password': '修改密码', 'Current password': '当前密码', 'New password (at least 10 characters)': '新密码（至少 10 个字符）', 'self-signed': '自签名证书', custom: '自定义证书',
   'Detecting…': '正在检测…', 'No SIM card in this reader.': '此读卡器中没有 SIM 卡。', 'Card read.': '卡片读取成功。', 'Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.': '已检测到卡片；输入 PIN 后读取 IMSI。ICCID {iccid}，剩余 {tries} 次。', 'Verifying…': '正在验证…', 'PIN OK ✓': 'PIN 正确 ✓', 'PIN failed: {error} ({tries} tries left)': 'PIN 验证失败：{error}（剩余 {tries} 次）', 'Saved — restarting the line to apply changes…': '已保存，正在重启线路以应用修改…', 'Saved.': '已保存。', 'Delete this instance?': '确定删除此线路吗？', 'Delete the saved SIM PIN for this line?\n\nThe line will be stopped and the PIN will be requested again on next start.': '确定删除此线路保存的 SIM PIN 吗？\n\n线路将停止，并会在下次启动时重新要求输入 PIN。', 'Saved PIN deleted — the line will ask for it on next start.': '已删除保存的 PIN；下次启动线路时会重新询问。', 'No saved PIN to delete.': '没有可删除的已保存 PIN。', 'No readers': '没有读卡器', 'Bound to USB port {port} (stable across reader re-enumeration)': '已绑定 USB 端口 {port}（读卡器重新枚举后仍保持）', '(locked)': '（已锁定）', 'USB port': 'USB 端口', 'enabled, {tries} tries': '已启用，剩余 {tries} 次', disabled: '已关闭', 'No SIM card in reader {reader}.': '读卡器 {reader} 中没有 SIM 卡。', 'e.g. 123456': '例如 123456', 'A PIN is saved for this line and used automatically on start.': '此线路已保存 PIN，启动时会自动使用。', 'No PIN saved — you will be asked for it when the line starts if required.': '未保存 PIN；如 SIM 需要，启动线路时会询问。', 'auto from IMEI (DEVICE_IDENTITY)': '从 IMEI 自动生成（DEVICE_IDENTITY）', 'auto-learned': '自动学习', 'detect card / verify PIN to read from SIM': '检测卡片/验证 PIN 后从 SIM 读取', 'Auto-detected: {mode}. Switch back to Auto-detect to re-probe.': '已自动检测为 {mode}；切回“自动检测”可重新探测。', 'IDr help': 'IDr 决定如何向 ePDG 提交 APN。大多数运营商使用裸 APN；只有少数严格网络需要 APN-FQDN，错误格式可能被拒绝。', 'IMS address family help': 'IMS 地址族必须匹配运营商 IMS PDN。建议保持自动检测；系统会根据已知运营商或认证后的探测结果固定可用地址族。', all: '全部接口', local: '仅本机', 'Device User-Agent (identify to the carrier as this device)': '设备 User-Agent（以该设备身份向运营商标识）', username: '用户名', password: '密码', 'Show logs for': '查看以下线路日志', 'Select a SIM / line to view its engine and IKE logs.': '请选择一张 SIM/线路以查看引擎和 IKE 日志。', '(empty)': '（空）', 'Auto refresh': '自动刷新', 'Enter a number': '输入号码',
 
      'Card error: {error}': '读卡失败：{error}',
@@ -614,6 +625,10 @@ const en = {
   'restart.error.dry_run': 'A dry-run orchestrator does not restart services',
   'restart.error.launch': 'The restart job could not be started; check journalctl -u mdd-sim-gateway-restart on the host',
   'restart.error.failed': 'The restart did not complete; check the service status on the host',
+  'backup.transfer.invalid': 'The package is invalid, damaged, unsafe, or exceeds validation limits.',
+  'backup.transfer.failed': 'Backup transfer failed. Retry and check available disk space.',
+  'backup.transfer.busy': 'Another backup transfer is running. Try again shortly.',
+  'backup.transfer.too_large': 'Migration packages must not exceed 1 GiB.',
   'backup.error.invalid_status': 'The backup-operation status is invalid; check the management services.',
   'backup.error.not_picked_up': 'The host orchestrator did not pick up the backup request.',
   'backup.error.stalled': 'The backup or restore operation did not finish; check the managed job log.',
