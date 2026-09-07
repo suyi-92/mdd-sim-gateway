@@ -95,10 +95,39 @@ def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
 
+def _apdu_with_le(apdu, le):
+    """Correct a short APDU's Le without changing its Lc or command data."""
+    apdu = list(apdu)
+    if len(apdu) < 4:
+        raise ValueError("APDU header is incomplete")
+    if len(apdu) <= 5:
+        return apdu[:4] + [le]
+    lc = apdu[4]
+    if not lc or len(apdu) not in (5 + lc, 6 + lc):
+        raise ValueError("cannot correct Le on a malformed or extended APDU")
+    return apdu[:5 + lc] + [le]
+
+
+def _xfr(conn, apdu):
+    return _transmit(conn, apdu)
+
+
 def dec_imsi(ef_hex):
-    l = int(ef_hex[0:2], 16) * 2 - 1
+    """Decode EF_IMSI; None for anything that is not a plausible IMSI, so a garbled
+    read surfaces as a failure instead of a bogus identity."""
+    if len(ef_hex) < 4:
+        return None
+    try:
+        length = int(ef_hex[0:2], 16)
+    except ValueError:
+        return None
+    if not (1 <= length <= 8):
+        return None
     swapped = swap_nibbles(ef_hex[2:]).rstrip("f")
-    return swapped[1:]
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
 
 
 # This module is also the single Engine-side USIM selector used by ami_usim and swu_ike. Keep
@@ -107,20 +136,33 @@ USIM_AID_PREFIX = "A0000000871002"
 
 
 def _transmit(conn, command, depth=0):
-    """Send an APDU and normalize 61xx/9Fxx continuations plus 6Cxx length retries."""
-    if depth > 8:
-        raise RuntimeError("too many APDU continuations")
+    """Normalize bounded UICC exchanges while keeping SELECT acceptance separate.
+
+    A SELECT answering 61xx/9Fxx has succeeded even if fetching its response body
+    subsequently fails. Readers that return data with 9000 need no GET RESPONSE.
+    READ/AUTHENTICATE errors must keep their status, and callers needing SELECT's
+    body must still validate its length/TLVs. Never turn an exhausted loop into success.
+    """
     command = list(command)
-    data, s1, s2 = conn.transmit(command)
-    if s1 == 0x6C and len(command) >= 5:
-        retry = list(command)
-        retry[-1] = s2
-        return _transmit(conn, retry, depth + 1)
-    if s1 in (0x61, 0x9F):
-        more, final_s1, final_s2 = _transmit(
-            conn, [0x00, 0xC0, 0x00, 0x00, s2], depth + 1)
-        return list(data) + list(more), final_s1, final_s2
-    return list(data), s1, s2
+    current = command
+    selected = False
+    data = []
+    for _ in range(max(0, 9 - depth)):
+        chunk, s1, s2 = conn.transmit(current)
+        if s1 == 0x6C:
+            current = _apdu_with_le(current, s2)  # 00 denotes the full short Le, 256
+            continue
+        if s1 in (0x61, 0x9F):
+            data.extend(chunk)
+            selected = selected or (len(command) >= 2 and command[1] == 0xA4)
+            current = [current[0], 0xC0, 0x00, 0x00, s2]
+            continue
+        if (s1, s2) == (0x90, 0x00):
+            return data + list(chunk), s1, s2
+        if selected:
+            return data, 0x90, 0x00
+        return data + list(chunk), s1, s2
+    raise RuntimeError("too many APDU continuations")
 
 
 def _tlvs(data):
@@ -191,8 +233,8 @@ def select_adf_usim(conn):
 
 
 def read_imsi(conn):
-    conn.transmit(toBytes("00a40004026f0700"))
-    d, s1, s2 = conn.transmit(toBytes("00b0000009"))
+    _xfr(conn, toBytes("00a40004026f0700"))
+    d, s1, s2 = _xfr(conn, toBytes("00b0000009"))
     if s1 != 0x90:
         return None
     return dec_imsi(bytes(d).hex())
@@ -211,6 +253,8 @@ def pin_tries_left(conn):
 
 
 def verify_pin(conn, pin):
+    if not isinstance(pin, str) or not (4 <= len(pin) <= 8) or any(c not in "0123456789" for c in pin):
+        return 0x67, 0x00  # refuse to send a malformed VERIFY body (would spend a try)
     body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
     d, s1, s2 = conn.transmit(toBytes("00200001") + [0x08] + body)
     return s1, s2
@@ -264,13 +308,15 @@ def _with_deadline(fn, timeout=None):
 
 
 def read_iccid(conn):
-    conn.transmit(toBytes("00a40004023f0000"))
-    conn.transmit(toBytes("00a40004022fe200"))
-    d, s1, s2 = conn.transmit(toBytes("00b000000a"))
-    if s1 != 0x90:
+    """Read the complete EF.ICCID only after both file selections have succeeded."""
+    for command in ("00a40004023f0000", "00a40004022fe200"):
+        _data, s1, s2 = _xfr(conn, toBytes(command))
+        if (s1, s2) != (0x90, 0x00):
+            return None
+    data, s1, s2 = _xfr(conn, toBytes("00b000000a"))
+    if (s1, s2) != (0x90, 0x00) or len(data) != 10:
         return None
-    hx = bytes(d).hex()
-    return swap_nibbles(hx).rstrip("f")
+    return swap_nibbles(bytes(data).hex()).rstrip("f")
 
 
 class WrongCard(Exception):

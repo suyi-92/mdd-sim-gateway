@@ -235,6 +235,43 @@ class NotificationChannelTests(unittest.TestCase):
         self.assertTrue(notify_push.has_enabled_channel(settings, EV_INCOMING_SMS))
         self.assertFalse(notify_push.has_enabled_channel(settings, EV_INCOMING_CALL))
 
+    def test_legacy_feishu_config_is_exposed_as_one_channel(self):
+        channels = notify_push.feishu_channels({
+            "enabled": True,
+            "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+        })
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0]["id"], "legacy")
+
+    def test_explicit_empty_feishu_channels_disable_legacy_fallback(self):
+        self.assertEqual(notify_push.feishu_channels({
+            "enabled": True,
+            "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+            "channels": [],
+        }), [])
+
+    def test_feishu_instance_filter_matches_only_selected_lines(self):
+        self.assertTrue(notify_push.feishu_channel_matches({"instances": []}, "9"))
+        self.assertTrue(notify_push.feishu_channel_matches({"instances": ["2", "9"]}, "9"))
+        self.assertFalse(notify_push.feishu_channel_matches({"instances": ["2"]}, "9"))
+        self.assertFalse(notify_push.feishu_channel_matches({"instances": ["2"]}, ""))
+
+    def test_multi_feishu_validation_rejects_duplicate_ids_and_bad_filters(self):
+        with self.assertRaisesRegex(ValueError, "IDs must be unique"):
+            notify_push.validate_feishu_channels({"channels": [
+                {"id": "ops", "enabled": False}, {"id": "ops", "enabled": False},
+            ]})
+        with self.assertRaisesRegex(ValueError, "instance filters"):
+            notify_push.validate_feishu_channels({"channels": [
+                {"id": "ops", "enabled": False, "instances": ["bad/id"]},
+            ]})
+
+    def test_disabled_feishu_channel_can_be_saved_before_url_is_filled(self):
+        channels = notify_push.validate_feishu_channels({"channels": [{
+            "id": "draft", "name": "Draft", "enabled": False, "url": "",
+        }]})
+        self.assertEqual(channels[0]["id"], "draft")
+
     @patch("control.app.notify_push._deliver_with_retry")
     def test_dispatch_delivers_through_feishu_without_other_channels(self, deliver):
         settings = {"feishu": {
@@ -246,6 +283,33 @@ class NotificationChannelTests(unittest.TestCase):
         deliver.assert_called_once()
         self.assertEqual(deliver.call_args.args[0], "feishu")
         self.assertIs(deliver.call_args.args[1], send_feishu)
+
+    @patch("control.app.notify_push._deliver_with_retry")
+    def test_dispatch_fans_out_to_matching_feishu_channels(self, deliver):
+        settings = {"feishu": {"channels": [
+            {"id": "all", "enabled": True, "instances": [],
+             "events": {EV_INCOMING_SMS: True}},
+            {"id": "line-2", "enabled": True, "instances": ["2"],
+             "events": {EV_INCOMING_SMS: True}},
+            {"id": "line-3", "enabled": True, "instances": ["3"],
+             "events": {EV_INCOMING_SMS: True}},
+        ]}}
+        notify_push.dispatch(settings, EV_INCOMING_SMS, {"id": "2"}, "+100", "hello")
+        self.assertEqual(deliver.call_count, 2)
+        self.assertCountEqual([call.args[0] for call in deliver.call_args_list],
+                         ["feishu:all", "feishu:line-2"])
+
+    @patch("control.app.notify_push._deliver_with_retry")
+    def test_line_filtered_feishu_channels_skip_gateway_events(self, deliver):
+        settings = {"feishu": {"channels": [
+            {"id": "lines", "enabled": True, "instances": ["2"],
+             "events": {notify_push.EV_HOST_ALERT: True}},
+            {"id": "global", "enabled": True, "instances": [],
+             "events": {notify_push.EV_HOST_ALERT: True}},
+        ]}}
+        notify_push.dispatch(settings, notify_push.EV_HOST_ALERT, {}, "", "host alert")
+        deliver.assert_called_once()
+        self.assertEqual(deliver.call_args.args[0], "feishu:global")
 
     def test_manual_telegram_proxy_is_applied_without_environment_proxy(self):
         session = telegram_session({"proxy_mode": "manual",

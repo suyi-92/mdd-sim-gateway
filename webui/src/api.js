@@ -21,7 +21,7 @@ async function j(method, path, body) {
   }
   // detail may be a structured dict (e.g. {code, message}); prefer its message so
   // alerts show readable text instead of "[object Object]".
-  const detailMsg = data.detail && typeof data.detail === 'object' ? data.detail.message : data.detail
+  const detailMsg = data.detail && typeof data.detail === 'object' ? (data.detail.message || data.detail.code) : data.detail
   if (!r.ok) throw Object.assign(new Error(detailMsg || data.error || r.statusText), { status: r.status, data })
   return data
 }
@@ -74,9 +74,9 @@ export const api = {
   // `reader` (PC/SC reader NAME) lets the backend re-resolve the index at request time —
   // indices shift when another reader is unplugged, and a stale index could address the
   // wrong physical SIM.
-  verifyPin: (pin, reader_index = 0, reader) => j('POST', '/api/sim/verify-pin', { pin, reader_index, reader }),
-  changePin: (oldp, newp, reader_index = 0) => j('POST', '/api/sim/change-pin', { old: oldp, new: newp, reader_index }),
-  setPinEnabled: (pin, enabled, reader_index = 0) => j('POST', '/api/sim/pin-enabled', { pin, enabled, reader_index }),
+  verifyPin: (pin, reader_index = 0, reader, reader_port) => j('POST', '/api/sim/verify-pin', { pin, reader_index, reader, reader_port }),
+  changePin: (oldp, newp, reader_index = 0, reader, reader_port) => j('POST', '/api/sim/change-pin', { old: oldp, new: newp, reader_index, reader, reader_port }),
+  setPinEnabled: (pin, enabled, reader_index = 0, reader, reader_port) => j('POST', '/api/sim/pin-enabled', { pin, enabled, reader_index, reader, reader_port }),
 
   settings: () => j('GET', '/api/settings'),
   saveSettings: (patch) => j('PUT', '/api/settings', patch),

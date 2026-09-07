@@ -2,6 +2,23 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.9.1-vmware.1] - 2026-09-07
+
+### Added
+- 融合上游 1.9.1 发布主干，增加多飞书机器人、线路过滤、独立重试、国家出口搜索和最长 365 天保号间隔。
+- 增加仅针对 DITO PLMN 的 IKE 兼容套件；保留其他运营商的协商行为。
+
+### Fixed
+- 兼容 APDU/T=1、61xx/9Fxx SELECT 和保留数据的 6Cxx 长度纠正，继续共享严格 USIM 选择器。
+- PIN 预检核对实时卡身份并给出脱敏原因；eSIM 恢复复用本次读取证明，避免重复完整扫描。
+- 晚到短信以事务更新原消息，重复分片不重复提醒；正确应答提交报告，避免空白入站短信。
+- 仅修改线路名称不重启 Engine，继续过滤内部 IMS 身份字段。
+
+### Changed
+- Engine 按 128 项清单精简模块并保留 amd64 Opus；构建和激活验证精确模块集合及摘要。
+- 保留 VMware 原生部署、受管更新回滚、硬件配置、通话音频及较新的前端锁文件元数据。
+- 明确独立仓库的合并、提交推送和快照前置流程，退役 Release/CI 部署入口继续保持删除。
+
 ## [Unreleased]
 
 ### Added

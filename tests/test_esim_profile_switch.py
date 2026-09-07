@@ -238,7 +238,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
             [call.args[2] for call in events.await_args_list],
             ["recovery_retry", "line_started"])
 
-    async def test_verified_pin_disabled_switch_skips_the_duplicate_full_card_preflight(self):
+    async def test_switch_passes_its_read_proof_to_the_live_identity_preflight(self):
         target = {"id": "2", "iccid": "profile-target", "enabled": True,
                   "reader_index": 1}
         scheduled = []
@@ -263,12 +263,12 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.asyncio, "create_task", side_effect=capture):
             result = await main._start_instance(
-                "2", pin_preflight_verified=True,
+                "2", pin_preflight_proof={"proof": "this-switch"},
                 health_reason="esim_profile_switch",
                 engine_reason="esim_profile_switch")
 
         self.assertTrue(result["ok"])
-        preflight.assert_not_awaited()
+        preflight.assert_awaited_once_with(target, pin_proof={"proof": "this-switch"})
         self.assertEqual(start.call_args.kwargs["reason"], "esim_profile_switch")
         self.assertEqual(len(scheduled), 1)
 
@@ -296,9 +296,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 }), patch.object(main.hub, "reset_health"), \
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.asyncio, "create_task", side_effect=capture):
-            await main._start_instance("2", pin_preflight_verified=True)
+            await main._start_instance("2", pin_preflight_proof={"proof": "this-switch"})
 
-        preflight.assert_awaited_once_with(target)
+        preflight.assert_awaited_once_with(target, pin_proof={"proof": "this-switch"})
         self.assertEqual(len(scheduled), 1)
 
     def test_processed_notification_is_removed_from_only_the_selected_cached_se(self):

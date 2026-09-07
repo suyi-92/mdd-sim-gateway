@@ -93,27 +93,57 @@ def _hx(s: str):
     return [int(s[i:i + 2], 16) for i in range(0, len(s), 2)]
 
 
-def _transmit(conn, command, depth: int = 0):
-    """Send one APDU and normalize the continuation forms used by real UICCs.
+def _apdu_with_le(apdu, le):
+    """Correct a short APDU's Le without changing its Lc or command data."""
+    apdu = list(apdu)
+    if len(apdu) < 4:
+        raise ValueError("APDU header is incomplete")
+    if len(apdu) <= 5:
+        return apdu[:4] + [le]
+    lc = apdu[4]
+    if not lc or len(apdu) not in (5 + lc, 6 + lc):
+        raise ValueError("cannot correct Le on a malformed or extended APDU")
+    return apdu[:5 + lc] + [le]
 
-    pyscard exposes the raw status word.  Cards legitimately use either 61xx or the
-    SIM-era 9Fxx to request GET RESPONSE, and 6Cxx to correct an expected response
-    length.  Handling those forms in one bounded helper keeps identity discovery
-    consistent with the Engine and with native PC/SC implementations.
+
+def _transmit(conn, command, depth=0):
+    """Normalize bounded UICC exchanges while keeping SELECT acceptance separate.
+
+    A SELECT answering 61xx/9Fxx has succeeded even if fetching its response body
+    subsequently fails. Readers that return data with 9000 need no GET RESPONSE.
+    READ/AUTHENTICATE errors must keep their status, and callers needing SELECT's
+    body must still validate its length/TLVs. Never turn an exhausted loop into success.
     """
-    if depth > 8:
-        raise RuntimeError("too many APDU continuations")
     command = list(command)
-    data, s1, s2 = conn.transmit(command)
-    if s1 == 0x6C and len(command) >= 5:
-        retry = list(command)
-        retry[-1] = s2
-        return _transmit(conn, retry, depth + 1)
-    if s1 in (0x61, 0x9F):
-        more, final_s1, final_s2 = _transmit(
-            conn, [0x00, 0xC0, 0x00, 0x00, s2], depth + 1)
-        return list(data) + list(more), final_s1, final_s2
-    return list(data), s1, s2
+    current = command
+    selected = False
+    data = []
+    for _ in range(max(0, 9 - depth)):
+        chunk, s1, s2 = conn.transmit(current)
+        if s1 == 0x6C:
+            current = _apdu_with_le(current, s2)  # 00 denotes the full short Le, 256
+            continue
+        if s1 in (0x61, 0x9F):
+            data.extend(chunk)
+            selected = selected or (len(command) >= 2 and command[1] == 0xA4)
+            current = [current[0], 0xC0, 0x00, 0x00, s2]
+            continue
+        if (s1, s2) == (0x90, 0x00):
+            return data + list(chunk), s1, s2
+        if selected:
+            return data, 0x90, 0x00
+        return data + list(chunk), s1, s2
+    raise RuntimeError("too many APDU continuations")
+
+
+def _xfr(conn, apdu):
+    return _transmit(conn, apdu)
+
+
+def _pin_body(pin: str) -> Optional[list[int]]:
+    if not isinstance(pin, str) or not (4 <= len(pin) <= 8) or any(c not in "0123456789" for c in pin):
+        return None
+    return [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
 
 
 def swap_nibbles(s: str) -> str:
@@ -121,10 +151,22 @@ def swap_nibbles(s: str) -> str:
 
 
 def dec_imsi(ef_hex: str) -> Optional[str]:
+    """Decode EF_IMSI (TS 31.102 4.2.2): [len][parity nibble | BCD digits...]. Returns
+    None for anything that is not a plausible IMSI so a garbled read surfaces as a
+    failure instead of a bogus identity."""
     if len(ef_hex) < 4:
         return None
+    try:
+        length = int(ef_hex[0:2], 16)
+    except ValueError:
+        return None
+    if not (1 <= length <= 8):
+        return None
     swapped = swap_nibbles(ef_hex[2:]).rstrip("f")
-    return swapped[1:] if swapped else None
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
 
 
 def dec_iccid(ef_hex: str) -> str:
@@ -437,10 +479,13 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             info.pin_enabled = tries is not None
             # Optionally verify PIN in this same connection so IMSI becomes readable.
             if pin and tries is not None and tries >= MIN_TRIES:
-                body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
-                d, s1, s2 = _transmit(conn, _hx("00200001") + [0x08] + body)
-                if (s1, s2) != (0x90, 0x00):
-                    info.error = "wrong PIN" if s1 == 0x63 else f"pin sw={s1:02x}{s2:02x}"
+                body = _pin_body(pin)
+                if body is None:
+                    info.error = "invalid PIN format (4-8 digits)"
+                else:
+                    d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
+                    if (s1, s2) != (0x90, 0x00):
+                        info.error = "wrong PIN" if s1 == 0x63 else f"pin sw={s1:02x}{s2:02x}"
             # IMSI (needs PIN normally; may fail if not verified)
             d, s1, s2 = _read_binary(conn, "6f07", 9)
             if s1 == 0x90:
@@ -448,6 +493,8 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
                 if imsi:
                     info.imsi = imsi
                     info.mcc = imsi[:3]
+                else:
+                    info.error = info.error or "EF_IMSI returned undecodable data"
                 if not pin:
                     # Readable WITHOUT our VERIFY -> the PIN is not required right now
                     # (disabled, or already satisfied by another holder). The 63Cx status
@@ -456,6 +503,8 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
                     info.pin_enabled = False
             elif (s1, s2) == (0x69, 0x82):
                 info.pin_enabled = True     # security status not satisfied = PIN required
+            else:
+                info.error = info.error or f"IMSI read failed sw={s1:02x}{s2:02x}"
             # EF_AD (6FAD) for MNC length
             d, s1, s2 = _read_binary(conn, "6fad", 4)
             if s1 == 0x90 and len(d) >= 4:
@@ -515,6 +564,9 @@ def _open_conn(reader_index: int):
 
 
 def verify_pin(pin: str, reader_index: int = 0) -> dict:
+    body = _pin_body(pin)
+    if body is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -544,6 +596,9 @@ def verify_pin(pin: str, reader_index: int = 0) -> dict:
 
 
 def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
+    ob, nb = _pin_body(old), _pin_body(new)
+    if ob is None or nb is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -571,6 +626,9 @@ def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
 
 def set_pin_enabled(pin: str, enabled: bool, reader_index: int = 0) -> dict:
     """Enable (0x28) or disable (0x26) CHV1."""
+    body = _pin_body(pin)
+    if body is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -582,7 +640,6 @@ def set_pin_enabled(pin: str, enabled: bool, reader_index: int = 0) -> dict:
             tries = _pin_tries(conn)
             if tries is not None and tries < MIN_TRIES:
                 return {"ok": False, "error": f"refusing: only {tries} tries left"}
-            body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
             # ENABLE (0x28) / DISABLE (0x26) CHV1: 00 26/28 00 01 08 <pin padded FF>
             d, s1, s2 = _transmit(conn, _hx(f"00{ins}0001") + [0x08] + body)
             if (s1, s2) == (0x90, 0x00):

@@ -1,6 +1,6 @@
 import { physicallyPresentDevices, deviceSelection } from '../devicePresence'
 export { physicallyPresentDevices } from '../devicePresence'
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
@@ -241,6 +241,30 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
       showToast?.(t('Request accepted; waiting for device state'))
       await onChanged?.()
     } catch (e) {
+      // The start path refuses with a structured 409 when the SIM PIN preflight fails.
+      // pin_required / pin_invalid are recoverable right here: ask for the PIN and retry
+      // the start with it (the device-level "enabled" intent was already persisted).
+      const code = e.data?.detail?.code
+      if ((code === 'pin_required' || code === 'pin_invalid') && next && device.instance_id) {
+        const tries = e.data.detail.tries ?? '?'
+        const pin = window.prompt(code === 'pin_invalid'
+          ? t('The saved SIM PIN was rejected ({tries} tries left). Enter the SIM PIN:', { tries })
+          : t('This SIM requires a PIN ({tries} tries left). Enter the SIM PIN:', { tries }))
+        if (pin) {
+          try {
+            await api.start(device.instance_id, { pin })
+            showToast?.(t('Request accepted; waiting for device state'))
+            await onChanged?.()
+          } catch (e2) {
+            showToast?.(`${t('Capability change failed')}: ${e2.message}`)
+          }
+          return
+        }
+      }
+      if (code === 'no_card') {
+        showToast?.(`${t('Capability change failed')}: ${t('No readable SIM for this line — the reader is empty or holds another card/eSIM profile. For an eSIM, switch the active profile to this line first.')}`)
+        return
+      }
       showToast?.(`${t('Capability change failed')}: ${e.status === 404 ? t('Unified device control is not available on this backend') : e.message}`)
     } finally { setSubmitting(false); setPendingTarget(null) }
   }
@@ -475,6 +499,125 @@ function countryKeywords(code) {
   return [...new Set(values.filter(Boolean))]
 }
 
+function normalizeCountrySearch(value) {
+  return String(value || '').normalize('NFKD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+}
+
+function countryMatchesSearch(code, query) {
+  const tokens = normalizeCountrySearch(query).trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return true
+  // Search both languages regardless of the current UI locale. Operators often know a country
+  // by its English node name even while using the Chinese UI; the ISO code is the quickest path
+  // when they know neither localized spelling.
+  const haystack = normalizeCountrySearch([
+    code,
+    countryName(code, 'zh'),
+    countryName(code, 'en'),
+  ].join(' '))
+  return tokens.every(token => haystack.includes(token))
+}
+
+function SearchableCountrySelect({ countries, value, onChange, language, placeholder, noResults }) {
+  const [query, setQuery] = useState('')
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [menuLayout, setMenuLayout] = useState({ top: 'calc(100% + 5px)', bottom: 'auto', maxHeight: 280 })
+  const rootRef = useRef(null)
+  const listId = useId()
+  const matching = useMemo(
+    () => countries.filter(code => countryMatchesSearch(code, query)),
+    [countries, query])
+
+  useEffect(() => { setActiveIndex(0) }, [query])
+  useEffect(() => {
+    if (!open || !matching.length) return
+    const option = document.getElementById(`${listId}-${matching[activeIndex]}`)
+    const list = option?.parentElement
+    if (!list) return
+    if (option.offsetTop < list.scrollTop) list.scrollTop = option.offsetTop
+    else if (option.offsetTop + option.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = option.offsetTop + option.offsetHeight - list.clientHeight
+  }, [activeIndex, listId, matching, open])
+  useEffect(() => {
+    if (!open) return undefined
+    const close = event => {
+      if (!rootRef.current?.contains(event.target)) { setOpen(false); setQuery('') }
+    }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [open])
+
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    const position = () => {
+      const root = rootRef.current
+      if (!root) return
+      const box = root.getBoundingClientRect()
+      const content = root.closest('.u-content')?.getBoundingClientRect()
+      const footer = root.closest('.u-page')?.querySelector('.u-egress-save-bar')?.getBoundingClientRect()
+      const top = Math.max(0, content?.top || 0) + 8
+      const bottom = Math.min(window.innerHeight, content?.bottom || window.innerHeight,
+        footer && footer.top > top ? footer.top : window.innerHeight) - 8
+      const above = Math.max(0, box.top - top - 5), below = Math.max(0, bottom - box.bottom - 5)
+      const opensAbove = below < Math.min(280, Math.max(1, matching.length) * 40 + 12) && above > below
+      const edge = opensAbove ? Math.min(box.top - 5, bottom) : Math.max(box.bottom + 5, top)
+      const available = opensAbove ? edge - top : bottom - edge
+      const next = { top: opensAbove ? 'auto' : edge - box.top,
+        bottom: opensAbove ? box.bottom - edge : 'auto', maxHeight: Math.max(0, Math.min(280, available)) }
+      setMenuLayout(current => current.top === next.top && current.bottom === next.bottom && current.maxHeight === next.maxHeight ? current : next)
+    }
+    position()
+    window.addEventListener('resize', position)
+    document.addEventListener('scroll', position, true)
+    return () => { window.removeEventListener('resize', position); document.removeEventListener('scroll', position, true) }
+  }, [open, matching.length])
+
+  const choose = code => {
+    onChange(code)
+    setQuery('')
+    setOpen(false)
+  }
+  const keyDown = event => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setOpen(true)
+      setActiveIndex(index => Math.min(index + (open ? 1 : 0), matching.length - 1))
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setOpen(true)
+      setActiveIndex(index => Math.max(index - 1, 0))
+    } else if (event.key === 'Home' && open) {
+      event.preventDefault(); setActiveIndex(0)
+    } else if (event.key === 'End' && open) {
+      event.preventDefault(); setActiveIndex(Math.max(0, matching.length - 1))
+    } else if (event.key === 'Enter' && open && matching[activeIndex]) {
+      event.preventDefault(); choose(matching[activeIndex])
+    } else if (event.key === 'Escape' && open) {
+      event.preventDefault(); setOpen(false); setQuery('')
+    }
+  }
+  const displayed = open ? query : (value ? countryLabel(value, language) : '')
+  return <div className="u-country-picker" ref={rootRef}>
+    <input role="combobox" aria-label={placeholder} aria-autocomplete="list" aria-expanded={open}
+      aria-controls={listId} aria-activedescendant={open && matching[activeIndex] ? `${listId}-${matching[activeIndex]}` : undefined}
+      value={displayed} placeholder={placeholder} autoComplete="off" spellCheck={false}
+      onFocus={() => { setQuery(''); setOpen(true); setActiveIndex(0) }}
+      onClick={() => { if (!open) { setQuery(''); setOpen(true); setActiveIndex(0) } }}
+      onChange={event => { setQuery(event.target.value); onChange(''); setOpen(true) }}
+      onKeyDown={keyDown} />
+    <span className="u-country-picker-arrow" aria-hidden="true">⌄</span>
+    {open && <div className="u-country-picker-list" id={listId} role="listbox" style={menuLayout}>
+      {matching.map((code, index) => <button type="button" role="option" tabIndex={-1}
+        id={`${listId}-${code}`} aria-selected={index === activeIndex} key={code}
+        className={index === activeIndex ? 'active' : ''}
+        onMouseEnter={() => setActiveIndex(index)}
+        onMouseDown={event => event.preventDefault()} onClick={() => choose(code)}>
+        {countryLabel(code, language)}
+      </button>)}
+      {!matching.length && <div className="u-country-picker-empty" role="status">{noResults}</div>}
+    </div>}
+  </div>
+}
+
 function formatBytes(value) {
   const n = Number(value || 0)
   if (n < 1024) return `${n} B`
@@ -662,7 +805,7 @@ export function EgressPage({ showToast }) {
         <div className="u-proxy-actions">{['node', 'socks5'].includes(profile.type) && <button className="btn btn-ghost u-test-action" disabled={profileTests[id]?.busy} onClick={() => testProfile(id)}>{t(profileTests[id]?.busy ? 'Testing…' : 'Test UDP')}</button>}<button className="btn btn-ghost u-proxy-remove" onClick={() => removeProfile(id)}>{t('Remove')}</button></div>
       </div>
     })}</div>}
-    <div className="u-section-title"><div><h2>{t('Country exits')}</h2><p>{t('If no healthy UDP exit exists, only that SIM’s VoWiFi stops; 4G remains available.')}</p></div><div className="u-inline u-add-exit"><select value={newCountry} onChange={e => setNewCountry(e.target.value)}><option value="">{t('Select a country/region…')}</option>{available.map(code => <option key={code} value={code}>{countryLabel(code, language)}</option>)}</select><button className="btn btn-primary" disabled={!newCountry} onClick={addExit}>{t('+ Add')}</button></div></div>
+    <div className="u-section-title"><div><h2>{t('Country exits')}</h2><p>{t('If no healthy UDP exit exists, only that SIM’s VoWiFi stops; 4G remains available.')}</p></div><div className="u-inline u-add-exit"><SearchableCountrySelect countries={available} value={newCountry} onChange={setNewCountry} language={language} placeholder={t('Search countries/regions…')} noResults={t('No matching countries/regions')} /><button className="btn btn-primary" disabled={!newCountry} onClick={addExit}>{t('+ Add')}</button></div></div>
     {!Object.keys(proxy.exits || {}).length ? <Empty title={t('No country exits configured')} detail={t('Choose a country above, then configure its node source and keywords.')} /> : <div className="u-egress-list">{Object.entries(proxy.exits).map(([country, ex]) => {
       const st = live?.exits?.[country]
       const selected = profiles[ex.profile_id]
@@ -786,24 +929,48 @@ function MessageTemplateEditor({ channel, config, onChange, onTest }) {
   </details>
 }
 
-export function NotificationsPage({ showToast }) {
-  const { t } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('channels'); const [deliveries, setDeliveries] = useState(null); const [deliveriesLoading, setDeliveriesLoading] = useState(true); const [deliveriesError, setDeliveriesError] = useState(false); const [channelTesting, setChannelTesting] = useState('')
+export function NotificationsPage({ showToast, instances = [], initialLoading = false, loadErrors = {} }) {
+  const { t } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('channels'); const [deliveries, setDeliveries] = useState(null); const [deliveriesLoading, setDeliveriesLoading] = useState(true); const [deliveriesError, setDeliveriesError] = useState(false); const [channelTests, setChannelTests] = useState({}); const testingChannels = useRef(new Set()); const [revealNotifications, setRevealNotifications] = useState(false); const [saving, setSaving] = useState(false); const [saveResult, setSaveResult] = useState(null); const [activeFeishuId, setActiveFeishuId] = useState('')
   const loadDeliveries = () => { setDeliveriesLoading(true); return api.notificationDeliveries().then(value => { setDeliveries(value); setDeliveriesError(false) }).catch(() => setDeliveriesError(true)).finally(() => setDeliveriesLoading(false)) }
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadDeliveries() }, [])
   useEffect(() => { if (tab === 'delivery') loadDeliveries() }, [tab])
-  if (!s) return <p className={loadError ? 'u-error' : ''}>{t(loadError ? 'Loading failed' : 'Loading')}{!loadError && '…'}</p>
+  const feishuChannels = Array.isArray(s?.feishu?.channels) ? s.feishu.channels : []
+  useEffect(() => { if (feishuChannels.length && !feishuChannels.some(channel => channel.id === activeFeishuId)) setActiveFeishuId(feishuChannels[0].id); if (!feishuChannels.length && activeFeishuId) setActiveFeishuId('') }, [feishuChannels, activeFeishuId])
+  if (!s || initialLoading) return <p className={loadError ? 'u-error' : ''}>{t(loadError ? 'Loading failed' : 'Loading')}{!loadError && '…'}</p>
   const wh = s.webhook || {}, tg = s.telegram || {}, pp = s.pushplus || {}, fs = s.feishu || {}
   const setChannel = (key, patch) => setS(x => ({ ...x, [key]: { ...(x[key] || {}), ...patch } }))
   const setEvent = (key, cfg, event, checked) => setChannel(key, { events: { ...(cfg.events || {}), [event]: checked } })
-  const eventOptions = (key, cfg) => <details className="u-event-options"><summary>{t('Forward these events')}</summary><div className="u-inline">{NOTIFICATION_TEMPLATE_EVENTS.map(([event, label]) => <label key={event}><input type="checkbox" className="u-toggle" checked={cfg.events?.[event] !== false} onChange={e => setEvent(key, cfg, event, e.target.checked)} />{t(label)}</label>)}</div></details>
-  const runChannelTest = async (key, send, config) => {
-    if (channelTesting) return
-    setChannelTesting(key)
-    try { await send(config); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } finally { setChannelTesting('') }
+  const eventOptions = (key, cfg, onEvents) => <details className="u-event-options"><summary>{t('Forward these events')}</summary><div className="u-inline">{NOTIFICATION_TEMPLATE_EVENTS.map(([event, label]) => <label key={event}><input type="checkbox" className="u-toggle" checked={cfg.events?.[event] !== false} onChange={e => onEvents ? onEvents({ ...(cfg.events || {}), [event]: e.target.checked }) : setEvent(key, cfg, event, e.target.checked)} />{t(label)}</label>)}</div></details>
+  const activeFeishu = feishuChannels.find(channel => channel.id === activeFeishuId) || feishuChannels[0]
+  const setFeishuChannels = channels => setChannel('feishu', { channels })
+  const setFeishuChannel = patch => setS(current => ({ ...current, feishu: { ...current.feishu,
+    channels: (current.feishu?.channels || []).map(channel => channel.id === activeFeishu?.id ? { ...channel, ...patch } : channel) } }))
+  const addFeishuChannel = () => {
+    const id = `bot-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+    setFeishuChannels([...feishuChannels, { id, name: '', enabled: false, url: '', secret: '', instances: [], events: {}, message_templates: {} }])
+    setActiveFeishuId(id)
   }
-  const testButton = (key, send, config) => <button type="button" className="btn btn-ghost u-test-action" disabled={!!channelTesting} onClick={() => runChannelTest(key, send, config)}>{t(channelTesting === key ? 'Testing…' : 'Test')}</button>
-  const save = async () => { try { await api.saveSettings(s); showToast(t('Saved')) } catch (e) { showToast(e.message) } }
-  return <div className="u-page"><div className="u-tabs"><button className={tab === 'channels' ? 'active' : ''} onClick={() => setTab('channels')}>{t('Channels')}</button><button className={tab === 'delivery' ? 'active' : ''} onClick={() => setTab('delivery')}>{t('Delivery log')}</button></div>
+  const runChannelTest = async (key, send, config) => {
+    if (testingChannels.current.has(key)) return
+    testingChannels.current.add(key)
+    setChannelTests(current => ({ ...current, [key]: { busy: true } }))
+    try {
+      await send(config)
+      setChannelTests(current => ({ ...current, [key]: { busy: false, ok: true } }))
+    } catch (error) {
+      setChannelTests(current => ({ ...current, [key]: { busy: false, error: error.message } }))
+    } finally { testingChannels.current.delete(key) }
+  }
+  const feedback = result => result?.busy ? t('Testing…') : result?.ok ? t('Test succeeded') : result?.error ? (revealNotifications ? result.error : t('Test failed')) : ''
+  const testButton = (key, send, config) => <div className="u-notification-test"><span role="status" title={feedback(channelTests[key]) || undefined}>{feedback(channelTests[key])}</span><button type="button" className="btn btn-ghost u-test-action" disabled={!!channelTests[key]?.busy} onClick={() => runChannelTest(key, send, config)}>{t(channelTests[key]?.busy ? 'Testing…' : 'Test')}</button></div>
+  const save = async () => {
+    if (saving) return
+    setSaving(true); setSaveResult(null)
+    try { const saved = await api.saveSettings(s); setS(saved); setSaveResult({ ok: true }) }
+    catch (error) { setSaveResult({ error: error.message }) }
+    finally { setSaving(false) }
+  }
+  return <div className="u-page u-notifications-page"><div className="u-tabs"><button className={tab === 'channels' ? 'active' : ''} onClick={() => setTab('channels')}>{t('Channels')}</button><button className={tab === 'delivery' ? 'active' : ''} onClick={() => setTab('delivery')}>{t('Delivery log')}</button></div>
     {tab === 'channels' && <><div className="u-device-grid">
       <div className="card u-panel u-form-card"><div className="u-card-head"><div><h2>Webhook</h2><p>{t('Standard GET or POST webhook with optional custom fields.')}</p></div><input type="checkbox" className="u-toggle" checked={!!wh.enabled} onChange={e => setChannel('webhook', { enabled: e.target.checked })} /></div>
         <FormField label={t('Payload format')}><select value={wh.format || 'generic'} onChange={e => setChannel('webhook', { format: e.target.value })}><option value="generic">{t('Standard event fields')}</option><option value="custom">{t('Custom template')}</option></select></FormField>
@@ -812,7 +979,7 @@ export function NotificationsPage({ showToast }) {
         {wh.format === 'custom' && <FormField label={t('Payload template')}><textarea rows="5" value={wh.payload_template || ''} onChange={e => setChannel('webhook', { payload_template: e.target.value })} placeholder={'{"title":"{{title}}","text":"{{text}}"}'} /></FormField>}
         <FormField label={t('Custom headers (JSON)')}><textarea rows="3" value={wh.headers_json || '{}'} onChange={e => setChannel('webhook', { headers_json: e.target.value })} /></FormField>
         <label><input type="checkbox" className="u-toggle" checked={wh.verify_tls !== false} onChange={e => setChannel('webhook', { verify_tls: e.target.checked })} />{t('Verify remote TLS certificate')}</label>
-        <MessageTemplateEditor channel="Webhook" config={wh} onChange={message_templates => setChannel('webhook', { message_templates })} onTest={async event => { try { await api.testWebhook({ ...wh, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('webhook', wh)}{testButton('webhook', api.testWebhook, wh)}
+        <MessageTemplateEditor channel="Webhook" config={wh} onChange={message_templates => setChannel('webhook', { message_templates })} onTest={event => runChannelTest('webhook', api.testWebhook, { ...wh, _test_event: event })} />{eventOptions('webhook', wh)}{testButton('webhook', api.testWebhook, wh)}
       </div>
       <div className="card u-panel u-form-card">
         <div className="u-card-head"><div><h2>Telegram</h2><p>{t('Direct, a proxy library entry, or an existing country exit.')}</p></div><input type="checkbox" className="u-toggle" checked={!!tg.enabled} onChange={e => setChannel('telegram', { enabled: e.target.checked })} /></div>
@@ -822,21 +989,29 @@ export function NotificationsPage({ showToast }) {
         {tg.proxy_mode === 'library' && <FormField label={t('Proxy')}><select value={tg.proxy_profile_id || ''} onChange={e => setChannel('telegram', { proxy_profile_id: e.target.value })}><option value="">{t('Select a proxy…')}</option>{selectableProxyProfiles(s).map(([id, profile]) => <option key={id} value={id}>{profile.name || t('Unnamed proxy')}</option>)}</select></FormField>}
         {tg.proxy_mode === 'manual' && <FormField label={t('Proxy URL')}><input value={tg.proxy_url || ''} onChange={e => setChannel('telegram', { proxy_url: e.target.value })} /></FormField>}
         {tg.proxy_mode === 'country' && <FormField label={t('Country exit')}><select value={tg.proxy_country || ''} onChange={e => setChannel('telegram', { proxy_country: e.target.value })}><option value="">{t('Select a country/region…')}</option>{Object.keys(s.proxy?.exits || {}).map(country => <option key={country} value={country}>{country.toUpperCase()}</option>)}</select></FormField>}
-        <MessageTemplateEditor channel="Telegram" config={tg} onChange={message_templates => setChannel('telegram', { message_templates })} onTest={async event => { try { await api.testTelegram({ ...tg, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('telegram', tg)}{testButton('telegram', api.testTelegram, tg)}
+        <MessageTemplateEditor channel="Telegram" config={tg} onChange={message_templates => setChannel('telegram', { message_templates })} onTest={event => runChannelTest('telegram', api.testTelegram, { ...tg, _test_event: event })} />{eventOptions('telegram', tg)}{testButton('telegram', api.testTelegram, tg)}
       </div>
       <div className="card u-panel u-form-card"><div className="u-card-head"><div><h2>PushPlus</h2><p>{t('Push through the official PushPlus service.')}</p></div><input type="checkbox" className="u-toggle" checked={!!pp.enabled} onChange={e => setChannel('pushplus', { enabled: e.target.checked })} /></div>
         <FormField label={t('PushPlus token')}><input type="password" value={pp.token || ''} onChange={e => setChannel('pushplus', { token: e.target.value })} /></FormField>
         <FormField label={t('Topic code (optional)')}><input value={pp.topic || ''} onChange={e => setChannel('pushplus', { topic: e.target.value })} /></FormField>
         <div className="u-form-grid"><div><label>{t('Content format')}</label><select value={pp.template || 'html'} onChange={e => setChannel('pushplus', { template: e.target.value })}><option value="html">HTML</option><option value="txt">{t('Plain text')}</option><option value="markdown">Markdown</option><option value="json">JSON</option></select></div><div><label>{t('PushPlus channel')}</label><select value={pp.channel || 'wechat'} onChange={e => setChannel('pushplus', { channel: e.target.value })}><option value="wechat">{t('WeChat')}</option><option value="app">App</option><option value="mail">{t('Email')}</option><option value="webhook">Webhook</option><option value="cp">{t('WeCom')}</option><option value="clawbot">ClawBot</option></select></div></div>
-        <MessageTemplateEditor channel="PushPlus" config={pp} onChange={message_templates => setChannel('pushplus', { message_templates })} onTest={async event => { try { await api.testPushPlus({ ...pp, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('pushplus', pp)}{testButton('pushplus', api.testPushPlus, pp)}
+        <MessageTemplateEditor channel="PushPlus" config={pp} onChange={message_templates => setChannel('pushplus', { message_templates })} onTest={event => runChannelTest('pushplus', api.testPushPlus, { ...pp, _test_event: event })} />{eventOptions('pushplus', pp)}{testButton('pushplus', api.testPushPlus, pp)}
       </div>
-      <div className="card u-panel u-form-card"><div className="u-card-head"><div><h2>Feishu / Lark</h2><p>{t('Send through a Feishu or Lark custom bot.')}</p></div><input type="checkbox" className="u-toggle" checked={!!fs.enabled} onChange={e => setChannel('feishu', { enabled: e.target.checked })} /></div>
-        <FormField label={t('Feishu webhook URL')}><input type="url" value={fs.url || ''} onChange={e => setChannel('feishu', { url: e.target.value })} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" /></FormField>
-        <FormField label={t('Signing secret (optional)')}><input type="password" value={fs.secret || ''} onChange={e => setChannel('feishu', { secret: e.target.value })} /></FormField>
-        <p className="u-note">{t('Use the secret only when signature verification is enabled for the custom bot.')}</p>
-        <MessageTemplateEditor channel="Feishu / Lark" config={fs} onChange={message_templates => setChannel('feishu', { message_templates })} onTest={async event => { try { await api.testFeishu({ ...fs, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('feishu', fs)}{testButton('feishu', api.testFeishu, fs)}
+      <div className="card u-panel u-form-card u-feishu-panel"><div className="u-card-head"><div><h2>Feishu / Lark</h2><p>{t('Send to multiple custom bots and route each bot by SIM line.')}</p></div><div className="u-head-actions"><button type="button" className="u-icon-button" aria-label={t(revealNotifications ? 'Hide sensitive information' : 'Show sensitive information')} title={t(revealNotifications ? 'Hide sensitive information' : 'Show sensitive information')} aria-pressed={revealNotifications} onClick={() => setRevealNotifications(value => !value)}><EyeIcon open={revealNotifications}/></button><button type="button" className="btn btn-ghost" onClick={addFeishuChannel}>{t('Add bot')}</button></div></div>
+        {!activeFeishu ? <Empty title={t('No Feishu bots configured')} /> : <>
+          <div className="u-tabs u-feishu-tabs" role="tablist" aria-label={t('Feishu bot')}>{feishuChannels.map((channel, index) => <button type="button" role="tab" aria-selected={channel.id === activeFeishu.id} key={channel.id} className={channel.id === activeFeishu.id ? 'active' : ''} onClick={() => setActiveFeishuId(channel.id)}>{revealNotifications && channel.name ? channel.name : t('Bot {number}', { number: index + 1 })}</button>)}</div>
+          <div className="u-card-head"><label><input type="checkbox" className="u-toggle" checked={!!activeFeishu.enabled} onChange={e => setFeishuChannel({ enabled: e.target.checked })} />{t('Enabled')}</label><button type="button" className="btn btn-ghost" onClick={() => setFeishuChannels(feishuChannels.filter(channel => channel.id !== activeFeishu.id))}>{t('Delete bot')}</button></div>
+          <FormField label={t('Channel name')}><input type={revealNotifications ? 'text' : 'password'} autoComplete="off" maxLength="120" value={activeFeishu.name || ''} onChange={e => setFeishuChannel({ name: e.target.value })} /></FormField>
+          <FormField label={t('Feishu webhook URL')}><input type={revealNotifications ? 'url' : 'password'} autoComplete="off" value={activeFeishu.url || ''} onChange={e => setFeishuChannel({ url: e.target.value })} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" /></FormField>
+          <FormField label={t('Signing secret (optional)')}><input type={revealNotifications ? 'text' : 'password'} autoComplete="off" value={activeFeishu.secret || ''} onChange={e => setFeishuChannel({ secret: e.target.value })} /></FormField>
+          <p className="u-note">{t('Use the secret only when signature verification is enabled for the custom bot.')}</p>
+          <fieldset className="u-feishu-lines"><legend>{t('SIM line routing')}</legend><p className="u-hint">{t('No selected lines means this bot receives every line and system event.')}</p>{loadErrors.instances ? <p className="u-error">{t('Loading failed')}</p> : instances.map((instance, index) => <label key={instance.id}><input type="checkbox" checked={(activeFeishu.instances || []).map(String).includes(String(instance.id))} onChange={e => setFeishuChannel({ instances: e.target.checked ? [...(activeFeishu.instances || []), String(instance.id)] : (activeFeishu.instances || []).filter(id => String(id) !== String(instance.id)) })} />{revealNotifications ? instance.name || t('Line {number}', { number: index + 1 }) : t('Line {number}', { number: index + 1 })}</label>)}</fieldset>
+          <MessageTemplateEditor key={activeFeishu.id} channel="Feishu / Lark" config={activeFeishu} onChange={message_templates => setFeishuChannel({ message_templates })} onTest={event => runChannelTest(`feishu:${activeFeishu.id}`, api.testFeishu, { ...activeFeishu, _test_event: event })} />
+          {eventOptions('feishu', activeFeishu, events => setFeishuChannel({ events }))}
+          {testButton(`feishu:${activeFeishu.id}`, api.testFeishu, activeFeishu)}
+        </>}
       </div>
-    </div><div className="u-settings-actions"><button className="btn btn-primary" onClick={save}>{t('Save')}</button></div></>}
+    </div><div className="u-settings-actions u-notification-save"><span role="status">{saving ? t('Saving…') : saveResult?.ok ? t('Saved') : saveResult?.error ? (revealNotifications ? saveResult.error : t('Save failed')) : ''}</span><button className="btn btn-primary" disabled={saving} onClick={save}>{t('Save')}</button></div></>}
     {tab === 'delivery' && <div className="card u-panel"><div className="u-card-head"><div><h2>{t('Delivery log')}</h2><p>{t('Failed deliveries retry automatically up to three times.')}</p></div><div className="u-inline"><button className="btn btn-ghost u-refresh-action" disabled={deliveriesLoading} onClick={loadDeliveries}>{t(deliveriesLoading ? 'Loading…' : 'Refresh')}</button><button className="btn btn-ghost" onClick={async () => { await api.clearNotificationDeliveries(); loadDeliveries() }}>{t('Clear')}</button></div></div>{!deliveries && <p className={deliveriesError ? 'u-error' : 'u-muted'}>{t(deliveriesError ? 'Loading failed' : 'Loading')}{!deliveriesError && '…'}</p>}{deliveries?.pending.map(row => <div className="u-detail" key={row.id}><span>{row.channel} · {row.event}</span><b>{t('Retrying')} ({row.attempts}/3)</b></div>)}{deliveries?.history.map(row => <div className="u-detail" key={row.id}><span>{new Date(row.finished_at * 1000).toLocaleString()} · {row.channel} · {row.event}</span><b>{row.status} · {row.attempts}</b></div>)}{deliveries && !deliveries.pending.length && !deliveries.history.length && <p className="u-muted">{t('No delivery records')}</p>}</div>}
   </div>
 }

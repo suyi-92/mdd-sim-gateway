@@ -3,6 +3,11 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Bot {number}': '机器人 {number}',
+  'Line {number}': '线路 {number}',
+  'Test failed': '测试失败，请查看投递日志',
+  'Save failed': '保存失败',
+
   'Administrative policy': '管理策略',
   'Local backups': '本地备份',
   'Source updates': '源码更新',
@@ -84,7 +89,7 @@ const zh = {
   'Activated at': '激活时间', 'Configure to enable reminders': '配置后通知',
   Updated: '更新时间', 'Carrier SMS': '运营商短信', Edit: '编辑',
   'Query allowance': '查询余量', 'Query settings': '查询设置', 'Working…': '处理中…',
-  'Could not load allowance data': '无法读取余额与余量', 'Loading failed': '加载失败，请稍后重试', 'Allowance data saved': '余额与余量已保存', 'Save failed': '保存失败',
+  'Could not load allowance data': '无法读取余额与余量', 'Loading failed': '加载失败，请稍后重试', 'Allowance data saved': '余额与余量已保存',
   'Allowance reply received and cached': '已收到运营商回复并缓存余量',
   'The query method for this carrier is unknown. Configure it below.': '不知道当前运营商的查询方式，请在下方设置。',
   'Send “{body}” to {recipient} to query the allowance? SMS charges may apply.': '将向 {recipient} 发送“{body}”查询余量，可能产生短信费用。是否继续？',
@@ -104,7 +109,7 @@ const zh = {
   'Cellular call failed': '蜂窝呼叫失败', 'Cellular hangup failed': '蜂窝挂断失败',
   'Cellular call ended': '蜂窝呼叫已结束', 'Cellular modem is unavailable': '蜂窝模块不可用',
   'Call state is unknown': '呼叫状态未知',
- 
+
   '4G off': '4G 未开启',
   'Turn on 4G and wait for the cellular modem to become ready first.': '请先开启 4G，并等待蜂窝模块进入就绪状态。',
   'Could not read cellular call status': '无法读取蜂窝呼叫状态',
@@ -119,7 +124,7 @@ const zh = {
   'Existing sing-box config (migration/import mode only)': '已有 sing-box 配置（仅迁移/导入模式需要）',
   'Subscription workflow:': '订阅模式工作流程：',
   'Choose a country → filter subscription nodes using “node-name keywords” → put every matching node in a health-test pool → automatically use a healthy low-latency node → route that country’s SIM ePDG through its own TUN (for example, Japan uses mdd-jp). This does not create a proxy port that you connect to manually.': '选择国家 → 用“节点名称关键词”筛选订阅 → 将所有匹配节点加入健康测速池 → 自动使用低延迟健康节点 → 将该国 SIM 的 ePDG 路由到独立 TUN（例如日本使用 mdd-jp）。系统不会创建需要手工连接的代理端口。',
-  '2. Add a country exit': '2. 添加国家出口', 'Select a country/region…': '选择国家/地区…', '+ Add': '+ 添加',
+  '2. Add a country exit': '2. 添加国家出口', 'Select a country/region…': '选择国家/地区…', 'Search countries/regions…': '搜索国家/地区…', 'No matching countries/regions': '没有匹配的国家/地区', '+ Add': '+ 添加',
   Enabled: '启用', Remove: '移除', 'Exit source': '出口来源', 'Automatic selection from subscription': '订阅自动选择',
   'Import an existing outbound': '导入已有 outbound', 'Specified proxy URL': '指定代理地址', 'Explicit direct connection': '明确直连',
   'Existing outbound tag': '已有 outbound 标签', 'Copies this outbound from the existing sing-box config above.': '从上面的已有 sing-box 配置中复制这个 outbound。',
@@ -375,6 +380,21 @@ const zh = {
   'Number keeping performs one real, chargeable action on your SIM at the interval you set — charged at your carrier’s rate. A free balance lookup does not count as usage with most carriers and cannot keep a prepaid number alive.': '保号会按你设定的间隔，在你的 SIM 上执行一次真实的计费动作，费用以运营商资费为准。免费的余额查询在多数运营商处不计入使用，无法让预付费号码保持活跃。',
   'Cellular data online': '蜂窝数据在线', 'VoWiFi online': 'VoWiFi 在线', 'Needs attention': '需处理', 'No communication devices found': '未发现通信设备', 'Connect a modem or smart-card reader. Discovery updates automatically.': '请连接蜂窝模块或智能卡读卡器，系统会自动发现。',
   'Cellular data (4G)': '蜂窝数据（4G）', 'Flight mode': '飞行模式', 'VoWiFi / WiFi Calling': 'VoWiFi / WiFi Calling', 'Changing cellular data rebuilds SIM access. VoWiFi may reconnect for 20–60 seconds. Continue?': '切换蜂窝数据会重建 SIM 访问通道，VoWiFi 可能中断 20–60 秒后自动恢复。是否继续？', '{action} {name}? The UI will wait for the real device state.': '{action}{name}？界面会等待设备返回真实状态。', 'Request accepted; waiting for device state': '请求已接受，正在等待设备状态', 'Capability change failed': '能力切换失败', 'Unified device control is not available on this backend': '当前后端尚未提供统一设备控制接口', 'Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.': '蜂窝数据、飞行模式和 VoWiFi 可独立控制。飞行模式控制模块射频；蜂窝数据开关只连接或断开数据承载。飞行模式关闭时，即使蜂窝数据关闭，模块仍可保持注册到蜂窝网络。', 'Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.': '软件支持表示系统已实现相应技术路径；实际可用性仍取决于 SIM 套餐、运营商、所在区域、模块固件及设备身份策略。', 'Flight mode is enabled': '飞行模式已开启',
+
+          'This SIM requires a PIN ({tries} tries left). Enter the SIM PIN:': '这张 SIM 卡需要 PIN 码（剩余 {tries} 次尝试）。请输入 SIM PIN：', 'The saved SIM PIN was rejected ({tries} tries left). Enter the SIM PIN:': '已保存的 SIM PIN 被拒绝（剩余 {tries} 次尝试）。请重新输入 SIM PIN：', 'No readable SIM for this line — the reader is empty or holds another card/eSIM profile. For an eSIM, switch the active profile to this line first.': '读不到这条线路的 SIM 卡——读卡器为空或当前是另一张卡/另一个 eSIM profile。若为 eSIM，请先在 eSIM 页切换到本线路的 profile。',
+
+    'Retry': '重试',
+
+
+
+
+
+
+
+
+   '{seconds} sec': '{seconds} 秒',
+
+
   Restart: '重启',
   'Ordered by how much they interrupt: the control plane can be restarted without touching a call, the host cannot.': '按影响范围从小到大排列：重启控制面不会打断通话，重启主机会。',
   'Restart the control plane': '重启控制服务',
@@ -477,6 +497,8 @@ const zh = {
   'This assignment is saved. No line is using the country exit now; it starts when an enabled line or a UDP test needs it.': '该出口分配已保存；当前没有线路使用它，会在启用的线路或 UDP 测试需要时启动。',
   'Not configured': '未配置', 'Unsaved changes': '有未保存更改', 'Saved configuration': '配置已保存',
   Channels: '通知通道', 'Delivery log': '投递日志', 'Standard GET or POST webhook with optional custom fields.': '标准 GET/POST Webhook，可按需自定义字段。', 'Payload format': '载荷格式', Method: '请求方法', Test: '测试', 'Direct, manual proxy, or an existing country exit.': '支持直连、手动代理或复用已有国家出口。', 'Direct, a proxy library entry, or an existing country exit.': '支持直连、代理库条目或复用已有国家出口。', Connection: '联网方式', Direct: '直连', 'Manual HTTP/SOCKS proxy': '手动 HTTP/SOCKS 代理', 'Legacy setting': '旧版设置', 'Use country exit': '使用国家出口', 'Test succeeded': '测试成功', 'Forward these events': '转发以下事件', 'Push through the official PushPlus service.': '通过 PushPlus 官方服务推送。', 'PushPlus token': 'PushPlus Token', 'Topic code (optional)': '群组编码（可选）', 'Message template': '消息模板', 'Content format': '内容格式', 'PushPlus channel': 'PushPlus 渠道', 'Plain text': '纯文本', WeChat: '微信', Email: '邮件', WeCom: '企业微信', 'Send through a Feishu or Lark custom bot.': '通过飞书或 Lark 自定义机器人推送。', 'Feishu webhook URL': '飞书 Webhook 地址', 'Signing secret (optional)': '签名密钥（可选）', 'Use the secret only when signature verification is enabled for the custom bot.': '仅当自定义机器人启用了签名校验时填写此密钥。',
+
+  'Send to multiple custom bots and route each bot by SIM line.': '向多个飞书/Lark 自定义机器人推送，并按 SIM 线路分别路由。', 'Add bot': '添加机器人', 'Delete bot': '删除机器人', 'Feishu bot': '飞书机器人', 'Channel name': '通道名称', 'SIM line routing': 'SIM 线路路由', 'No selected lines means this bot receives every line and system event.': '未选择线路时，该机器人接收所有线路和系统事件。', 'No Feishu bots configured': '尚未配置飞书机器人',
   'Customize notification messages': '自定义通知文案', 'Template event': '模板事件', 'Title template': '标题模板', 'Content template': '正文模板', 'Available variables': '可用变量', 'Restore this event template': '恢复此事件默认模板', 'Test this event': '测试此事件', 'This event is using the built-in message format.': '此事件正在使用内置消息格式。', 'Override one event at a time. Empty fields keep the built-in wording; templates only replace the listed fields and cannot run code.': '每次编辑一种事件；留空的标题或正文沿用内置文案。模板只能替换列出的变量，不能执行代码。',
   General: '常规', 'Web access': 'Web 访问', 'Calls & VoWiFi': '通话与 VoWiFi', Security: '安全', 'Backup & updates': '备份与更新', Maintenance: '维护', Timezone: '时区', 'SIM capacity': 'SIM 容量', 'Maximum SIM lines': 'SIM 线路上限', 'Controls how many SIM line records can be saved and started. Existing records above a lowered limit are kept but cannot start. Range: 1–32.': '控制可保存和启动的 SIM 线路数量。降低上限后，超出范围的已有记录会保留，但不能启动。范围：1–32。', 'SIM line limit must be an integer from 1 to 32.': 'SIM 线路上限必须是 1–32 的整数。', 'New device defaults': '新设备默认策略', 'Rekey minutes': '换钥间隔（分钟）', 'IKE rekey minutes': 'IKE 会话换钥间隔（分钟）', 'IKE rekey': 'IKE 换钥', 'Some carriers silently expire a VoWiFi session on a fixed clock (observed: ~2h50m). The IKE rekey renews the session before that clock fires; keep it below the shortest carrier interval. 0 disables it.': '部分运营商会按固定时钟静默作废 VoWiFi 会话（实测约 2 小时 50 分）。IKE 换钥会在该时钟到期前主动续期会话；请保持小于所用运营商的最短周期，0 表示关闭。', Health: '健康检查', 'Live logs': '实时日志', 'Support bundle': '支持包', 'Diagnostics started': '诊断已开始', 'Run diagnostics': '运行诊断', 'VoWiFi-only mode (do not run ModemManager)': '纯 VoWiFi 模式（不运行 ModemManager）', serialModeHint: '开启后本机不再运行 ModemManager，SIM 通过串口直接访问。适用于虚拟机/容器等 ModemManager 不稳定的环境。4G 数据、飞行模式、蜂窝短信/呼叫将不可用；VoWiFi 不受影响。', serialModeEnableConfirm: '开启纯 VoWiFi 模式将停止 ModemManager 并复位模块，线路会中断约 30 秒，且 4G/飞行模式/蜂窝短信不可用。确定开启？', serialModeDisableConfirm: '关闭后将重新启动 ModemManager 并重建 SIM 桥接，线路会短暂中断。确定关闭？', 'Issues and suggestions': '问题与建议', 'Found a problem or have a suggestion?': '遇到问题或有功能建议？', 'Open a GitHub Issue. For faults, attach the redacted support bundle when appropriate.': '欢迎提交 GitHub Issue；反馈故障时，建议按需附上脱敏支持包。', 'Submit an Issue': '提交 Issue', 'Star on GitHub': '在 GitHub 上 Star',
   'Refresh interval (minutes)': '刷新间隔（分钟）', 'Refresh interval': '刷新间隔', 'Not assigned to a country exit': '尚未分配国家出口', 'Reality/XHTTP and common share-link protocols': '支持 Reality/XHTTP 及常见分享链接协议', 'Compatibility entry': '兼容条目', 'save this proxy before testing it': '请先保存这个代理，再进行测试', 'only individual nodes and SOCKS5 proxies can be tested here': '这里只能测试具体节点和 SOCKS5 代理', 'country exit has no UDP test endpoint': '该国家出口尚未准备好 UDP 测试端点', 'SOCKS5 server or port is invalid': 'SOCKS5 服务器地址或端口无效', 'SOCKS5 username or password is invalid': 'SOCKS5 用户名或密码无效', 'SOCKS5 username or password was rejected': 'SOCKS5 用户名或密码认证失败', 'SOCKS5 proxy rejected UDP test negotiation': 'SOCKS5 代理拒绝了 UDP 测试协商', 'node share link is empty': '节点分享链接不能为空', 'this node protocol does not support UDP': '该节点协议不支持 UDP', 'sing-box executable not found': '未找到 sing-box，无法测试该节点', 'Xray-core executable not found for this node': '未找到 Xray-core，无法测试该节点', 'node configuration is invalid': '节点配置无效', 'Xray node configuration is invalid': 'Xray 节点配置无效', 'sing-box exited during startup': 'sing-box 启动即退出', 'sing-box did not become ready': 'sing-box 未能正常就绪', 'Xray-core exited during startup': 'Xray-core 启动即退出', 'Xray-core did not become ready': 'Xray-core 未能正常就绪', 'country proxy routing is switched off — enable it before testing an exit': '按国家分流的总开关未开启，请先启用再测试出口', 'the host orchestrator has not published any exit status yet — check that mdd-sim-gateway-orchestrator is running': '宿主机编排器尚未发布任何出口状态，请检查 mdd-sim-gateway-orchestrator 是否在运行', 'the exit did not come up within 25s and reported no error — check the orchestrator log for sing-box startup failures': '出口在 25 秒内没有就绪，也没有报错，请查看编排器日志中 sing-box 的启动失败信息', 'How this gateway read the link': '本网关对该链接的解析结果', 'UDP test failed. Check the proxy address, credentials, protocol and UDP support.': 'UDP 测试失败，请检查代理地址、认证信息、协议及 UDP 支持', 'Choose a country above, then configure its node source and keywords.': '请在上方选择国家，然后配置节点来源和关键词。', 'Save and apply': '保存并应用',
@@ -492,6 +514,8 @@ const zh = {
   'Select a saved SIM line to edit or delete it. This list does not depend on whether its former device is connected.': '选择已保存的 SIM 线路进行编辑或删除；此列表不依赖原设备当前是否连接。',
   'Sign in to manage the gateway': '登录后管理网关', 'Create the administrator account': '创建管理员账号', Username: '用户名', Password: '密码', 'Confirm password': '确认密码', 'Passwords do not match': '两次输入的密码不一致', 'Sign in': '登录', 'Keep me signed in for 30 days': '保持登录 30 天', 'Sign out': '退出登录', 'Create account': '创建账号', 'Please wait…': '请稍候…', 'Login is sent only when you click the button.': '只有明确点击按钮后才会发送登录请求。', 'Too many attempts. Try again in {seconds} seconds.': '尝试次数过多，请在 {seconds} 秒后重试。', 'Try again in {seconds}s': '{seconds} 秒后重试', 'Use at least 10 characters. Reset it from the host if it is lost.': '请至少使用 10 个字符；遗忘后可在主机运行 reset-admin 重置。', 'Change administrator password': '修改管理员密码', 'Change password': '修改密码', 'Current password': '当前密码', 'New password (at least 10 characters)': '新密码（至少 10 个字符）', 'self-signed': '自签名证书', custom: '自定义证书',
   'Detecting…': '正在检测…', 'No SIM card in this reader.': '此读卡器中没有 SIM 卡。', 'Card read.': '卡片读取成功。', 'Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.': '已检测到卡片；输入 PIN 后读取 IMSI。ICCID {iccid}，剩余 {tries} 次。', 'Verifying…': '正在验证…', 'PIN OK ✓': 'PIN 正确 ✓', 'PIN failed: {error} ({tries} tries left)': 'PIN 验证失败：{error}（剩余 {tries} 次）', 'Saved — restarting the line to apply changes…': '已保存，正在重启线路以应用修改…', 'Saved.': '已保存。', 'Delete this instance?': '确定删除此线路吗？', 'Delete the saved SIM PIN for this line?\n\nThe line will be stopped and the PIN will be requested again on next start.': '确定删除此线路保存的 SIM PIN 吗？\n\n线路将停止，并会在下次启动时重新要求输入 PIN。', 'Saved PIN deleted — the line will ask for it on next start.': '已删除保存的 PIN；下次启动线路时会重新询问。', 'No saved PIN to delete.': '没有可删除的已保存 PIN。', 'No readers': '没有读卡器', 'Bound to USB port {port} (stable across reader re-enumeration)': '已绑定 USB 端口 {port}（读卡器重新枚举后仍保持）', '(locked)': '（已锁定）', 'USB port': 'USB 端口', 'enabled, {tries} tries': '已启用，剩余 {tries} 次', disabled: '已关闭', 'No SIM card in reader {reader}.': '读卡器 {reader} 中没有 SIM 卡。', 'e.g. 123456': '例如 123456', 'A PIN is saved for this line and used automatically on start.': '此线路已保存 PIN，启动时会自动使用。', 'No PIN saved — you will be asked for it when the line starts if required.': '未保存 PIN；如 SIM 需要，启动线路时会询问。', 'auto from IMEI (DEVICE_IDENTITY)': '从 IMEI 自动生成（DEVICE_IDENTITY）', 'auto-learned': '自动学习', 'detect card / verify PIN to read from SIM': '检测卡片/验证 PIN 后从 SIM 读取', 'Auto-detected: {mode}. Switch back to Auto-detect to re-probe.': '已自动检测为 {mode}；切回“自动检测”可重新探测。', 'IDr help': 'IDr 决定如何向 ePDG 提交 APN。大多数运营商使用裸 APN；只有少数严格网络需要 APN-FQDN，错误格式可能被拒绝。', 'IMS address family help': 'IMS 地址族必须匹配运营商 IMS PDN。建议保持自动检测；系统会根据已知运营商或认证后的探测结果固定可用地址族。', all: '全部接口', local: '仅本机', 'Device User-Agent (identify to the carrier as this device)': '设备 User-Agent（以该设备身份向运营商标识）', username: '用户名', password: '密码', 'Show logs for': '查看以下线路日志', 'Select a SIM / line to view its engine and IKE logs.': '请选择一张 SIM/线路以查看引擎和 IKE 日志。', '(empty)': '（空）', 'Auto refresh': '自动刷新', 'Enter a number': '输入号码',
+
+     'Card error: {error}': '读卡失败：{error}',
   'Detecting devices…': '正在检测设备…',
   'The gateway is reading the connected readers and modems. This takes a few seconds after a restart.': '网关正在读取已连接的读卡器和蜂窝模块，重启后通常需要几秒钟。',
   'Connection history': '连接历史', 'Connected while observed': '有记录时段的在线率',

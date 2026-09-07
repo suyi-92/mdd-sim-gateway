@@ -197,3 +197,12 @@ See [the detailed installation guide](docs/INSTALL.md),
 The project is GPL-3.0-only. The CCID patch is an LGPL-2.1-or-later derivative of CCID; see
 [patches/ccid/README.md](patches/ccid/README.md), [NOTICE](NOTICE), and
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+## VMware update based on 1.9.1
+
+`1.9.1-vmware.1` integrates reader/PIN compatibility, late SMS completion and submission-report
+fixes, multiple Feishu bots with per-line routing, renaming without restarting an Engine,
+keepalive intervals up to 365 days and searchable country exits. DITO negotiation is scoped
+to its own PLMN. The smaller amd64 Engine retains Opus and verifies all 128 selected modules,
+fingerprints and artifact identity. Existing configuration, remembered hardware, native services
+and managed `mddctl` update/rollback remain in place. Hardware and calls still require live acceptance.

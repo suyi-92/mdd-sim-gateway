@@ -172,6 +172,11 @@ class OperationsTests(unittest.TestCase):
             "feishu": {
                 "url": "https://open.feishu.cn/open-apis/bot/v2/hook/private-token",
                 "secret": "feishu-signing-secret",
+                "channels": [{
+                    "id": "ops", "name": "Operations",
+                    "url": "https://open.feishu.cn/open-apis/bot/v2/hook/second-private-token",
+                    "secret": "second-feishu-secret", "instances": ["1"],
+                }],
             },
         }
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), patch.object(
@@ -188,6 +193,9 @@ class OperationsTests(unittest.TestCase):
                 log = archive.read("logs/sim1-charon.log").decode()
             self.assertNotIn("feishu-signing-secret", settings)
             self.assertNotIn("private-token", settings)
+            self.assertNotIn("second-private-token", settings)
+            self.assertNotIn("second-feishu-secret", settings)
+            self.assertNotIn("Operations", settings)
             self.assertNotIn("header-secret", settings)
             self.assertNotIn("url-secret", settings)
             self.assertNotIn("001122", log)

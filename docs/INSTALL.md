@@ -253,7 +253,7 @@ Engine 门禁：
 - OCI source revision 等于当前提交；
 - OCI product version 等于仓库 `VERSION`，镜像 ID/大小与构建 manifest 一致；
 - runtime/base fingerprint 与当前源码一致；
-- Asterisk 可执行并有合理模块数量；
+- Asterisk 可执行，实际模块名称集合精确匹配源码清单（本版 128 项），manifest 记录数量及集合 SHA-256；
 - `jinja2`、`requests`、`pyscard`、`cryptography` 可导入；
 - Control venv 通过 `pip check`，正式 WebUI 树哈希与构建 manifest 一致；
 - 最小容器在 `/dev/net/tun + NET_ADMIN` 下可创建并删除 TUN。
@@ -404,3 +404,10 @@ sudo mddctl uninstall --purge
 | 两线路并发 IMS/通话/音频 | 待实机 | 待实机 | 待实机 | 待实机 |
 
 只有真实完成后才能把对应“待实机”改为“通过”。
+
+## 1.9.1 更新兼容
+
+从 `1.7.0-vmware.7` 普通快进更新到 `1.9.1-vmware.1`。旧活动代在 fetch 前由旧源码中的验证器检查，
+新代按模块清单及 `asterisk_modules_sha256` 检查；失败回滚不会要求旧 336 模块镜像满足新清单。
+数据库新增补片表及原消息删除时的清理触发器，已有消息、通话和所有保存线路保持不变。
+飞书未配置时保持禁用；旧单机器人迁移不重复投递。回滚使用更新前完整数据快照。

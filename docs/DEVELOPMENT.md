@@ -66,7 +66,7 @@ Engine、Dockerfile、patch 或运行层输入变化时，还必须至少执行�
 
 - source revision、version、Architecture；
 - runtime/base fingerprint；
-- Asterisk 和模块数量；
+- Asterisk、与 `engine/asterisk-keep-modules.txt` 完全一致的模块名称集合及其 SHA-256；
 - Engine Python 依赖；
 - `/dev/net/tun + NET_ADMIN` 最小容器。
 
@@ -119,9 +119,13 @@ lsusb、pcsc_scan、mmcli 和网络输出。测试不得真实修改开发机 sy
 
 ## 提交与交付
 
-本仓库在 Server 超级项目中是独立子模块。先在 `vmware` 分支提交并推送子项目，确认提交在
-团队可访问的 origin 后，再在父项目提交 gitlink。提交信息遵守父项目 `AGENTS.md` 的
-`【苏忆】` 署名规则。永不强推。
+本仓库独立维护，不涉及父项目或 gitlink。`main` 只跟随权威上游发布主干；从 `vmware` 建立
+隔离集成分支，普通合并已审定的上游提交，再将验证后的结果快进交付到 `vmware`。
+提交信息遵守本仓库 `AGENTS.md` 的 `【苏忆】` 署名及编号条目规则。永不强推。
+
+自有 VMware 行为变更以审定计划和明确的分阶段授权为入口；向权威上游贡献时才遵守其
+Issue/develop 流程，不自动对外发布 Issue。部署通过 `mddctl update`，有快照前置要求的任务
+必须等用户明确确认整机恢复点完成后，才能更新或进行停服备份。
 
 ## 设备显示回归
 
@@ -136,3 +140,15 @@ NODE_PATH=/tmp/mdd-device-ui-check/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/md
 ```
 
 该脚本只服务本地构建资产与虚构 API 响应，不连接生产服务；覆盖拔出、剩余设备选择、空状态、历史记录、重连、无写请求和宽/中/窄视口。截图默认位于 `/tmp/mdd-device-ui-check/results`。
+
+## 上游 1.9.1 集成回归
+
+读卡同时覆盖直接 9000、61xx/9Fxx、保留命令数据的 6Cxx 重试与 SELECT 响应体失败；PIN、IKE、SIP
+共享严格 USIM 选择器。eSIM 读取证明只用于该次恢复的首次启动，并在 reader 锁内重新核对 ICCID；
+过期、读卡器绑定改变或无法读取时回到完整预检。
+
+短信补片与原消息正文必须在同一 SQLite 事务提交。WebSocket `sms.updated=true` 只刷新旧记录，
+不重复通知。飞书旧单机器人配置兼容为一个通道，显式空通道列表禁用回退；事件及模板均过滤退役
+更新事件。新增模块清单和校验工具属于 base fingerprint 输入，旧代回滚继续使用旧源码验证器。
+
+测试真实数据库只能使用仓库外受限副本；记录布尔结果、结构及计数比较，禁止记录正文或凭据。

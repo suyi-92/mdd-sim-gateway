@@ -25,8 +25,10 @@ from smartcard.scard import SCardBeginTransaction, SCardEndTransaction, SCARD_LE
 
 try:                                # installed scripts live together in /usr/local/bin
     from pin_keeper import select_adf_usim as _shared_select_adf_usim
+    from pin_keeper import _transmit as _shared_transmit
 except ImportError:                 # source-tree imports use the namespace package
     from engine.pin_keeper import select_adf_usim as _shared_select_adf_usim
+    from engine.pin_keeper import _transmit as _shared_transmit
 
 RUNDIR = os.environ.get("MDD_RUNDIR", "/run/mdd-sim-gateway")
 USIM_PIN = os.environ.get("USIM_PIN", "")
@@ -167,13 +169,28 @@ def swap_nibbles(s):
 
 
 def dec_imsi(ef):
+    """Decode EF_IMSI; None for anything that is not a plausible IMSI, so a garbled
+    read surfaces as a failure instead of a bogus identity."""
     if len(ef) < 4:
         return None
-    l = int(ef[0:2], 16) * 2 - 1
-    swapped = swap_nibbles(ef[2:]).rstrip("f")
-    if len(swapped) < 1:
+    try:
+        length = int(ef[0:2], 16)
+    except ValueError:
         return None
-    return swapped[1:]
+    if not (1 <= length <= 8):
+        return None
+    swapped = swap_nibbles(ef[2:]).rstrip("f")
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
+
+
+
+
+
+def _xfr(connection, apdu):
+    return _shared_transmit(connection, apdu)
 
 
 def make_connection_index(reader_index):
@@ -240,12 +257,14 @@ def _with_deadline(fn, timeout=None):
     return box.get("value")
 
 
-def read_iccid(connection):
-    """Read EF.ICCID (no PIN required). Returns None when the card will not answer."""
-    connection.transmit(toBytes("00a40004023f0000"))
-    connection.transmit(toBytes("00a40004022fe200"))
-    data, sw1, sw2 = connection.transmit(toBytes("00b000000a"))
-    if sw1 != 0x90:
+def read_iccid(conn):
+    """Read the complete EF.ICCID only after both file selections have succeeded."""
+    for command in ("00a40004023f0000", "00a40004022fe200"):
+        _data, s1, s2 = _xfr(conn, toBytes(command))
+        if (s1, s2) != (0x90, 0x00):
+            return None
+    data, s1, s2 = _xfr(conn, toBytes("00b000000a"))
+    if (s1, s2) != (0x90, 0x00) or len(data) != 10:
         return None
     return swap_nibbles(bytes(data).hex()).rstrip("f")
 
@@ -309,10 +328,10 @@ def make_connection_name(reader_name):
             connection = make_connection_index(idx)
             if connection is None:
                 continue
-            data, sw1, sw2 = connection.transmit(toBytes("00a40004026f0700"))
-            if sw1 != 0x61:
+            data, sw1, sw2 = _xfr(connection, toBytes("00a40004026f0700"))
+            if sw1 != 0x90:
                 continue
-            data, sw1, sw2 = connection.transmit(toBytes("00b0000009"))
+            data, sw1, sw2 = _xfr(connection, toBytes("00b0000009"))
             if (sw1, sw2) != (0x90, 0x00):
                 continue
             imsi = dec_imsi(bytes(data).hex())
@@ -394,8 +413,8 @@ def open_usim(reader_spec):
                 continue
             with _Tx(conn):
                 if select_adf_usim(conn) and verify_pin(conn):
-                    conn.transmit(toBytes("00a40004026f0700"))
-                    d, s1, s2 = conn.transmit(toBytes("00b0000009"))
+                    _xfr(conn, toBytes("00a40004026f0700"))
+                    d, s1, s2 = _xfr(conn, toBytes("00b0000009"))
                     if s1 == 0x90 and dec_imsi(bytes(d).hex()) == target:
                         return conn
             try:
@@ -430,6 +449,9 @@ def verify_pin(connection):
         return True  # already verified in this card session
     if s1 == 0x63 and (s2 & 0x0F) < 2:
         print(f"Refusing PIN verify: only {s2 & 0x0F} tries left", flush=True)
+        return False
+    if not (4 <= len(USIM_PIN) <= 8) or not USIM_PIN.isdigit():
+        print("Refusing PIN verify: malformed USIM_PIN (want 4-8 digits)", flush=True)
         return False
     body = [ord(c) for c in USIM_PIN] + [0xFF] * (8 - len(USIM_PIN))
     d, s1, s2 = connection.transmit(toBytes("00200001") + [0x08] + body)
@@ -469,10 +491,9 @@ def read_res_ck_ik(reader_spec, rand, autn):
             if not verify_pin(conn):
                 write_status(state="PIN_FAIL")
                 return res, ck, ik, auts
-            data, sw1, sw2 = conn.transmit(
-                toBytes("008800812210" + rand.upper() + "10" + autn.upper()))
-            if sw1 == 0x61:
-                data, sw1, sw2 = conn.transmit(toBytes("00C00000") + [sw2])
+            data, sw1, sw2 = _xfr(conn, toBytes(
+                "008800812210" + rand.upper() + "10" + autn.upper()))
+            if (sw1, sw2) == (0x90, 0x00) and data:
                 result = toHexString(data).replace(" ", "")
                 rc = result[0:2]
                 if rc == "DB":  # success

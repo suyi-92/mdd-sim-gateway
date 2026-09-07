@@ -1615,18 +1615,7 @@ def _concat_triplet(args: list) -> tuple[int, int, int] | None:
 
 
 def _join_sms_parts(bodies: list[str], seqs: list[int], total: int) -> str:
-    """Concatenate parts in sequence order, marking each run of missing ones."""
-    have = dict(zip(seqs, bodies))
-    out: list[str] = []
-    in_gap = False
-    for i in range(1, total + 1):
-        if i in have:
-            out.append(have[i])
-            in_gap = False
-        elif not in_gap:
-            out.append(SMS_GAP_MARK)
-            in_gap = True
-    return "".join(out)
+    return store.join_sms_parts(bodies, seqs, total)
 
 
 async def sms_segment_reaper():
@@ -1639,18 +1628,21 @@ async def sms_segment_reaper():
     while True:
         await asyncio.sleep(60)
         try:
-            stale = await asyncio.to_thread(store.take_stale_sms_segments)
+            stale = await asyncio.to_thread(store.take_stale_sms_segments, publish=True)
         except Exception as exc:  # noqa
             log.debug("SMS segment sweep failed: %r", exc)
             continue
+        try:
+            await asyncio.to_thread(store.prune_late_sms_groups)
+        except Exception as exc:  # noqa
+            log.debug("late SMS group prune failed: %r", exc)
         for group in stale:
             iid = str(group["instance"])
             body = _join_sms_parts(group["bodies"], group["seqs"], group["total"])
             log.info("incomplete multi-part SMS on line %s from %s: parts %s of %d — storing "
                      "what arrived", iid, group["peer"],
                      ",".join(str(n) for n in group["seqs"]), group["total"])
-            rec = await asyncio.to_thread(store.add_message, iid, "in", group["peer"], body,
-                                          ts=group["first_ts"])
+            rec = group["message"]
             await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
             await asyncio.to_thread(_harvest_allowance_reply, iid, group["peer"])
             _dispatch_push(notify_push.EV_INCOMING_SMS, iid, group["peer"], body)
@@ -2732,7 +2724,8 @@ async def api_verify_pin(body: dict):
                 card_entry.update(present=True, iccid=c.iccid, imsi=c.imsi, mcc=c.mcc,
                                   mnc=c.mnc, mnc_len=getattr(c, "mnc_len", None),
                                   pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
-                                  smsc=c.smsc, carrier_identity=_carrier_identity(c))
+                                  smsc=c.smsc, reader_port=c.reader_port,
+                                  carrier_identity=_carrier_identity(c))
                 inst = _match_instance_by_iccid(c.iccid)
                 if inst and _carrier_identity_update(c):
                     await asyncio.to_thread(cfg.upsert_instance, {
@@ -3177,10 +3170,13 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     )
     return {"card": info, "readers": readers, "instance_id": str(target["id"]),
             "bridge": bridge,
-            "pin_preflight_verified": bool(
-                info.get("present")
-                and str(info.get("iccid") or "") == str(iccid)
-                and info.get("pin_enabled") is False),
+            "pin_preflight_proof": {
+                "iccid": str(iccid), "pin_enabled": info.get("pin_enabled"),
+                "observed_at": refreshed_at,
+                "readers": [{"name": reader, "index": (hub.cards.get(reader) or {}).get("index"),
+                             "reader_port": (hub.cards.get(reader) or {}).get("reader_port") or ""}
+                            for reader in readers],
+            } if info.get("present") and str(info.get("iccid") or "") == str(iccid) else None,
             }
 
 
@@ -3228,7 +3224,7 @@ async def _esim_start_profile_line(
     iccid: str,
     iid: str,
     *,
-    pin_preflight_verified: bool = False,
+    pin_preflight_proof: dict | None = None,
 ) -> None:
     """Start a switched profile with bounded retries for transient country-egress startup."""
     iid = str(iid)
@@ -3260,10 +3256,10 @@ async def _esim_start_profile_line(
                         reader, iccid, "line_started", profile_state="enabled")
                     return
                 try:
-                    if pin_preflight_verified and attempt == 0:
+                    if pin_preflight_proof and attempt == 0:
                         await _start_instance(
                             iid,
-                            pin_preflight_verified=True,
+                            pin_preflight_proof=pin_preflight_proof,
                             health_reason="esim_profile_switch",
                             engine_reason="esim_profile_switch",
                         )
@@ -3485,27 +3481,48 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
 def _raise_card_mismatch(inst: dict, mism: dict):
     raise HTTPException(409, {
         "code": "card_mismatch",
-        "reader": mism["reader"],
-        "card_iccid": mism["iccid"],
-        "line_iccid": inst.get("iccid") or "",
-        "message": (f"The card in {mism['reader']} now has a different identity "
-                    f"(ICCID {mism['iccid']}; this line expects {inst.get('iccid')}). "
-                    "This usually means the eSIM profile was switched. Provision the "
-                    "active profile as its own line, or switch the eSIM back to this "
-                    "profile, then start again."),
+        "message": ("The SIM currently in this reader does not match this line. "
+                    "Activate this line's eSIM profile, or select the line for the current SIM."),
     })
 
 
-def _preflight_pin_locked(inst: dict, idx: int) -> dict:
+def _preflight_pin_locked(inst: dict, idx: int, pin_proof: dict | None = None) -> dict:
     """PIN preflight body — caller must already hold the reader asyncio.Lock.
     Sync so it can run under asyncio.to_thread (PC/SC is blocking)."""
+    if _verified_pin_disabled_card_matches(inst, pin_proof, idx):
+        try:
+            actual = str(sim.read_iccid(idx) or "")
+        except Exception:
+            actual = ""
+        if actual and actual != str(inst.get("iccid") or ""):
+            return {"ok": False, "code": "card_mismatch"}
+        if actual:
+            return {"ok": True, "need_pin": False}
     try:
         probe = sim.read_card(idx)          # no VERIFY: learns pin_enabled + presence
     except Exception as e:  # noqa
         log.debug("preflight probe failed: %r", e)
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
+    want = (inst.get("iccid") or "").strip()
     if not probe.present:
-        return {"ok": False, "code": "no_card"}
+        # Nothing readable at the reader index this line binds to. Carry the expected ICCID
+        # so the operator-facing error can say which SIM we were looking for (support bundles
+        # get only the closed reason code, never the identifier).
+        return {"ok": False, "code": "no_card", "line_iccid": want}
+    # Real-time identity check. _card_identity_mismatch runs first but off the (sampled) card
+    # monitor cache; inside an eSIM REFRESH/profile-switch window that cache lags, so a live
+    # read here is what actually catches "the reader now holds a different profile" instead of
+    # letting it fall through to a misleading no_card.
+    got = (probe.iccid or "").strip()
+    if want and got and got != want:
+        return {"ok": False, "code": "card_mismatch", "card_iccid": got, "line_iccid": want}
+    if probe.pin_enabled is None:
+        # The card answered, but read_card never got far enough to learn its PIN state (an
+        # ADF.USIM select that failed leaves every PIN field unset). Falling through would
+        # report 'pin_required' with an unknown retry counter, and the UI would ask for a PIN
+        # that cannot help — the dead end issues #51 and #60 both ended in. Report the read
+        # failure itself so the operator sees a fixable fact.
+        return {"ok": False, "code": "card_unreadable", "error": probe.error or ""}
     if probe.pin_enabled is False:
         return {"ok": True, "need_pin": False}
     saved = inst.get("pin")
@@ -3521,10 +3538,11 @@ def _preflight_pin_locked(inst: dict, idx: int) -> dict:
     return {"ok": True, "need_pin": True}
 
 
-async def _preflight_pin(inst: dict) -> dict:
+async def _preflight_pin(inst: dict, *, pin_proof: dict | None = None) -> dict:
     """Actively check the SIM's PIN state BEFORE starting the engine (so we never spin up
     the SWu tunnel/IMS against a locked card). Reads the physical card:
       - card absent                         -> {ok:False, code:'no_card'}
+      - card present but unreadable         -> {ok:False, code:'card_unreadable'}
       - PIN not required (disabled)          -> {ok:True,  need_pin:False}
       - PIN required, no saved PIN           -> {ok:False, code:'pin_required'}
       - PIN required, saved PIN verifies     -> {ok:True,  need_pin:True}
@@ -3549,27 +3567,81 @@ async def _preflight_pin(inst: dict) -> dict:
     except asyncio.TimeoutError:
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
     try:
+        if isinstance(pin_proof, dict) and any(
+                bound.get("name") == rname and bound.get("index") == idx
+                for bound in pin_proof.get("readers") or []):
+            return await asyncio.to_thread(_preflight_pin_locked, inst, idx, pin_proof)
         return await asyncio.to_thread(_preflight_pin_locked, inst, idx)
     finally:
         lock.release()
 
 
-def _verified_pin_disabled_card_matches(inst: dict) -> bool:
-    """Whether the just-refreshed card view proves this exact SIM has PIN disabled.
+def _verified_pin_disabled_card_matches(inst: dict, proof: dict | None, idx: int) -> bool:
+    """Only reuse a recent full read from this eSIM recovery on the same reader binding.
 
-    The modem eSIM switch path has already completed one authoritative full card read before
-    it schedules Engine startup. Repeating the same multi-file scan immediately afterwards
-    costs several seconds on serial AT+CSIM readers. Only reuse the proof for a present,
-    ICCID-matched card with an explicit ``pin_enabled=False``; unknown/locked states retain the
-    normal active PIN preflight.
+    The caller still reads ICCID under the reader lock. This avoids a second multi-file
+    scan, without using the sampled card cache as authority for the card currently present.
     """
-    iccid = str(inst.get("iccid") or "")
-    return bool(iccid) and any(
-        card_info.get("present")
-        and str(card_info.get("iccid") or "") == iccid
-        and card_info.get("pin_enabled") is False
-        for card_info in hub.cards.values()
-    )
+    if not isinstance(proof, dict) or proof.get("pin_enabled") is not False:
+        return False
+    want = str(inst.get("iccid") or "")
+    if not want or str(proof.get("iccid") or "") != want:
+        return False
+    observed = proof.get("observed_at")
+    if not isinstance(observed, (int, float)) or not 0 <= time.monotonic() - observed <= 30:
+        return False
+    for bound in proof.get("readers") or []:
+        current = hub.cards.get(bound.get("name")) or {}
+        if (bound.get("index") == idx and current.get("index") == idx
+                and current.get("present") and current.get("pin_enabled") is False
+                and str(current.get("iccid") or "") == want
+                and str(current.get("reader_port") or "") == str(bound.get("reader_port") or "")):
+            return True
+    return False
+
+
+def _pin_preflight_http(pf: dict) -> HTTPException:
+    """A readable 409 whose message remains safe when subscriber details are hidden."""
+    code = str(pf.get("code") or "preflight_failed")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+        code = "preflight_failed"
+    tries = pf.get("tries")
+    if type(tries) is not int or not 0 <= tries <= 15:
+        tries = None
+    left = f" ({tries} tries left)" if tries is not None else ""
+    messages = {
+        "no_card": ("No readable SIM is ready at this line's reader. An eSIM may reset "
+                    "briefly while switching; activate this line's profile before starting."),
+        "pin_required": f"The SIM requires a PIN and none is saved{left}. Enter the SIM PIN.",
+        "pin_invalid": f"The saved SIM PIN was rejected{left}. Re-enter the PIN.",
+        "card_unreadable": ("The SIM was detected but its application could not be read. "
+                            "This is not a PIN problem; check the card and reader connection."),
+        "card_mismatch": "The reader's active SIM does not match this line. Select the matching profile.",
+    }
+    return HTTPException(409, {"code": code, "tries": tries,
+                              "message": messages.get(code, f"SIM preflight failed: {code}")})
+
+
+def _raise_preflight_block(iid: str, pf: dict):
+    """Record a closed-schema lifecycle event for the refused start (so support bundles
+    show the preflight decision without any identifier) and raise the operator-facing 409.
+
+    A live ICCID conflict is reported as the existing card_mismatch error — same shape the
+    cache-based guard produces — so the UI's message is identical however it was detected."""
+    code = pf.get("code") or ""
+    facts: dict = {}
+    if code in {"pin_required", "pin_invalid", "card_mismatch", "card_unreadable"}:
+        facts["card_present"] = True
+    elif code == "no_card":
+        facts["card_present"] = False
+    if code == "card_mismatch":
+        facts["iccid_matches"] = False
+    _record_lifecycle(str(iid), "preflight_blocked", reason_code=code, **facts)
+    if code == "card_mismatch":
+        _raise_card_mismatch({"iccid": pf.get("line_iccid") or ""},
+                             {"reader": pf.get("reader") or "the reader",
+                              "iccid": pf.get("card_iccid") or ""})
+    raise _pin_preflight_http(pf)
 
 
 @app.post("/api/provision")
@@ -4434,6 +4506,10 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_put_settings(body: dict):
+    body = {key: (cfg.clean_notification_events(value)
+                  if key in {"webhook", "telegram", "pushplus", "feishu"}
+                  and isinstance(value, dict) else value)
+            for key, value in body.items()}
     # Ignore the legacy field from older cached clients. Product identity is fixed.
     body.pop("system_name", None)
     if "max_sim_lines" in body:
@@ -4474,7 +4550,7 @@ def api_put_settings(body: dict):
             raise HTTPException(400, "invalid new-device defaults")
         if any(not isinstance(value, bool) for value in defaults.values()):
             raise HTTPException(400, "new-device defaults must be boolean")
-    for channel in ("webhook", "telegram", "pushplus", "feishu"):
+    for channel in ("webhook", "telegram", "pushplus"):
         try:
             notify_push.validate_message_templates(body.get(channel) or {})
         except ValueError as exc:
@@ -4515,16 +4591,21 @@ def api_put_settings(body: dict):
         if str(pushplus.get("template") or "html") not in {"html", "txt", "markdown", "json"}:
             raise HTTPException(400, "unsupported PushPlus template")
     feishu = body.get("feishu") or {}
-    if feishu.get("enabled"):
+    try:
+        channels = notify_push.validate_feishu_channels(feishu)
+    except ValueError as exc:
+        raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
+    for channel in channels:
         try:
+            if not channel.get("enabled"):
+                continue
             sample = notify_push.build_payload(
                 notify_push.EV_INCOMING_SMS,
                 {"id": "preview", "name": "SIM", "iccid": "", "msisdn": ""},
                 "+10000000000", "123456")
             # Validation happens before the HTTP request inside send_feishu. Use a local copy
             # of the same checks here so saving settings never sends a notification.
-            notify_push.validate_feishu_url(feishu.get("url"))
-            notify_push.build_notification_message(sample, feishu)
+            notify_push.build_notification_message(sample, channel)
         except ValueError as exc:
             raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
     # Release-based update settings are retired in the VMware edition. Ignore stale cached
@@ -4969,6 +5050,22 @@ async def api_instances():
     return {"instances": out}
 
 
+def _only_instance_name_changed(before: dict | None, after: dict) -> bool:
+    """Whether a saved edit changed display metadata and no engine configuration.
+
+    A line name is resolved by the manager whenever it builds UI, notification or diagnostic
+    output. It is never consumed by the running IKE/Asterisk engine, so replacing that engine
+    for a rename only interrupts working calls and tunnels without applying anything useful.
+    Compare the persisted documents rather than trusting a client-side flag: a request that also
+    changes any operational field must continue through the normal fail-closed rebuild.
+    """
+    if before is None or before == after:
+        return False
+    before_runtime = {key: value for key, value in before.items() if key != "name"}
+    after_runtime = {key: value for key, value in after.items() if key != "name"}
+    return before_runtime == after_runtime
+
+
 @app.post("/api/instances")
 async def api_instance_upsert(body: dict):
     if "id" not in body:
@@ -4981,17 +5078,19 @@ async def api_instance_upsert(body: dict):
     # handle in the UI and audit history.
     if "name" in body and cfg.instance_name_taken(body.get("name"), exclude_iid=iid):
         raise HTTPException(409, "another line already uses that name")
+    previous = cfg.get_instance(iid)
     was_running = await asyncio.to_thread(engine.is_running, iid)
     try:
         inst = cfg.upsert_instance(body)
     except cfg.LineLimitError as exc:
         raise HTTPException(409, {
             "code": "line_limit", "message": str(exc)}) from exc
+    name_only_change = _only_instance_name_changed(previous, inst)
     applied = False
     # A running line holds its config in the engine container (rendered instance.json:
     # WebRTC credentials, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
     # the running Asterisk — so restart the container to re-render + reload the new config.
-    if was_running:
+    if was_running and not name_only_change:
         try:
             hub._msisdn_tries.pop(iid, None)
             hub.reset_health(iid, "configuration_restart")
@@ -5002,8 +5101,12 @@ async def api_instance_upsert(body: dict):
             asyncio.create_task(push_status(iid))
         except Exception as e:  # noqa
             log.warning("apply-on-save restart failed for %s: %r", iid, e)
-    safe = {k: v for k, v in inst.items()
-            if k not in ("pin", "carrier_identity", "ims_home_domain")}
+    elif name_only_change:
+        # The host-side desired document carries the label for observability. Its proxy
+        # fingerprint excludes line names, so publishing this metadata does not reload sing-box
+        # or disturb the line either.
+        egress.publish()
+    safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity", "ims_home_domain")}
     safe["applied"] = applied      # true => config was re-applied to the running engine
     return safe
 
@@ -5088,7 +5191,7 @@ async def _start_instance(
     iid: str,
     body: dict | None = None,
     *,
-    pin_preflight_verified: bool = False,
+    pin_preflight_proof: dict | None = None,
     health_reason: str = "user_requested",
     engine_reason: str = "manual",
 ):
@@ -5108,26 +5211,21 @@ async def _start_instance(
     if mism:
         _raise_card_mismatch(inst, mism)
 
-    # If the caller re-supplied a PIN (unlock flow), verify + persist it before preflight.
     supplied = (body or {}).get("pin")
+    candidate = inst
     if supplied:
-        idx = await asyncio.to_thread(_reader_index_for_instance, inst)
-        if idx is not None:
-            chk = await asyncio.to_thread(sim.read_card, idx, supplied)
-            if chk.error and "PIN" in (chk.error or "").upper():
-                raise HTTPException(400, f"PIN error: {chk.error}"
-                                         + (f" ({chk.pin_tries} tries left)" if chk.pin_tries is not None else ""))
-        inst = cfg.upsert_instance({"id": str(iid), "pin": supplied})
-
-    reuse_pin_proof = (pin_preflight_verified
-                       and not supplied
-                       and _verified_pin_disabled_card_matches(inst))
-    pf = ({"ok": True, "need_pin": False}
-          if reuse_pin_proof else await _preflight_pin(inst))
+        if sim._pin_body(supplied) is None:
+            raise _pin_preflight_http({"code": "pin_invalid"})
+        candidate = {**inst, "pin": supplied}
+    pf = (await _preflight_pin(candidate, pin_proof=pin_preflight_proof)
+          if pin_preflight_proof is not None and not supplied
+          else await _preflight_pin(candidate))
     if not pf["ok"]:
-        if pf.get("clear"):
-            cfg.clear_pin(str(iid))     # stale saved PIN — force re-entry next time
-        raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+        if pf.get("clear") and not supplied:
+            cfg.clear_pin(str(iid))
+        _raise_preflight_block(str(iid), pf)
+    if supplied:
+        inst = cfg.upsert_instance({"id": str(iid), "pin": supplied})
 
     settings = cfg.get_settings()
     dev = os.environ.get("MDD_DEV_MOUNTS", "") == "1"
@@ -5187,7 +5285,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))
-        raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+        _raise_preflight_block(str(iid), pf)
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid, "user_requested")
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
@@ -5654,6 +5752,7 @@ async def api_allowance_query(iid: str, body: dict):
 
 # ----------------------------- Number keeping -----------------------------
 KEEPALIVE_ACTIONS = {"sms", "balance_watch"}
+KEEPALIVE_MAX_INTERVAL_DAYS = 365
 
 
 def _local_tz() -> ZoneInfo:
@@ -5706,8 +5805,9 @@ def _clean_keepalive(body: dict) -> dict:
         interval = 30 if raw_interval in (None, "") else int(raw_interval)
     except (TypeError, ValueError):
         raise HTTPException(422, "interval_days must be a number") from None
-    if not 1 <= interval <= 90:
-        raise HTTPException(422, "interval_days must be between 1 and 90")
+    if not 1 <= interval <= KEEPALIVE_MAX_INTERVAL_DAYS:
+        raise HTTPException(
+            422, f"interval_days must be between 1 and {KEEPALIVE_MAX_INTERVAL_DAYS}")
     enabled = 1 if body.get("enabled") else 0
     sms_to = str(body.get("sms_to") or "").strip()
     sms_body = str(body.get("sms_body") or "").strip()
@@ -6410,6 +6510,29 @@ async def api_engine_event(payload: dict):
         # a part that decoded to nothing would leave the whole message forever incomplete.
         if segment:
             ref, total, seq = segment
+            # A part can arrive long after its group was flushed incomplete (ten minutes
+            # measured between segment 1 and segment 2 of one text crossing two networks).
+            # Buffering it again would publish a second fragment of a message the thread
+            # already shows, so it is folded back into that message first.
+            late = await asyncio.to_thread(store.merge_late_sms_segment, iid, sender, ref,
+                                           total, seq, text)
+            if late is not None:
+                if late["duplicate"]:
+                    log.info("ignoring a repeat of part %d/%d from %s (ref %d) already in "
+                             "message %d", seq, total, sender, ref, late["message_id"])
+                    return {"ok": True, "merged": "duplicate"}
+                merged = _join_sms_parts(late["bodies"], late["seqs"], total)
+                rec = await asyncio.to_thread(store.set_message_body, late["message_id"],
+                                              merged)
+                log.info("late part %d/%d from %s (ref %d) merged into message %d — %s",
+                         seq, total, sender, ref, late["message_id"],
+                         "now complete" if late["complete"]
+                         else f"{len(late['seqs'])}/{total} parts")
+                if rec:
+                    await hub.broadcast({"type": "sms", "instance": iid,
+                                         "message": rec, "updated": True})
+                    await asyncio.to_thread(_harvest_allowance_reply, iid, sender)
+                return {"ok": True, "merged": f"{len(late['seqs'])}/{total}"}
             parts = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
                                             seq, text)
             if parts is None:
@@ -6671,9 +6794,7 @@ def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
     wh = settings.get("webhook") or {}
     tg = settings.get("telegram") or {}
     pp = settings.get("pushplus") or {}
-    fs = settings.get("feishu") or {}
-    if not (wh.get("enabled") or tg.get("enabled") or pp.get("enabled")
-            or fs.get("enabled")):
+    if not notify_push.has_enabled_channel(settings, event):
         return
     asyncio.create_task(
         asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
@@ -6993,7 +7114,7 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                         "recovery_error": str(detail) or "line recovery failed"}
             asyncio.create_task(_esim_start_profile_line(
                 name, switch_key, iccid, str(recovery["instance_id"]),
-                pin_preflight_verified=bool(recovery.get("pin_preflight_verified"))))
+                pin_preflight_proof=recovery.get("pin_preflight_proof")))
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],

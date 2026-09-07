@@ -153,6 +153,7 @@ message_context=msg-from-local
 from_domain={{ realm }}
 disallow=all
 allow=amr
+; The amd64 image includes codec_opus and its AMR translation path.
 allow=ulaw
 allow=alaw
 allow=opus
@@ -160,7 +161,7 @@ rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 ; Never let the WebRTC softphone direct-media with the IMS side:
-; the two legs are incompatible (DTLS-SRTP + opus/ulaw on the client vs plain RTP + AMR on
+; the two legs are incompatible (DTLS-SRTP + ulaw/alaw on the client vs plain RTP + AMR on
 ; the carrier), so Asterisk MUST stay in the media path to bridge/transcode. With direct_media
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)

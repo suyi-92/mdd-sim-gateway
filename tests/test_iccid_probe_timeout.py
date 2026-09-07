@@ -62,7 +62,7 @@ class _Connection:
             raise RuntimeError("unblocked")
         if self.iccid is None:
             raise RuntimeError("card does not answer")
-        if str(apdu).lower().startswith("00b0"):
+        if bytes(apdu).hex().startswith("00b0"):
             return _iccid_apdu_bytes(self.iccid), 0x90, 0x00
         return [], 0x90, 0x00
 
@@ -85,7 +85,7 @@ def _load(filename, module_name):
     system = types.ModuleType("smartcard.System")
     system.readers = lambda: []
     util = types.ModuleType("smartcard.util")
-    util.toBytes = lambda value: value
+    util.toBytes = lambda value: list(bytes.fromhex(value))
     util.toHexString = lambda value: ""
     exceptions = types.ModuleType("smartcard.Exceptions")
     exceptions.NoCardException = type("NoCardException", (Exception,), {})

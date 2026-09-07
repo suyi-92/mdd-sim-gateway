@@ -732,14 +732,21 @@ with open(os.path.join(root, "bin", "pip"), "rb") as stream:
 PY
 }
 
+engine_module_contract() {
+  local source=$1
+  shift
+  python3 "$source/tools/engine-modules.py" "$source/engine/asterisk-keep-modules.txt" "$@"
+}
+
 verify_prepared_build() {
-  local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image
+  local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image modules_contract
   [[ -f "$root/READY" && -f "$root/webui/index.html" && -x "$root/venv/bin/python" && \
      -f "$root/manifest.json" ]] || return 1
   [[ $(git -C "$source" rev-parse HEAD 2>/dev/null) == "$expected_sha" ]] || return 1
   expected_version=$(tr -d '\r\n' < "$source/VERSION")
   runtime_fp=$(engine_fingerprint "$source" runtime) || return 1
   base_fp=$(engine_fingerprint "$source" base) || return 1
+  modules_contract=$(engine_module_contract "$source") || return 1
   image="mdd-sim-gateway/engine:$expected_sha"
   docker image inspect "$image" >/dev/null 2>&1 || return 1
   [[ $(docker image inspect "$image" --format '{{.Architecture}}') == amd64 ]] || return 1
@@ -755,9 +762,10 @@ verify_prepared_build() {
   }
   python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
     "$(docker image inspect "$image" --format '{{.Id}}')" \
-    "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" <<'PY'
+    "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" "$modules_contract" <<'PY'
 import json, sys
-path, sha, version, image, runtime_fp, base_fp, image_id, image_size, webui_hash = sys.argv[1:]
+path, sha, version, image, runtime_fp, base_fp, image_id, image_size, webui_hash, modules_json = sys.argv[1:]
+modules = json.loads(modules_json)
 try:
     with open(path, encoding="utf-8") as stream:
         value = json.load(stream)
@@ -768,6 +776,7 @@ expected = {
     "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
     "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
     "image_id": image_id, "image_size": int(image_size), "webui_hash": webui_hash,
+    "asterisk_modules": modules["count"], "asterisk_modules_sha256": modules["sha256"],
 }
 if any(value.get(key) != item for key, item in expected.items()):
     raise SystemExit(1)
@@ -793,7 +802,7 @@ prepare_build() {
     warn "cached build identity check failed; rebuilding $sha"
   fi
   local temp="${build_root}.tmp.$$" runtime_fp base_fp image="mdd-sim-gateway/engine:$sha" version module_count asterisk_version
-  local image_id image_size webui_hash
+  local image_id image_size webui_hash actual_modules modules_contract module_hash
   [[ "$temp" == "$(dirname "$build_root")/"* ]] || die "unsafe build staging path"
   rm -rf -- "$temp"; install -d -m 0755 "$temp/venv" "$temp/webui"
 
@@ -813,11 +822,11 @@ prepare_build() {
   base_fp=$(engine_fingerprint "$source_dir" base)
   version=$(tr -d '\r\n' < "$source_dir/VERSION")
   info "building Engine image for commit $sha"
-  local build_args=(docker build --pull --label "org.opencontainers.image.revision=$sha" \
+  local build_args=(docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$sha" \
     --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
     --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
     -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir/engine")
-  ((no_cache)) && build_args=(docker build --pull --no-cache --label "org.opencontainers.image.revision=$sha" \
+  ((no_cache)) && build_args=(docker build --pull --no-cache --platform linux/amd64 --label "org.opencontainers.image.revision=$sha" \
     --build-arg "PCSC_VERSION=$PCSC_VERSION" --build-arg "RUNTIME_FP=$runtime_fp" \
     --build-arg "BASE_FP=$base_fp" --build-arg "MDD_VERSION=$version" \
       -t "$image" -f "$source_dir/engine/Dockerfile" "$source_dir/engine")
@@ -831,23 +840,29 @@ prepare_build() {
      "https://github.com/suyi-92/mdd-sim-gateway" ]] || die "Engine source repository label mismatch"
   asterisk_version=$(docker run --rm --entrypoint /usr/sbin/asterisk "$image" -V)
   [[ "$asterisk_version" == Asterisk\ * ]] || die "Engine Asterisk version could not be verified"
-  module_count=$(docker run --rm --entrypoint /bin/sh "$image" -c "find /usr/lib64/asterisk/modules /usr/lib/asterisk/modules -type f -name '*.so' 2>/dev/null | wc -l")
+  actual_modules=$(docker run --rm --entrypoint /bin/sh "$image" -c \
+    "find /usr/lib/asterisk/modules -maxdepth 1 -type f -name '*.so' -printf '%f\\n'")
+  modules_contract=$(printf '%s\n' "$actual_modules" | engine_module_contract "$source_dir" --actual-stdin) || \
+    die "Engine Asterisk module set does not match the source keep-list"
+  module_count=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' <<< "$modules_contract")
+  module_hash=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])' <<< "$modules_contract")
   ((module_count > 20)) || die "Engine Asterisk module count is unexpectedly low: $module_count"
-  docker run --rm --entrypoint python3 "$image" -c 'import jinja2, requests, smartcard, cryptography'
+  docker run --rm --entrypoint python3 "$image" -c 'import jinja2, requests, smartcard, cryptography, Crypto, panoramisk, serial, socks, card'
   docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --entrypoint /bin/sh "$image" -c \
     'test -c /dev/net/tun; ip tuntap add dev mdd-build-test mode tun; ip link delete mdd-build-test'
   image_id=$(docker image inspect "$image" --format '{{.Id}}')
   image_size=$(docker image inspect "$image" --format '{{.Size}}')
   webui_hash=$(tree_hash "$temp/webui")
   python3 - "$temp/manifest.json" "$sha" "$version" "$image" "$runtime_fp" "$base_fp" \
-    "$asterisk_version" "$module_count" "$image_id" "$image_size" "$webui_hash" <<'PY'
+    "$asterisk_version" "$module_count" "$image_id" "$image_size" "$webui_hash" "$module_hash" <<'PY'
 import datetime, json, os, sys
-path, sha, version, image, runtime_fp, base_fp, asterisk, modules, image_id, image_size, webui_hash = sys.argv[1:]
+path, sha, version, image, runtime_fp, base_fp, asterisk, modules, image_id, image_size, webui_hash, module_hash = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as stream:
     json.dump({"source_commit": sha, "version": version, "image": image,
                "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
                "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
                "asterisk": asterisk.strip(), "asterisk_modules": int(modules),
+               "asterisk_modules_sha256": module_hash,
                "image_id": image_id, "image_size": int(image_size),
                "webui_hash": webui_hash,
                "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},

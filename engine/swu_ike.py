@@ -438,6 +438,64 @@ TV =  1
 KEY_LENGTH = (14, TV)
 
 
+def ike_proposals_for_plmn(mcc, mnc):
+    """Return IKE proposals for the home PLMN.
+
+    DITO Telecommunity's ePDG (515-66) advertises only the legacy 3GPP suite
+    AES-CBC-128 / HMAC-SHA1 / MODP-1024.  Keep the stronger, proven upstream
+    proposal set for every other carrier instead of weakening negotiation globally.
+    """
+    plmn = (str(mcc or "").zfill(3), str(mnc or "").zfill(3))
+    if plmn == ("515", "066"):
+        return [[
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_1024_bit],
+        ]]
+    return [
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+    ]
+
+
+def requests_permanent_eap_identity(attributes):
+    """Recognize an identity request anywhere in the EAP-AKA attribute list."""
+    return any(attribute and attribute[0] in (
+        AT_PERMANENT_ID_REQ, AT_ANY_ID_REQ, AT_FULLAUTH_ID_REQ, AT_IDENTITY)
+        for attribute in (attributes or []))
+
+
+
+
+
 #states
 OK =                            0
 TIMEOUT =                       1
@@ -6215,6 +6273,9 @@ def _swu_verify_chv1(conn, pin):
     elif (s1, s2) == (0x69, 0x83):
         print("VoWiFi: CHV1 blocked")
         return False
+    if not (4 <= len(pin) <= 8) or not pin.isdigit():
+        print("VoWiFi: refusing PIN VERIFY, malformed PIN (want 4-8 digits)")
+        return False
     body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
     d, s1, s2 = conn.transmit(toBytes("00200001") + [0x08] + body)
     ok = (s1, s2) == (0x90, 0x00)
@@ -6495,42 +6556,6 @@ def main():
         print("[swu_ike] CP mode pinned: %s" % _cp_mode)
 
 
-    # IKE proposals. Telus' ePDG rejects the emulator's stock SHA1/MD5 list with
-    # NO_PROPOSAL_CHOSEN; it requires PRF/INTEG SHA2-256. This list mirrors the engine's
-    # render.py default_ike (the set proven with strongSwan on Telus). MODP_2048 MUST be first
-    # because the IKE_SA_INIT KE payload is derived from the first proposal's DH group.
-    sa_list = [
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]
-    ]
-
-
     # Child/ESP proposals. AES_CBC_128/HMAC_SHA1_96 first — the transform Telus selected with
     # strongSwan (render.py default_esp). Remaining kept as fallbacks. No DH transform here
     # (no PFS at initial IKE_AUTH).
@@ -6579,6 +6604,9 @@ def main():
                       help="IMEISV (16 digits) for DEVICE_IDENTITY; auto-derived from IMEI if blank")
 
     (options, args) = parser.parse_args()
+    sa_list = ike_proposals_for_plmn(options.mcc, options.mnc)
+    if (str(options.mcc).zfill(3), str(options.mnc).zfill(3)) == ("515", "066"):
+        print("[swu_ike] DITO 515-66: using AES-CBC-128/SHA1/MODP-1024 IKE proposal")
     
     try:
         destination_addr = socket.gethostbyname(options.destination_addr)

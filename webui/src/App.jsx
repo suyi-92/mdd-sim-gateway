@@ -206,7 +206,7 @@ export default function App() {
     }
     if(['device','capability','cellular','engine'].includes(msg.type)) refresh()
     wsEvents.current.handlers.forEach(h=>h(msg))
-    if(msg.type==='sms'&&msg.message?.direction==='in')showToast(t('SMS from {peer}',{peer:msg.message.peer}))
+    if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:msg.message.peer}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
   },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])

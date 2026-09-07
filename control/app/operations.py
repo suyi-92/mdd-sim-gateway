@@ -55,6 +55,8 @@ def _path_secret(path: tuple[str, ...]) -> bool:
     if len(path) >= 3 and path[0:2] == ("proxy", "profiles") \
             and key in {"name", "value", "server", "username", "outbound_tag"}:
         return True
+    if "feishu" in path and "channels" in path and key in {"name", "url", "secret"}:
+        return True
     return False
 
 

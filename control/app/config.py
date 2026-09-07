@@ -174,6 +174,7 @@ DEFAULTS = {
             "enabled": False,
             "url": "",
             "secret": "",
+            "channels": [],
             "message_templates": {},
             "events": {"incoming_sms": True, "incoming_call": True,
                        "missed_call": True, "voicemail_received": True,
@@ -339,7 +340,45 @@ def load() -> dict:
             # VMware editions are source-updated through mddctl; retired Release notifications
             # must not survive in an older configuration as a hidden delivery event.
             merged["events"].pop("software_update", None)
+            merged["message_templates"] = {event: template for event, template in
+                (merged.get("message_templates") or {}).items()
+                if event not in {"activation_reminder", "software_update"}}
             out["settings"][key] = merged
+        # Feishu originally stored one bot directly under ``settings.feishu``. Preserve that
+        # shape on disk for rollback compatibility, while exposing it as a synthetic channel
+        # when no explicit multi-channel list has been saved yet.
+        feishu = out["settings"]["feishu"]
+        saved_feishu = data.get("settings", {}).get("feishu", {}) or {}
+        channels = feishu.get("channels")
+        if not isinstance(channels, list):
+            channels = []
+        normalized_channels = []
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            item = dict(channel)
+            item["events"] = {**DEFAULTS["settings"]["feishu"]["events"],
+                              **(channel.get("events", {}) or {})}
+            item["events"].pop("activation_reminder", None)
+            item["events"].pop("software_update", None)
+            item["message_templates"] = {event: template for event, template in
+                (channel.get("message_templates") or {}).items()
+                if event not in {"activation_reminder", "software_update"}}
+            item["instances"] = [str(value) for value in (channel.get("instances") or [])
+                                 if str(value).strip()]
+            normalized_channels.append(item)
+        if "channels" not in saved_feishu and (feishu.get("url") or feishu.get("enabled")):
+            normalized_channels.append({
+                "id": "legacy",
+                "name": "Feishu / Lark",
+                "enabled": bool(feishu.get("enabled")),
+                "url": str(feishu.get("url") or ""),
+                "secret": str(feishu.get("secret") or ""),
+                "instances": [],
+                "message_templates": dict(feishu.get("message_templates", {}) or {}),
+                "events": dict(feishu.get("events", {}) or {}),
+            })
+        feishu["channels"] = normalized_channels
         # Telegram is notification-only. Drop command settings left by an older configuration
         # so an upgrade cannot preserve a remote call/SMS control channel.
         out["settings"]["telegram"].pop("commands", None)
@@ -475,11 +514,27 @@ def get_settings() -> dict:
     return load()["settings"]
 
 
+def clean_notification_events(channel: dict) -> dict:
+    """Remove retired events from old clients without changing active destinations."""
+    out = dict(channel)
+    for field in ("events", "message_templates"):
+        if isinstance(out.get(field), dict):
+            out[field] = {key: value for key, value in out[field].items()
+                          if key not in {"activation_reminder", "software_update"}}
+    if isinstance(out.get("channels"), list):
+        out["channels"] = [clean_notification_events(item) if isinstance(item, dict) else item
+                           for item in out["channels"]]
+    return out
+
+
 def update_settings(patch: dict) -> dict:
     patch = dict(patch)
     # VMware installations are updated only through mddctl. Stale WebUI tabs from an older
     # release may still submit this key, so ignore it instead of saving hidden updater policy.
     patch.pop("updates", None)
+    for channel in ("webhook", "telegram", "pushplus", "feishu"):
+        if isinstance(patch.get(channel), dict):
+            patch[channel] = clean_notification_events(patch[channel])
     if "max_sim_lines" in patch:
         patch["max_sim_lines"] = validate_sim_line_limit(patch["max_sim_lines"])
     data = load()

@@ -63,7 +63,8 @@ else:
         raise SystemExit("engine/Dockerfile is not managed by Git")
     add_file(dockerfile)
     digest.update(f"pcsc={pcsc_version}\n".encode())
-    for relative in tracked_files("engine/patches"):
+    for relative in tracked_files("engine/patches", "engine/asterisk-keep-modules.txt",
+                                  "tools/engine-modules.py"):
         add_file(relative)
 
 print(digest.hexdigest())

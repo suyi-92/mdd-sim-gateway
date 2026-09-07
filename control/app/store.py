@@ -7,6 +7,7 @@ layer by the caller (main.py).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -95,6 +96,30 @@ def init():
                     PRIMARY KEY(instance, peer, concat_ref, total, seq)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sms_segments_age ON sms_segments(created_ts);
+
+                -- A group flushed incomplete, kept so the parts that arrive after the flush
+                -- still land in the message they belong to. Carriers can be minutes late with
+                -- a part (10 minutes measured between segment 1 and segment 2 of one text
+                -- crossing two networks), which is far longer than a buffer meant to hold a
+                -- message can wait. `parts` is the {seq: body} already merged, so the body can
+                -- be rebuilt in sequence order without re-parsing the gap marks in the stored
+                -- message. One row per flushed group; the row dies when the message completes
+                -- or the late window passes.
+                CREATE TABLE IF NOT EXISTS sms_late_groups (
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    concat_ref INTEGER NOT NULL,
+                    total INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    parts TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    PRIMARY KEY(instance, peer, concat_ref, total)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sms_late_message ON sms_late_groups(message_id);
+                CREATE TRIGGER IF NOT EXISTS sms_late_groups_message_deleted
+                AFTER DELETE ON messages BEGIN
+                    DELETE FROM sms_late_groups WHERE message_id=OLD.id;
+                END;
                 -- Inbound SMS that were never meant to be read: 8-bit binary payloads, SIM
                 -- data-download, silent service pushes. They are kept out of `messages` so
                 -- they cannot reach a conversation, a notification or an export, but kept
@@ -462,15 +487,17 @@ def add_sms_segment(instance: str, peer: str, concat_ref: int, total: int, seq: 
 
 
 def take_stale_sms_segments(timeout: int = SEGMENT_TIMEOUT,
-                            now: int | None = None) -> list[dict]:
+                            now: int | None = None, *, publish: bool = False) -> list[dict]:
     """Remove every part group whose FIRST part arrived more than `timeout` seconds ago and
     return what each one had collected, so an incomplete message is still shown rather than
     silently dropped. Each entry carries the ordered bodies plus the seq numbers present, so
-    the caller can mark which parts are missing."""
+    the caller can mark which parts are missing. With publish=True, the history row,
+    late-part memory and buffer removal commit together; a failed publication loses nothing."""
     now = int(now or time.time())
     cutoff = now - int(timeout)
     out: list[dict] = []
     with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
         groups = c.execute(
             "SELECT instance,peer,concat_ref,total,MIN(created_ts) AS first_ts "
             "FROM sms_segments GROUP BY instance,peer,concat_ref,total "
@@ -489,7 +516,133 @@ def take_stale_sms_segments(timeout: int = SEGMENT_TIMEOUT,
                         "first_ts": int(g["first_ts"]),
                         "seqs": [int(r["seq"]) for r in rows],
                         "bodies": [r["body"] for r in rows]})
+            if publish:
+                group = out[-1]
+                body = join_sms_parts(group["bodies"], group["seqs"], group["total"])
+                cur = c.execute("INSERT INTO messages(instance,direction,peer,body,status,ts,transport) "
+                                "VALUES(?,'in',?,?,'ok',?,'vowifi')",
+                                (g["instance"], g["peer"], body, g["first_ts"]))
+                mid = cur.lastrowid
+                c.execute("INSERT INTO sms_late_groups(instance,peer,concat_ref,total,message_id,parts,created_ts) "
+                          "VALUES(?,?,?,?,?,?,?) ON CONFLICT(instance,peer,concat_ref,total) DO UPDATE SET "
+                          "message_id=excluded.message_id,parts=excluded.parts,created_ts=excluded.created_ts",
+                          (*key, mid, json.dumps({str(r["seq"]): r["body"] for r in rows}), now))
+                group["message"] = dict(c.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone())
     return out
+
+
+# How long a group flushed incomplete stays open to its missing parts. Measured on live
+# networks: the parts of one text can be split across SMSC frontends and arrive ten minutes
+# apart, so the window that decides "this message is finished" (SEGMENT_TIMEOUT) is far too
+# short to also decide "this part belongs to nothing". An hour costs one small row per
+# incomplete message and spares the user a second, near-duplicate fragment in the thread.
+SEGMENT_LATE_WINDOW = 3600
+SMS_GAP_MARK = "[…]"
+
+
+def join_sms_parts(bodies: list[str], seqs: list[int], total: int) -> str:
+    """Concatenate parts in sequence order, marking each run of missing ones."""
+    have = dict(zip(seqs, bodies))
+    out: list[str] = []
+    in_gap = False
+    for i in range(1, total + 1):
+        if i in have:
+            out.append(have[i])
+            in_gap = False
+        elif not in_gap:
+            out.append(SMS_GAP_MARK)
+            in_gap = True
+    return "".join(out)
+
+_LATE_KEY = "instance=? AND peer=? AND concat_ref=? AND total=?"
+
+
+def remember_partial_sms_group(instance: str, peer: str, concat_ref: int, total: int,
+                               message_id: int, seqs: list[int], bodies: list[str],
+                               ts: int | None = None) -> None:
+    """Record which message a flushed-incomplete group produced, and what it already held."""
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO sms_late_groups(instance,peer,concat_ref,total,message_id,parts,"
+            "created_ts) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(instance,peer,concat_ref,total) DO UPDATE SET "
+            "message_id=excluded.message_id, parts=excluded.parts, "
+            "created_ts=excluded.created_ts",
+            (str(instance), peer, int(concat_ref), int(total), int(message_id),
+             json.dumps({str(int(s)): b for s, b in zip(seqs, bodies)}),
+             int(ts or time.time())))
+
+
+def merge_late_sms_segment(instance: str, peer: str, concat_ref: int, total: int, seq: int,
+                           body: str, now: int | None = None,
+                           window: int = SEGMENT_LATE_WINDOW) -> dict | None:
+    """Atomically attach a late part to its original message and return that message.
+
+    Completed groups stay addressable until the bounded window expires, so redeliveries
+    remain duplicates. A different body in an occupied slot proves reference reuse.
+    """
+    now = int(time.time() if now is None else now)
+    total, seq = int(total), int(seq)
+    if total < 2 or not 1 <= seq <= total:
+        return None
+    key = (str(instance), peer, int(concat_ref), total)
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            f"SELECT message_id,parts,created_ts FROM sms_late_groups WHERE {_LATE_KEY}", key
+        ).fetchone()
+        if not row:
+            return None
+        rec = c.execute("SELECT * FROM messages WHERE id=? AND instance=? AND peer=? "
+                        "AND direction='in'", (row["message_id"], str(instance), peer)).fetchone()
+        if not rec or now - int(row["created_ts"]) >= int(window):
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+        try:
+            parts = json.loads(row["parts"])
+            valid = isinstance(parts, dict) and bool(parts) and all(
+                isinstance(k, str) and k.isascii() and k.isdigit()
+                and str(int(k)) == k and 1 <= int(k) <= total and isinstance(v, str)
+                for k, v in parts.items())
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+        slot = str(seq)
+        if slot in parts and parts[slot] != body:
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+        duplicate = slot in parts
+        parts[slot] = body
+        order = sorted(int(k) for k in parts)
+        bodies = [parts[str(n)] for n in order]
+        if not duplicate:
+            c.execute(f"UPDATE sms_late_groups SET parts=? WHERE {_LATE_KEY}",
+                      (json.dumps(parts), *key))
+            c.execute("UPDATE messages SET body=? WHERE id=?",
+                      (join_sms_parts(bodies, order, total), row["message_id"]))
+            rec = c.execute("SELECT * FROM messages WHERE id=?", (row["message_id"],)).fetchone()
+        return {"message_id": int(row["message_id"]), "seqs": order, "bodies": bodies,
+                "complete": len(parts) == total, "duplicate": duplicate, "message": dict(rec)}
+
+
+def prune_late_sms_groups(window: int = SEGMENT_LATE_WINDOW, now: int | None = None) -> int:
+    """Forget groups whose missing parts never came, so the table cannot grow without bound."""
+    cutoff = int(now or time.time()) - int(window)
+    with _lock, _conn() as c:
+        return c.execute("DELETE FROM sms_late_groups WHERE created_ts <= ?",
+                         (cutoff,)).rowcount
+
+
+def set_message_body(mid: int, body: str) -> dict | None:
+    """Replace a stored message's text and return the record as it now reads."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        row = c.execute(
+            "SELECT id,instance,direction,peer,body,status,error,ts,transport "
+            "FROM messages WHERE id=?", (int(mid),)).fetchone()
+    return dict(row) if row else None
 
 
 def add_message(instance: str, direction: str, peer: str, body: str, status: str = "ok",
