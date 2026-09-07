@@ -8,7 +8,8 @@
   <a href="README.md">中文</a> ·
   <a href="#install-first-attach-hardware-later">Quick start</a> ·
   <a href="docs/INSTALL.md">Detailed guide</a> ·
-  <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a>
+  <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a> ·
+  <a href="docs/upstream-sync/README.md">Upstream integration (Chinese)</a>
 </p>
 
 ## Install first, attach hardware later

@@ -9,6 +9,7 @@
   <a href="#先安装后接设备推荐">快速开始</a> ·
   <a href="docs/INSTALL.md">完整安装说明</a> ·
   <a href="docs/TROUBLESHOOTING.md">故障排查</a> ·
+  <a href="docs/upstream-sync/README.md">上游同步维护</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
 
