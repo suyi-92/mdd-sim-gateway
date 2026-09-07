@@ -19,20 +19,26 @@ function ActionButton({ icon, label, tone = 'neutral', onClick, active = false, 
   )
 }
 
-function DtmfKeypad({ value, onTone, t }) {
+export function DialKeypad({ onKey, t }) {
+  return (
+    <div className="u-call-dtmf-grid" aria-label={t('Keypad')}>
+      {CALL_KEYS.map(([key, letters]) => (
+        <button type="button" key={key} onClick={() => onKey?.(key)} aria-label={key}>
+          <b>{key}</b>
+          <small aria-hidden="true">{letters || '\u00a0'}</small>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+export function DtmfKeypad({ value, onTone, t }) {
   return (
     <div className="u-call-dtmf">
       <div className="u-call-dtmf-display mono" aria-live="polite" aria-label={t('Entered tones')}>
-        {value || t('Type or tap keys')}
+        {value}
       </div>
-      <div className="u-call-dtmf-grid" aria-label={t('Keypad')}>
-        {CALL_KEYS.map(([key, letters]) => (
-          <button type="button" key={key} onClick={() => onTone?.(key)} aria-label={key}>
-            <b>{key}</b>
-            <small>{letters || '\u00a0'}</small>
-          </button>
-        ))}
-      </div>
+      <DialKeypad onKey={onTone} t={t} />
     </div>
   )
 }

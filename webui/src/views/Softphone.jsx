@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api.js'
 import { Softphone as Phone } from '../softphone.js'
-import CallSurface, { CALL_KEYS } from '../CallSurface.jsx'
+import CallSurface, { DialKeypad, DtmfKeypad } from '../CallSurface.jsx'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
@@ -676,21 +676,7 @@ export default function Softphone({
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
             {call.transport !== 'cellular' && !call.serviceCode && keypad && (
-              <div style={{ maxWidth: 220, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {/* Echo strip: shows every digit/symbol entered via click or physical keyboard */}
-                <div className="mono" style={{ minHeight: 40, padding: '8px 12px', borderRadius: 8,
-                  background: 'var(--surface-2, rgba(255,255,255,0.06))', border: '1px solid var(--border, rgba(255,255,255,0.12))',
-                  fontSize: 20, letterSpacing: 2, textAlign: 'center', overflow: 'hidden', whiteSpace: 'nowrap',
-                  direction: 'rtl', color: dtmfSeq ? 'var(--text)' : 'var(--text-mute)' }}>
-                  {dtmfSeq || t('Type or tap keys')}
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
-                  {CALL_KEYS.map(([k]) => (
-                    <button key={k} className="btn btn-ghost" style={{ padding: 12, fontSize: 18 }}
-                      onClick={() => pressDTMF(k)}>{k}</button>
-                  ))}
-                </div>
-              </div>
+              <DtmfKeypad value={dtmfSeq} onTone={pressDTMF} t={t} />
             )}
             {/* Mute, keypad and record all act on audio, and a service code has none: it is
                 signalling that the carrier answers and tears down in about a second. Offering
@@ -773,20 +759,10 @@ export default function Softphone({
 
         {/* ===== DIALER (idle) ===== */}
         {!inCall && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-            <input value={num} onChange={(e) => setNum(e.target.value)} placeholder={t('Enter a number')}
+          <div className="u-call-dialer" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+            <input value={num} onChange={(e) => setNum(e.target.value)} aria-label={t('Enter a number')}
               className="mono" style={{ fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1, border: 'none', background: 'transparent' }} />
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
-              {CALL_KEYS.map(([k, sub]) => (
-                <button key={k} onClick={() => dialKey(k)} style={{
-                  padding: '10px 0', borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
-                  border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column', alignItems: 'center',
-                }}>
-                  <span style={{ fontSize: 22, fontWeight: 600 }}>{k}</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-mute)', letterSpacing: 1, height: 10 }}>{sub}</span>
-                </button>
-              ))}
-            </div>
+            <DialKeypad onKey={dialKey} t={t} />
             <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16 }}>
               <button type="button" className="u-dial-plus" onClick={() => dialKey('+')}
                 aria-label={t('Plus')} title={t('Plus')}>+</button>

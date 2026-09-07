@@ -2,6 +2,12 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.9.1-vmware.2] - 2026-09-07
+
+### Fixed
+- 待机、通话中与跨页浮窗共用拨号按键，统一尺寸、间距、数字和字母样式。
+- 去掉号码与 DTMF 输入框的占位提示，保留输入内容及可访问名称。
+
 ## [1.9.1-vmware.1] - 2026-09-07
 
 ### Added
