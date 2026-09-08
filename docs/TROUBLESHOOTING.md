@@ -330,6 +330,18 @@ Engine。页面恢复后需重新登录。若任务没有被接取或失败，�
 
 ## 14. VoWiFi、通话和短信
 
+如果切换大疆/Quectel eSIM 后，另一台 SCR Prime 的线路也停止，但 USB、PC/SC 与卡仍可见，
+先检查是否残留旧的三路 VPCD 读卡器绑定。旧版本从 modem 转到 native reader 时只更新了 USB
+端口和索引，没有清除 `pin_reader`、`swu_reader`、`ami_reader`；eSIM 停线范围因此可能误含
+已迁移到 SCR 的线路。新启用的 profile 若仍引用旧 USB 路径，还可能在自动重新绑定前被旧桥接
+元数据误判为 `card_mismatch`。
+
+`1.9.1-vmware.4` 在启动与身份/PIN 校验前按当前 SIM 证据刷新绑定，转到 native reader 时
+原子清除遗留的 modem 三路覆盖；eSIM 停线以当前实际读卡器归属为准。旧 metadata 文件可保留
+用于历史设备记录，但不存在的读卡器不能提供当前卡冲突证据。多个设备同时报告相同 SIM 身份
+时停止操作，不自动猜选。通过 `sudo mddctl update` 更新后由正常发现、启动流程修正已有记录，
+不要手工编辑运行配置或删除 SIM/线路数据。
+
 如果国家出口测试的 DNS 与 STUN 目标全部超时，但同一节点的 TCP 连接正常，先区分临时节点
 测试和常驻的 sing-box → Xray bridge。Xray-backed REALITY/XHTTP 出口应在 TUN 启动前经
 宿主直连 TCP DNS 固定节点拨号 IPv4，并继续保留原始 REALITY/TLS server name；旧实现让

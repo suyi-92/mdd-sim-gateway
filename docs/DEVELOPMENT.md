@@ -146,6 +146,10 @@ NODE_PATH=/tmp/mdd-device-ui-check/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/md
 
 ## 上游 1.9.1 集成回归
 
+`tests/test_reader_binding_recovery.py` 复现“原生 SCR 遗留 modem 三路绑定，同时另一 modem
+切换 eSIM”的隔离场景。覆盖启动前迁移、native 覆盖清理、只读身份检查、eSIM 自动恢复、
+旧离线桥接元数据、实际错卡和跨设备身份歧义；持久化测试确认 PIN、线路凭据、端口和路由均保留。
+
 管理员恢复与迁移包的行为测试位于 `tests/test_admin_recovery_transfer.py`，覆盖认证回滚、
 会话撤销、两个隔离数据目录之间的 SQLite 迁移、导入不触发恢复、鉴权/CSRF 和传输中断清理。
 复用上节的 Playwright 环境运行 `tests/webui_backup_transfer_browser.cjs`，检查导出下载、导入、

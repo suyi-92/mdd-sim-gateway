@@ -748,17 +748,19 @@ def _free_instance_name(data: dict, name: str, iid: str) -> str:
     return f"{name} ({iid})"      # ids are unique, so this always terminates
 
 
-def upsert_instance(inst: dict, unique_name: bool = False) -> dict:
+def upsert_instance(inst: dict, unique_name: bool = False, *,
+                    clear_modem_readers: bool = False) -> dict:
     """Create or update one line. `unique_name` marks the name as GENERATED, letting this
     function append a counter when it collides; an operator's explicit rename is never
     silently altered — the API rejects that instead. Holding the lock across the whole
     read-modify-write keeps two concurrent hotplug creations from choosing the same name
     (or index) after both read a config that still lacked the other."""
     with _lock:
-        return _upsert_instance_locked(inst, unique_name)
+        return _upsert_instance_locked(inst, unique_name, clear_modem_readers=clear_modem_readers)
 
 
-def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
+def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
+                            clear_modem_readers: bool = False) -> dict:
     data = load()
     iid = str(inst["id"])
     # Runtime-only fields sometimes ride along on the instance object (the API returns
@@ -805,6 +807,11 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     if (subscriber_changed or carrier_changed) and "ims_home_domain" not in inst:
         inst["ims_home_domain"] = ""
     merged = {**existing, **inst}
+    if clear_modem_readers:
+        # Internal, identity-proven migration to a native reader. Remove keys atomically;
+        # an ordinary partial save must still preserve the three modem channel bindings.
+        for field in ("pin_reader", "swu_reader", "ami_reader"):
+            merged.pop(field, None)
     # Production Asterisk debug can expose complete SIP messages and subscriber identities.
     # Diagnostic SIP logging is enabled briefly at runtime by the dedicated number-learning
     # flow instead; it must never be persisted on a line.

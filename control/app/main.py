@@ -223,6 +223,7 @@ def _live_modem_binding_for_instance(inst: dict) -> dict:
     wanted = str(inst.get("iccid") or "").strip()
     if not wanted:
         return {}
+    bindings = {}
     for path in sorted(glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json"))):
         try:
             with open(path, encoding="utf-8") as handle:
@@ -236,8 +237,70 @@ def _live_modem_binding_for_instance(inst: dict) -> dict:
             continue
         binding = _modem_reader_binding(f"VoWiFi Modem {hardware_id} 00 00")
         if binding:
-            return binding
-    return {}
+            observed = [card for card in hub.cards.values()
+                        if device_state.vpcd_modem_hardware_id(card.get("name")) == hardware_id]
+            if observed and not any(card.get("present") for card in observed):
+                continue
+            bindings[hardware_id] = binding
+    if len(bindings) > 1:
+        _raise_ambiguous_reader_binding()
+    return next(iter(bindings.values()), {})
+
+
+def _raise_ambiguous_reader_binding() -> None:
+    raise HTTPException(409, {
+        "code": "card_mismatch",
+        "message": "More than one connected device reports this SIM; its reader binding is ambiguous.",
+    })
+
+
+def _live_native_binding_for_instance(inst: dict) -> dict:
+    """Use a positive card identity and current reader enumeration, never an old index."""
+    wanted = str(inst.get("iccid") or "")
+    candidates = {str(card.get("name")): card for card in hub.cards.values()
+                  if wanted and card.get("present") and card.get("iccid") == wanted
+                  and card.get("name") and not str(card["name"]).startswith("Virtual PCD")
+                  and not device_state.vpcd_modem_hardware_id(card["name"])}
+    if not candidates:
+        return {}
+    try:
+        names = sim.list_readers()
+    except Exception:
+        return {}
+    candidates = {name: card for name, card in candidates.items() if name in names}
+    if len(candidates) > 1:
+        _raise_ambiguous_reader_binding()
+    if not candidates:
+        return {}
+    name, card = next(iter(candidates.items()))
+    return {"reader_index": names.index(name), "reader_port": str(card.get("reader_port") or "")}
+
+
+def _has_modem_reader_overrides(inst: dict) -> bool:
+    return any(device_state.vpcd_modem_hardware_id(inst.get(key))
+               for key in ("pin_reader", "swu_reader", "ami_reader"))
+
+
+def _refresh_instance_reader_binding(inst: dict, *, persist: bool = True) -> dict:
+    """Resolve ownership before PIN/identity guards and before every Engine start."""
+    native = _live_native_binding_for_instance(inst)
+    modem = _live_modem_binding_for_instance(inst)
+    if native and modem:
+        _raise_ambiguous_reader_binding()
+    binding = native or modem
+    clear = bool(native and _has_modem_reader_overrides(inst))
+    if not binding or (not clear and all(inst.get(key) == value for key, value in binding.items())):
+        return inst
+    if not persist:
+        resolved = {**inst, **binding}
+        if clear:
+            for key in ("pin_reader", "swu_reader", "ami_reader"):
+                resolved.pop(key, None)
+        return resolved
+    update = {"id": str(inst["id"]), **binding}
+    if clear:
+        return cfg.upsert_instance(update, clear_modem_readers=True)
+    return cfg.upsert_instance(update)
 
 
 def _bootstrap_saved_modem_cards() -> list[str]:
@@ -617,11 +680,7 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
         # serial-less modems are moved/re-enumerated, that live name may now belong to the
         # other card. Reusing it sends the carrier's AKA challenge to the wrong USIM
         # (typically SW=9862) and creates an endless reg_rejected rebuild loop.
-        binding = _live_modem_binding_for_instance(inst)
-        if binding and any(inst.get(key) != value for key, value in binding.items()):
-            log.warning("instance %s: correcting modem reader binding before %s start",
-                        inst.get("id"), reason)
-            inst = cfg.upsert_instance({"id": str(inst["id"]), **binding})
+        inst = _refresh_instance_reader_binding(inst)
         # A line follows its SIM; its device identity follows the physical modem/reader
         # currently holding that SIM. Refresh the rendered snapshot on every start.
         inst = _apply_current_hardware_imei(inst)
@@ -784,8 +843,12 @@ async def _on_card_insert(name, idx):
             else:
                 update.update(reader_index=idx,
                               reader_port=str(info.get("reader_port") or ""))
-            if any(inst.get(key) != value for key, value in update.items() if key != "id"):
-                inst = await asyncio.to_thread(cfg.upsert_instance, update)
+            clear = not modem_identity and _has_modem_reader_overrides(inst)
+            if clear or any(inst.get(key) != value for key, value in update.items() if key != "id"):
+                if clear:
+                    inst = await asyncio.to_thread(cfg.upsert_instance, update, clear_modem_readers=True)
+                else:
+                    inst = await asyncio.to_thread(cfg.upsert_instance, update)
         elif info.get("iccid") and cfg.card_auto_create_suppressed(info["iccid"]):
             # The user explicitly deleted this SIM line while the card was still inserted.
             # Keep it visibly unconfigured, but do not immediately recreate the record behind
@@ -2966,12 +3029,21 @@ def _esim_modem_reader_names(
 def _esim_instance_uses_modem(inst: dict, hardware_id: str) -> bool:
     if not hardware_id:
         return False
-    if str(inst.get("imei_source_device_id") or "") == hardware_id:
-        return True
     iid = str(inst.get("id") or "")
-    if iid and any(str(card_info.get("matched") or "") == iid
-                   and device_state.vpcd_modem_hardware_id(card_info.get("name")) == hardware_id
-                   for card_info in hub.cards.values()):
+    wanted = str(inst.get("iccid") or "")
+    owners = {device_state.vpcd_modem_hardware_id(card.get("name")) or "native-reader"
+              for card in hub.cards.values() if card.get("present") and card.get("name")
+              and ((wanted and str(card.get("iccid") or "") == wanted)
+                   or (iid and str(card.get("matched") or "") == iid))}
+    if len(owners) > 1:
+        _raise_ambiguous_reader_binding()
+    if owners:
+        return owners == {hardware_id}
+    # A native USB port is stronger evidence than channel names left over from a modem.
+    # While card identity is unavailable, don't stop another reader on that stale claim.
+    if inst.get("reader_port"):
+        return False
+    if str(inst.get("imei_source_device_id") or "") == hardware_id:
         return True
     return any(device_state.vpcd_modem_hardware_id(inst.get(key)) == hardware_id
                for key in ("pin_reader", "swu_reader", "ami_reader"))
@@ -2982,9 +3054,9 @@ async def _esim_prepare_profile_switch(hardware_id: str) -> dict[str, dict]:
     previous: dict[str, dict] = {}
     if not hardware_id:
         return previous
-    for inst in cfg.list_instances():
-        if not _esim_instance_uses_modem(inst, hardware_id):
-            continue
+    affected = [inst for inst in cfg.list_instances()
+                if _esim_instance_uses_modem(inst, hardware_id)]
+    for inst in affected:
         iid = str(inst["id"])
         running = await asyncio.to_thread(engine.is_running, iid)
         previous[iid] = {"enabled": bool(inst.get("enabled", True)), "running": running}
@@ -3162,6 +3234,7 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
         missing = ", ".join(target.get("auto_provision_missing") or [])
         raise HTTPException(
             409, f"the active eSIM profile still needs line configuration: {missing}")
+    target = await asyncio.to_thread(_refresh_instance_reader_binding, target)
     target = await asyncio.to_thread(
         cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
     egress.publish()
@@ -3388,7 +3461,7 @@ def _reader_index_for_instance(inst: dict) -> int | None:
         for c in hub.cards.values():
             if c.get("name") == swu_name:
                 return c.get("index")
-    if "pin_reader" in inst and "ami_reader" in inst:
+    if inst.get("pin_reader") and inst.get("ami_reader"):
         try:
             return int(inst.get("reader_index", 1))
         except (TypeError, ValueError):
@@ -3435,11 +3508,19 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
     want = (inst.get("iccid") or "").strip()
     if not want:
         return None
+    try:
+        inst = _refresh_instance_reader_binding(inst, persist=False)
+    except HTTPException:
+        return {"ambiguous": True}
     # A generated modem reader name can remain live while ownership has changed to the other
     # physical card. Check the bridge's authoritative identity before treating that name as a
     # successful match.
-    modem_identity = _modem_identity_for_reader(
-        inst.get("swu_reader") or inst.get("pin_reader") or inst.get("ami_reader"))
+    bound_name = inst.get("swu_reader") or inst.get("pin_reader") or inst.get("ami_reader")
+    try:
+        live_name = bool(bound_name and bound_name in sim.list_readers())
+    except Exception:
+        live_name = False
+    modem_identity = _modem_identity_for_reader(bound_name) if live_name else None
     modem_iccid = str((modem_identity or {}).get("iccid") or "").strip()
     if modem_iccid and modem_iccid != want:
         return {
@@ -5209,6 +5290,7 @@ async def _start_instance(
     # eSIM-profile-switch guard: never start a line whose reader now holds a different
     # identity — EAP-AKA with mismatched IMSI/keys is guaranteed to be rejected by the
     # carrier (and can burn PIN tries on the wrong profile).
+    inst = await asyncio.to_thread(_refresh_instance_reader_binding, inst)
     mism = _card_identity_mismatch(inst)
     if mism:
         _raise_card_mismatch(inst, mism)
@@ -5280,6 +5362,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
         raise HTTPException(404, "no such instance")
     if body:
         inst = cfg.upsert_instance({"id": str(iid), **body})
+    inst = await asyncio.to_thread(_refresh_instance_reader_binding, inst)
     mism = _card_identity_mismatch(inst)
     if mism:
         _raise_card_mismatch(inst, mism)

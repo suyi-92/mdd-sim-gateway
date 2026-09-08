@@ -507,7 +507,8 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
             "ami_reader": "wrong slot 2", "reader_index": 1,
         }
 
-        mismatch = main._card_identity_mismatch(inst)
+        with patch.object(main.sim, "list_readers", return_value=["wrong slot 1"]):
+            mismatch = main._card_identity_mismatch(inst)
 
         self.assertEqual(mismatch["reader"], "wrong slot 1")
         self.assertEqual(mismatch["iccid"], "wrong-card")
