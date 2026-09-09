@@ -356,6 +356,8 @@ def record_lifecycle(iid: str, event: str, *, reason_code: str = "", **facts) ->
     _append_bounded_jsonl(
         os.path.join(base, "logs", "lifecycle.jsonl"), record, LIFECYCLE_RECORDS,
         _lifecycle_jsonl_lock, create_parent=False)
+    from . import stability
+    stability.event(iid, event, reason_code=reason_code, **facts)
 
 
 def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):

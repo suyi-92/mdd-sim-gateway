@@ -45,6 +45,7 @@ if kind == "runtime":
         b"engine/ami_usim.py",
         b"engine/swu_ike.py",
         b"engine/log_capture.py",
+        b"engine/stability_log.py",
         b"engine/render.py",
         b"engine/notify.py",
         b"engine/entrypoint.sh",

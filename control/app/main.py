@@ -34,6 +34,7 @@ from . import (store, engine, status as status_mod, sim, card, notify_push, lpa,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
 from .version import VERSION
+from . import stability
 from .backup_transfer import router as backup_transfer_router
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -2095,6 +2096,7 @@ async def _poll_instance_status(inst: dict) -> None:
             # applied and the replacement registration has settled.
             st = _with_ims_identity_settling(st)
         hub.status_cache[iid] = st
+        await asyncio.to_thread(stability.sample, inst, st, runtime)
         if held_previous and previous_sampled_at is not None:
             # apply_health(OK) clears health and its related cache bookkeeping. Restore the
             # original authoritative timestamp, never the current poll time, so unknown
@@ -4922,6 +4924,22 @@ def api_system_status():
             "audit_enabled": bool((settings.get("security") or {}).get("audit_enabled", True)),
         },
     }
+
+
+@app.post("/api/diagnostics/client-events")
+async def api_client_diagnostics(request: Request):
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 8192:
+            raise HTTPException(413, "client diagnostics too large")
+    try:
+        count = await asyncio.to_thread(stability.client_events, json.loads(body))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, "invalid client diagnostics") from exc
+    except OSError as exc:
+        raise HTTPException(503, "client diagnostics unavailable") from exc
+    return {"ok": True, "accepted": count}
 
 
 @app.get("/api/system/backups")

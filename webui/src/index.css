@@ -509,3 +509,9 @@ label:has(>.u-toggle) { display:flex; align-items:center; gap:10px; min-height:3
   .u-backup-import { grid-template-columns:minmax(0,1fr) auto; }
   .u-backup-import label { grid-column:1 / -1; }
 }
+
+.u-live { max-width:min(48vw,26rem); min-width:0; }
+.u-live-label { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.u-live.is-stale { display:flex; color:#8a5300; background:#fff4d6; }
+.u-live .u-dot { flex-shrink:0; }
+.u-live.is-stale .u-dot { background:#b36a00; }

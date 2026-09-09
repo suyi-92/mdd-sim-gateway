@@ -576,8 +576,14 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
             continue
 
     # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
+    stability_names = [f"stability-{component}{suffix}.jsonl"
+                       for component in ("ike", "control")
+                       for suffix in ("", *(f".{n}" for n in range(1, 7)))]
+    stability_paths = [path for name in stability_names for path in base.glob(f"*/logs/{name}")]
+    stability_paths.extend(path for name in stability_names if "-control" in name
+                           for path in (Path(cfg.DATA_DIR) / "logs").glob(name))
     paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
-             *base.glob("*/logs/lifecycle.jsonl"),
+             *base.glob("*/logs/lifecycle.jsonl"), *stability_paths,
              *base.glob("*/logs/ike/charon-*.log")]
     for path in sorted(paths):
         try:
@@ -590,8 +596,10 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
             joined = "\n".join(selected)
             text = redact_jsonl(joined) if path.suffix == ".jsonl" else redact_log(joined)
             iid = path.parents[2].name if path.parent.name == "ike" else path.parent.parent.name
+            if path.parent == Path(cfg.DATA_DIR) / "logs":
+                iid = "webui"
             priority = 50 if path.name == "lifecycle.jsonl" else 40 \
-                if path.name == "diagnostics.jsonl" else 10
+                if path.name == "diagnostics.jsonl" or path.name.startswith("stability-") else 10
             add_candidate(path, f"logs/{iid}-{path.name}", source, source, selected,
                           text, priority)
         except OSError:

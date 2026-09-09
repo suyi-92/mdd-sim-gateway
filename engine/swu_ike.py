@@ -18,6 +18,7 @@ import signal
 import requests
 import hashlib
 import ipaddress
+from stability_log import ike_event as stability_event
 
 # Python 3.14 changed POSIX multiprocessing's default from fork to forkserver.  The SWu data
 # plane workers intentionally inherit the live IKE/crypto state; serialising that state is both
@@ -962,9 +963,9 @@ class swu():
         # on the ePDG (which otherwise stops accepting our ESP => a periodic idle drop). 0 disables
         # (passive only). SWU_CHILD_REKEY_MINUTES is set by render.py from settings.rekey.minutes
         # (default 30 min). We use a UE-initiated make-before-break CREATE_CHILD_SA with PFS
-        # (Telus rejects a no-PFS child rekey with NO_PROPOSAL_CHOSEN); on reject/timeout we fall
-        # back to a supervised re-establish (state_delete + exit -> entrypoint restarts with PIN
-        # verify), i.e. never worse than the pre-rekey behaviour at the same expiry point.
+        # (Telus requires it). An explicit NO_PROPOSAL_CHOSEN permits one no-KE compatibility
+        # attempt per session. Silence is retransmitted verbatim, then supervised re-establishment
+        # restores an unambiguous IKE message-id sequence.
         _rk_min = float(os.environ.get("SWU_CHILD_REKEY_MINUTES", "30") or 30)
         self.child_rekey_period = _rk_min * 60.0 if _rk_min > 0 else 0.0
         self._child_sa_time = None           # time.monotonic() the current CHILD SA was installed
@@ -973,6 +974,10 @@ class swu():
         self._rekey_packet = None            # exact bytes in flight, for verbatim retransmission
         self._rekey_tries = 0                # transmissions of the current request (1 = original)
         self._rekey_retry_at = None          # retry time after an explicit peer rejection
+        self._child_rekey_mode = "pfs"
+        self._rekey_request_mode = "pfs"
+        self._rekey_last_notify = None
+        self._rekey_compat_attempted = False
         self.rekey_response_timeout = float(os.environ.get("SWU_REKEY_TIMEOUT", "10") or 10)
         # RFC 7296 2.1 makes retransmitting an unanswered request the initiator's job. Sending
         # once and giving up treated a single lost packet as a dead peer: measured on this
@@ -1382,6 +1387,8 @@ class swu():
                         self.decode_ike(data[4:])
                     if self.ike_decoded_ok == True:
                         return True
+            stability_event("ike_request_timeout", message_id=self.message_id_request,
+                            attempt=len(schedule), timeout_ms=int(sum(schedule) * 1000))
             return False
         finally:
             try:
@@ -4099,7 +4106,8 @@ class swu():
         base = [list(t) for t in self.sa_list_negotiated_child[0]]   # shallow-copy transforms
         # Drop any existing D_H (defensive) then append the requested group.
         base = [t for t in base if not (len(t) >= 1 and t[0] == D_H)]
-        base.append([D_H, group])
+        if group is not None:
+            base.append([D_H, group])
         return [base]
 
     def _child_sa_list_with_pfs(self):
@@ -4964,28 +4972,32 @@ class swu():
         print('sending CREATE_CHILD_SA (IPSEC)')
 
     def state_ue_rekey_child(self):
-        """Proactive UE-initiated CHILD_SA (ESP) rekey WITH PFS (the periodic-rekey path). Builds a
-        child proposal augmented with MODP_2048, generates a fresh DH keypair, and sends
-        CREATE_CHILD_SA [ SA Ni KEi TSi TSr ]. The response is processed by
-        state_epdg_create_sa_response (ESP branch, which folds in the peer KE when present). On
-        NO_PROPOSAL_CHOSEN / TEMPORARY_FAILURE / no-response the caller (_rekey_tick) falls back to a
-        supervised re-establish."""
-        print('\nSTATE UE STARTED PFS IPSEC REKEY:\n--------------------------')
-        swu_log("proactive CHILD_SA rekey (PFS, MODP_2048): sending CREATE_CHILD_SA")
-        self.sa_list_create_child_sa_child = self._child_sa_list_with_pfs()
-        # Fresh DH keypair for this rekey (group 14).
-        self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(MODP_2048_bit))
-        self.dh_group_num = MODP_2048_bit
+        """Prefer PFS; an authenticated NO_PROPOSAL_CHOSEN may permit one no-KE retry.
+
+        The alternative retains negotiated ESP encryption/integrity and derives fresh keys
+        from the established IKE SA plus nonces (RFC 7296 sections 1.3.3/2.17). It is scoped
+        to this IKE session, never selected after silence or for an IKE rekey.
+        """
+        mode = getattr(self, "_child_rekey_mode", "pfs")
+        self._rekey_request_mode = mode
+        if mode == "pfs":
+            self.sa_list_create_child_sa_child = self._child_sa_list_with_pfs()
+            self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(MODP_2048_bit))
+            self.dh_group_num = MODP_2048_bit
+        else:
+            self.sa_list_create_child_sa_child = self._child_sa_list_with_dh(None)
         self.message_id_request += 1
         self._begin_create_child_request()
         self._create_child_kind = "child"
-        packet = self.create_CREATE_CHILD_SA_CHILD_pfs(0)
-        # Retained so a timeout resends these exact bytes: a retransmission must carry the same
-        # message id, nonce and KE, or the peer sees an unrelated second request.
+        packet = (self.create_CREATE_CHILD_SA_CHILD_pfs(0) if mode == "pfs"
+                  else self.create_CREATE_CHILD_SA_CHILD(0))
         self._rekey_packet = packet
         self._rekey_tries = 1
         self.send_data(packet)
-        print('sending CREATE_CHILD_SA (IPSEC PFS)')
+        stability_event("child_rekey_sent", mode=mode, attempt=1,
+                        message_id=self.message_id_request,
+                        dh_group=MODP_2048_bit if mode == "pfs" else 0)
+        swu_log("proactive CHILD_SA rekey (%s): sending CREATE_CHILD_SA" % mode)
 
     def _begin_create_child_request(self):
         self._create_child_request_id = self.message_id_request
@@ -5023,7 +5035,11 @@ class swu():
             elif i[0] == KE:
                 dh_peer_group = i[1][0]
                 dh_peer_public_key_bytes = i[1][1]
-                self.dh_calculate_shared_key(dh_peer_public_key_bytes)
+                # A no-KE request has no fresh DH private key; reject an unexpected KE
+                # below without calculating against stale material from an earlier exchange.
+                if not (getattr(self, "_rekey_outstanding", False)
+                        and getattr(self, "_rekey_request_mode", "pfs") == "inherited"):
+                    self.dh_calculate_shared_key(dh_peer_public_key_bytes)
                 ke_received = True
 
             elif i[0] == NINR:
@@ -5041,9 +5057,15 @@ class swu():
             if getattr(self, "_create_child_kind", None) == "ike":
                 self._ike_rekey_outstanding = False
                 self._ike_rekey_failed = True
+                stability_event("ike_rekey_rejected", notify_code=int(error_notify),
+                                message_id=getattr(self, "_create_child_request_id", 0))
             else:
                 self._rekey_outstanding = False
                 self._rekey_failed = True
+                self._rekey_last_notify = error_notify
+                stability_event("child_rekey_rejected", notify_code=int(error_notify),
+                                mode=getattr(self, "_rekey_request_mode", "pfs"),
+                                message_id=self.message_id_request)
             return
 
 
@@ -5079,6 +5101,8 @@ class swu():
 
             # Proactive-rekey bookkeeping: restart the IKE SA age clock, clear the in-flight state.
             self._ike_sa_time = time.monotonic()
+            stability_event("ike_rekey_complete",
+                            message_id=getattr(self, "_create_child_request_id", 0))
             self._ike_rekey_outstanding = False
             self._ike_rekey_sent_at = None
             self._ike_rekey_packet = None
@@ -5088,6 +5112,14 @@ class swu():
                 swu_log("next proactive IKE SA rekey in ~%d min" % int(self.ike_rekey_period / 60))
 
         if isESP == True:
+            if (getattr(self, "_rekey_outstanding", False)
+                    and ke_received != (getattr(self, "_rekey_request_mode", "pfs") == "pfs")):
+                self._rekey_outstanding = False
+                self._rekey_failed = True
+                self._rekey_last_notify = INVALID_SYNTAX
+                stability_event("child_rekey_rejected", notify_code=INVALID_SYNTAX,
+                                mode=getattr(self, "_rekey_request_mode", "pfs"))
+                return
             print('received CREATE_CHILD_SA response IPSEC')                
             self.message_id_request += 1    
             self.spi_init_child_old = self.spi_init_child
@@ -5099,7 +5131,7 @@ class swu():
 
 
             # PFS rekey (our proactive path) folds the fresh DH secret into the child keymat;
-            # a no-PFS rekey (ePDG-initiated, no KE) uses SK_d + nonces only.
+            # an accepted no-KE compatibility proposal uses SK_d + fresh nonces only.
             if ke_received:
                 self.generate_keying_material_child_pfs()
             else:
@@ -5142,6 +5174,8 @@ class swu():
             self._rekey_tries = 0
             self._rekey_retry_at = None
             if self.child_rekey_period > 0:
+                stability_event("child_rekey_complete", mode=getattr(self, "_rekey_request_mode", "pfs"),
+                                message_id=getattr(self, "_create_child_request_id", 0))
                 swu_log("CHILD_SA rekey complete; next proactive rekey in ~%d min" %
                         int(self.child_rekey_period / 60))
 
@@ -5239,6 +5273,11 @@ class swu():
         self._rekey_outstanding = False
         self._rekey_sent_at = None
         self._rekey_failed = False
+        self._child_rekey_mode = "pfs"
+        self._rekey_request_mode = "pfs"
+        self._rekey_last_notify = None
+        self._rekey_compat_attempted = False
+        stability_event("session_started", state="CONNECTED", mode="pfs")
         # A reconnect reuses this object, and an in-process reauth restarts the message-id
         # sequence: anything held over from the previous SA's attempt would be retransmitted
         # onto a peer that never saw it.
@@ -5428,6 +5467,8 @@ class swu():
         if idle < self.liveness_period:
             return
         if self._liveness_outstanding >= self.liveness_retries:
+            stability_event("tunnel_down", reason_code="liveness_timeout",
+                            attempt=self._liveness_outstanding, elapsed_ms=int(idle * 1000))
             swu_log("liveness: %d consecutive DPD probes unanswered (~%ds of silence) -> ePDG "
                     "declared dead, tearing down for supervised re-establish" %
                     (self._liveness_outstanding, int(idle)))
@@ -5486,7 +5527,20 @@ class swu():
         # The response handler clears outstanding before returning. Consume its rejection here
         # rather than immediately starting another request because the CHILD SA is already due.
         if getattr(self, "_rekey_failed", False):
+            compatible = (getattr(self, "_rekey_last_notify", None) == NO_PROPOSAL_CHOSEN
+                          and getattr(self, "_rekey_request_mode", "pfs") == "pfs"
+                          and not getattr(self, "_rekey_compat_attempted", False))
+            inherited_rejected = getattr(self, "_rekey_request_mode", "pfs") == "inherited"
             self._rekey_give_up("rejected by the ePDG")
+            if compatible:
+                self._rekey_compat_attempted = True
+                self._child_rekey_mode = "inherited"
+                self._rekey_retry_at = now + 1.0
+                stability_event("child_rekey_fallback", notify_code=NO_PROPOSAL_CHOSEN,
+                                mode="inherited", delay_seconds=1)
+                swu_log("peer rejected PFS CHILD rekey; trying negotiated ESP without extra DH once")
+            elif inherited_rejected:
+                self._child_rekey_mode = "pfs"
             return
 
         # An in-flight rekey we started: handle rejection, retransmission or give-up.
@@ -5497,6 +5551,9 @@ class swu():
                     try:
                         self.send_data(self._rekey_packet)
                         self._rekey_sent_at = now
+                        stability_event("child_rekey_retry", attempt=self._rekey_tries,
+                                        mode=getattr(self, "_rekey_request_mode", "pfs"),
+                                        message_id=self.message_id_request)
                         swu_log("proactive rekey unanswered in %ds; retransmission %d/%d "
                                 "(same message id; the current SA keeps carrying traffic)" %
                                 (int(self.rekey_response_timeout), self._rekey_tries,
@@ -5522,11 +5579,11 @@ class swu():
         if now < due_at:
             return
 
-        # Due: fire a PFS CHILD_SA rekey. A send error leaves the message-id sequence in an
+        # Due: rekey using the current session's accepted mode. A send error leaves the sequence in an
         # unknown state, which the peer would reject for every later request, so that one case
         # still takes the supervised re-establish.
         age = int(now - self._child_sa_time)
-        swu_log("CHILD_SA reached rekey age (~%d min); initiating proactive PFS rekey" % (age // 60))
+        swu_log("CHILD_SA reached rekey age (~%d min); initiating proactive rekey" % (age // 60))
         try:
             self._rekey_failed = False
             self.state_ue_rekey_child()
@@ -5609,6 +5666,7 @@ class swu():
             self.state_ue_create_sa()
             self._ike_rekey_outstanding = True
             self._ike_rekey_sent_at = now
+            stability_event("ike_rekey_sent", attempt=1, message_id=self.message_id_request)
         except Exception as e:
             swu_log("proactive IKE rekey send failed (%r) -> supervised re-establish" % e)
             self._rekey_teardown("ike_rekey_send_error")
@@ -5633,6 +5691,7 @@ class swu():
         """
         self._rekey_outstanding = False
         self._rekey_failed = False
+        self._rekey_last_notify = None
         self._rekey_sent_at = None
         self._rekey_packet = None
         self._rekey_tries = 0
@@ -5643,6 +5702,8 @@ class swu():
     def _rekey_teardown(self, reason_code):
         """Fallback used when a proactive rekey can't complete: best-effort DELETE, publish a
         transient DOWN, and exit so the entrypoint supervisor re-establishes the tunnel."""
+        stability_event("tunnel_down", state="DOWN", reason_code=reason_code,
+                        attempt=getattr(self, "_rekey_tries", 0))
         try:
             self.state_delete(True, kill=False)   # DELETE + tear down SAs; we exit ourselves
         except Exception:

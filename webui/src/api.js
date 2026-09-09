@@ -1,6 +1,53 @@
 // Thin REST + WebSocket client for the manager API (same origin).
+import { boundedRead } from './pollRequest.js'
 const base = ''
 let csrfToken = ''
+const clientEvents = []
+let clientSequence = 0, flushingEvents = false
+const failedPolls = new Set()
+
+function clientEvent(scope, outcome, statusCode, elapsedMs) {
+  clientEvents.push({ scope, outcome, status_code: Number(statusCode) || 0,
+    elapsed_ms: Math.round(elapsedMs), client_epoch: Math.floor(Date.now() / 1000),
+    sequence: ++clientSequence })
+  if (clientEvents.length > 20) clientEvents.splice(10, 1) // Keep the first failure and recent outcomes.
+}
+
+async function flushClientEvents() {
+  if (flushingEvents || !clientEvents.length || !csrfToken) return
+  flushingEvents = true
+  const batch = clientEvents.slice()
+  try {
+    const response = await boundedRead(signal => fetch('/api/diagnostics/client-events', {
+      method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'X-MDD-CSRF-Token': csrfToken },
+      body: JSON.stringify({ events: batch }),
+    }), 5000)
+    if (response.ok) {
+      const acknowledged = batch[batch.length - 1].sequence
+      while (clientEvents.length && clientEvents[0].sequence <= acknowledged) clientEvents.shift()
+    }
+  } catch { /* Keep at most 20 closed-schema records until connectivity returns. */ }
+  finally { flushingEvents = false }
+}
+
+async function poll(scope, path) {
+  const started = performance.now()
+  try {
+    const result = await boundedRead(signal => j('GET', path, undefined, signal))
+    if (['devices', 'cards', 'instances'].includes(scope)
+        && !Array.isArray(result?.[scope]) && !(scope === 'devices' && Array.isArray(result))) {
+      throw Object.assign(new Error('Invalid polling response'), { code: 'invalid_response' })
+    }
+    if (failedPolls.delete(scope)) clientEvent(scope, 'recovered', 200, performance.now() - started)
+    void flushClientEvents()
+    return result
+  } catch (error) {
+    failedPolls.add(scope)
+    clientEvent(scope, ['timeout', 'invalid_response'].includes(error.code) ? error.code : error.status ? 'http' : 'network',
+      error.status, performance.now() - started)
+    throw error
+  }
+}
 
 export function setCsrf(token) { csrfToken = token || '' }
 
@@ -20,8 +67,9 @@ async function transfer(path, file) {
   return file ? response.json() : response.blob()
 }
 
-async function j(method, path, body) {
-  const opt = { method, headers: {} }
+async function j(method, path, body, signal) {
+  const requestCsrf = csrfToken
+  const opt = { method, headers: {}, ...(signal ? { signal } : {}) }
   if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) opt.headers['X-MDD-CSRF-Token'] = csrfToken
   if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body) }
   const r = await fetch(base + path, opt)
@@ -29,9 +77,8 @@ async function j(method, path, body) {
   let data
   try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text } }
   // A non-empty CSRF token means this tab previously had an authenticated session.
-  // Sessions are intentionally memory-only and disappear when the control plane restarts;
-  // notify the app once so it can stop all polling and return to the login screen.
-  if (r.status === 401 && csrfToken) {
+  // Notify the app once if the persisted session has expired or been revoked.
+  if (r.status === 401 && csrfToken && requestCsrf === csrfToken) {
     csrfToken = ''
     window.dispatchEvent(new CustomEvent('mdd-auth-expired'))
   }
@@ -79,7 +126,7 @@ export const api = {
   authPassword: (current_password, new_password) => j('POST', '/api/auth/password', { current_password, new_password }),
   // Unified physical-device control plane. Older deployments may return 404;
   // App.jsx then derives read-only device cards from /api/instances + /api/cards.
-  devices: () => j('GET', '/api/devices'),
+  devices: () => poll('devices', '/api/devices'),
   patchDeviceCapabilities: (id, patch) => j('PATCH', `/api/devices/${encodeURIComponent(id)}/capabilities`, patch),
   deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),
   deviceDiagnostics: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/diagnostics`, {}),
@@ -106,7 +153,7 @@ export const api = {
   testFeishu: (config) => j('POST', '/api/notifications/feishu/test', config || {}),
   notificationDeliveries: (limit = 100) => j('GET', `/api/notifications/deliveries?limit=${limit}`),
   clearNotificationDeliveries: () => j('DELETE', '/api/notifications/deliveries'),
-  systemStatus: () => j('GET', '/api/system/status'),
+  systemStatus: () => poll('system', '/api/system/status'),
   backups: () => j('GET', '/api/system/backups'),
   backupOperation: () => j('GET', '/api/system/backups/operation'),
   createBackup: () => j('POST', '/api/system/backups', {}),
@@ -119,8 +166,8 @@ export const api = {
   restartProgress: () => j('GET', '/api/system/maintenance/restart-progress'),
   supportBundleUrl: '/api/diagnostics/support-bundle',
 
-  instances: () => j('GET', '/api/instances'),
-  cards: () => j('GET', '/api/cards'),
+  instances: () => poll('instances', '/api/instances'),
+  cards: () => poll('cards', '/api/cards'),
   portsSuggest: () => j('GET', '/api/ports/suggest'),
   provision: (body) => j('POST', '/api/provision', body),
   saveInstance: (inst) => j('POST', '/api/instances', inst),
@@ -132,7 +179,7 @@ export const api = {
   clearPin: (id) => j('POST', `/api/instances/${id}/pin/clear`),
   status: (id) => j('GET', `/api/instances/${id}/status`),
   // Recorded VoWiFi up/down timeline; the window follows the accumulated history (max 2 days).
-  lineAvailability: (id) => j('GET', `/api/instances/${id}/availability`),
+  lineAvailability: (id) => poll('availability', `/api/instances/${id}/availability`),
   logs: (id, tail = 300) => j('GET', `/api/instances/${id}/logs?tail=${tail}`),
   register: (id) => j('POST', `/api/instances/${id}/register`),
 

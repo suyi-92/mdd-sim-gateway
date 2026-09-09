@@ -1,5 +1,7 @@
 [global]
 type=global
+; Keep idle IMS TCP connections active through stateful middleboxes; no SIP identity payload.
+keep_alive_interval=30
 allow_sending_180_after_183=yes
 user_agent={{ user_agent }}
 

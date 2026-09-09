@@ -244,6 +244,7 @@ COPY pin_keeper.py   /usr/local/bin/pin_keeper.py
 COPY ami_usim.py     /usr/local/bin/ami_usim.py
 COPY swu_ike.py      /usr/local/bin/swu_ike.py
 COPY log_capture.py  /usr/local/bin/log_capture.py
+COPY stability_log.py /usr/local/bin/stability_log.py
 COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
 COPY templates/      /opt/mdd-sim-gateway/templates/
@@ -255,6 +256,7 @@ RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
 ARG RUNTIME_FP=""
 ARG BASE_FP=""
 ARG MDD_VERSION=""
+ENV MDD_VERSION=${MDD_VERSION}
 LABEL io.mdd-sim-gateway.managed="true" \
       io.mdd-sim-gateway.runtime-fp="${RUNTIME_FP}" \
       io.mdd-sim-gateway.base-fp="${BASE_FP}" \

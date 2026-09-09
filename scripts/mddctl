@@ -27,6 +27,7 @@ usage() {
 Usage:
   mddctl status
   mddctl doctor [--json]
+  mddctl stability [--hours 1-168] [--json]
   mddctl start | stop | restart | logs
   mddctl update [--no-cache] [--dry-run] [--yes]
   mddctl backup [--output PATH]
@@ -449,6 +450,20 @@ cmd_transfer_backup() {
     archive_tool import-bundle "$input" "$BACKUP_DIR"
     info "backup imported and verified; active data is unchanged. Restore it explicitly when ready."
   fi
+}
+
+cmd_stability() {
+  local hours=24
+  local -a options=()
+  while (($#)); do
+    case "$1" in
+      --hours) (($# >= 2)) || die "--hours requires 1-168"; hours=$2; shift 2 ;;
+      --json) options+=(--json); shift ;;
+      *) die "unknown stability option: $1" ;;
+    esac
+  done
+  [[ "$hours" =~ ^[0-9]{1,3}$ ]] && ((10#$hours >= 1 && 10#$hours <= 168)) || die "--hours must be 1-168"
+  python3 "$INSTALL_DIR/scripts/mdd_stability_report.py" --data-dir "$DATA_DIR" --hours "$hours" "${options[@]}"
 }
 
 git_operation_in_progress() {
@@ -995,6 +1010,7 @@ cmd_uninstall() {
 case "$command" in
   status) (($# == 0)) || die "status takes no options"; cmd_status ;;
   doctor) cmd_doctor "$@" ;;
+  stability) cmd_stability "$@" ;;
   start) (($# == 0)) || die "start takes no options"; acquire_lock; start_runtime; health_check || die "start health check failed" ;;
   stop) (($# == 0)) || die "stop takes no options"; acquire_lock; stop_runtime ;;
   restart) (($# == 0)) || die "restart takes no options"; acquire_lock; stop_runtime; start_runtime; health_check || die "restart health check failed" ;;

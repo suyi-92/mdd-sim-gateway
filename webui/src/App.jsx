@@ -103,6 +103,7 @@ export default function App() {
   const [discovering, setDiscovering] = useState(true)
   const [initialLoading, setInitialLoading] = useState(true)
   const [loadErrors, setLoadErrors] = useState({})
+  const [lastDeviceUpdate, setLastDeviceUpdate] = useState(null)
   const [selected, setSelected] = useState(null); const [toast, setToast] = useState(null)
   const [callSelected, setCallSelected] = useState(null)
   const [globalCallLineId, setGlobalCallLineId] = useState(null)
@@ -169,6 +170,7 @@ export default function App() {
       if (devicesResult.status === 'fulfilled') {
         const r=devicesResult.value; const list=Array.isArray(r)?r:(r.devices||[])
         unifiedAvailable.current=true; setDevices(list); setDiscovering(!!r.discovering)
+        setLastDeviceUpdate(Date.now())
       // Compatibility mode is only for an older backend that does not implement the unified
       // endpoint. A transient network failure must not turn every saved line and reader into
       // a temporary "device" until the next poll succeeds.
@@ -189,6 +191,13 @@ export default function App() {
     const load=()=>api.systemStatus().then(status=>setSystemMeta(s=>({...s,...status}))).catch(()=>{})
     load(); const timer=setInterval(load,60*1000); return()=>clearInterval(timer) },[authState?.authenticated])
   useEffect(()=>{ if(!authState?.authenticated)return; const timer=setInterval(refresh,10000); return()=>clearInterval(timer) },[refresh,authState?.authenticated])
+  useEffect(() => {
+    if (!authState?.authenticated) return
+    const resume = () => { if (!document.hidden) refresh() }
+    document.addEventListener('visibilitychange', resume)
+    window.addEventListener('online', resume)
+    return () => { document.removeEventListener('visibilitychange', resume); window.removeEventListener('online', resume) }
+  }, [refresh, authState?.authenticated])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
     if(msg.type==='status'){
@@ -236,7 +245,7 @@ export default function App() {
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>{view !== 'calls' && content}</div></main>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className={`u-live${loadErrors.devices ? " is-stale" : ""}`} role="status" title={lastDeviceUpdate ? t('Last device update: {time}', { time: new Date(lastDeviceUpdate).toLocaleTimeString() }) : undefined}><span className="u-dot" /><span className="u-live-label">{initialLoading?t('Loading…'):loadErrors.devices?t('Device list is out of date; retrying'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</span></div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>{view !== 'calls' && content}</div></main>
     {toast&&<div className="u-toast" key={toast.id} role="status">{toast.message}</div>}
   </div>
 }

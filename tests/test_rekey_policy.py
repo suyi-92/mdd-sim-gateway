@@ -25,7 +25,8 @@ def _load_methods():
         if isinstance(node, ast.FunctionDef) and node.name in WANTED:
             picked.append(node)
     module = ast.Module(body=picked, type_ignores=[])
-    namespace = {"time": __import__("time"), "swu_log": lambda *_a, **_k: None}
+    namespace = {"time": __import__("time"), "swu_log": lambda *_a, **_k: None,
+                 "stability_event": lambda *_a, **_k: None, "NO_PROPOSAL_CHOSEN": 14}
     exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102
     return {name: namespace[name] for name in WANTED}
 
@@ -49,6 +50,10 @@ class FakeTunnel:
         self._rekey_packet = None
         self._rekey_tries = 0
         self._rekey_retry_at = None
+        self._child_rekey_mode = "pfs"
+        self._rekey_request_mode = "pfs"
+        self._rekey_last_notify = None
+        self._rekey_compat_attempted = False
         self.message_id_request = 41
         self._create_child_request_id = None
         self._create_child_response_handled = False
@@ -75,7 +80,8 @@ class FakeTunnel:
     def state_ue_rekey_child(self):
         self.rekeys_started += 1
         self.message_id_request += 1
-        self._rekey_packet = b"rekey-request"
+        self._rekey_request_mode = self._child_rekey_mode
+        self._rekey_packet = b"rekey-request" if self._child_rekey_mode == "pfs" else b"no-ke-request"
         self._rekey_tries = 1
         self.send_data(self._rekey_packet)
 

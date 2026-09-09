@@ -3,6 +3,9 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Device list is out of date; retrying': '设备列表尚未更新，正在重试',
+  'Last device update: {time}': '上次设备更新：{time}',
+  'Request timed out': '请求超时',
   'Export': '导出', 'Import backup': '导入备份', 'Imported backup': '导入的备份',
   'Migration package': '迁移备份包', 'Preparing download…': '正在准备下载…',
   'Download started': '已开始下载', 'Uploading and checking…': '正在上传并校验…',

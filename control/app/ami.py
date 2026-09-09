@@ -41,6 +41,7 @@ class AmiClient:
         self._mgr = Manager(host=self.host, port=self.port,
                             username=self.username, secret=self.secret,
                             ping_delay=15, reconnect_timeout=5)
+        self._mgr.register_event("MDDTransportState", self._stability_event)
         # panoramisk auto-reconnects on connection loss/refusal by scheduling
         # loop.call_later(reconnect_timeout, self.connect); its close() only cancels the
         # pinger, NOT that pending timer — so a Manager whose target container was stopped
@@ -81,6 +82,15 @@ class AmiClient:
                         self.instance_id, action.get("Action"))
             self._connected = False
             raise
+
+    async def _stability_event(self, _manager, message):
+        if self._closed:
+            return
+        from . import stability
+        # Select the closed fields before leaving the AMI callback; never retain a raw event.
+        selected = {key: message.get(key) for key in (
+            "Event", "State", "Protocol", "StatusCode", "DirectionCode")}
+        await asyncio.to_thread(stability.ami_event, self.instance_id, selected)
 
     async def close(self):
         # Mark closed FIRST so any reconnect that panoramisk already scheduled
