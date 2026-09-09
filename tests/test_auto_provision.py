@@ -126,13 +126,14 @@ class AutoProvisionTests(unittest.TestCase):
         live = {"updated_at": 1000, "exits": {"gb": {
             "ready": True, "proxy_host": "127.0.0.1", "proxy_port": 1080,
             "node": "Example node", "interface": "mdd-gb",
+            "config_revision": main.egress.country_exit_revision(settings["proxy"], "gb"),
         }}}
         with patch.object(main.cfg, "get_settings", return_value=settings), \
                 patch.object(main.egress, "publish") as publish, \
                 patch.object(main.egress, "request_test",
                              return_value=("request-token", 1000.25)) as request, \
                 patch.object(main.egress, "status", side_effect=[
-                    {"updated_at": 999, "exits": {}}, live]), \
+                    {"updated_at": 999, "exits": {}}, live, live]), \
                 patch.object(main.egress, "test_udp_proxy", return_value=42), \
                 patch.object(main.egress, "finish_test", return_value=True) as finish:
             result = asyncio.run(main._test_egress_country("gb"))

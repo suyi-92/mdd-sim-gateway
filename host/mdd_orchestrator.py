@@ -89,6 +89,21 @@ def atomic_json(path: Path, value: dict):
     os.replace(tmp, path)
 
 
+def country_exit_revision(proxy: dict, country: str) -> str:
+    """Identify one saved assignment without publishing its link or credentials.
+
+    Ignore unrelated countries/profiles so an idle-host, country-scoped test has the same
+    identity as the full settings document. Include legacy inputs still used by the builder.
+    """
+    exit_cfg = (proxy.get("exits") or {}).get(str(country).lower()) or {}
+    profile = (proxy.get("profiles") or {}).get(str(exit_cfg.get("profile_id") or ""))
+    value = {"enabled": bool(proxy.get("enabled")), "exit": exit_cfg, "profile": profile,
+             "subscription_url": proxy.get("subscription_url"),
+             "refresh_minutes": proxy.get("refresh_minutes"),
+             "existing_singbox_config": proxy.get("existing_singbox_config")}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
 def append_jsonl(path: Path, record: dict, limit: int = 500):
     """Append one bounded diagnostic record, trimming to the newest ``limit`` lines.
 
@@ -2298,6 +2313,8 @@ class Orchestrator:
                     state[country]["pinned_missing"] = bool(pinned_name and not pinned_tag)
             except Exception as exc:
                 state[country] = {"ready": False, "mode": mode, "error": str(exc), "terminal": True}
+        for country, exit_state in state.items():
+            exit_state["config_revision"] = country_exit_revision(proxy, country)
         config = {"log": {"level": "info"}, "inbounds": inbounds,
                   "outbounds": outbounds, "route": {"rules": rules, "auto_detect_interface": True}}
         self.next_xray_config = ({"log": {"loglevel": "warning"},

@@ -394,6 +394,19 @@ def test_proxy_profile(profile: dict, timeout: float = 24.0) -> int:
     via_xray = bool(node and helper.node_needs_xray(node))
     local_port, bridge_port = _free_loopback_port(), _free_loopback_port()
     if via_xray:
+        # Use the same pre-TUN TCP DNS path as the permanent country bridge. Letting the
+        # temporary Xray resolve this name through host UDP/Fake-IP DNS can recurse into
+        # an existing country TUN, making the library test fail while that exit works.
+        original_server = str(node.get("server") or "").strip()
+        node = {**node, "servername": node.get("servername") or original_server}
+        try:
+            node["server"] = str(ipaddress.ip_address(original_server))
+        except ValueError:
+            try:
+                addresses, _ttl = helper.resolve_ipv4_direct_dns_tcp(original_server)
+                node["server"] = addresses[0]
+            except (RuntimeError, ValueError, IndexError) as exc:
+                raise EgressError("proxy node DNS lookup failed before UDP test") from exc
         outbound = {"type": "socks", "tag": "test-out", "version": "5",
                     "server": "127.0.0.1", "server_port": bridge_port}
     else:
@@ -516,6 +529,10 @@ def epdg_for(inst: dict) -> str:
     if not mcc.strip("0") or not mnc.strip("0"):
         return ""
     return f"epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"
+
+
+def country_exit_revision(proxy: dict, country: str) -> str:
+    return _orchestrator_module().country_exit_revision(proxy, country)
 
 
 def desired_document(instances: list[dict], settings: dict) -> dict:

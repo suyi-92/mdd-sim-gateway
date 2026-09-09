@@ -4775,7 +4775,7 @@ async def _test_egress_country(country: str):
                             "country proxy routing is switched off — enable it before testing an exit")
     if not (exits.get(country) or {}).get("enabled", False):
         raise HTTPException(503, f"the {country.upper()} exit is configured but not enabled")
-    baseline_updated_at = float(egress.status().get("updated_at") or 0)
+    revision = egress.country_exit_revision(proxy, country)
     egress.publish()
     try:
         token, _requested_at = await asyncio.to_thread(egress.request_test, country)
@@ -4788,10 +4788,15 @@ async def _test_egress_country(country: str):
         while time.monotonic() < deadline:
             document = egress.status()
             latest = (document.get("exits") or {}).get(country) or {}
-            # Ignore a ready/error snapshot left by an earlier run.  The test request wakes the
-            # orchestrator; its next publication proves the requested temporary exit exists now.
-            fresh = float(document.get("updated_at") or 0) > baseline_updated_at
-            if fresh and latest.get("ready"):
+            # Resolving other lines' ePDGs can delay the next status publication beyond this
+            # request's deadline while this country's listener is already serving traffic.
+            # Match the saved assignment instead of waiting for an unrelated newer timestamp;
+            # the real UDP round trip below must still prove that the listener is alive.
+            matches = latest.get("config_revision") == revision
+            if matches and latest.get("ready"):
+                if egress.country_exit_revision(
+                        cfg.get_settings().get("proxy") or {}, country) != revision:
+                    raise HTTPException(409, "country exit configuration changed during UDP test; test again")
                 host = str(latest.get("proxy_host") or "")
                 port = int(latest.get("proxy_port") or 0)
                 if not host or not port:
@@ -4800,13 +4805,21 @@ async def _test_egress_country(country: str):
                     latency = await asyncio.to_thread(egress.test_udp_proxy, host, port)
                 except egress.EgressError as exc:
                     raise HTTPException(503, str(exc)) from exc
+                confirmed = (egress.status().get("exits") or {}).get(country) or {}
+                if confirmed.get("config_revision") != revision or not confirmed.get("ready") \
+                        or egress.country_exit_revision(
+                            cfg.get_settings().get("proxy") or {}, country) != revision:
+                    raise HTTPException(409, "country exit configuration changed during UDP test; test again")
                 return {"ok": True, "country": country, "node": latest.get("node") or "",
                         "interface": latest.get("interface") or "", "latency_ms": latency}
-            if fresh and latest.get("error"):
+            if matches and latest.get("error"):
                 break
             await asyncio.sleep(.5)
     finally:
         await asyncio.to_thread(egress.finish_test, country, token)
+    if latest.get("config_revision") != revision:
+        raise HTTPException(503, "country exit configuration has not been applied yet; "
+                                 "wait for the host orchestrator and test again")
     raise HTTPException(503, await asyncio.to_thread(
         _egress_not_ready_reason, country, latest))
 
