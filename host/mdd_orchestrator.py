@@ -760,7 +760,7 @@ class Orchestrator:
         self.epdg_fake_dns_reported: set[str] = set()
         # Proxy server names must be resolved before Xray sends UDP through a country TUN.
         # Keep a stable address while it remains in DNS to avoid restarting a healthy exit.
-        self.proxy_server_dns: dict[str, tuple[float, str]] = {}
+        self.proxy_server_dns: dict[str, tuple[float, str, str]] = {}
         # Last node change per country, so the UI can say why the exit is not the pinned one.
         self.exit_last_change: dict[str, dict] = {
             str(country): dict(state["last_change"])
@@ -2059,7 +2059,8 @@ class Orchestrator:
             raise RuntimeError("PyYAML is required for subscription mode")
         return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
 
-    def resolve_proxy_server(self, server: str) -> str:
+    def resolve_proxy_server(self, server: str, *, cache_key: str = "",
+                             revision: str = "") -> str:
         """Return a stable IPv4 dial address while leaving TLS/REALITY naming untouched."""
         server = str(server or "").strip()
         if not server:
@@ -2070,9 +2071,14 @@ class Orchestrator:
             pass
         if self.dry_run:
             return server
-        key = server.lower()
+        key = cache_key or server.lower()
+        identity = f"{server.lower()}:{revision}"
         now = time.time()
         cached = self.proxy_server_dns.get(key)
+        # A replaced link may keep its name/hostname while the VPS address and keys change.
+        # Only an unchanged node may reuse its pin, including the DNS-outage fallback.
+        if cached and cached[2] != identity:
+            cached = None
         if cached and cached[0] > now:
             return cached[1]
         try:
@@ -2084,30 +2090,37 @@ class Orchestrator:
                 "proxy node DNS lookup failed before country TUN activation") from exc
         address = cached[1] if cached and cached[1] in addresses else addresses[0]
         self.proxy_server_dns[key] = (
-            now + max(PROXY_SERVER_DNS_CACHE_TTL, float(ttl)), address)
+            now + max(PROXY_SERVER_DNS_CACHE_TTL, float(ttl)), address, identity)
         return address
 
     def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
         """Register one loopback-only Xray endpoint and return its sing-box detour."""
         if runtime_id not in self._xray_ports:
+            original_server = str(node.get("server") or "").strip()
+            dial_node = dict(node)
+            # xray_outbound falls back to `server` for serverName. Preserve that original
+            # name before replacing only the network dial address with its pinned IPv4.
+            dial_node["servername"] = str(node.get("servername") or original_server)
+            revision = hashlib.sha256(json.dumps(
+                {key: value for key, value in node.items() if key != "name"},
+                sort_keys=True).encode()).hexdigest()
+            dial_node["server"] = self.resolve_proxy_server(
+                original_server, cache_key=runtime_id, revision=revision)
+            inbound_tag, outbound_tag = f"in-{slug(runtime_id)}", f"out-{slug(runtime_id)}"
+            outbound = xray_outbound(dial_node, outbound_tag)
+            # Publish the bridge only after DNS and conversion succeed. Otherwise a second
+            # country sharing this profile could reuse an inbound with no valid outbound.
             # Stable allocation with collision probing. Ports never leave loopback.
             port = 24000 + int(hashlib.sha256(runtime_id.encode()).hexdigest()[:6], 16) % 1000
             used = set(self._xray_ports.values())
             while port in used:
                 port = 24000 + ((port - 23999) % 1000)
             self._xray_ports[runtime_id] = port
-            inbound_tag, outbound_tag = f"in-{slug(runtime_id)}", f"out-{slug(runtime_id)}"
             self._xray_inbounds.append({"listen": "127.0.0.1", "port": port,
                                         "protocol": "socks", "tag": inbound_tag,
                                         "settings": {"auth": "noauth", "udp": True,
                                                      "ip": "127.0.0.1"}})
-            original_server = str(node.get("server") or "").strip()
-            dial_node = dict(node)
-            # xray_outbound falls back to `server` for serverName. Preserve that original
-            # name before replacing only the network dial address with its pinned IPv4.
-            dial_node["servername"] = str(node.get("servername") or original_server)
-            dial_node["server"] = self.resolve_proxy_server(original_server)
-            self._xray_outbounds.append(xray_outbound(dial_node, outbound_tag))
+            self._xray_outbounds.append(outbound)
             self._xray_rules.append({"type": "field", "inboundTag": [inbound_tag],
                                      "outboundTag": outbound_tag})
         return {"type": "socks", "tag": sing_tag, "version": "5",
@@ -2807,6 +2820,12 @@ class Orchestrator:
                     self.log(f"Xray failed; {len(self._xray_countries)} exit(s) affected: {exc}")
                 self.apply_singbox(config)
             else:
+                if self.singbox and self.singbox.poll() is None:
+                    self.singbox.terminate()
+                    try: self.singbox.wait(5)
+                    except subprocess.TimeoutExpired: self.singbox.kill(); self.singbox.wait()
+                self.singbox = None
+                self.last_proxy_fingerprint = ""
                 self.apply_xray(None)
             # Ranking must come first: update_selected_nodes then reports the node this cycle
             # actually settled on, so proxy-status.json never shows the pre-selection default.
