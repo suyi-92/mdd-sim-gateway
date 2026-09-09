@@ -531,6 +531,8 @@ class EpdgFakeIpResolutionTests(unittest.TestCase):
                                      "addresses": ["198.18.2.58"]}}}
         fresh = {"lines": {"2": {"ready": True, "mode": "manual",
                                      "addresses": ["31.94.76.1"]}}}
+        for snapshot in (stale, fresh):
+            snapshot["lines"]["2"]["config_revision"] = egress.country_exit_revision(settings["proxy"], "gb")
         with patch.object(egress, "publish"), \
                 patch.object(egress, "status", side_effect=[stale, fresh]), \
                 patch.object(egress.time, "sleep"):
@@ -543,6 +545,8 @@ class EpdgFakeIpResolutionTests(unittest.TestCase):
         stale = {"lines": {"5": {"ready": True, "mode": "disabled"}}}
         fresh = {"lines": {"5": {"ready": True, "mode": "manual",
                                      "addresses": ["31.94.76.1"]}}}
+        for snapshot in (stale, fresh):
+            snapshot["lines"]["5"]["config_revision"] = egress.country_exit_revision(settings["proxy"], "gb")
         with patch.object(egress, "publish"), \
                 patch.object(egress, "status", side_effect=[stale, fresh]), \
                 patch.object(egress.time, "sleep"):

@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import socket
 
-from . import engine
+from . import engine, egress
 
 LABELS = {
     "STOPPED": "Stopped",
@@ -177,7 +177,10 @@ async def compute(inst: dict, ami_client=None, runtime: dict | None = None) -> d
         # address, not a name. Checking it first used to chart healthy lines as down for a
         # minute whenever the upstream resolver blipped — the ePDG records rotate every ~30s,
         # so they are always a cache miss and always the first names to fail.
-        if not await asyncio.to_thread(resolve_epdg, epdg):
+        # Proxy-routed Engines have a real address pinned by the host. Host DNS cannot
+        # override that applied route and mislabel an unanswered IKE handshake as DNS failure.
+        route = await asyncio.to_thread(egress.confirmed_line_route, inst)
+        if not route and not await asyncio.to_thread(resolve_epdg, epdg):
             # Which resolvers refused the name is the difference between "DNS was down"
             # and knowing whose DNS was down.
             detail["nameservers"] = nameservers()

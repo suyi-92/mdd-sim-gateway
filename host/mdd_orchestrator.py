@@ -97,11 +97,25 @@ def country_exit_revision(proxy: dict, country: str) -> str:
     """
     exit_cfg = (proxy.get("exits") or {}).get(str(country).lower()) or {}
     profile = (proxy.get("profiles") or {}).get(str(exit_cfg.get("profile_id") or ""))
-    value = {"enabled": bool(proxy.get("enabled")), "exit": exit_cfg, "profile": profile,
+    value = {"country": str(country).lower(),
+             "enabled": bool(proxy.get("enabled")), "exit": exit_cfg, "profile": profile,
              "subscription_url": proxy.get("subscription_url"),
              "refresh_minutes": proxy.get("refresh_minutes"),
              "existing_singbox_config": proxy.get("existing_singbox_config")}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def country_connection_revision(proxy: dict, country: str) -> str:
+    """Assignment identity excluding a node's display-only name and URI fragment."""
+    scoped = dict(proxy)
+    profiles = {key: dict(value) for key, value in (proxy.get("profiles") or {}).items()}
+    for profile in profiles.values():
+        profile.pop("name", None)
+        value = profile.get("value")
+        if profile.get("type") == "node" and isinstance(value, str) and "://" in value:
+            profile["value"] = value.split("#", 1)[0].strip()
+    scoped["profiles"] = profiles
+    return country_exit_revision(scoped, country)
 
 
 def append_jsonl(path: Path, record: dict, limit: int = 500):
@@ -776,6 +790,7 @@ class Orchestrator:
         # Proxy server names must be resolved before Xray sends UDP through a country TUN.
         # Keep a stable address while it remains in DNS to avoid restarting a healthy exit.
         self.proxy_server_dns: dict[str, tuple[float, str, str]] = {}
+        self.exit_connection_revisions: dict[str, str] = {}
         # Last node change per country, so the UI can say why the exit is not the pinned one.
         self.exit_last_change: dict[str, dict] = {
             str(country): dict(state["last_change"])
@@ -2161,6 +2176,12 @@ class Orchestrator:
             country = str(country).lower()
             if not re.fullmatch(r"[a-z]{2}", country) or not exit_cfg.get("enabled"):
                 continue
+            connection_revision = country_connection_revision(proxy, country)
+            if self.exit_connection_revisions.get(country) != connection_revision:
+                suffix = f":{COUNTRY_PROXY_LISTEN}:{country_proxy_port(country)}"
+                self.epdg_proxy_dns = {key: value for key, value in self.epdg_proxy_dns.items()
+                                       if not key.endswith(suffix)}
+                self.exit_connection_revisions[country] = connection_revision
             mode = str(exit_cfg.get("mode") or "subscription").lower()
             profile_id = str(exit_cfg.get("profile_id") or "").strip()
             profile = profiles.get(profile_id) if profile_id else None
@@ -2322,10 +2343,10 @@ class Orchestrator:
                                   "outbounds": self._xray_outbounds,
                                   "routing": {"domainStrategy": "AsIs", "rules": self._xray_rules}}
                                  if self._xray_inbounds else None)
-        if any(value.get("mode") == "subscription" and value.get("ready")
+        if any(value.get("mode") != "direct" and value.get("ready")
                for value in state.values()):
-            # Loopback-only: used to resolve urltest's current member tag to the human-readable
-            # node name. It is not exposed on LAN and does not proxy user traffic.
+            # Loopback-only: node selection and scoped cleanup of dead UDP sessions. Manual
+            # nodes need cleanup too, especially after replacing a VPS link in the library.
             config["experimental"] = {"clash_api": {"external_controller": CLASH_API}}
         return config, state
 
@@ -2389,8 +2410,8 @@ class Orchestrator:
             print(f"exit reselect: cannot select {tag} for {country}: {exc}", flush=True)
             return False
 
-    def drop_exit_connections(self, country: str) -> int:
-        """Close the connections currently pinned to a country's exit. Returns how many.
+    def drop_exit_connections(self, country: str) -> int | None:
+        """Close one country's connections; None means the API could not be queried.
 
         sing-box keys a UDP session on its 5-tuple and retires it on an IDLE timeout. A line
         rebuilding its tunnel retransmits IKE every few seconds, and every retransmit refreshes
@@ -2408,9 +2429,10 @@ class Orchestrator:
                 payload = json.load(response) or {}
         except Exception as exc:
             print(f"exit cleanup: cannot list {country.upper()} connections: {exc}", flush=True)
-            return 0
+            return None
         prefix = f"exit-{country}"
         dropped = 0
+        failed = False
         for conn in (payload.get("connections") or []):
             # Match the country's selector and its members ("exit-gb", "exit-gb-0"), never
             # another country whose tag merely starts the same way.
@@ -2428,8 +2450,8 @@ class Orchestrator:
                     dropped += 1
             except Exception:
                 # Already gone, or the API blinked: the next report retries.
-                pass
-        return dropped
+                failed = True
+        return None if failed else dropped
 
     def process_stalled_reports(self, exits_state: dict):
         """Clear a country exit's sessions once the control plane proves they carry nothing.
@@ -2453,11 +2475,24 @@ class Orchestrator:
                 handled_changed = True
                 continue
             state = exits_state.get(country) or {}
-            if not state.get("ready") or state.get("mode") != "subscription":
+            if not state.get("ready") or state.get("mode") not in {"subscription", "manual", "existing"}:
+                continue
+            # A report about the old VPS must not close sessions belonging to a replacement
+            # link with the same display name. Legacy unversioned reports are not evidence.
+            revision = str(entry.get("config_revision") or "")
+            if not revision or revision != state.get("config_revision"):
+                self.handled_stalled[country] = requested_at
+                handled_changed = True
+                continue
+            if self.country_has_connected_line(country):
+                self.handled_stalled[country] = requested_at
+                handled_changed = True
+                continue
+            dropped = self.drop_exit_connections(country)
+            if dropped is None:
                 continue
             self.handled_stalled[country] = requested_at
             handled_changed = True
-            dropped = self.drop_exit_connections(country)
             if dropped:
                 print(f"exit cleanup: closed {dropped} stalled {country.upper()} connection(s) "
                       f"on {state.get('node') or 'the current node'} "
@@ -2466,6 +2501,27 @@ class Orchestrator:
         if handled_changed:
             atomic_json(self.stalled_handled_path,
                         {"version": 1, "countries": self.handled_stalled})
+
+    def country_has_connected_line(self, country: str) -> bool:
+        """Recheck the peer shield when consuming a possibly delayed cleanup request."""
+        for line in read_json(self.desired_path).get("lines") or []:
+            iid = str(line.get("id") or "")
+            if (line.get("country") != country or not line.get("enabled", True)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", iid)):
+                continue
+            observed = read_json(self.data / "instances" / iid / "run" / "swu_status.json")
+            if observed.get("state") != "CONNECTED":
+                continue
+            result = run(["env", "-u", "DOCKER_HOST", "-u", "DOCKER_CONTEXT",
+                          "-u", "DOCKER_TLS", "-u", "DOCKER_TLS_VERIFY", "-u", "DOCKER_CERT_PATH",
+                          "docker", "--host", "unix:///var/run/docker.sock", "ps", "-q",
+                          "--filter", f"name=^/mdd-sim-gateway-engine-{iid}$",
+                          "--filter", "label=io.mdd-sim-gateway.managed=true",
+                          "--filter", "label=io.mdd-sim-gateway.component=engine"])
+            # Missing runtime evidence cannot justify interrupting a connected peer.
+            if result.returncode or result.stdout.strip():
+                return True
+        return False
 
     def rank_and_select(self, country: str, state: dict, avoid: str = "", prefer: str = "") -> str:
         """Measure the candidates and move the selector to the best usable one.
@@ -2729,6 +2785,18 @@ class Orchestrator:
         self.last_xray_fingerprint = fingerprint
 
     def resolve(self, host: str, proxy_host: str = "", proxy_port: int = 0) -> list[str]:
+        key = f"{host}:{proxy_host}:{int(proxy_port)}"
+        now = time.time()
+        cached = self.epdg_proxy_dns.get(key)
+        if cached:
+            # This name already needed the exit resolver. Do not block every reconciliation
+            # on the same failing host DNS again, even before checking the valid cache.
+            if cached[0] > now:
+                return list(cached[1])
+            addresses, ttl = resolve_ipv4_via_socks_doh(
+                host, proxy_host, int(proxy_port), EPDG_DOH_TIMEOUT)
+            self.epdg_proxy_dns[key] = (now + max(15.0, ttl), list(addresses))
+            return list(addresses)
         result = set()
         system_error = None
         try:

@@ -142,7 +142,7 @@ class DropConnectionsTests(unittest.TestCase):
 
     def test_an_unreachable_api_drops_nothing_and_does_not_raise(self):
         with patch.object(self.orch.urllib.request, "urlopen", side_effect=OSError("refused")):
-            self.assertEqual(self._agent().drop_exit_connections("gb"), 0)
+            self.assertIsNone(self._agent().drop_exit_connections("gb"))
 
 
 class PrincipleTests(unittest.TestCase):

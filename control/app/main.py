@@ -516,6 +516,9 @@ class Hub:
         # Per-line exit failover ledger. Persisted: a control-plane restart must not
         # re-announce a give-up it already reported, nor re-walk an exhausted pool.
         self.exit_ledgers: dict[str, dict] = _load_exit_ledgers()
+        self.egress_updates: dict[str, dict] = {}
+        self.egress_rebuilding: set[str] = set()
+        self.event_loop: asyncio.AbstractEventLoop | None = None
         self.health: dict[str, dict] = {}    # per-instance retry/health tracking
         # Kept outside health: a successful registration resets health, but must not erase the
         # anti-churn interval for the next stale-session failure on the replacement container.
@@ -1930,9 +1933,14 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         swu, retransmits = "", 0
     verdict = failover.classify(swu, retransmits, stable_for,
                                 egress.RESELECT_MIN_STABLE_SECONDS)
-    was_backing_off = bool((hub.exit_ledgers.get(iid) or {}).get("exhausted"))
-    action, ledger = failover.record(hub.exit_ledgers.get(iid), verdict, node,
+    revision = egress.country_connection_revision(cfg.get_settings().get("proxy") or {}, country)
+    previous = hub.exit_ledgers.get(iid) or {}
+    if previous.get("config_revision") != revision:
+        previous = {}
+    was_backing_off = bool(previous.get("exhausted"))
+    action, ledger = failover.record(previous, verdict, node,
                                      pinned, candidates, peer_registered=peer_registered)
+    ledger["config_revision"] = revision
     hub.exit_ledgers[iid] = ledger
     _save_exit_ledgers()
     log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%d "
@@ -1959,7 +1967,9 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         # pin, and the peer check above means no sibling line is registered over this exit, so
         # nothing that currently works is torn down.
         try:
-            egress.report_stalled_exit(country, node, f"health-freeze:{st['reason_code']}", iid)
+            egress.report_stalled_exit(
+                country, node, f"health-freeze:{st['reason_code']}", iid,
+                config_revision=str(exits.get("config_revision") or ""))
         except Exception as exc:  # noqa
             log.debug("stalled-exit report failed for line %s: %r", iid, exc)
     # Independent of the branch above, not an alternative to it: closing dead sessions and
@@ -2024,6 +2034,94 @@ async def cellular_sms_poller():
         await asyncio.sleep(5)
 
 
+def _queue_saved_proxy_change(previous: dict) -> None:
+    # Worker-thread responses may complete out of order. Always queue the latest durable
+    # settings once this callback reaches the control event loop.
+    _queue_changed_country_exits(previous, cfg.get_settings().get("proxy") or {})
+
+
+def _queue_changed_country_exits(previous: dict, current: dict) -> None:
+    """A saved link change invalidates only the lines and failure history using that exit."""
+    changed = False
+    for inst in cfg.list_instances():
+        iid, country = str(inst["id"]), egress.line_country(inst)
+        if not country:
+            continue
+        if egress.country_connection_revision(previous, country) == \
+                egress.country_connection_revision(current, country):
+            if iid in hub.egress_updates:
+                # A display-only save must not strand an already pending connection edit.
+                hub.egress_updates[iid]["revision"] = egress.country_exit_revision(current, country)
+            continue
+        changed = hub.exit_ledgers.pop(iid, None) is not None or changed
+        hub.ok_since.pop(iid, None)
+        health = hub.health_for(iid)
+        # A node edit is not permission to retry a blocked/wrong SIM PIN or enable a line.
+        if (not inst.get("enabled", True)
+                or health.get("frozen_code") in {"pin_wrong", "pin_invalid", "pin_blocked", "pin_required"}
+                or (current.get("enabled") and not
+                    ((current.get("exits") or {}).get(country) or {}).get("enabled"))):
+            hub.egress_updates.pop(iid, None)
+            continue
+        hub.egress_updates[iid] = {
+            "revision": egress.country_exit_revision(current, country),
+            "running": False, "retry_at": 0.0,
+        }
+    if changed:
+        _save_exit_ledgers()
+
+
+async def _apply_changed_country_exit(iid: str, ticket: dict) -> None:
+    """Rebuild through the ordinary identity/PIN/route gates, retaining a newer queued edit."""
+    if iid in hub.egress_rebuilding or iid in hub._learning or hub.health_for(iid).get("auto_retrying"):
+        ticket.update(running=False, retry_at=time.monotonic() + 2)
+        return
+    hub.egress_rebuilding.add(iid)
+    try:
+        inst = await asyncio.to_thread(cfg.get_instance, iid)
+        if not inst or not _line_auto_start_allowed(inst)[0]:
+            if hub.egress_updates.get(iid) is ticket:
+                hub.egress_updates.pop(iid, None)
+            return
+        settings = await asyncio.to_thread(cfg.get_settings)
+        country = egress.line_country(inst)
+        if (hub.egress_updates.get(iid) is not ticket
+                or egress.country_exit_revision(settings.get("proxy") or {}, country)
+                != ticket["revision"]):
+            return
+        runtime = await hub.runtime.get(iid, force=True)
+        if runtime.get("running"):
+            ami = await hub.ami_for(iid, runtime)
+            channels = await ami.active_channel_count() if ami else None
+            # Let a live call finish. Unknown AMI on an established tunnel is not zero calls.
+            if channels or (channels is None and await asyncio.to_thread(engine.tunnel_installed, iid)):
+                ticket["retry_at"] = time.monotonic() + 5
+                return
+        await _start_instance(iid, health_reason="maintenance_rebuild",
+                              engine_reason="country-exit-updated")
+        hub.runtime.invalidate(iid)
+        if hub.egress_updates.get(iid) is ticket:
+            hub.egress_updates.pop(iid, None)
+        _record_lifecycle(iid, "recovery_succeeded", "maintenance_rebuild", card_present=True)
+    except Exception as exc:
+        code = _recovery_failure_code(exc)
+        ticket["retry_at"] = time.monotonic() + 30
+        blocked = (code in {"pin_required", "pin_invalid", "pin_wrong", "pin_blocked",
+                     "card_mismatch", "no_card", "card_unreadable", "line_limit"}
+                and hub.egress_updates.get(iid) is ticket)
+        if blocked:
+            hub.egress_updates.pop(iid, None)
+            health = hub.health_for(iid)
+            health.update(frozen_code=code, next_retry_at=None,
+                          frozen_reason="SIM or line configuration requires attention before starting.")
+        _record_lifecycle(iid, "recovery_cancelled" if blocked else "recovery_failed", code,
+                          delay_seconds=0 if blocked else 30)
+        log.warning("saved country exit update could not start line %s (%s)", iid, code)
+    finally:
+        ticket["running"] = False
+        hub.egress_rebuilding.discard(iid)
+
+
 async def _poll_instance_status(inst: dict) -> None:
     """Sample one line in the background; slow carrier state never blocks HTTP pages."""
     iid = str(inst["id"])
@@ -2042,6 +2140,7 @@ async def _poll_instance_status(inst: dict) -> None:
             if current and current.get("enabled", True):
                 inst = current
             else:
+                hub.egress_updates.pop(iid, None)
                 if runtime["running"]:
                     await asyncio.to_thread(engine.stop, iid)
                     await hub.drop_ami(iid)
@@ -2056,7 +2155,17 @@ async def _poll_instance_status(inst: dict) -> None:
                 await hub.broadcast({"type": "status", "instance": iid, **stopped})
                 return
         ami = await hub.ami_for(iid, runtime)
-        st = await status_mod.compute(inst, ami, runtime)
+        update = hub.egress_updates.get(iid)
+        if update:
+            if not update["running"] and time.monotonic() >= update["retry_at"]:
+                update["running"] = True
+                asyncio.create_task(_apply_changed_country_exit(iid, update))
+            st = {"state": "REGISTERING", "label": "Applying saved country exit",
+                  "reason_code": "maintenance_rebuild",
+                  "reason": "Applying the saved proxy configuration and rebuilding the VoWiFi line.",
+                  "detail": {"registration": "unknown"}, "retry": {"count": 0, "max": 0}}
+        else:
+            st = await status_mod.compute(inst, ami, runtime)
         registration = str((st.get("detail") or {}).get("registration") or "unknown")
         previous = hub.status_cache.get(iid)
         previous_sampled_at = hub.status_sampled_at.get(iid)
@@ -2065,7 +2174,7 @@ async def _poll_instance_status(inst: dict) -> None:
         # A single management timeout is not evidence that a known-good registration vanished.
         # Hold the last confirmed OK briefly, but never refresh that timestamp from unknown
         # samples: a dead Asterisk must become unhealthy after the bounded grace period.
-        if (st.get("state") == "REGISTERING" and registration == "unknown"
+        if (not update and st.get("state") == "REGISTERING" and registration == "unknown"
                 and (previous or {}).get("state") == "OK"
                 and observed_at - hub.status_sampled_at.get(iid, 0) <= STATUS_OK_GRACE_SECONDS
                 and runtime["running"]):
@@ -2087,7 +2196,7 @@ async def _poll_instance_status(inst: dict) -> None:
         if st["state"] == "OK":
             asyncio.create_task(_maybe_run_keepalive(iid, inst))
         st = _with_status_activity(
-            iid, apply_health(iid, inst, st, runtime.get("container_id")))
+            iid, st if update else apply_health(iid, inst, st, runtime.get("container_id")))
         if identity_settling:
             # The first IMS registration is operationally healthy, but it may reveal the
             # authoritative telephone identity only after Asterisk is already online. The
@@ -2138,7 +2247,7 @@ def _with_status_activity(iid: str, st: dict) -> dict:
     retrying = bool(health.get("auto_retrying"))
     remaining = st.get("automatic_retry_in")
 
-    if retrying:
+    if retrying or st.get("reason_code") == "maintenance_rebuild":
         current = "Rebuilding the VoWiFi line automatically"
         next_action = "The SIM will be read again, then ePDG and IMS will reconnect."
     elif st.get("frozen") and remaining:
@@ -2488,6 +2597,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    hub.event_loop = asyncio.get_running_loop()
     store.init()
     # A lowered operator limit may leave more saved or running lines than currently allowed.
     # Keep every saved record, but stop excess engines before background recovery begins.
@@ -2527,6 +2637,7 @@ async def lifespan(app: FastAPI):
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
+    hub.event_loop = None
     poller.cancel()
     monitor.cancel()
     sms_poller.cancel()
@@ -4591,6 +4702,7 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_put_settings(body: dict):
+    previous_proxy = (cfg.get_settings().get("proxy") or {}) if "proxy" in body else None
     body = {key: (cfg.clean_notification_events(value)
                   if key in {"webhook", "telegram", "pushplus", "feishu"}
                   and isinstance(value, dict) else value)
@@ -4711,6 +4823,14 @@ def api_put_settings(body: dict):
     if defaults is not None:
         device_state.set_defaults(**defaults)
     egress.publish(settings=saved)
+    if previous_proxy is not None:
+        # FastAPI invokes this synchronous endpoint on a worker thread. Keep the shared
+        # health ledger and rebuild queue on the poller's event loop.
+        if hub.event_loop is not None and hub.event_loop.is_running():
+            hub.event_loop.call_soon_threadsafe(
+                _queue_saved_proxy_change, previous_proxy)
+        else:
+            _queue_changed_country_exits(previous_proxy, saved.get("proxy") or {})
     return {key: value for key, value in saved.items() if key != "system_name"}
 
 

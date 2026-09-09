@@ -535,6 +535,32 @@ def country_exit_revision(proxy: dict, country: str) -> str:
     return _orchestrator_module().country_exit_revision(proxy, country)
 
 
+def country_connection_revision(proxy: dict, country: str) -> str:
+    return _orchestrator_module().country_connection_revision(proxy, country)
+
+
+def confirmed_line_route(inst: dict, settings: dict | None = None) -> dict | None:
+    """Read the current assignment's resolved route without a host DNS query."""
+    settings = cfg.get_settings() if settings is None else settings
+    proxy = settings.get("proxy") or {}
+    country = line_country(inst)
+    if not proxy.get("enabled") or not country:
+        return None
+    route = (status().get("lines") or {}).get(str(inst.get("id"))) or {}
+    if (not route.get("ready") or route.get("mode") in {"disabled", "direct", "legacy"}
+            or route.get("config_revision") != country_exit_revision(proxy, country)
+            or route.get("epdg") != epdg_for(inst)
+            or route.get("interface") != f"mdd-{country}"):
+        return None
+    try:
+        addresses = route.get("addresses") or []
+        if not addresses or not all(ipaddress.IPv4Address(str(ip)).is_global for ip in addresses):
+            return None
+    except ipaddress.AddressValueError:
+        return None
+    return route
+
+
 def desired_document(instances: list[dict], settings: dict) -> dict:
     proxy = deepcopy(settings.get("proxy") or {})
     lines = []
@@ -646,7 +672,8 @@ def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:
     return country
 
 
-def report_stalled_exit(country: str, node: str, reason: str, line: str) -> bool:
+def report_stalled_exit(country: str, node: str, reason: str, line: str, *,
+                        config_revision: str = "") -> bool:
     """Tell the host this country's exit is holding connections that carry nothing.
 
     Deliberately weaker than request_reselect: that one says "this node is bad, move off it",
@@ -670,7 +697,8 @@ def report_stalled_exit(country: str, node: str, reason: str, line: str) -> bool
     if not isinstance(countries, dict):
         countries = {}
     countries[country] = {"ts": time.time(), "reason": str(reason or ""),
-                          "node": str(node or ""), "line": str(line or "")}
+                          "node": str(node or ""), "line": str(line or ""),
+                          "config_revision": str(config_revision or "")}
     _atomic_json(_STALLED, {"version": 1, "countries": countries})
     return True
 
@@ -695,10 +723,18 @@ def ensure_line(inst: dict, settings: dict, timeout: float = 18.0) -> dict:
         raise EgressError(f"no enabled proxy exit configured for country {country.upper()}")
     deadline = time.monotonic() + max(1.0, timeout)
     iid = str(inst.get("id", ""))
+    revision = country_exit_revision(proxy, country)
     last = {}
     while time.monotonic() < deadline:
         state = status()
         last = (state.get("lines") or {}).get(iid) or {}
+        if last.get("mode") == "disabled" and not inst.get("enabled", True):
+            return last
+        if (last.get("config_revision") != revision
+                or (last.get("epdg") and last.get("epdg") != epdg_for(inst))):
+            last = {"error": "country exit has not applied the current line configuration yet"}
+            time.sleep(0.4)
+            continue
         if last.get("ready"):
             mode = str(last.get("mode") or "")
             if mode in {"direct", "legacy"}:
