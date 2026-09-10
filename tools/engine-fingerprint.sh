@@ -46,6 +46,7 @@ if kind == "runtime":
         b"engine/swu_ike.py",
         b"engine/log_capture.py",
         b"engine/stability_log.py",
+        b"engine/asterisk_supervisor.py",
         b"engine/render.py",
         b"engine/notify.py",
         b"engine/entrypoint.sh",
@@ -64,7 +65,7 @@ else:
         raise SystemExit("engine/Dockerfile is not managed by Git")
     add_file(dockerfile)
     digest.update(f"pcsc={pcsc_version}\n".encode())
-    for relative in tracked_files("engine/patches", "engine/asterisk-keep-modules.txt",
+    for relative in tracked_files("engine/patches", "engine/native", "engine/asterisk-keep-modules.txt",
                                   "tools/engine-modules.py"):
         add_file(relative)
 

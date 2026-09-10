@@ -558,6 +558,10 @@ def main():
         print(f"AuthRequest: Algorithm={algo}")
         started = time.monotonic()
         res, ck, ik, auts = read_res_ck_ik(cfg_reader, rand, autn)
+        from stability_log import record
+        from pathlib import Path
+        record(Path("/logs"), "asterisk", "ims_auth", auth_elapsed_ms=round((time.monotonic() - started) * 1000),
+               auth_state="AUTH_OK" if res is not None else "AUTH_FAIL")
         print("SIM authentication response prepared in %d ms" %
               round((time.monotonic() - started) * 1000), flush=True)
         if res is not None:

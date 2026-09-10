@@ -16,8 +16,8 @@ INSERT = '''\tstruct ao2_container *transports;
 \t}
 \tif (mdd_state && PJSIP_TRANSPORT_IS_RELIABLE(transport)) {
 \t\tmanager_event(EVENT_FLAG_SYSTEM, "MDDTransportState",
-\t\t\t"State: %s\\r\\nProtocol: %s\\r\\nStatusCode: %d\\r\\nDirectionCode: %d\\r\\n",
-\t\t\tmdd_state, transport->type_name, info ? (int) info->status : 0, (int) transport->dir);
+\t\t\t"State: %s\\r\\nProtocol: %s\\r\\nStatusCode: %d\\r\\nDirectionCode: %d\\r\\nProcessId: %ld\\r\\nTransportId: %p\\r\\n",
+\t\t\tmdd_state, transport->type_name, info ? (int) info->status : 0, (int) transport->dir, (long) getpid(), (void *) transport);
 \t}
 
 \t/* We only care about reliable transports */'''

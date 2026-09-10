@@ -35,6 +35,7 @@ from . import (store, engine, status as status_mod, sim, card, notify_push, lpa,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
 from .version import VERSION
 from . import stability
+from . import ims_recovery
 from .backup_transfer import router as backup_transfer_router
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -2195,8 +2196,12 @@ async def _poll_instance_status(inst: dict) -> None:
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
         if st["state"] == "OK":
             asyncio.create_task(_maybe_run_keepalive(iid, inst))
+        recovering_ims = False if update else await ims_recovery.hold(iid, inst, st, runtime, ami)
+        if recovering_ims:
+            hub.health_for(iid)["fail_start"] = None
+            st["retry"] = {"count": 0, "max": 0}
         st = _with_status_activity(
-            iid, st if update else apply_health(iid, inst, st, runtime.get("container_id")))
+            iid, st if update or recovering_ims else apply_health(iid, inst, st, runtime.get("container_id")))
         if identity_settling:
             # The first IMS registration is operationally healthy, but it may reveal the
             # authoritative telephone identity only after Asterisk is already online. The

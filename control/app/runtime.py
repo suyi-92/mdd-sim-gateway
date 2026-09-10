@@ -98,6 +98,16 @@ class RuntimeRegistry:
             return
         iid = name[len(prefix):]
         action = str(event.get("Action") or event.get("status") or "").lower()
+        if action in _STOP_ACTIONS | _START_ACTIONS | {"oom"}:
+            from . import stability
+            facts = {"action": action, "oom_killed": action == "oom",
+                     "container_ref": stability._writer.fingerprint(event.get("id") or actor.get("ID"))}
+            for key, field in (("exitCode", "exit_code"), ("signal", "signal_code")):
+                try:
+                    facts[field] = int(attrs.get(key))
+                except (TypeError, ValueError):
+                    pass
+            stability.event(iid, "engine_lifecycle", **facts)
         if action in _STOP_ACTIONS:
             runtime = {"running": False, "ip": None,
                        "container_id": event.get("id") or actor.get("ID"),

@@ -3,24 +3,35 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import time
+import uuid
 
 MAX_BYTES = 2 * 1024 * 1024
 ARCHIVES = 6
 RETENTION_SECONDS = 7 * 86400
+PROCESS_SESSION = uuid.uuid4().hex
+_dropped = {}
 EVENTS = {
     "session_started", "ike_request_timeout", "child_rekey_sent", "child_rekey_rejected", "child_rekey_retry",
     "child_rekey_fallback", "child_rekey_complete", "ike_rekey_sent", "ike_rekey_rejected",
     "ike_rekey_complete", "tunnel_down", "health_sample", "health_changed",
     "ims_transport", "ims_registry", "recovery_scheduled", "recovery_started",
     "recovery_succeeded", "recovery_failed", "recovery_cancelled", "client_request",
+    "asterisk_started", "asterisk_exited", "asterisk_restart_requested", "asterisk_restart_deferred",
+    "asterisk_restart_applied", "native_crash", "ims_register_response", "ims_auth",
+    "ims_recovery_started", "ims_recovery_succeeded", "ims_recovery_failed",
+    "engine_lifecycle", "network_sample", "reauth_scheduled", "reauth_deferred",
+    "ike_rekey_retry", "diagnostics_failed", "exit_probe",
 }
 ENUMS = {
+    "phase": {"register", "asterisk", "engine", "pcscf", "running", "stopping"},
+    "action": {"start", "restart", "stop", "die", "destroy", "kill", "oom", "unpause"},
     "mode": {"pfs", "inherited"},
     "state": {"OK", "STOPPED", "NO_CARD", "PIN_PROBLEM", "EPDG_UNRESOLVED", "TUNNEL_DOWN",
               "REGISTERING", "ERROR", "CONNECTED", "DOWN", "CONNECTING", "unknown"},
@@ -39,19 +50,37 @@ ENUMS = {
                     "registering", "rekey_timeout", "ike_rekey_timeout", "rekey_send_error",
                     "ike_rekey_send_error", "maintenance_rebuild", "client_engine_failure",
                     "reader_ambiguous", "esim_profile_switch", "manual", "liveness_timeout",
-                    "engine_start_failed", "engine_start_error", "unknown"},
+                    "engine_start_failed", "engine_start_error", "unknown", "pcscf_changed",
+                    "peer_no_additional_sas", "call_active", "call_state_unknown", "render_failed",
+                    "process_exit", "log_write_failed", "ims_recovery_exhausted"},
 }
 NUMBERS = {"message_id", "notify_code", "attempt", "elapsed_ms", "sa_age_seconds", "timeout_ms",
            "dh_group", "encryption_id", "integrity_id", "status_code", "direction_code",
            "active_channels", "retry_count", "delay_seconds", "engine_restart_count", "client_epoch", "sequence"}
-BOOLEANS = {"running", "card_present", "exit_ready", "imei_valid", "imei_source_matches", "iccid_matches"}
+NUMBERS |= {"signal_code", "exit_code", "asterisk_pid", "stack_frames", "rx_packets", "tx_packets",
+            "rx_errors", "tx_errors", "rx_dropped", "tx_dropped", "last_rx_age_seconds",
+            "expiration_seconds", "retry_after_seconds", "cseq", "dropped_records", "auth_elapsed_ms"}
+BOOLEANS = {"running", "card_present", "exit_ready", "imei_valid", "imei_source_matches", "iccid_matches",
+            "trace_available", "trace_complete", "response_received", "config_matches", "oom_killed"}
+TOKENS = {"engine_session", "process_session", "asterisk_session", "container_ref", "exit_revision",
+          "pcscf_ref", "transport_ref", "request_id", "transaction_ref"}
+
+
+def fingerprint(value) -> str:
+    return hashlib.sha256(str(value).encode()).hexdigest()[:32] if value else ""
 
 
 def payload(component: str, event: str, facts: dict, now: float) -> dict | None:
-    if component not in {"ike", "control"} or event not in EVENTS:
+    if component not in {"ike", "control", "asterisk"} or event not in EVENTS:
         return None
     record = {"schema": 1, "ts": round(now, 3), "mono_ms": int(time.monotonic() * 1000),
               "pid": os.getpid(), "component": component, "event": event}
+    record["process_session"] = PROCESS_SESSION
+    facts = {"engine_session": os.environ.get("MDD_ENGINE_SESSION", ""), **facts}
+    for key in TOKENS:
+        value = facts.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{16,64}", value):
+            record[key] = value
     version = str(facts.get("version") or os.environ.get("MDD_VERSION", "unknown"))
     if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-vmware\.[0-9]+)?|unknown", version):
         record["version"] = version
@@ -86,7 +115,7 @@ def _regular(path: Path) -> bool:
 
 def record(directory: Path, component: str, event: str, *, now: float | None = None, **facts) -> bool:
     stamp = time.time() if now is None else now
-    data = payload(component, event, facts, stamp)
+    data = payload(component, event, {"dropped_records": _dropped.get(component, 0), **facts}, stamp)
     if data is None:
         return False
     lock = None
@@ -100,7 +129,15 @@ def record(directory: Path, component: str, event: str, *, now: float | None = N
         if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1
                 or lock_info.st_uid != os.geteuid() or lock_info.st_mode & 0o077):
             return False
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + 0.2
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
         current = directory / f"stability-{component}.jsonl"
         paths = [current, *(directory / f"stability-{component}.{n}.jsonl" for n in range(1, ARCHIVES + 1))]
         for path in paths:
@@ -120,8 +157,10 @@ def record(directory: Path, component: str, event: str, *, now: float | None = N
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 return False
             stream.write(line)
+        _dropped[component] = 0
         return True
     except (OSError, ValueError, TypeError):
+        _dropped[component] = _dropped.get(component, 0) + 1
         return False  # Logging must not break a tunnel or recovery.
     finally:
         if lock is not None:
@@ -129,4 +168,5 @@ def record(directory: Path, component: str, event: str, *, now: float | None = N
 
 
 def ike_event(event: str, **facts) -> None:
-    record(Path("/logs"), "ike", event, **facts)
+    if not record(Path("/logs"), "ike", event, **facts):
+        print("[stability] IKE event persistence failed", flush=True)

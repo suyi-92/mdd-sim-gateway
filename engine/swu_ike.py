@@ -246,37 +246,23 @@ def swu_notify(event, arg=None):
 
 
 def swu_apply_pcscf(addr):
-    """Re-render pjsip.conf for a (possibly new) P-CSCF and reload Asterisk, but only when the
-    P-CSCF actually changed. The ePDG can hand out a DIFFERENT P-CSCF on every (re)connect /
-    reauth; pjsip's type=identify/type=resolve are pinned to the P-CSCF IP, so a stale value
-    means inbound INVITEs from the new P-CSCF don't match (calls/SMS fail) and outbound routing
-    is wrong. This keeps them in sync on every reconnect, not just the first bring-up."""
-    if not addr:
+    """Queue a process replacement; never hot-reload native IMS/IPsec objects.
+
+    A new SWu process requests fresh IMS even when the peer reuses its P-CSCF:
+    the inner address and security associations may have changed independently.
+    """
+    if not addr or globals().get("_pcscf_requested") == addr:
         return
-    last = None
     try:
-        with open(os.path.join(SWU_RUNDIR, "pcscf.applied")) as f:
-            last = f.read().strip()
+        from asterisk_supervisor import request_restart
+        request_id = request_restart("pcscf_changed")
+        globals()["_pcscf_requested"] = addr
+        stability_event("asterisk_restart_requested", reason_code="pcscf_changed",
+                        request_id=request_id)
+        swu_log("P-CSCF/session changed; queued supervised IMS process replacement")
     except Exception:
-        last = None
-    if last == addr:
-        return
-    render = os.environ.get("SWU_RENDER", "/usr/local/bin/render.py")
-    if not os.path.exists(render):
-        return
-    try:
-        swu_log("P-CSCF changed (%s -> %s); re-rendering pjsip + reloading Asterisk" % (last, addr))
-        subprocess.call(["python3", render], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Reload just the parts affected by the P-CSCF change. res_pjsip reload re-reads
-        # pjsip.conf (identify/resolve/registration/endpoint) without dropping the tunnel.
-        subprocess.call(["asterisk", "-rx", "module reload res_pjsip.so"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["asterisk", "-rx", "pjsip send register volte_ims"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(os.path.join(SWU_RUNDIR, "pcscf.applied"), "w") as f:
-            f.write(addr)
-    except Exception as e:
-        swu_log("pcscf apply failed: %r" % e)
+        swu_log("P-CSCF restart request failed; retaining unapplied state for retry")
+
 
 
 '''
@@ -4936,8 +4922,9 @@ class swu():
 
     def state_ue_create_sa(self,lowest = 0): #IKEv2 REKEY
         print('\nSTATE UE STARTED IKE REKEY:\n--------------------------')
-        self.sa_list_negotiated[0][0][1] = 8
-        self.sa_list_create_child_sa = self.sa_list_negotiated
+        self.sa_list_create_child_sa = [[list(transform) for transform in proposal]
+                                        for proposal in self.sa_list_negotiated]
+        self.sa_list_create_child_sa[0][0][1] = 8
 
         self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(self.negotiated_diffie_hellman_group))
         self.dh_group_num = self.negotiated_diffie_hellman_group
@@ -5057,6 +5044,7 @@ class swu():
             if getattr(self, "_create_child_kind", None) == "ike":
                 self._ike_rekey_outstanding = False
                 self._ike_rekey_failed = True
+                self._ike_rekey_last_notify = error_notify
                 stability_event("ike_rekey_rejected", notify_code=int(error_notify),
                                 message_id=getattr(self, "_create_child_request_id", 0))
             else:
@@ -5464,6 +5452,11 @@ class swu():
         if self._rekey_outstanding or self._ike_rekey_outstanding:
             return
         idle = time.monotonic() - (self._last_rx if self._last_rx is not None else time.monotonic())
+        if time.monotonic() - getattr(self, "_stability_sample_at", 0) >= 30:
+            self._stability_sample_at = time.monotonic()
+            stability_event("network_sample", state="CONNECTED", last_rx_age_seconds=max(0, int(idle)),
+                            sa_age_seconds=max(0, int(time.monotonic() - (self._child_sa_time or time.monotonic()))))
+
         if idle < self.liveness_period:
             return
         if self._liveness_outstanding >= self.liveness_retries:
@@ -5494,9 +5487,41 @@ class swu():
         except Exception as e:
             swu_log("liveness: probe send failed: %r" % e)
 
+    def _schedule_peer_reauth(self):
+        # RFC 7296 section 4: a minimal peer may reject CREATE_CHILD_SA with 35.
+        # Renew by fresh IKE_AUTH instead of repeating rejected proposals indefinitely.
+        # No learned policy survives this authenticated SA or a node/config replacement.
+        now = time.monotonic()
+        self._reauth_due_at = now + 1.0
+        self._reauth_deadline = now + 300.0
+        stability_event("reauth_scheduled", reason_code="peer_no_additional_sas",
+                        notify_code=NO_ADDITIONAL_SAS, delay_seconds=1)
+
+    def _peer_reauth_tick(self):
+        due = getattr(self, "_reauth_due_at", None)
+        if due is None:
+            return False
+        now = time.monotonic()
+        if now < due:
+            return True
+        from asterisk_supervisor import active_channels
+        channels = active_channels()
+        if channels == 0 or now >= self._reauth_deadline:
+            # A maximum five-minute grace protects ongoing calls without extending an
+            # unrenewable SA indefinitely. The reason stays distinct from peer silence.
+            self._rekey_teardown("peer_no_additional_sas")
+        else:
+            self._reauth_due_at = min(now + 30.0, self._reauth_deadline)
+            stability_event("reauth_deferred", reason_code=("call_state_unknown"
+                            if channels is None else "call_active"), active_channels=channels,
+                            delay_seconds=int(self._reauth_due_at - now))
+        return True
+
     def _rekey_select_timeout(self):
         """Seconds until the next proactive-rekey action (rekey due, or in-flight rekey response
         timeout), so state_connected's select() wakes in time. None when rekey is disabled/idle."""
+        if getattr(self, "_reauth_due_at", None) is not None:
+            return max(0.0, self._reauth_due_at - time.monotonic())
         if self.child_rekey_period <= 0 or self._child_sa_time is None:
             return None
         now = time.monotonic()
@@ -5520,6 +5545,8 @@ class swu():
         makes one lost packet insufficient to trigger that recovery.
 
         Disabled when child_rekey_period<=0."""
+        if self._peer_reauth_tick():
+            return
         if self.child_rekey_period <= 0 or self._child_sa_time is None:
             return
         now = time.monotonic()
@@ -5527,6 +5554,10 @@ class swu():
         # The response handler clears outstanding before returning. Consume its rejection here
         # rather than immediately starting another request because the CHILD SA is already due.
         if getattr(self, "_rekey_failed", False):
+            if getattr(self, "_rekey_last_notify", None) == NO_ADDITIONAL_SAS:
+                self._rekey_give_up("peer requires fresh IKE authentication", reauth=True)
+                self._schedule_peer_reauth()
+                return
             compatible = (getattr(self, "_rekey_last_notify", None) == NO_PROPOSAL_CHOSEN
                           and getattr(self, "_rekey_request_mode", "pfs") == "pfs"
                           and not getattr(self, "_rekey_compat_attempted", False))
@@ -5596,6 +5627,8 @@ class swu():
     def _ike_rekey_select_timeout(self):
         """Seconds until the next proactive IKE-SA-rekey action, mirroring _rekey_select_timeout,
         so state_connected's select() wakes in time. None when disabled/idle."""
+        if getattr(self, "_reauth_due_at", None) is not None:
+            return max(0.0, self._reauth_due_at - time.monotonic())
         if self.ike_rekey_period <= 0 or self._ike_sa_time is None:
             return None
         now = time.monotonic()
@@ -5619,12 +5652,16 @@ class swu():
         An unanswered request is retransmitted verbatim; exhausting the retransmissions leaves the
         message-id window ambiguous, so that path re-establishes — no worse than the ePDG-initiated
         teardown this timer exists to preempt. Disabled when ike_rekey_period<=0."""
+        if self._peer_reauth_tick():
+            return
         if self.ike_rekey_period <= 0 or self._ike_sa_time is None:
             return
         now = time.monotonic()
 
         if getattr(self, "_ike_rekey_failed", False):
             self._ike_rekey_give_up("rejected by the ePDG")
+            if getattr(self, "_ike_rekey_last_notify", None) == NO_ADDITIONAL_SAS:
+                self._schedule_peer_reauth()
             return
 
         if self._ike_rekey_outstanding:
@@ -5634,6 +5671,8 @@ class swu():
                     try:
                         self.send_data(self._ike_rekey_packet)
                         self._ike_rekey_sent_at = now
+                        stability_event("ike_rekey_retry", attempt=self._ike_rekey_tries,
+                                        message_id=self.message_id_request)
                         swu_log("proactive IKE rekey unanswered in %ds; retransmission %d/%d "
                                 "(same message id; the current SA keeps carrying traffic)" %
                                 (int(self.rekey_response_timeout), self._ike_rekey_tries,
@@ -5683,7 +5722,7 @@ class swu():
         swu_log("proactive IKE rekey abandoned (%s); keeping the established IKE SA and retrying "
                 "in ~%d min. DPD still guards the tunnel." % (why, int(self.ike_rekey_retry_interval / 60)))
 
-    def _rekey_give_up(self, why):
+    def _rekey_give_up(self, why, reauth=False):
         """After an explicit rejection, keep the old CHILD SA and schedule a new request.
 
         A response proves the peer consumed this message id, so it must never be reclaimed.
@@ -5696,6 +5735,9 @@ class swu():
         self._rekey_packet = None
         self._rekey_tries = 0
         self._rekey_retry_at = time.monotonic() + self.rekey_retry_interval
+        if reauth:
+            swu_log("peer does not support this renewal; scheduling fresh IKE authentication")
+            return
         swu_log("proactive rekey abandoned (%s); keeping the established SA and retrying in "
                 "~%d min. DPD still guards the tunnel." % (why, int(self.rekey_retry_interval / 60)))
 
@@ -5703,7 +5745,9 @@ class swu():
         """Fallback used when a proactive rekey can't complete: best-effort DELETE, publish a
         transient DOWN, and exit so the entrypoint supervisor re-establishes the tunnel."""
         stability_event("tunnel_down", state="DOWN", reason_code=reason_code,
-                        attempt=getattr(self, "_rekey_tries", 0))
+                        attempt=getattr(self, "_ike_rekey_tries" if reason_code.startswith("ike_") else "_rekey_tries", 0),
+                        last_rx_age_seconds=max(0, int(time.monotonic() - (self._last_rx or time.monotonic()))),
+                        sa_age_seconds=max(0, int(time.monotonic() - (self._child_sa_time or time.monotonic()))))
         try:
             self.state_delete(True, kill=False)   # DELETE + tear down SAs; we exit ourselves
         except Exception:

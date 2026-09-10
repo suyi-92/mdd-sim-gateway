@@ -428,6 +428,45 @@ VoWiFi 链路：
 SIM/PCSC → UICC 选择与 AKA → 国家出口 UDP → ePDG/IKE → IMS/SIP → Asterisk/WebRTC
 ```
 
+### 反复掉线的时间线与分层恢复（vmware.9 起）
+
+首先运行 `sudo mddctl stability --hours 24`；需要按秒关联时使用
+`sudo mddctl stability --hours 24 --json`。报告包含每条线路最近 80 个关键事件、日志覆盖
+时间及已检测到的丢日志计数。按 `engine_session`、`asterisk_session`、`container_ref`、
+`request_id` 和 `exit_revision` 区分容器重建、Asterisk 单独重启、隧道新会话及换节点。
+这些是随机代次或摘要，不含节点链接、SIM 身份、SIP 正文或 AKA 密钥。
+
+- `ims_register_response` 同时记录 SIP 状态码、是否确实收到报文、响应 CSeq、有效期及
+  Asterisk PID；本地产生的 408 与运营商返回的 408 不再混为一谈。TCP/TLS 与 WebSocket
+  的 transport 事件必须按 protocol 区分，不能把浏览器关闭当成 IMS 掉线。
+- IMS 无响应时自动保存当时的隧道、SIM 认证、主机与出口快照，并对当前国家 SOCKS 出口
+  做一次有界的独立 UDP 探测。`config_matches=false` 表示探测期间配置发生变化，
+  该结果不能用于判定新节点。UDP 探测成功也只证明测试目标可达，不能证明运营商 IMS 回应。
+- IMS 恢复先发一次 REGISTER，等待完整事务窗口 160 秒；未恢复再请求单独重启 Asterisk，
+  等待 200 秒，仍失败才交给 Engine 恢复策略。每次恢复和结果分别记录；只有确认没有通话
+  才执行，通话状态未知时也等待。SIM/PIN 错误、停用线路和容器代次变化不沿用旧恢复请求。
+- P-CSCF 或 SWu 会话变化只发布重启请求，由 supervisor 渲染配置并使空闲 Asterisk 优雅
+  退出，避免运行中 reload `res_pjsip` 销毁 IMS/IPsec 对象。同地址的新 SWu 会话也会更新
+  IMS；并发到达的新请求不会被旧进程误确认。PIN keeper 和 SWu 继续运行。
+- 收到经过认证的 `NO_ADDITIONAL_SAS(35)` 后，按 RFC 7296 第 4 节通过完整 IKE_AUTH
+  续期，不再每五分钟重复发送已经被拒绝的 CREATE_CHILD_SA。允许通话最多延后五分钟，
+  之后仍必须续期，不能无限延长旧 SA。它会造成一次有记录的短暂重新注册。静默丢包继续
+  原样重传，不触发算法降级；NO_PROPOSAL_CHOSEN 的单次兼容路径保持原有约束。
+- `native_crash` 保存信号、是否取得调用栈及完整性。每条线路 `logs/crash/` 最多保留 20
+  份、七天的私有栈记录，仅含模块、函数名和相对偏移；不启用 core 或内存/参数转储。
+  unwinder 最多运行两秒，损坏栈或 loader 死锁可能只有部分证据，不能把缺失帧当成健康。
+  精确构建的 Asterisk/PJSIP 调试信息随镜像保存在 `/usr/local/share/mdd-debug/`，可用模块
+  对应的 `.debug` 文件解析偏移。系统库帧需同时核对镜像中的 ELF build ID 与 RPM 版本。
+
+结构化稳定性日志按组件限制为每段 2 MiB、最多六份归档、七天；新增 Asterisk 控制台日志
+每段 2 MiB、归档总计 20 MiB、七天，当前文件也位于持久化 `logs/`。IKE 原有归档限制保持
+100 MiB。高频事件可能使体积上限先于七天达到；报告的覆盖时间和丢记录提示必须一起检查。
+原始控制台、IKE 日志及故障快照仍可能含私有运行信息，不能原样贴到聊天或公开 Issue。
+
+判断原因必须写明证据层级：进程崩溃可由信号与调用栈确认；peer 35 是明确协议拒绝；只有
+IMS 超时而出口探测正常时，只能定位到 IMS 路径/对端无响应，无法仅凭本机证明是哪台 VPS
+或哪一跳丢包。此时应保留相同代次、发生时间和探测结果，再对照 VPS/运营商侧证据。
+
 按层检查，不要只凭最后一条错误猜原因：
 
 - SIM 的 MCC/MNC、SPN/GID 和运营商品牌；

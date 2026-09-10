@@ -40,6 +40,10 @@ RUN dnf -y --refresh --setopt=zchunk=False --setopt=fastestmirror=True --setopt=
     meson ninja-build perl-podlators systemd-devel \
     tcpdump bind-utils iputils
 
+COPY native/crash_trace.c /home/asterisk-build/crash_trace.c
+RUN mkdir -p /usr/local/lib && gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+    -o /usr/local/lib/mdd-crash-trace.so crash_trace.c -ldl
+
 # Build pcsc-lite ${PCSC_VERSION} from source (client library + headers) for Asterisk linkage,
 # image self-tests and a deterministic fallback. At managed runtime Control bind-mounts the
 # guest distribution's libpcsclite.so.1 over this copy: pcsc-lite's private socket protocol can
@@ -179,9 +183,9 @@ RUN set -eu; \
 # Shrink what the runtime stage copies. Three independent reductions, kept in one layer at the
 # very end of the build stage so they cannot invalidate the expensive compile layers above, and
 # placed after the closure derivation because none of them changes an ldd dependency:
-#   1. Strip debug symbols. The shipped image is not a debugging target — a crash is reproduced
-#      by rebuilding the same pinned commits with symbols intact. --strip-unneeded keeps .dynsym,
-#      so dlopened modules still resolve against each other and against the main binary.
+#   1. Keep the exact ELF debug information separately, then strip the runtime binaries.
+#      Native fault offsets must resolve against this build, including its Fedora libraries,
+#      rather than a future rebuild. The debug files contain no operational configuration.
 #   2. Stage the individually copied libraries under /stage. A per-file
 #      `COPY --from=build /usr/lib/libasteriskpj.so` dereferences the symlink and stores a second
 #      full copy of the library; copying a *directory* preserves the link as a link. cp -a decides
@@ -193,6 +197,10 @@ RUN set -eu; \
 #      ("Cannot update type ... no existing documentation! ... ASTERISK EXITING!").
 #      Bundled prompts live in /var/lib/asterisk/mdd-sounds (render.py), so sounds/ stays.
 RUN set -eu; \
+    mkdir -p /usr/local/share/mdd-debug; \
+    for binary in /usr/sbin/asterisk /usr/lib/asterisk/modules/*.so /usr/lib/libasteriskpj.so.2 /usr/lib/libasteriskssl.so.1; do \
+      objcopy --only-keep-debug "$binary" "/usr/local/share/mdd-debug/$(basename "$binary").debug"; \
+    done; \
     strip /usr/sbin/asterisk; \
     find /usr/lib/asterisk/modules -type f -name '*.so' -exec strip --strip-unneeded {} +; \
     for library in /usr/lib/libasteriskpj.so* /usr/lib/libasteriskssl.so*; do \
@@ -245,6 +253,7 @@ COPY ami_usim.py     /usr/local/bin/ami_usim.py
 COPY swu_ike.py      /usr/local/bin/swu_ike.py
 COPY log_capture.py  /usr/local/bin/log_capture.py
 COPY stability_log.py /usr/local/bin/stability_log.py
+COPY asterisk_supervisor.py /usr/local/bin/asterisk_supervisor.py
 COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
 COPY templates/      /opt/mdd-sim-gateway/templates/

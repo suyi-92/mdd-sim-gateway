@@ -654,6 +654,20 @@ def read_run_json(iid: str, name: str) -> dict | None:
         return None
 
 
+def request_ims_restart(iid: str, expected_container_id: str) -> str:
+    """Ask only the observed generation's supervisor; never recreate a SIM container."""
+    try:
+        container = _client().containers.get(container_name(iid))
+        if container.id != expected_container_id or container.status != "running":
+            return ""
+        rc, output = container.exec_run(["python3", "/usr/local/bin/asterisk_supervisor.py",
+                                         "--request", "reg_unanswered"])
+        ticket = output.decode(errors="replace").strip()
+        return ticket if rc == 0 and re.fullmatch(r"[0-9a-f]{32}", ticket) else ""
+    except Exception:
+        return ""
+
+
 def read_pcscf(iid: str) -> str | None:
     path = os.path.join(DATA_DIR, "instances", str(iid), "run", "pcscf")
     try:

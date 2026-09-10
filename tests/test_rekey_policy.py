@@ -14,7 +14,8 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parent.parent / "engine" / "swu_ike.py"
 WANTED = {"_rekey_tick", "_rekey_give_up", "_rekey_select_timeout", "_liveness_tick",
           "_begin_create_child_request", "_accept_create_child_response",
-          "_ike_rekey_tick", "_ike_rekey_give_up", "_ike_rekey_select_timeout"}
+          "_ike_rekey_tick", "_ike_rekey_give_up", "_ike_rekey_select_timeout",
+          "_schedule_peer_reauth", "_peer_reauth_tick"}
 
 
 def _load_methods():
@@ -26,7 +27,8 @@ def _load_methods():
             picked.append(node)
     module = ast.Module(body=picked, type_ignores=[])
     namespace = {"time": __import__("time"), "swu_log": lambda *_a, **_k: None,
-                 "stability_event": lambda *_a, **_k: None, "NO_PROPOSAL_CHOSEN": 14}
+                 "stability_event": lambda *_a, **_k: None, "NO_PROPOSAL_CHOSEN": 14,
+                 "NO_ADDITIONAL_SAS": 35}
     exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102
     return {name: namespace[name] for name in WANTED}
 

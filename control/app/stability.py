@@ -25,6 +25,10 @@ def event(iid: str, name: str, *, inst: dict | None = None, **facts) -> None:
         from . import egress
         facts.update(country=egress.line_country(inst),
                      plmn=f'{inst.get("mcc", "")}-{inst.get("mnc", "")}')
+    from . import engine
+    current = engine.read_run_json(iid, "asterisk.status.json") or {}
+    facts.setdefault("asterisk_session", current.get("session"))
+    facts.setdefault("engine_session", current.get("engine_session"))
     _writer.record(Path(cfg.DATA_DIR) / "instances" / iid / "logs", "control", name,
                    version=VERSION, **facts)
 
@@ -45,6 +49,14 @@ def sample(inst: dict, status: dict, runtime: dict) -> None:
             return
         _samples[iid] = (signature, now)
     try:
+        from . import egress
+        country = egress.line_country(inst)
+        proxy = cfg.get_settings().get("proxy") or {}
+        current = (egress.status().get("exits") or {}).get(country) or {}
+        facts.update(container_ref=_writer.fingerprint(runtime.get("container_id")),
+                     exit_revision=current.get("config_revision"),
+                     exit_ready=bool(current.get("ready")),
+                     config_matches=current.get("config_revision") == egress.country_exit_revision(proxy, country))
         event(iid, "health_changed" if previous != signature else "health_sample", inst=inst, **facts)
     except (OSError, ValueError, TypeError):
         pass  # Diagnostics must not interrupt health publication or recovery.
@@ -52,11 +64,28 @@ def sample(inst: dict, status: dict, runtime: dict) -> None:
 
 def ami_event(iid: str, message) -> None:
     """AMI dictionaries can contain identities: extract only a fixed public schema."""
-    if str(message.get("Event", "")) != "MDDTransportState":
+    name = str(message.get("Event", ""))
+    if name == "Registry":
+        event(iid, "ims_registry", registration=message.get("Status"))
+        return
+    if name == "MDDRegisterResponse":
+        facts = {"response_received": str(message.get("ResponseReceived")) == "1",
+                 "transport_ref": _writer.fingerprint(message.get("TransportId"))}
+        for source, target in (("StatusCode", "status_code"), ("ExpirationSeconds", "expiration_seconds"),
+                               ("CSeq", "cseq"), ("ProcessId", "asterisk_pid")):
+            try:
+                facts[target] = int(message.get(source))
+            except (TypeError, ValueError):
+                pass
+        event(iid, "ims_register_response", **facts)
+        return
+    if name != "MDDTransportState":
         return
     facts = {"transport_state": str(message.get("State", "unknown")),
-             "protocol": str(message.get("Protocol", "unknown"))}
-    for source, target in (("StatusCode", "status_code"), ("DirectionCode", "direction_code")):
+             "protocol": str(message.get("Protocol", "unknown")),
+             "transport_ref": _writer.fingerprint(message.get("TransportId"))}
+    for source, target in (("StatusCode", "status_code"), ("DirectionCode", "direction_code"),
+                           ("ProcessId", "asterisk_pid")):
         try:
             facts[target] = int(message.get(source))
         except (TypeError, ValueError):

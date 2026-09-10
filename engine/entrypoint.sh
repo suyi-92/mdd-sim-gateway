@@ -13,6 +13,9 @@
 # bind-mounted /run/pcscd socket. The image pins its own client library and uses pcsc-lite's
 # stable socket protocol; it does not replace the guest daemon.
 set -u
+umask 077
+export MDD_ENGINE_SESSION
+MDD_ENGINE_SESSION=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 
 export MDD_RUNDIR="${MDD_RUNDIR:-/run/mdd-sim-gateway}"
 mkdir -p "$MDD_RUNDIR" /logs /etc/asterisk
@@ -109,5 +112,5 @@ fi
 log "starting ami_usim bridge..."
 python3 -u /usr/local/bin/ami_usim.py /usr/local/etc/ami_usim.ini &
 
-log "starting Asterisk..."
-exec asterisk -f
+log "starting supervised Asterisk..."
+exec python3 -u /usr/local/bin/asterisk_supervisor.py
