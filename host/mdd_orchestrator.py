@@ -2691,10 +2691,68 @@ class Orchestrator:
         self.exit_last_change[country] = record
         append_jsonl(self.exit_node_history, record)
 
+    def isolate_country_tun_dns(self, config: dict):
+        """Country exits carry explicit ePDG routes, never the host's default DNS.
+
+        sing-tun can register ~. even with auto_route=false. Reconcile after every
+        start and on unchanged generations, since that registration is asynchronous.
+        Only consider TUNs proven to belong to this applied configuration; retain
+        any more-specific DNS domains and do not touch another VPN's interfaces.
+        """
+        if self.dry_run or not shutil.which("resolvectl"):
+            return
+        for inbound in config.get("inbounds") or []:
+            iface = str(inbound.get("interface_name") or "")
+            if (inbound.get("type") != "tun" or inbound.get("auto_route") is not False
+                    or not re.fullmatch(r"mdd-[a-z]{2}", iface)
+                    or inbound.get("tag") != "tun-" + iface[4:]):
+                continue
+            try:
+                result = subprocess.run(
+                    ["resolvectl", "domain", iface], capture_output=True, text=True,
+                    timeout=3, env={**os.environ, "LC_ALL": "C"})
+                if result.returncode:
+                    # A new interface may not have reached resolved yet. Retry next cycle.
+                    continue
+                match = re.fullmatch(r"Link \d+ \(" + re.escape(iface) + r"\):\s*(.*?)\s*",
+                                     result.stdout.strip())
+                if not match:
+                    raise ValueError("unexpected resolved domain response")
+                domains = match[1].split()
+                route = subprocess.run(
+                    ["resolvectl", "default-route", iface], capture_output=True, text=True,
+                    timeout=3, env={**os.environ, "LC_ALL": "C"})
+                route_match = re.fullmatch(
+                    r"Link \d+ \(" + re.escape(iface) + r"\):\s*(yes|no|true|false)",
+                    route.stdout.strip())
+                if route.returncode or not route_match:
+                    raise ValueError("unexpected resolved default-route response")
+                default_route = route_match[1] in ("yes", "true")
+                if "~." not in domains and not default_route:
+                    continue
+                changes = []
+                if "~." in domains:
+                    changes.append(["domain", iface, *([d for d in domains if d != "~."] or [""])])
+                # Check this independently: a delayed native registration may restore
+                # DefaultRoute after ~. was removed in an earlier reconcile.
+                if default_route:
+                    changes.append(["default-route", iface, "no"])
+                for args in changes:
+                    subprocess.run(["resolvectl", *args], capture_output=True, text=True,
+                                   timeout=3, check=True)
+                self.log(f"host DNS isolated from country TUN {iface}")
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # DNS maintenance must not rebuild or move an established voice line.
+                self.log(f"country TUN DNS isolation will retry for {iface}: {type(exc).__name__}")
+
     def apply_singbox(self, config: dict):
         fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
         if fingerprint == self.last_proxy_fingerprint and self.singbox and self.singbox.poll() is None:
+            self.isolate_country_tun_dns(config)
             return
+        if self.singbox and self.singbox.poll() is None:
+            # Also maintain the restored generation when a new candidate is rejected.
+            self.isolate_country_tun_dns(read_json(self.generated))
         # Restarting resets every selector to its configured default. Where that default is
         # the node already carrying this country's tunnels the restart is a no-op for the
         # exit, so the memory of it is kept and nothing is ranked: re-ranking there would
@@ -2740,6 +2798,8 @@ class Orchestrator:
                 self.singbox = None
             raise RuntimeError("sing-box exited during startup")
         self.last_proxy_fingerprint = fingerprint
+
+        self.isolate_country_tun_dns(config)
 
     def apply_xray(self, config: dict | None):
         if not config:

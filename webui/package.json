@@ -1,7 +1,7 @@
 {
   "name": "mdd-sim-gateway-webui",
   "private": true,
-  "version": "1.9.1-vmware.9",
+  "version": "1.9.1-vmware.10",
   "type": "module",
   "scripts": {
     "test:polling": "node --test tests/pollRequest.test.js",

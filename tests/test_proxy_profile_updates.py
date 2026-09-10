@@ -88,6 +88,7 @@ class ProxyProfileUpdateTests(unittest.TestCase):
             return process
 
         for patcher in (patch.object(orch.shutil, "which", side_effect=lambda name: name),
+                        patch.object(self.app, "isolate_country_tun_dns"),
                         patch.object(orch, "run", return_value=Mock(returncode=0)),
                         patch.object(orch.subprocess, "Popen", side_effect=start),
                         patch.object(orch.time, "sleep"),

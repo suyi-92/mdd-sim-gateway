@@ -365,6 +365,14 @@ Engine。页面恢复后需重新登录。若任务没有被接取或失败，�
 
 ## 14. VoWiFi、通话和短信
 
+`1.9.1-vmware.10` 防止国家 TUN 接管宿主机默认 DNS。部分 sing-tun 版本即使在
+`auto_route=false` 时仍会为每个接口注册 `~.` 和虚拟 DNS 地址；国家出口没有提供该
+DNS 服务时，普通域名解析会超时，而 HTTP 代理仍可能正常。orchestrator 在启动后及
+后续协调中，仅为当前已应用配置中的专用国家 TUN 移除 `~.`、关闭 DNS 默认路由，
+保留其他域名和 ePDG 路由，不修改其他 VPN。通过 `sudo mddctl update` 更新后，用
+`resolvectl domain`、`resolvectl default-route` 和普通 `getent ahostsv4 github.com` 复验。
+这项恢复不要求修改生成配置，也不会为清理 DNS 重建线路或更换出口。
+
 如果切换大疆/Quectel eSIM 后，另一台 SCR Prime 的线路也停止，但 USB、PC/SC 与卡仍可见，
 先检查是否残留旧的三路 VPCD 读卡器绑定。旧版本从 modem 转到 native reader 时只更新了 USB
 端口和索引，没有清除 `pin_reader`、`swu_reader`、`ami_reader`；eSIM 停线范围因此可能误含
