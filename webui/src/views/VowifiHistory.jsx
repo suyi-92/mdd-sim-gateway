@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import { HISTORY_SPANS, savedHistorySpan, saveHistorySpan } from '../historyRange.js'
@@ -134,11 +135,72 @@ function duration(seconds, t) {
   return parts.length ? parts.join(' ') : t('{count} s', { count: 0 })
 }
 
+// Cards intentionally clip their contents. Keep the timeline detail outside that clipping
+// tree, then measure it before painting so either end of the track stays readable.
+function HistoryTooltip({ hover, id, onClose, onEnter, onLeave, children }) {
+  const ref = useRef(null)
+  const [position, setPosition] = useState(null)
+  useLayoutEffect(() => {
+    const tip = ref.current
+    const anchor = hover.anchor
+    const place = () => {
+      if (!anchor.isConnected) { onClose(); return }
+      const bounds = anchor.getBoundingClientRect()
+      const rect = tip.getBoundingClientRect()
+      const margin = 12, gap = 8
+      const width = document.documentElement.clientWidth, height = window.innerHeight
+      const above = bounds.top - gap - rect.height
+      const below = bounds.bottom + gap
+      const top = above >= margin || bounds.top > height - bounds.bottom ? above : below
+      const next = {
+        left: Math.max(margin, Math.min(bounds.left + bounds.width / 2 - rect.width / 2, width - rect.width - margin)),
+        top: Math.max(margin, Math.min(top, height - rect.height - margin)),
+      }
+      setPosition(previous => previous?.left === next.left && previous?.top === next.top ? previous : next)
+    }
+    const outside = event => {
+      if (!anchor.contains(event.target) && !tip.contains(event.target)) onClose()
+    }
+    const escape = event => { if (event.key === 'Escape') onClose() }
+    const scroll = event => { if (!tip.contains(event.target)) onClose() }
+    place()
+    const observer = new ResizeObserver(place)
+    observer.observe(tip)
+    document.addEventListener('pointerdown', outside, true)
+    document.addEventListener('keydown', escape)
+    window.addEventListener('scroll', scroll, true)
+    window.addEventListener('resize', onClose)
+    return () => {
+      observer.disconnect()
+      document.removeEventListener('pointerdown', outside, true)
+      document.removeEventListener('keydown', escape)
+      window.removeEventListener('scroll', scroll, true)
+      window.removeEventListener('resize', onClose)
+    }
+  }, [hover, onClose])
+  return createPortal(<div ref={ref} id={id} role="tooltip" className="u-uptime-tip"
+    style={position || { visibility: 'hidden' }} onMouseEnter={onEnter} onMouseLeave={onLeave}>
+    {children}
+  </div>, document.body)
+}
+
 export default function VowifiHistory({ instanceId, subscribe, compact = false }) {
   const { t, language } = useI18n()
   const [range, setRange] = useState(savedHistorySpan)
   const [view, setView] = useState(null)
   const [hover, setHover] = useState(null)
+  const tooltipId = useId()
+  const hoverTimer = useRef(null)
+  const keepHover = useCallback(() => clearTimeout(hoverTimer.current), [])
+  const clearHover = useCallback(() => { clearTimeout(hoverTimer.current); setHover(null) }, [])
+  const leaveHover = () => {
+    keepHover()
+    if (hover?.anchor !== document.activeElement) hoverTimer.current = setTimeout(clearHover, 150)
+  }
+  const showHover = (segment, segmentKey, anchor) => {
+    keepHover()
+    setHover({ ...segment, segmentKey, anchor })
+  }
   const [plotWidth, setPlotWidth] = useState(0)
   const plotRef = useRef(null)
   const request = useRef(0)
@@ -167,11 +229,13 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
   }, [instanceId, range, key])
 
   useEffect(() => {
-    setHover(null)
+    clearHover()
     load()
     const timer = setInterval(load, REFRESH_MS)
     return () => { clearInterval(timer); request.current++ }
-  }, [load])
+  }, [load, clearHover])
+  useEffect(() => { clearHover() }, [data, clearHover])
+  useEffect(() => () => clearTimeout(hoverTimer.current), [])
 
   // Status events arrive every few seconds whether or not anything changed. Only a real
   // transition is worth a refetch; the interval bounds how stale the right edge can get.
@@ -216,31 +280,33 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
 
   return <div className={`u-uptime ${compact ? 'compact' : ''}`}>
     <div className="u-uptime-head">
-      <div>
-        <h4>{t('Connection history')}</h4>
-        <p>{compact
-          ? t('Past {window}', { window: duration(range, t) })
-          : t('Past {window}. Up to 30 days is kept; unrecorded time is excluded from uptime.',
-            { window: duration(range, t) })}</p>
-      </div>
-      <div className="u-uptime-controls">
-        <label className="u-uptime-range">
-          <span>{t('Time range')}</span>
-          <select aria-label={t('Connection history time range')} value={range}
-            onChange={event => {
-              const value = Number(event.target.value)
-              saveHistorySpan(value)
-              setRange(value)
-            }}>
-            {HISTORY_SPANS.map(value => <option key={value} value={value}>
-              {t('Past {window}', { window: duration(value, t) })}
-            </option>)}
-          </select>
-        </label>
-        <div className="u-uptime-figure">
-          <strong>{uptime}</strong>
-          <span>{t('Connected while observed')}</span>
+      <div className="u-uptime-heading">
+        <div className="u-uptime-title">
+          <h4>{t('Connection history')}</h4>
+          <label className="u-uptime-range">
+            <svg className="u-uptime-range-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" />
+            </svg>
+            <select aria-label={t('Connection history time range')} value={range}
+              onChange={event => {
+                const value = Number(event.target.value)
+                saveHistorySpan(value)
+                setRange(value)
+              }}>
+              {HISTORY_SPANS.map(value => <option key={value} value={value}>
+                {t('Past {window}', { window: duration(value, t) })}
+              </option>)}
+            </select>
+            <svg className="u-uptime-range-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+              <path d="m4 6 4 4 4-4" />
+            </svg>
+          </label>
         </div>
+        {!compact && <p>{t('Up to 30 days is kept; unrecorded time is excluded from uptime.')}</p>}
+      </div>
+      <div className="u-uptime-figure">
+        <strong>{uptime}</strong>
+        <span>{t('Connected while observed')}</span>
       </div>
     </div>
 
@@ -259,23 +325,30 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
     </div>
 
     <div className="u-uptime-plot" ref={plotRef}>
-      <div className="u-uptime-track" role="img" aria-label={ariaLabel}
-        onMouseLeave={() => setHover(null)}>
+      <div className="u-uptime-track" role="group" aria-label={ariaLabel} onMouseLeave={leaveHover}>
         {segments.map((segment, index) => {
           const left = ((segment.start - data.start) / span) * 100
           const width = ((segment.end - segment.start) / span) * 100
-          return <div key={`${segment.start}-${index}`}
+          const segmentKey = `${segment.start}-${index}`
+          return <button key={segmentKey} type="button"
             className={`u-uptime-seg is-${segment.state}`}
             style={{ left: `${left}%`, width: `${width}%` }}
-            onMouseEnter={() => setHover({ ...segment, center: left + width / 2 })} />
+            aria-label={`${t(STATE_LABEL[segment.state])}, ${duration(segment.end - segment.start, t)}, ${stampLabel(segment.start, language)} → ${stampLabel(segment.end, language)}`}
+            aria-describedby={hover?.segmentKey === segmentKey ? tooltipId : undefined}
+            onMouseEnter={event => showHover(segment, segmentKey, event.currentTarget)}
+            onFocus={event => showHover(segment, segmentKey, event.currentTarget)}
+            onClick={event => showHover(segment, segmentKey, event.currentTarget)}
+            onBlur={clearHover} />
         })}
       </div>
-      {hover && <div className="u-uptime-tip" style={{ left: `${hover.center}%` }}>
-        <b>{t(STATE_LABEL[hover.state])}</b>
-        {hover.state === 'down' && hover.reason && <span>{outageCause(hover, t).summary}</span>}
-        <span>{duration(hover.end - hover.start, t)}</span>
-        <span>{stampLabel(hover.start, language)} → {clockLabel(hover.end, language)}</span>
-      </div>}
+      {hover && <HistoryTooltip hover={hover} id={tooltipId} onClose={clearHover}
+        onEnter={keepHover} onLeave={leaveHover}>
+        <div className="u-uptime-tip-head"><b>{t(STATE_LABEL[hover.state])}</b>
+          <span>{duration(hover.end - hover.start, t)}</span></div>
+        {hover.state === 'down' && hover.reason && <span className="u-uptime-tip-reason">{outageCause(hover, t).summary}</span>}
+        <span className="u-uptime-tip-time"><span>{stampLabel(hover.start, language)}</span>
+          <span>→ {stampLabel(hover.end, language)}</span></span>
+      </HistoryTooltip>}
       <div className="u-uptime-axis">
         {ticks.map(({ ts }) => {
           const at = ((ts - data.start) / span) * 100

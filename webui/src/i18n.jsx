@@ -542,6 +542,7 @@ const zh = {
   'The gateway is reading the connected readers and modems. This takes a few seconds after a restart.': '网关正在读取已连接的读卡器和蜂窝模块，重启后通常需要几秒钟。',
   'Connection history': '连接历史', 'Connected while observed': '有记录时段的在线率',
   'Time range': '时间范围', 'Connection history time range': '连接历史时间范围',
+  'Up to 30 days is kept; unrecorded time is excluded from uptime.': '最多保留 30 天，无记录时段不计入在线率。',
   'Past {window}. Up to 30 days is kept; unrecorded time is excluded from uptime.': '过去 {window}；最多保留 30 天，无记录时段不计入在线率。',
   'Refresh failed; showing the last successful history.': '刷新失败，当前显示上次成功读取的数据。',
   'Connection history returned an unexpected time range.': '连接历史返回的时间范围不匹配，请重试。',
