@@ -313,7 +313,8 @@ class ModemCard:
             # the standard handshake, but forwarding it would allocate a different channel
             # or close the bridge-owned one behind its back. Emulate only the exact OPEN and
             # CLOSE forms lpac uses: OPEN reports the channel this slot already holds, while
-            # CLOSE succeeds without releasing it. Reject every malformed/unsupported variant
+            # transmit() recycles that same physical channel before acknowledging CLOSE.
+            # Reject every malformed/unsupported variant
             # with Incorrect parameters (6A86) so no ambiguous command reaches the modem.
             if apdu == bytes.fromhex("0070000001"):
                 return None, bytes((channel, 0x90, 0x00))
@@ -330,20 +331,29 @@ class ModemCard:
     def closes_logical_channel(apdu, channel) -> bool:
         return apdu == bytes((0x00, 0x70, 0x80, channel, 0x00))
 
+    def reset_channel(self, channel):
+        """Give this slot a fresh UICC session without touching sibling channels.
+
+        ISD-R can reject ordinary SELECT MF with 6E00 after an LPA session. A virtual
+        close/reset must therefore close and reopen the physical channel. Never silently
+        rebind the slot to a different channel: its number is also returned to LPA clients.
+        """
+        if channel not in (1, 2, 3):
+            raise ModemError("cannot reset an unowned logical channel")
+        with self.lock:
+            response = self.csim(bytes((0x00, 0x70, 0x80, channel, 0x00)))
+            if response != bytes.fromhex("9000"):
+                raise ModemError("logical channel close failed")
+            replacement = self.open_channel()
+            if replacement != channel:
+                # A stale/duplicate reply may name a sibling. Do not close or steal it.
+                raise ModemError("logical channel number changed during reset")
+
     def transmit(self, apdu, channel):
         rewritten, local_response = self.on_channel(apdu, channel)
         if local_response is not None:
             if self.closes_logical_channel(apdu, channel):
-                # An LPA leaves the ISD-R selected here when it closes its channel, but the
-                # slot is shared: pin_keeper and the engine come back to the same real UICC
-                # channel expecting the plain USIM view, and their ADF.USIM select fails
-                # against an eUICC application. pcscd only power-cycles the card when every
-                # client is gone, so restore the file system now instead of waiting for it.
-                try:
-                    self.select_mf(channel)
-                except ModemError as exc:
-                    print("[bridge] slot channel %d could not restore MF after an LPA "
-                          "session: %s" % (channel, exc), flush=True)
+                self.reset_channel(channel)
             return local_response
         try:
             return self.csim(rewritten)
@@ -438,14 +448,7 @@ def serve_slot(card, host, port, slot, channel, atr, debug):
                     if control == 0x04:
                         sock.sendall(struct.pack(">H", len(atr)) + atr)
                     elif control in (0x01, 0x02):
-                        try:
-                            card.select_mf(channel)
-                        except ModemError as exc:
-                            print(
-                                "[bridge] slot %d reset/select failed: %s"
-                                % (slot, exc),
-                                flush=True,
-                            )
+                        card.reset_channel(channel)
                     if debug:
                         print(
                             "[bridge] slot %d control 0x%02X" % (slot, control),
@@ -454,6 +457,11 @@ def serve_slot(card, host, port, slot, channel, atr, debug):
                     continue
                 response = card.transmit(payload, channel)
                 sock.sendall(struct.pack(">H", len(response)) + response)
+        except ModemError:
+            # A failed close/reopen leaves the slot unusable. Exiting this worker makes the
+            # bridge supervisor retire the generation instead of publishing a false 9000.
+            print("[bridge] slot %d channel reset failed; retiring bridge" % slot, flush=True)
+            return
         except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
             # Repeating an unchanged reason says nothing the first line did not, so only a
             # new one is printed. Debug mode keeps every attempt for a live investigation.

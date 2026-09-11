@@ -1,7 +1,7 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from host import mdd_orchestrator
 from host.mdd_orchestrator import Orchestrator
@@ -32,20 +32,49 @@ class ManageChannelTests(unittest.TestCase):
         self.assertIsNone(rewritten)
         self.assertEqual(response, bytes.fromhex("9000"))
 
-    def test_closing_the_channel_restores_the_usim_file_system(self):
+    def test_closing_the_channel_replaces_the_isdr_session(self):
         """The LPA leaves the ISD-R selected on a channel pin_keeper shares, and pcscd only
         power-cycles the card once every client is gone — so the next ADF.USIM select would
         fail and the line would report NO_CARD with a perfectly good SIM in the reader."""
         card = ModemCard.__new__(ModemCard)
-        selected = []
-        card.select_mf = lambda channel: selected.append(channel)
+        card.lock = threading.RLock()
+        selected = {1: 'USIM', 2: 'ISD-R', 3: 'USIM'}
+        calls = []
+        def csim(apdu):
+            calls.append(apdu.hex())
+            if apdu == self.close(2):
+                selected.pop(2)
+                return bytes.fromhex('9000')
+            if apdu == self.OPEN:
+                self.assertNotIn(2, selected)
+                selected[2] = 'MF'
+                return bytes.fromhex('029000')
+            return bytes.fromhex('6E00')  # SELECT MF cannot escape this ISD-R session.
+        card.csim = csim
 
         self.assertEqual(card.transmit(self.close(2), 2), bytes.fromhex("9000"))
-        self.assertEqual(selected, [2])
+        self.assertEqual(selected, {1: 'USIM', 2: 'MF', 3: 'USIM'})
+        self.assertEqual(calls, ['0070800200', '0070000001'])
+
+    def test_failed_real_close_is_not_acknowledged_and_does_not_open_another_channel(self):
+        card = ModemCard.__new__(ModemCard)
+        card.lock = threading.RLock()
+        with patch.object(card, 'csim', return_value=bytes.fromhex('6A86')) as csim:
+            with self.assertRaises(ModemError):
+                card.transmit(self.close(2), 2)
+        csim.assert_called_once_with(self.close(2))
+
+    def test_unexpected_replacement_never_closes_a_sibling(self):
+        card = ModemCard.__new__(ModemCard)
+        card.lock = threading.RLock()
+        with patch.object(card, 'csim', side_effect=[bytes.fromhex('9000'), bytes.fromhex('019000')]) as csim:
+            with self.assertRaises(ModemError):
+                card.transmit(self.close(2), 2)
+        self.assertEqual([c.args[0] for c in csim.call_args_list], [self.close(2), self.OPEN])
 
     def test_opening_a_channel_does_not_disturb_the_selection(self):
         card = ModemCard.__new__(ModemCard)
-        card.select_mf = lambda channel: self.fail("MF must not be reselected on open")
+        card.reset_channel = lambda channel: self.fail("open must not reset a held session")
 
         self.assertEqual(card.transmit(self.OPEN, 1), bytes.fromhex("019000"))
 
@@ -65,7 +94,7 @@ class ModemBackendTests(unittest.TestCase):
     def test_preallocated_slot_emulates_manage_channel_open_and_its_exact_close(self):
         card = ModemCard.__new__(ModemCard)
         with patch.object(card, "csim") as csim, \
-                patch.object(card, "select_mf") as select_mf:
+                patch.object(card, "reset_channel") as reset_channel:
             self.assertEqual(
                 card.transmit(bytes.fromhex("0070000001"), 2),
                 bytes.fromhex("029000"))
@@ -73,7 +102,7 @@ class ModemBackendTests(unittest.TestCase):
                 card.transmit(bytes.fromhex("0070800200"), 2),
                 bytes.fromhex("9000"))
         csim.assert_not_called()
-        select_mf.assert_called_once_with(2)
+        reset_channel.assert_called_once_with(2)
 
     def test_preallocated_slot_rejects_wrong_or_malformed_manage_channel_commands(self):
         card = ModemCard.__new__(ModemCard)
@@ -205,6 +234,16 @@ class ModemBackendTests(unittest.TestCase):
 
         self.assertEqual(len(lines), 2)
         self.assertIn("timed out", lines[1])
+
+    def test_pcsc_power_reset_recycles_the_slot_and_retires_failed_generation(self):
+        card = SimpleNamespace(reset_channel=Mock(side_effect=ModemError('failed reset')))
+        sock = Mock()
+        sock.recv.side_effect = [b'\x00\x01', b'\x02']
+        with patch('host.vpcd_modem_bridge.socket.create_connection', return_value=sock), \
+                patch('builtins.print'):
+            serve_slot(card, '127.0.0.1', 36221, 2, 3, b'', False)
+        card.reset_channel.assert_called_once_with(3)
+        sock.close.assert_called_once()
 
 
 class ControlLineToleranceTests(unittest.TestCase):

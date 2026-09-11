@@ -38,7 +38,9 @@ from smartcard.System import readers
 try:
     from smartcard.scard import (
         SCardEstablishContext, SCardReleaseContext, SCardConnect, SCardGetAttrib, SCardDisconnect,
+        SCardReconnect,
         SCARD_SCOPE_USER, SCARD_SHARE_DIRECT, SCARD_LEAVE_CARD,
+        SCARD_SHARE_SHARED, SCARD_RESET_CARD,
         SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_ATTR_CHANNEL_ID, SCARD_S_SUCCESS,
     )
     _SCARD_OK = True
@@ -48,6 +50,57 @@ except Exception:  # noqa - pyscard without the low-level scard bindings
 log = logging.getLogger("vowifi.usbreader")
 
 _SYS_USB = "/sys/bus/usb/devices"
+
+
+def recover_scr_prime(reader_name: str, expected_port: str) -> bool:
+    """Reset one failed cold-insert session, pinned by this handle's USB identity.
+
+    The caller must hold its reader lock and prove no Engine owns the reader. No APDU or
+    PIN is sent. Other readers, pcscd and the USB driver remain running.
+    """
+    if not _SCARD_OK or not expected_port:
+        return False
+    context = handle = None
+    try:
+        hr, context = SCardEstablishContext(SCARD_SCOPE_USER)
+        if hr != SCARD_S_SUCCESS:
+            return False
+        hr, handle, _protocol = SCardConnect(
+            context, reader_name, SCARD_SHARE_DIRECT, SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1)
+        if hr != SCARD_S_SUCCESS:
+            return False
+        hr, value = SCardGetAttrib(handle, SCARD_ATTR_CHANNEL_ID)
+        if hr != SCARD_S_SUCCESS or not value or len(value) < 4:
+            return False
+        channel_id = int.from_bytes(bytes(value[:4]), "little")
+        if channel_id >> 16 != 0x0020:
+            return False
+        port = _port_path_for((channel_id >> 8) & 0xff, channel_id & 0xff)
+        if port != expected_port:
+            return False
+        directory = os.path.join(_SYS_USB, port)
+        with open(os.path.join(directory, "idVendor")) as source:
+            vendor = source.read().strip().lower()
+        with open(os.path.join(directory, "idProduct")) as source:
+            product = source.read().strip().lower()
+        if (vendor, product) != ("04d9", "c001"):
+            return False
+        hr, _protocol = SCardReconnect(
+            handle, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, SCARD_RESET_CARD)
+        return hr == SCARD_S_SUCCESS
+    except Exception:
+        return False
+    finally:
+        if handle is not None:
+            try:
+                SCardDisconnect(handle, SCARD_LEAVE_CARD)
+            except Exception:
+                pass
+        if context is not None:
+            try:
+                SCardReleaseContext(context)
+            except Exception:
+                pass
 
 
 def _channel_id_bus_dev(reader_name: str):

@@ -821,7 +821,9 @@ async def _on_card_insert(name, idx):
             log.debug("card probe skipped — reader lock busy: %s", name)
             return
         try:
-            c = await asyncio.to_thread(sim.read_card, idx)
+            c = await _probe_inserted_card(name, idx, info.get("reader_port"))
+            idx = getattr(c, "reader_index", idx)
+            info["index"] = idx
             info.update(iccid=c.iccid, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
                         imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
                         mnc_len=getattr(c, "mnc_len", None), smsc=c.smsc,
@@ -874,6 +876,28 @@ async def _on_card_insert(name, idx):
         asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
 
 
+async def _probe_inserted_card(name: str, idx: int, port: str | None):
+    """One bounded SCR Prime recovery after a failed cold-insert transport, never a PIN retry."""
+    result = await asyncio.to_thread(sim.read_card, idx)
+    if not getattr(result, "transport_error", False) or not port:
+        return result
+    if device_state.vpcd_modem_hardware_id(name):
+        return result
+    if await asyncio.to_thread(_find_running_by_reader, name, port, require_port_match=True):
+        return result
+    if not await asyncio.to_thread(usbreader.recover_scr_prime, name, port):
+        return result
+    names = await asyncio.to_thread(sim.list_readers)
+    if name not in names:
+        return result
+    retried = await asyncio.to_thread(sim.read_card, names.index(name))
+    if retried.reader != name:
+        raise RuntimeError("reader enumeration changed during recovery")
+    log.info("native reader cold-insert recovery completed readable=%s",
+             bool(retried.present and retried.iccid and not retried.transport_error))
+    return retried
+
+
 async def _auto_start_hotplugged_line(iid: str) -> None:
     """Start one enabled matched line after reader enumeration settles.
 
@@ -885,39 +909,49 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
         return
     hub.hotplug_starts.add(iid)
     try:
-        await asyncio.sleep(6)
-        inst = cfg.get_instance(iid)
-        if not inst or await asyncio.to_thread(engine.is_running, iid):
-            return
-        cards = hub.cards_list()
-        card_info = next((item for item in cards if item.get("present")
-                          and str(item.get("iccid") or "") == str(inst.get("iccid") or "")), None)
-        if not card_info:
-            return
-
-        # Completing a newly discovered line describes the SIM and its hardware; it does not
-        # start VoWiFi. Do this before consulting the device switch so a deliberately disabled
-        # modem still gets a usable line record whose switch can be enabled later in the UI.
-        if inst.get("provisioning_state") == "draft":
-            inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
-            if inst.get("provisioning_state") == "draft":
-                log.info("hotplug draft %s awaiting: %s", iid,
-                         ", ".join(inst.get("auto_provision_missing") or []))
+        for attempt in range(6):
+            await asyncio.sleep(6 if attempt == 0 else 5)
+            inst = cfg.get_instance(iid)
+            if not inst or await asyncio.to_thread(engine.is_running, iid):
+                return
+            cards = hub.cards_list()
+            card_info = next((item for item in cards if item.get("present")
+                              and str(item.get("iccid") or "") == str(inst.get("iccid") or "")), None)
+            if not card_info:
                 return
 
-        device_id, device_type = _device_for_card(card_info, cards)
-        desired = device_state.desired()
-        wanted = ((desired.get("devices") or {}).get(device_id)
-                  or desired.get("defaults") or {})
-        if not wanted.get("vowifi_enabled", True):
+            # Completing a newly discovered line describes the SIM and its hardware; it does not
+            # start VoWiFi. Do this before consulting the device switch so a deliberately disabled
+            # modem still gets a usable line record whose switch can be enabled later in the UI.
+            if inst.get("provisioning_state") == "draft":
+                inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
+                if inst.get("provisioning_state") == "draft":
+                    log.info("hotplug draft %s awaiting: %s", iid,
+                             ", ".join(inst.get("auto_provision_missing") or []))
+                    return
+
+            device_id, device_type = _device_for_card(card_info, cards)
+            desired = device_state.desired()
+            wanted = ((desired.get("devices") or {}).get(device_id)
+                      or desired.get("defaults") or {})
+            if not wanted.get("vowifi_enabled", True):
+                return
+            if not inst.get("enabled", True):
+                return
+            try:
+                await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
+                                        os.environ.get("MDD_DEV_MOUNTS", "") == "1")
+            except HTTPException as exc:
+                if (isinstance(exc.detail, dict) and exc.detail.get("code") == "egress_unavailable"
+                        and attempt < 5):
+                    _record_lifecycle(iid, "recovery_scheduled", "egress_unavailable",
+                                      retry_count=attempt + 1, delay_seconds=5, card_present=True)
+                    continue
+                raise
+            hub.reset_health(iid, "hotplug_start")
+            await hub.broadcast({"type": "engine", "instance": iid, "event": "hotplug_started",
+                                 "args": []})
             return
-        if not inst.get("enabled", True):
-            return
-        await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
-                                os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-        hub.reset_health(iid, "hotplug_start")
-        await hub.broadcast({"type": "engine", "instance": iid, "event": "hotplug_started",
-                             "args": []})
     except Exception as exc:  # noqa
         log.warning("hotplug auto-start failed for %s: %s", iid, getattr(exc, "detail", exc))
     finally:

@@ -47,6 +47,7 @@ class CardInfo:
     # Stable physical USB port path of this reader (e.g. "3-2"). Used to bind a line to a
     # physical reader socket instead of the unstable pcscd enumeration index.
     reader_port: Optional[str] = None
+    transport_error: bool = False  # A cold USB insert may need one reader-session reset.
 
     def dict(self):
         return asdict(self)
@@ -460,6 +461,7 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
         conn.connect()
     except (NoCardException, CardConnectionException) as e:
         info.error = f"no card: {e}"
+        info.transport_error = True
         return info
     info.present = True
     try:
@@ -525,10 +527,11 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             # SMSC from EF_SMSP (6F42) — authoritative per-SIM SMS centre (needs PIN, like IMSI)
             try:
                 info.smsc = _read_smsc(conn)
-            except Exception:  # noqa
-                pass
+            except Exception as e:  # noqa
+                info.transport_error = isinstance(e, (NoCardException, CardConnectionException))
     except Exception as e:  # noqa
         info.error = repr(e)
+        info.transport_error = isinstance(e, (NoCardException, CardConnectionException))
     finally:
         try:
             conn.disconnect()
