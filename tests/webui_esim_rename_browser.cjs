@@ -12,7 +12,7 @@ const profiles = [
   { iccid: 'profile-active', profileNickname: 'Active fixture', profileState: 'enabled' },
   { iccid: 'profile-inactive', profileNickname: 'Inactive fixture', profileState: 'disabled' },
 ]
-let running = true, failure = '', liveReads = 0
+let running = true, failure = '', liveReads = 0, statusReads = 0
 const writes = []
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost')
@@ -40,15 +40,21 @@ const server = http.createServer(async (request, response) => {
         assert.equal(data.se_id, 'default')
         assert.equal(data.aid, 'fixture-aid')
         if (failure === 'nickname') return json(400, { detail: 'fixture nickname rejected' })
+        if (failure === 'write-and-bridge') return json(503, { detail: { message: 'fixture SIM recovery failed', reader_recovery_failed: true } })
         const p = profiles.find(p => url.pathname.includes(`/${p.iccid}/`))
         p.profileNickname = data.nickname
-        return json(200, { ok: true, nickname: data.nickname })
+        return json(200, { ok: true, nickname: data.nickname, reader_ready: failure !== 'bridge',
+          ...(failure === 'bridge' ? { recovery_error: 'fixture SIM recovery failed' } : {}) })
       } else {
         assert.fail(`Unexpected write ${url.pathname}`)
       }
       return json(200, { ok: true })
     }
     if (url.pathname === '/api/esim/chip') liveReads++
+    if (url.pathname === '/api/instances/7/status') {
+      statusReads++
+      return json(200, { state: running ? (failure === 'health' ? 'NO_CARD' : 'OK') : 'STOPPED' })
+    }
     const values = {
       '/api/auth/status': { configured: true, authenticated: true, csrf: 'fixture-only' },
       '/api/devices': { devices: [], discovering: false },
@@ -118,19 +124,32 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.reload()
       await page.getByText(`Renamed ${width} ${'long fixture '.repeat(12)}`.trim(), { exact: true }).waitFor()
     }
-    for (failure of ['stop', 'nickname', 'start', '']) {
+    for (failure of ['stop', 'nickname', 'start', 'bridge', 'write-and-bridge', 'health', '']) {
       await open(failure !== '')
       await page.getByRole('button', { name: '重命名', exact: true }).first().click()
       await dialog.getByRole('textbox').fill('New active fixture')
+      const beforeReads = statusReads
       await dialog.getByRole('button', { name: failure ? '停止线路并重命名' : '更新', exact: true }).click()
-      if (failure === 'stop' || failure === 'nickname') {
+      if (failure === 'health') {
+        while (statusReads === beforeReads) await new Promise(resolve => setTimeout(resolve, 20))
+        assert.equal(await dialog.isVisible(), true, 'start 200 must not claim a NO_CARD line recovered')
+        await page.clock.install()
+        await page.clock.fastForward(95000)
+        await page.locator('.u-esim-page [role="status"]').filter({ hasText: '90 秒内未恢复就绪' }).waitFor()
+      }
+      if (failure === 'stop' || failure === 'nickname' || failure === 'write-and-bridge') {
         await dialog.getByRole('alert').waitFor()
-        assert.equal(running, true, 'original line survives a rejected rename')
+        assert.equal(running, failure !== 'write-and-bridge', 'restart only after reader recovery succeeds')
       } else {
         await dialog.waitFor({ state: 'hidden' })
       }
       if (failure === 'start') await page.locator('.u-esim-page [role="status"]').filter({ hasText: '线路 7 恢复失败' }).waitFor()
+      if (failure === 'bridge') {
+        await page.locator('.u-esim-page [role="status"]').filter({ hasText: '昵称已写入，但 SIM 通道恢复失败' }).waitFor()
+        assert.equal(running, false)
+      }
       const expected = failure === 'stop' ? ['/api/instances/7/stop']
+        : ['bridge', 'write-and-bridge'].includes(failure) ? ['/api/instances/7/stop', '/api/esim/profiles/profile-active/nickname']
         : failure ? ['/api/instances/7/stop', '/api/esim/profiles/profile-active/nickname', '/api/instances/7/start']
           : ['/api/esim/profiles/profile-active/nickname']
       assert.deepEqual(writes, expected)

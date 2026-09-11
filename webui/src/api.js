@@ -177,7 +177,7 @@ export const api = {
   stop: (id) => j('POST', `/api/instances/${id}/stop`),
   reprovision: (id, body) => j('POST', `/api/instances/${id}/reprovision`, body || {}),
   clearPin: (id) => j('POST', `/api/instances/${id}/pin/clear`),
-  status: (id) => j('GET', `/api/instances/${id}/status`),
+  status: (id, signal) => j('GET', `/api/instances/${id}/status`, undefined, signal),
   // Recorded VoWiFi up/down timeline; the window follows the accumulated history (max 2 days).
   lineAvailability: (id) => poll('availability', `/api/instances/${id}/availability`),
   logs: (id, tail = 300) => j('GET', `/api/instances/${id}/logs?tail=${tail}`),

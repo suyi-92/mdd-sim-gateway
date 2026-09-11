@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
+import { waitForEsimLine } from '../esimRecovery.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -799,7 +800,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     const runningId = lineRunning && matchedInst && String(matchedInst.id) === String(runningLine?.id)
       ? matchedInst.id : null
     const feedback = (message, error = '') => setRenameStatus({ iccid: profile.iccid, seId: se.id, message, error })
-    let stopped = false, renamed = false, failure = '', resumeFailure = ''
+    let stopped = false, renamed = false, readerReady = true, failure = '', resumeFailure = ''
     setBusyOp('Nickname')
     setErr('')
     try {
@@ -811,6 +812,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       feedback(t('Saving…'))
       const result = await api.esimNickname(profile.iccid, nick, target)
       renamed = true
+      if (result.reader_ready === false || result.recovery_error) {
+        readerReady = false
+        resumeFailure = t('The nickname was saved, but the SIM channels could not recover. Keep the line stopped and retry recovery from Devices.')
+      }
       // The nickname API updates the gateway cache. A fresh exclusive read is unnecessary,
       // and would fail once the original line owns the reader again.
       setSes(list => list.map(item => item.id !== se.id ? item : {
@@ -819,10 +824,16 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       }))
     } catch (e) {
       failure = e.message
+      if (e.data?.detail?.reader_recovery_failed) readerReady = false
     } finally {
-      if (stopped) {
+      if (stopped && readerReady) {
         feedback(t('Restarting the original line…'))
-        try { await api.start(runningId) }
+        try {
+          await api.start(runningId)
+          if (!await waitForEsimLine(api, runningId)) {
+            resumeFailure = t('Line {id} did not become ready within 90 seconds. Check its SIM and registration status in Devices.', { id: runningId })
+          }
+        }
         catch (e) { resumeFailure = t('Line {id} could not restart: {error}', { id: runningId, error: e.message }) }
       }
       const message = [renamed ? t('Profile renamed.') : failure, resumeFailure].filter(Boolean).join(' ')

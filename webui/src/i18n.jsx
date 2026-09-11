@@ -304,6 +304,8 @@ const zh = {
   'Stop line and rename': '停止线路并重命名',
   'Stopping the line to rename…': '正在停止线路以重命名…',
   'Restarting the original line…': '正在恢复原线路…',
+  'The nickname was saved, but the SIM channels could not recover. Keep the line stopped and retry recovery from Devices.': '昵称已写入，但 SIM 通道恢复失败。线路保持停止，请前往“设备”页面处理恢复。',
+  'Line {id} did not become ready within 90 seconds. Check its SIM and registration status in Devices.': '线路 {id} 在 90 秒内未恢复就绪，请前往“设备”页面检查 SIM 和注册状态。',
   'Line {id} could not restart: {error}': '线路 {id} 恢复失败：{error}',
   'Profile renamed.': '配置文件已重命名。',
   'Saving…': '正在保存…', Update: '更新', 'Read default SM-DP+': '读取默认 SM-DP+', 'Get eUICC challenge': '获取 eUICC 质询',

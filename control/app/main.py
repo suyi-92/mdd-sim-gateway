@@ -7411,14 +7411,78 @@ async def api_esim_delete(
 async def api_esim_nickname(iccid: str, body: dict):
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    se = await asyncio.to_thread(
-        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
-        require=True)
     nick = body.get("nickname", "")
-    await _esim_run(
-        name, idx, lpa.profile_nickname(name, iccid, nick, aid=se.get("aid")))
-    await asyncio.to_thread(_esim_cache_update_profile, iccid, nickname=nick)
-    return {"ok": True, "iccid": iccid, "nickname": nick, "se_id": se["id"]}
+    if not isinstance(nick, str):
+        raise HTTPException(400, "nickname must be a string")
+    switch_key, hardware_id = _esim_switch_identity(name)
+    async with hub.esim_switch_lock(switch_key):
+        readers = await asyncio.to_thread(_esim_modem_reader_names, name, hardware_id)
+        if any(hub.lpa_busy.get(reader) for reader in readers):
+            raise HTTPException(409, "an eSIM operation is already running on this reader")
+        # An LPA on any modem slot affects the shared physical UICC. Guard every sibling,
+        # including a line whose PIN reader differs from the selected eSIM reader.
+        for reader in readers:
+            await asyncio.to_thread(_esim_guard_engine, reader)
+        for reader in readers:
+            hub.lpa_busy[reader] = True
+        try:
+            return await _esim_run(
+                name, idx, _esim_nickname_and_recover(name, idx, hardware_id, iccid, nick, body),
+                keep_busy=True)
+        finally:
+            for reader in readers:
+                hub.lpa_busy.pop(reader, None)
+
+
+async def _esim_nickname_and_recover(name, idx, hardware_id, iccid, nick, body):
+    """Restore the modem's USIM channels before the caller may restart its original line.
+
+    lpac can leave ISD-R selected despite the bridge's best-effort SELECT MF. Restarting
+    only the Engine then leaves pin_keeper reporting ADF.USIM select failed indefinitely.
+    Renaming an inactive profile must restore the *inserted* identity, not enable that
+    profile or change which saved line is enabled.
+    """
+    active_iccid = ""
+    if hardware_id:
+        active_iccid = str(await asyncio.to_thread(sim.read_iccid, idx) or "")
+        if not active_iccid:
+            raise HTTPException(409, "the active SIM identity could not be verified before renaming")
+    saved = False
+    operation_error = recovery_error = None
+    se = {}
+    try:
+        se = await asyncio.to_thread(
+            _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
+            body.get("aid"), require=True)
+        await lpa.profile_nickname(name, iccid, nick, aid=se.get("aid"))
+        saved = True
+        await asyncio.to_thread(_esim_cache_update_profile, iccid, nickname=nick)
+    except Exception as exc:
+        operation_error = exc
+    finally:
+        if hardware_id:
+            recovery_started = time.monotonic()
+            stage = "bridge"
+            try:
+                await _esim_restart_modem_bridge(hardware_id, active_iccid)
+                stage = "verify_slots"
+                await _esim_refresh_modem_readers(name, hardware_id, active_iccid)
+                log.info("eSIM nickname modem recovery complete elapsed_ms=%d",
+                         round((time.monotonic() - recovery_started) * 1000))
+            except Exception as exc:
+                # Never forward generated bridge configuration or card identities in errors.
+                log.warning("eSIM nickname modem recovery failed stage=%s error_type=%s",
+                            stage, type(exc).__name__)
+                recovery_error = "The modem SIM channels could not recover. Keep the line stopped and retry recovery."
+    if recovery_error:
+        if not saved:
+            raise HTTPException(503, {"message": recovery_error, "reader_recovery_failed": True})
+        return {"ok": True, "iccid": iccid, "nickname": nick, "se_id": se["id"],
+                "recovery_error": recovery_error, "reader_ready": False}
+    if operation_error:
+        raise operation_error
+    return {"ok": True, "iccid": iccid, "nickname": nick, "se_id": se["id"],
+            "reader_ready": True}
 
 
 @app.post("/api/esim/download")
