@@ -128,6 +128,7 @@ function StatePill({ state, pending = false }) {
   return (
     <span style={{
       fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 999,
+      flexShrink: 0, whiteSpace: 'nowrap',
       background: pending ? '#fef3c7' : enabled ? '#dcfce7' : 'var(--hover)',
       color: pending ? '#92400e' : enabled ? '#166534' : 'var(--text-dim)',
     }}>
@@ -143,7 +144,7 @@ function profileDisplayName(p, fallback = 'Profile') {
   return (p.profileName || p.serviceProviderName || fallback).trim() || fallback
 }
 
-function RenameModal({ profile, busy, onClose, onSave }) {
+function RenameModal({ profile, runningLine, busy, error, onClose, onSave }) {
   const { t } = useI18n()
   const [nick, setNick] = useState(() => profileDisplayName(profile))
   useEffect(() => {
@@ -152,21 +153,28 @@ function RenameModal({ profile, busy, onClose, onSave }) {
   if (!profile) return null
   return (
     <div style={{ position: 'fixed', inset: 0, background: '#0008', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50 }}
-      onClick={onClose}>
-      <div className="card" style={{ width: 360, maxWidth: '92vw', padding: 20 }} onClick={(e) => e.stopPropagation()}>
+      onClick={() => { if (!busy) onClose() }}>
+      <div className="card" role="dialog" aria-modal="true" aria-label={t('Rename')}
+        style={{ width: 360, maxWidth: '92vw', padding: 20 }} onClick={(e) => e.stopPropagation()}>
         <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>{t('Rename')}</div>
         <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 14, wordBreak: 'break-all' }}>
           {profile.iccid}
         </div>
+        {runningLine && <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
+          {t('Renaming writes to the eSIM. Line {id} will stop briefly and restart after the attempt. Any current call will end.', { id: runningLine.id })}
+        </p>}
+        {error && <p className="u-error" role="alert">{error}</p>}
         <label className="u-field-stack u-esim-modal-field">
           <div>{t('Nickname')}</div>
           <input
             autoFocus
+            disabled={busy}
             value={nick}
             onChange={(e) => setNick(e.target.value)}
             placeholder={t('Nickname')}
             style={{ width: '100%' }}
             onKeyDown={(e) => {
+              if (busy) return
               if (e.key === 'Enter') onSave(nick.trim())
               if (e.key === 'Escape') onClose()
             }}
@@ -174,8 +182,9 @@ function RenameModal({ profile, busy, onClose, onSave }) {
         </label>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>{t('Cancel')}</button>
-          <button className="btn btn-primary u-update-action" disabled={busy} onClick={() => onSave(nick.trim())}>
-            {t(busy ? 'Saving…' : 'Update')}
+          <button className="btn btn-primary u-update-action" style={{ minWidth: runningLine ? 156 : undefined }}
+            disabled={busy} onClick={() => onSave(nick.trim())}>
+            {t(busy ? 'Saving…' : runningLine ? 'Stop line and rename' : 'Update')}
           </button>
         </div>
       </div>
@@ -459,6 +468,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   const [showDl, setShowDl] = useState(false)
   const [dl, setDl] = useState(null) // {step, event, metadata, error, done}
   const [renameTarget, setRenameTarget] = useState(null) // { se, profile }
+  const [renameStatus, setRenameStatus] = useState(null)
+  const renameBusy = useRef(false)
   const [busyOp, setBusyOp] = useState('')
   const [profileSwitch, setProfileSwitch] = useState(null) // { iccid, phase }
 
@@ -511,6 +522,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     setErr('')
     setDl(null)
     setRenameTarget(null)
+    setRenameStatus(null)
     setProfileSwitch(null)
   }, [reader])
 
@@ -779,6 +791,50 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     setBusyOp('')
   }
 
+  const saveNickname = async (nick) => {
+    if (!renameTarget || renameBusy.current || busyOp || switchActive || loading) return
+    renameBusy.current = true
+    const { se, profile, runningLine } = renameTarget
+    const target = seTarget(reader, se)
+    const runningId = lineRunning && matchedInst && String(matchedInst.id) === String(runningLine?.id)
+      ? matchedInst.id : null
+    const feedback = (message, error = '') => setRenameStatus({ iccid: profile.iccid, seId: se.id, message, error })
+    let stopped = false, renamed = false, failure = '', resumeFailure = ''
+    setBusyOp('Nickname')
+    setErr('')
+    try {
+      if (runningId != null) {
+        feedback(t('Stopping the line to rename…'))
+        await api.stop(runningId)
+        stopped = true
+      }
+      feedback(t('Saving…'))
+      const result = await api.esimNickname(profile.iccid, nick, target)
+      renamed = true
+      // The nickname API updates the gateway cache. A fresh exclusive read is unnecessary,
+      // and would fail once the original line owns the reader again.
+      setSes(list => list.map(item => item.id !== se.id ? item : {
+        ...item, profiles: (item.profiles || []).map(p => p.iccid !== profile.iccid ? p
+          : { ...p, profileNickname: result.nickname ?? nick }),
+      }))
+    } catch (e) {
+      failure = e.message
+    } finally {
+      if (stopped) {
+        feedback(t('Restarting the original line…'))
+        try { await api.start(runningId) }
+        catch (e) { resumeFailure = t('Line {id} could not restart: {error}', { id: runningId, error: e.message }) }
+      }
+      const message = [renamed ? t('Profile renamed.') : failure, resumeFailure].filter(Boolean).join(' ')
+      feedback(message, [failure, resumeFailure].filter(Boolean).join(' '))
+      if (renamed) setRenameTarget(null)
+      showToast?.(message)
+      try { await refresh?.() } catch { /* The operation result stays in its profile row. */ }
+      setBusyOp('')
+      renameBusy.current = false
+    }
+  }
+
   if (initialLoading && !present.length) return <p role="status">{t('Loading')}…</p>
   if (loadErrors?.cards && !present.length) return <p className="u-error">{t('Loading failed')}</p>
   if (!present.length) {
@@ -794,7 +850,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       <div className="u-esim-toolbar">
         <label className="u-inline-field u-esim-reader-field">
           <span>{t('Reader')}</span>
-          <select value={reader} onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
+          <select value={reader} disabled={!!busyOp || loading || switchActive || !!renameTarget}
+            onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
             {present.map((c) => (
               <option key={c.name} value={c.name}>
                 #{c.index} · {modemReaderGroup(c.name) || c.name}{c.iccid ? ` · ${c.iccid}` : ''}
@@ -996,6 +1053,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                         const enabled = String(p.profileState || '').toLowerCase() === 'enabled'
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))
+                        const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
+                          ? renameStatus : null
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
                             border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
@@ -1005,7 +1064,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                           }}>
                             <div style={{ minWidth: 0, flex: 1 }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                                <span style={{
+                                <span title={title} style={{
                                   fontWeight: 700, fontSize: 14, overflow: 'hidden',
                                   textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                                 }}>
@@ -1014,12 +1073,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                 <StatePill state={p.profileState}
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
-                              <div style={{
+                              <div role={renameFeedback ? 'status' : undefined} title={renameFeedback?.message} style={{
                                 marginTop: 4, fontSize: 12, color: 'var(--text-mute)',
+                                height: 18, lineHeight: '18px',
                                 fontFamily: 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                               }}>
-                                {p.iccid}
+                                {renameFeedback?.message || p.iccid}
                               </div>
                             </div>
                             <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -1035,8 +1095,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                   {t('Disable')}
                                 </button>
                               )}
-                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
-                                onClick={() => setRenameTarget({ se, profile: p })}>
+                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || loading}
+                                onClick={() => {
+                                  setRenameStatus(null)
+                                  setRenameTarget({ se, profile: p, runningLine: lineRunning ? matchedInst : null })
+                                }}>
                                 {t('Rename')}
                               </button>
                               <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
@@ -1143,14 +1206,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       {renameTarget && (
         <RenameModal
           profile={renameTarget.profile}
+          runningLine={renameTarget.runningLine}
           busy={busyOp === 'Nickname'}
-          onClose={() => setRenameTarget(null)}
-          onSave={(nick) => {
-            const { se, profile } = renameTarget
-            const target = seTarget(reader, se)
-            runProfileOp('Nickname', () => api.esimNickname(profile.iccid, nick, target)
-              .then(() => setRenameTarget(null)))
-          }}
+          error={renameStatus?.error}
+          onClose={() => { if (!renameBusy.current) setRenameTarget(null) }}
+          onSave={saveNickname}
         />
       )}
     </div>
