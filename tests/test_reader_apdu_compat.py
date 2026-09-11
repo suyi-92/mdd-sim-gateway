@@ -117,7 +117,7 @@ class FakeUsim:
             return _ef_imsi_bytes(), 0x90, 0x00
         return [], 0x6D, 0x00
 
-    def connect(self):
+    def connect(self, **kwargs):
         pass
 
     def disconnect(self):

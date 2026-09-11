@@ -422,7 +422,7 @@ def read_iccid(reader_index: int = 0) -> str:
     conn = None
     try:
         conn = rlist[reader_index].createConnection()
-        conn.connect()
+        conn.connect(disposition=SCARD_LEAVE_CARD)
     except (NoCardException, CardConnectionException):
         return ""
     try:
@@ -458,7 +458,7 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
         pass
     try:
         conn = r.createConnection()
-        conn.connect()
+        conn.connect(disposition=SCARD_LEAVE_CARD)
     except (NoCardException, CardConnectionException) as e:
         info.error = f"no card: {e}"
         info.transport_error = True
@@ -545,7 +545,7 @@ def _find_conn(reader_index: int):
     if reader_index >= len(rlist):
         raise RuntimeError("reader index out of range")
     conn = rlist[reader_index].createConnection()
-    conn.connect()
+    conn.connect(disposition=SCARD_LEAVE_CARD)
     return conn
 
 

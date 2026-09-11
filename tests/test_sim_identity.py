@@ -36,7 +36,7 @@ class SimCarrierIdentityTests(unittest.TestCase):
                 self.commands = []
                 self.disconnected = False
 
-            def connect(self):
+            def connect(self, **kwargs):
                 pass
 
             def disconnect(self):

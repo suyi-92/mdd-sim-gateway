@@ -478,7 +478,7 @@ def find_reader(reader_spec):
     def _open(r):
         try:
             c = r.createConnection()
-            c.connect()
+            c.connect(disposition=SCARD_LEAVE_CARD)
             return c
         except Exception:
             return None

@@ -34,7 +34,7 @@ class _Connection:
         # None models a card that will not answer EF.ICCID at all — a fault, not a swap.
         self.iccid = iccid
 
-    def connect(self):
+    def connect(self, **kwargs):
         if not self.openable:
             raise RuntimeError("card unavailable")
         self.connected = True

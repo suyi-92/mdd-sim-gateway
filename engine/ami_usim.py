@@ -198,7 +198,7 @@ def make_connection_index(reader_index):
     if reader_index >= len(r):
         return None
     connection = r[reader_index].createConnection()
-    connection.connect()
+    connection.connect(disposition=SCARD_LEAVE_CARD)
     if not _shared_select_adf_usim(connection):
         print("Failed to select AID")
         try:
@@ -381,7 +381,7 @@ def open_usim(reader_spec):
         if pidx is not None and pidx < len(rlist):
             try:
                 conn = rlist[pidx].createConnection()
-                conn.connect()
+                conn.connect(disposition=SCARD_LEAVE_CARD)
                 return conn
             except Exception:
                 pass
@@ -393,7 +393,7 @@ def open_usim(reader_spec):
             if str(reader) == wanted:
                 try:
                     conn = reader.createConnection()
-                    conn.connect()
+                    conn.connect(disposition=SCARD_LEAVE_CARD)
                     return conn
                 except Exception:
                     return None
@@ -403,12 +403,12 @@ def open_usim(reader_spec):
             # One reader holds the only card there is; IMSI cannot be read before the PIN is
             # verified anyway, so scanning for it would just burn PIN tries on that same card.
             conn = rlist[0].createConnection()
-            conn.connect()
+            conn.connect(disposition=SCARD_LEAVE_CARD)
             return conn
         for r in rlist:
             try:
                 conn = r.createConnection()
-                conn.connect()
+                conn.connect(disposition=SCARD_LEAVE_CARD)
             except Exception:
                 continue
             with _Tx(conn):
@@ -436,7 +436,7 @@ def open_usim(reader_spec):
     if idx < 0 or idx >= len(rlist):
         return None
     conn = rlist[idx].createConnection()
-    conn.connect()
+    conn.connect(disposition=SCARD_LEAVE_CARD)
     return conn
 
 

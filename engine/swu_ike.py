@@ -6263,7 +6263,7 @@ def read_iccid_at_index(reader_index):
     """Read EF.ICCID from a reader index. No PIN needed; None when the card will not answer."""
     r = readers()
     connection = r[int(reader_index)].createConnection()
-    connection.connect()
+    connection.connect(disposition=SCARD_LEAVE_CARD)
     try:
         connection.transmit(toBytes('00A40000023F00'))
         connection.transmit(toBytes('00A40000022FE2'))
@@ -6303,7 +6303,7 @@ def read_imsi(reader_index):
     imsi = None
     r = readers()
     connection = r[int(reader_index)].createConnection()
-    connection.connect()
+    connection.connect(disposition=SCARD_LEAVE_CARD)
     data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))     
     data, sw1, sw2 = connection.transmit(toBytes('00A40000027F20'))
     data, sw1, sw2 = connection.transmit(toBytes('00A40000026F07'))
@@ -6319,7 +6319,7 @@ def read_res_ck_ik(reader_index, rand, autn):
     ik = None
     r = readers()
     connection = r[int(reader_index)].createConnection()
-    connection.connect()
+    connection.connect(disposition=SCARD_LEAVE_CARD)
     data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))    
     data, sw1, sw2 = connection.transmit(toBytes('00A40000022F00')) 
     data, sw1, sw2 = connection.transmit(toBytes('00A4040010A0000000871002FF44FFFF8901010100'))
@@ -6403,7 +6403,7 @@ def _pcsc_hcard(conn):
 def _read_res_ck_ik_pin(reader_index, rand, autn, pin):
     r = readers()
     conn = r[int(reader_index)].createConnection()
-    conn.connect()
+    conn.connect(disposition=SCARD_LEAVE_CARD)
     # Exclusive PC/SC transaction for the whole SELECT->VERIFY->AUTHENTICATE sequence: pcscd
     # serializes single APDUs but NOT multi-APDU groups, so without this ami_usim's own AKA
     # APDUs could interleave during a reauth and corrupt the sequence.

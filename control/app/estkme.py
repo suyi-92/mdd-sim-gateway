@@ -13,6 +13,7 @@ from typing import Optional
 
 from smartcard.Exceptions import CardConnectionException, NoCardException
 from smartcard.System import readers
+from smartcard.scard import SCARD_LEAVE_CARD
 
 log = logging.getLogger("vowifi.lpa.estkme")
 
@@ -92,7 +93,7 @@ def read_estk_sku(reader_name: str | None = None, reader_index: int = 0) -> Opti
         return None
     try:
         conn = r.createConnection()
-        conn.connect()
+        conn.connect(disposition=SCARD_LEAVE_CARD)
     except (NoCardException, CardConnectionException) as e:
         log.info("ESTKme connect failed: %r", e)
         return None

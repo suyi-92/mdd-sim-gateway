@@ -47,7 +47,7 @@ class _Connection:
         self.transmits = 0
         self.released = threading.Event()
 
-    def connect(self):
+    def connect(self, **kwargs):
         pass
 
     def disconnect(self):
