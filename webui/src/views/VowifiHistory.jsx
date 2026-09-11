@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
+import { HISTORY_SPANS, savedHistorySpan, saveHistorySpan } from '../historyRange.js'
 
 // Connectivity timeline for one VoWiFi line. The backend records merged up/down segments and
 // reports the periods it was not running as `unknown`, so this only has to draw what it is
@@ -75,7 +76,8 @@ function outageCause(segment, t) {
     legacyDetail: structured ? '' : segment.detail,
   }
 }
-const TICK_STEPS = [900, 1800, 3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600]
+const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 2 * 3600, 3 * 3600, 6 * 3600,
+  12 * 3600, 86400, 2 * 86400, 3 * 86400, 7 * 86400, 14 * 86400]
 const REFRESH_MS = 30000
 
 function tickStep(span, maxTicks) {
@@ -85,8 +87,18 @@ function tickStep(span, maxTicks) {
 /** Axis ticks on local-time boundaries, so labels land on :00 rather than on the window edge. */
 function axisTicks(start, end, maxTicks = 7) {
   const step = tickStep(Math.max(60, end - start), maxTicks)
-  const shift = -new Date().getTimezoneOffset() * 60
   const ticks = []
+  if (step >= 86400) {
+    // Keep multi-day labels at local midnight even when this range crosses a DST change.
+    const date = new Date(start * 1000)
+    date.setHours(0, 0, 0, 0)
+    if (date.getTime() / 1000 < start) date.setDate(date.getDate() + 1)
+    for (; date.getTime() / 1000 <= end; date.setDate(date.getDate() + step / 86400)) {
+      ticks.push({ ts: date.getTime() / 1000 })
+    }
+    return ticks
+  }
+  const shift = -new Date().getTimezoneOffset() * 60
   for (let ts = Math.ceil((start + shift) / step) * step - shift; ts <= end; ts += step) {
     if (ts >= start) ticks.push({ ts })
   }
@@ -124,22 +136,41 @@ function duration(seconds, t) {
 
 export default function VowifiHistory({ instanceId, subscribe, compact = false }) {
   const { t, language } = useI18n()
-  const [data, setData] = useState(null)
-  const [error, setError] = useState('')
+  const [range, setRange] = useState(savedHistorySpan)
+  const [view, setView] = useState(null)
   const [hover, setHover] = useState(null)
+  const [plotWidth, setPlotWidth] = useState(0)
+  const plotRef = useRef(null)
+  const request = useRef(0)
+  const key = `${instanceId}:${range}`
+  const currentView = view?.key === key ? view : null
+  const data = currentView?.data || null
+  const error = currentView?.error || ''
+  const loading = currentView?.loading ?? true
 
   const load = useCallback(() => {
     if (!instanceId) return
-    api.lineAvailability(instanceId)
-      .then(result => { setData(result); setError('') })
-      .catch(err => setError(err.message))
-  }, [instanceId])
+    const sequence = ++request.current
+    setView(previous => ({ key, data: previous?.key === key ? previous.data : null,
+      error: '', loading: true }))
+    api.lineAvailability(instanceId, range)
+      .then(result => {
+        if (!Array.isArray(result?.segments) || result.span_seconds !== range) {
+          throw new Error('Connection history returned an unexpected time range.')
+        }
+        if (sequence === request.current) setView({ key, data: result, error: '', loading: false })
+      })
+      .catch(err => {
+        if (sequence === request.current) setView(previous => ({ key,
+          data: previous?.key === key ? previous.data : null, error: err.message, loading: false }))
+      })
+  }, [instanceId, range, key])
 
   useEffect(() => {
-    setData(null); setHover(null)
+    setHover(null)
     load()
     const timer = setInterval(load, REFRESH_MS)
-    return () => clearInterval(timer)
+    return () => { clearInterval(timer); request.current++ }
   }, [load])
 
   // Status events arrive every few seconds whether or not anything changed. Only a real
@@ -154,9 +185,18 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
   }), [subscribe, instanceId, load])
 
   const segments = data?.segments || []
-  const span = Math.max(1, (data?.end || 0) - (data?.start || 0))
-  const ticks = useMemo(() => (data ? axisTicks(data.start, data.end, compact ? 5 : 7) : []),
-    [data?.start, data?.end, compact]) // eslint-disable-line react-hooks/exhaustive-deps
+  const span = data ? Math.max(1, data.end - data.start) : range
+  useEffect(() => {
+    const node = plotRef.current
+    if (!node) return
+    setPlotWidth(node.clientWidth)
+    const observer = new ResizeObserver(() => setPlotWidth(node.clientWidth))
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [Boolean(data)])
+  const maxTicks = Math.max(2, Math.min(compact ? 5 : 7, Math.floor(plotWidth / 75)))
+  const ticks = useMemo(() => (data ? axisTicks(data.start, data.end, maxTicks) : []),
+    [data?.start, data?.end, maxTicks]) // eslint-disable-line react-hooks/exhaustive-deps
   const outages = useMemo(() => segments.filter(s => s.state === 'down')
     .slice(-20).reverse(), [segments])
 
@@ -164,10 +204,7 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
   if (!instanceId) {
     return compact ? null : <div className="u-note">{t('Connectivity history starts once this device has a configured SIM line.')}</div>
   }
-  if (error) return compact ? null : <div className="u-note u-error">{`${t('Error')}: ${error}`}</div>
-  if (!data) return <div className="u-note">{t('Loading')}…</div>
-
-  const summary = data.summary || {}
+  const summary = data?.summary || {}
   const ratio = summary.uptime_ratio
   const uptime = ratio == null ? '—' : `${(ratio * 100).toFixed(ratio > 0.999 ? 2 : 1)}%`
   const present = STATES.filter(state => (summary[state] || 0) > 0)
@@ -182,23 +219,46 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
       <div>
         <h4>{t('Connection history')}</h4>
         <p>{compact
-          ? t('Past {window}', { window: duration(span, t) })
-          : t('Showing the past {window}, recorded every few seconds. Up to 2 days is kept.',
-            { window: duration(span, t) })}</p>
+          ? t('Past {window}', { window: duration(range, t) })
+          : t('Past {window}. Up to 30 days is kept; unrecorded time is excluded from uptime.',
+            { window: duration(range, t) })}</p>
       </div>
-      <div className="u-uptime-figure">
-        <strong>{uptime}</strong>
-        <span>{t('Connected while observed')}</span>
+      <div className="u-uptime-controls">
+        <label className="u-uptime-range">
+          <span>{t('Time range')}</span>
+          <select aria-label={t('Connection history time range')} value={range}
+            onChange={event => {
+              const value = Number(event.target.value)
+              saveHistorySpan(value)
+              setRange(value)
+            }}>
+            {HISTORY_SPANS.map(value => <option key={value} value={value}>
+              {t('Past {window}', { window: duration(value, t) })}
+            </option>)}
+          </select>
+        </label>
+        <div className="u-uptime-figure">
+          <strong>{uptime}</strong>
+          <span>{t('Connected while observed')}</span>
+        </div>
       </div>
     </div>
 
+    <div className="u-uptime-feedback" role="status" aria-live="polite">
+      <span>{loading ? `${t('Loading')}…` : error
+        ? t(data ? 'Refresh failed; showing the last successful history.' : 'Loading failed') : '\u00a0'}</span>
+      {error && <button className="btn btn-ghost" onClick={load}>{t('Retry')}</button>}
+    </div>
+    <div className="u-uptime-body" aria-busy={loading}>
+    {!data && error && <p className="u-note u-error" role="alert">{t(error)}</p>}
+    {data && <>
     <div className="u-uptime-legend">
       {legend.map(state => <span key={state} className={`u-uptime-key is-${state}`}>
         <i />{t(STATE_LABEL[state])}
       </span>)}
     </div>
 
-    <div className="u-uptime-plot">
+    <div className="u-uptime-plot" ref={plotRef}>
       <div className="u-uptime-track" role="img" aria-label={ariaLabel}
         onMouseLeave={() => setHover(null)}>
         {segments.map((segment, index) => {
@@ -237,6 +297,9 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
 
     {!compact && <details className="u-uptime-table">
       <summary>{t('Outage list')}</summary>
+      {summary.outages > outages.length && <p className="u-muted">
+        {t('Showing the latest {count} outages in this range.', { count: outages.length })}
+      </p>}
       {outages.length ? <table><thead><tr>
         <th>{t('Started')}</th><th>{t('Ended')}</th><th>{t('Duration')}</th><th>{t('Reason')}</th>
       </tr></thead><tbody>
@@ -252,5 +315,7 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
         })}
       </tbody></table> : <p className="u-muted">{t('No disconnection was recorded in this window.')}</p>}
     </details>}
+    </>}
+    </div>
   </div>
 }

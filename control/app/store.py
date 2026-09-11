@@ -22,13 +22,13 @@ PREVIOUS_DB_PATH = os.path.join(DATA_DIR, "vowifi.sqlite")
 _lock = threading.Lock()
 
 # Connectivity timeline. Line state is sampled every few seconds, so it is stored as merged
-# segments instead of one row per sample: two days of history stays a handful of rows.
+# segments instead of one row per sample, keeping month-long views compact.
 LINE_STATES = ("up", "down", "off")
 # The longest silence still treated as one continuous observation. Anything longer is a hole
 # in the record (control plane restarted / host powered off) and must stay visible as one
 # instead of being interpolated into a healthy stretch.
 LINE_STATE_CONTINUITY_SECONDS = 90
-LINE_STATE_RETENTION_SECONDS = 3 * 24 * 3600
+LINE_STATE_RETENTION_SECONDS = 31 * 24 * 3600  # 30-day view plus pruning-boundary margin.
 # A create reply normally arrives within 30 seconds and the scanner runs every five seconds.
 # Keep a wider recovery window for a service restart, but do not let an old timed-out draft hide
 # an unrelated, manually-created SMS with the same recipient and body for an entire day.
@@ -1496,7 +1496,10 @@ def line_state_timeline(instance: str, start_ts: int, end_ts: int) -> list[dict]
         segment_end = min(int(row["end_ts"]), end)
         # A segment holding a single sample is still zero-length; keep it so the newest
         # state appears immediately instead of after the second sample of that state.
-        if segment_end < segment_start:
+        if (segment_end < segment_start
+                or (segment_end == start and int(row["start_ts"]) < start)):
+            # A preceding outage ending exactly at the left edge is outside this view.
+            # Keep genuine zero-length observations that begin inside the selected range.
             continue
         hole = segment_start - cursor
         if hole > 0:

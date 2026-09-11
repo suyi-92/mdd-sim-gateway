@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from control.app import store
+from control.app import main, store
 
 
 class LineHistoryTests(unittest.TestCase):
@@ -77,6 +77,11 @@ class LineHistoryTests(unittest.TestCase):
         self.assertEqual(timeline, [{"state": "up", "start": 4000, "end": 6000,
                                      "reason": "", "detail": ""}])
 
+    def test_new_zero_length_state_at_window_start_remains_visible(self):
+        store.record_line_state('1', 'down', ts=5000, reason='reg_unanswered')
+        timeline = store.line_state_timeline('1', 5000, 5000)
+        self.assertEqual(timeline[0]['state'], 'down')
+
     def test_an_outage_keeps_the_reason_it_began_with(self):
         store.record_line_state("1", "up", ts=1000)
         store.record_line_state("1", "down", ts=1004, reason="tunnel_network")
@@ -145,6 +150,67 @@ class LineHistoryTests(unittest.TestCase):
         store.record_line_state("1", "down", ts=1000)
         store.record_line_state("1", "up", ts=1040)
         self.assertEqual(store.line_state_recorded_since("1"), 1000)
+
+    def test_month_history_survives_pruning_but_aged_rows_do_not(self):
+        now = 40 * 86400
+        store.record_line_state("1", "down", ts=now - 35 * 86400)
+        store.record_line_state("1", "up", ts=now - 20 * 86400)
+        store.prune_line_states(now - store.LINE_STATE_RETENTION_SECONDS)
+        self.assertEqual([r["state"] for r in store.line_states("1", 0)], ["up"])
+
+
+class HistoryRangeApiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = self.enterContext(tempfile.TemporaryDirectory())
+        root = Path(self.temp)
+        self.enterContext(patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(root / 'test.sqlite'),
+                                        PREVIOUS_DB_PATH=str(root / 'old.sqlite')))
+        store.init()
+        self.now = 40 * 86400
+        self.enterContext(patch.object(main.time, 'time', return_value=self.now))
+        self.enterContext(patch.object(main.cfg, 'get_instance', return_value={'id': 'fixture'}))
+
+    async def test_each_preset_returns_its_exact_window_even_before_first_observation(self):
+        for span in (900, 1800, 3600, 10800, 21600, 43200, 86400, 172800,
+                     259200, 604800, 1209600, 2592000):
+            with self.subTest(span=span):
+                result = await main.api_instance_availability('fixture', span)
+                self.assertEqual((result['start'], result['end']), (self.now - span, self.now))
+                self.assertEqual(result['span_seconds'], span)
+                self.assertEqual(result['summary']['unknown'], span)
+                self.assertIsNone(result['summary']['uptime_ratio'])
+                self.assertEqual(result['summary']['outages'], 0)
+
+    async def test_summary_and_outage_list_are_recomputed_for_the_selected_window(self):
+        with store._conn() as connection:
+            for state, start, end in [('up', self.now - 21600, self.now - 7200),
+                                      ('down', self.now - 7200, self.now - 3600),
+                                      ('up', self.now - 3600, self.now)]:
+                connection.execute('INSERT INTO line_states(instance,state,start_ts,end_ts) VALUES(?,?,?,?)',
+                                   ('fixture', state, start, end))
+        recent = await main.api_instance_availability('fixture', 3600)
+        longer = await main.api_instance_availability('fixture', 21600)
+        self.assertEqual(recent['summary']['uptime_ratio'], 1)
+        self.assertEqual(recent['summary']['outages'], 0)
+        self.assertEqual(longer['summary']['outages'], 1)
+        self.assertEqual(longer['summary']['longest_outage_seconds'], 3600)
+        self.assertAlmostEqual(longer['summary']['uptime_ratio'], 5 / 6)
+        self.assertTrue(all(s['start'] >= recent['start'] for s in recent['segments']))
+
+    async def test_invalid_ranges_cannot_create_unbounded_queries(self):
+        for span in (-1, 0, 899, 2592001, True, 3600.5):
+            with self.subTest(span=span), self.assertRaises(main.HTTPException) as error:
+                await main.api_instance_availability('fixture', span)
+            self.assertEqual(error.exception.status_code, 400)
+
+    def test_legacy_auto_and_keepalive_window_stay_bounded_at_two_days(self):
+        self.assertEqual(main._availability_window(self.now, None), 3600)
+        self.assertEqual(main._availability_window(self.now, 0), 172800)
+
+    async def test_missing_line_is_still_rejected(self):
+        with patch.object(main.cfg, 'get_instance', return_value=None), self.assertRaises(main.HTTPException) as error:
+            await main.api_instance_availability('absent', 3600)
+        self.assertEqual(error.exception.status_code, 404)
 
 
 if __name__ == "__main__":

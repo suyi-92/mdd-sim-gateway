@@ -81,9 +81,10 @@ MSISDN_LOG_TAIL_LINES = int(os.environ.get("MDD_MSISDN_LOG_TAIL", "4000"))
 # not a problem anyone can act on. Only a rate that holds across consecutive polls is one.
 SUSTAINED_ALERT_CODES = {"swap_pressure"}
 SUSTAINED_ALERT_SAMPLES = int(os.environ.get("MDD_SUSTAINED_ALERT_SAMPLES", "3"))
-# Connectivity timeline shown per line. The window follows how much history has actually
-# accumulated so a fresh install is not stretched across an empty two-day axis.
-LINE_HISTORY_MAX_SECONDS = 2 * 24 * 3600
+# Explicit history ranges reach 30 days. Legacy automatic views (also used by keepalive)
+# still follow recorded history up to two days instead of changing their statistics window.
+LINE_HISTORY_MAX_SECONDS = 30 * 24 * 3600
+LINE_HISTORY_AUTO_MAX_SECONDS = 2 * 24 * 3600
 LINE_HISTORY_MIN_SECONDS = 3600
 LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 # Comfortably below store.LINE_STATE_CONTINUITY_SECONDS, so throttled writes still read back
@@ -5615,22 +5616,28 @@ async def api_instance_status(iid: str):
     return _cached_line_status(inst)
 
 
-def _availability_window(now: int, recorded_since: int | None) -> int:
+def _availability_window(now: int, recorded_since: int | None,
+                         span_seconds: int | None = None) -> int:
     """How far back the chart reaches: as far as history goes, bounded on both sides."""
+    if span_seconds is not None:
+        if (isinstance(span_seconds, bool) or not isinstance(span_seconds, int)
+                or not 900 <= span_seconds <= LINE_HISTORY_MAX_SECONDS):
+            raise HTTPException(400, "history range must be between 15 minutes and 30 days")
+        return span_seconds
     span = (LINE_HISTORY_MIN_SECONDS if recorded_since is None
             else max(LINE_HISTORY_MIN_SECONDS, now - int(recorded_since)))
-    return min(span, LINE_HISTORY_MAX_SECONDS)
+    return min(span, LINE_HISTORY_AUTO_MAX_SECONDS)
 
 
 @app.get("/api/instances/{iid}/availability")
-async def api_instance_availability(iid: str):
+async def api_instance_availability(iid: str, span_seconds: int | None = None):
     """VoWiFi connectivity history for one line, as a gap-aware up/down timeline."""
     inst = cfg.get_instance(str(iid))
     if not inst:
         raise HTTPException(404, "no such instance")
     now = int(time.time())
     recorded_since = await asyncio.to_thread(store.line_state_recorded_since, str(iid))
-    span = _availability_window(now, recorded_since)
+    span = _availability_window(now, recorded_since, span_seconds)
     start = now - span
     segments = await asyncio.to_thread(store.line_state_timeline, str(iid), start, now)
     return {"instance": str(iid), "start": start, "end": now, "span_seconds": span,
