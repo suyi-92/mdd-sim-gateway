@@ -877,6 +877,61 @@ async def _on_card_insert(name, idx):
         asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
 
 
+def _live_vpcd_iccid(name: str) -> str:
+    """Return the current bridge-published ICCID for a connected VPCD reader.
+
+    VPCD reader names can survive a modem/card rebuild unchanged.  The bridge metadata is
+    updated from the card itself before those readers become ready, so it is more current than
+    the card monitor's in-memory row after a PC/SC maintenance window hid the remove/add edge.
+    """
+    hardware_id = device_state.vpcd_modem_hardware_id(name)
+    if not hardware_id:
+        return ""
+    identity = _modem_identity_for_reader(name) or {}
+    if str(identity.get("hardware_id") or hardware_id) != hardware_id:
+        return ""
+    if str(identity.get("channel_status") or "ready") != "ready":
+        return ""
+    return str(identity.get("iccid") or "")
+
+
+def _current_reader_iccid(name: str) -> str:
+    """Use only verified live metadata for VPCD; native readers use their monitor row."""
+    if device_state.vpcd_modem_hardware_id(name):
+        # Returning no identity is safer than lending this reader the previous card's cache
+        # while a replacement bridge is still allocating channels.
+        return _live_vpcd_iccid(name)
+    return str((hub.cards.get(name) or {}).get("iccid") or "")
+
+
+async def _reconcile_vpcd_card_identity(name: str, idx: int) -> bool:
+    """Refresh a same-name VPCD reader when its bridge now exposes another SIM.
+
+    Planned pcscd churn is ignored for a short maintenance window so healthy lines are not
+    stopped.  A complete unplug/replug or card swap can happen inside that window, leaving the
+    reader name and ``present`` bit unchanged.  Compare the bridge's current card identity after
+    the window and run the ordinary insertion path when it changed.
+    """
+    current_iccid = _live_vpcd_iccid(name)
+    if not current_iccid:
+        return False
+    previous = hub.cards.get(name) or {}
+    if str(previous.get("iccid") or "") == current_iccid:
+        return False
+
+    # Stop only a line that proves it is still using this exact reader.  The stale card row's
+    # ``matched`` value is not sufficient: that SIM may already be running correctly in another
+    # SCR reader after a swap.
+    claimed = await asyncio.to_thread(_find_running_by_reader, name)
+    if claimed and str(claimed.get("iccid") or "") != current_iccid:
+        await _stop_instance(str(claimed["id"]), "vpcd_identity_changed")
+
+    log.info("VPCD card identity changed after reader re-enumeration; refreshing binding "
+             "reader=%s", name)
+    await _on_card_insert(name, idx)
+    return True
+
+
 async def _probe_inserted_card(name: str, idx: int, port: str | None):
     """One bounded SCR Prime recovery after a failed cold-insert transport, never a PIN retry."""
     result = await asyncio.to_thread(sim.read_card, idx)
@@ -1190,6 +1245,17 @@ async def card_monitor():
             except OSError:
                 pass
             if maintenance:
+                # A same-name VPCD reader can already be back with a new bridge-published SIM
+                # while the broader remove/add stream is intentionally suppressed.  Ready
+                # metadata is safe to reconcile now and prevents the UI from borrowing the old
+                # card's cached profile list during the rest of the maintenance window.
+                reconciled = False
+                for name, st in current.items():
+                    if (name in hub.cards and st["present"]
+                            and await _reconcile_vpcd_card_identity(name, st["index"])):
+                        reconciled = True
+                if reconciled:
+                    await hub.broadcast({"type": "cards", "cards": _client_cards()})
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1254,6 +1320,9 @@ async def card_monitor():
                         await _on_card_insert(name, st["index"])
                     else:
                         await _on_card_remove(entry)
+                    changed = True
+                    continue
+                if st["present"] and await _reconcile_vpcd_card_identity(name, st["index"]):
                     changed = True
             # The first completed scan is always announced, even when it found nothing:
             # it is what turns the UI's "detecting devices" state into a real answer.
@@ -3005,6 +3074,13 @@ def _esim_resolve_reader(reader_index: int | None = None, reader: str | None = N
 def _esim_imei_for_reader(name: str, override: str | None = None) -> str:
     if override and str(override).strip():
         return str(override).strip()
+    if device_state.vpcd_modem_hardware_id(name):
+        # The hardware identity file belongs to the bridge that currently owns this modem.
+        # Never borrow an IMEI from the stale line association the card monitor may still hold
+        # during re-enumeration.
+        identity = _modem_identity_for_reader(name) or {}
+        imei = cfg.normalize_imei(identity.get("imei", ""))
+        return imei if len(imei) == 15 else ""
     entry = hub.cards.get(name) or {}
     matched = entry.get("matched")
     if matched:
@@ -7259,7 +7335,9 @@ async def api_esim_chip_cached(reader_index: int = 0, reader: str | None = None)
     """Cached chip view for the card in this reader — never touches the card, so it is safe
     while a VoWiFi line holds the reader."""
     name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
-    iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
+    iccid = _current_reader_iccid(name)
+    if not iccid:
+        return {"ok": True, "cached": False, "reader": name, "reader_index": idx}
     entry = await asyncio.to_thread(_esim_cache_for_iccid, iccid)
     if not entry:
         return {"ok": True, "cached": False, "reader": name, "reader_index": idx}
@@ -7279,6 +7357,8 @@ async def api_esim_chip(reader_index: int = 0, reader: str | None = None):
     payload = await _esim_run(name, idx, lpa.load_all_ses(name, idx))
     ses = payload.get("ses") or []
     await asyncio.to_thread(_esim_cache_store, ses, _esim_imei_for_reader(name))
+    if await _reconcile_vpcd_card_identity(name, idx):
+        await hub.broadcast({"type": "cards", "cards": _client_cards()})
     # Backward-compatible single-chip view = first SE that loaded successfully.
     primary = next((s for s in ses if s.get("chip")), ses[0] if ses else None)
     return {

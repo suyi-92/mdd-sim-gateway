@@ -657,6 +657,20 @@ class ServiceRestartTests(unittest.TestCase):
         self.assertEqual(status["state"], "stalled")
         self.assertEqual(status["error_code"], "restart.error.not_picked_up")
 
+    def test_a_consumed_restart_that_never_reboots_is_failed_and_persisted(self):
+        self.root.mkdir(parents=True)
+        status_path = self.root / "service-restart-status.json"
+        status_path.write_text(json.dumps({
+            "state": "running", "scope": "services", "updated_at": 100,
+        }))
+
+        with patch.object(operations.time, "time", return_value=1000):
+            status = operations.service_restart_status()
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "restart.error.failed")
+        self.assertEqual(json.loads(status_path.read_text())["state"], "failed")
+
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
 

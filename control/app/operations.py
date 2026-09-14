@@ -288,6 +288,9 @@ SERVICE_RESTART_SCOPES = ("control", "services", "host")
 # The orchestrator polls a few times a minute; a request still sitting here after this long
 # means nothing is consuming it, not that it is slow.
 _RESTART_PICKUP_SECONDS = 60
+# A full service restart normally tears the API down within seconds. If the detached systemd
+# job never does so, keep the browser from waiting forever on a stale ``running`` document.
+_RESTART_RUNNING_SECONDS = 120
 
 
 def _service_restart_paths() -> tuple[Path, Path]:
@@ -345,6 +348,15 @@ def service_restart_status() -> dict:
         if time.time() - requested_at > _RESTART_PICKUP_SECONDS:
             status["state"] = "stalled"
             status["error_code"] = "restart.error.not_picked_up"
+    elif (status.get("state") == "running"
+          and isinstance(status.get("updated_at"), (int, float))
+          and time.time() - float(status["updated_at"]) > _RESTART_RUNNING_SECONDS):
+        # The request was consumed, but a detached restart job that exits before touching the
+        # services cannot be completed by settle_service_restart(). Persist the failure so a
+        # later unrelated orchestrator restart cannot misreport this attempt as successful.
+        status.update(state="failed", error_code="restart.error.failed",
+                      updated_at=int(time.time()))
+        _write_private_json(status_path, status)
     return status
 
 

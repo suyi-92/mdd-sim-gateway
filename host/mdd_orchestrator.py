@@ -64,6 +64,7 @@ MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
 BACKUP_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
+SERVICE_RESTART_SETTLE_SECONDS = {"services": 300, "host": 1800}
 DEVICE_STATE_VERSION = 3
 DEFAULT_DEVICE_CAPABILITIES = {
     "cellular_enabled": False,
@@ -1061,8 +1062,9 @@ class Orchestrator:
             return
         run(["systemctl", "reset-failed", "mdd-sim-gateway-restart.service"])
         result = run(["systemd-run", "--unit", "mdd-sim-gateway-restart", "--collect",
+                      "--property=Type=exec",
                       "--description", "MDD Sim Gateway service restart",
-                      "sh", str(self.repo / "install.sh"), "restart"])
+                      "/usr/local/sbin/mddctl", "restart"])
         if result.returncode:
             publish("failed", error_code="restart.error.launch",
                     error=(result.stderr or result.stdout or "").strip()[:400])
@@ -1128,9 +1130,23 @@ class Orchestrator:
         """
         status_path = self.root / "service-restart-status.json"
         status = read_json(status_path)
-        if status.get("state") == "running" and status.get("scope") in {"services", "host"}:
-            atomic_json(status_path, {**status, "state": "success",
-                                      "updated_at": int(time.time())})
+        scope = str(status.get("scope") or "")
+        if status.get("state") == "running" and scope in SERVICE_RESTART_SETTLE_SECONDS:
+            now = int(time.time())
+            try:
+                age = max(0, now - int(status.get("updated_at") or 0))
+            except (TypeError, ValueError):
+                age = SERVICE_RESTART_SETTLE_SECONDS[scope] + 1
+            if age <= SERVICE_RESTART_SETTLE_SECONDS[scope]:
+                atomic_json(status_path, {**status, "state": "success",
+                                          "updated_at": now})
+            else:
+                # An unrelated later restart must not turn a long-dead detached job into a
+                # false success. The API also applies a shorter timeout while Control remains
+                # alive; this covers the case where nobody had the page open to observe it.
+                atomic_json(status_path, {**status, "state": "failed",
+                                          "error_code": "restart.error.failed",
+                                          "updated_at": now})
 
     def publish_device_status(self, desired_devices: dict, assignments: dict,
                               *, transitioning=False, error="", disruption=None,
@@ -3078,8 +3094,6 @@ class Orchestrator:
             return
         for modem in discovered:
             new_id = modem["id"]
-            if new_id in configured:
-                continue
             fam = f"{modem['vid']}-{modem['pid']}"
             stale = [device_id for device_id in configured
                      if device_id not in current and family(device_id) == fam]
@@ -3089,17 +3103,28 @@ class Orchestrator:
             old_imei, new_imei = imei(old_id), imei(new_id)
             if not old_imei or not new_imei or old_imei != new_imei:
                 continue
-            configured[new_id] = configured.pop(old_id)
+            if new_id in configured:
+                # Discovery can persist the new USB-path id before its bridge has published
+                # the IMEI needed to prove migration.  Once both identity files prove this is
+                # the same modem, collapse duplicate records only when their requested policy
+                # is identical. Conflicting operator choices remain untouched for review.
+                if configured[new_id] != configured[old_id]:
+                    continue
+                configured.pop(old_id)
+            else:
+                configured[new_id] = configured.pop(old_id)
             document["devices"] = configured
             document["updated_at"] = int(time.time())
             atomic_json(self.device_desired_path, document)
             hardware_doc = read_json(self.hw_state_path)
             assignments = hardware_doc.get("assignments") or {}
-            if old_id in assignments and new_id not in assignments:
+            if old_id in assignments:
                 moved = assignments.pop(old_id)
-                moved.update({key: modem[key] for key in ("id", "tty", "usb_path")
-                              if key in modem})
-                hardware_doc["assignments"] = assignments | {new_id: moved}
+                if new_id not in assignments:
+                    moved.update({key: modem[key] for key in ("id", "tty", "usb_path")
+                                  if key in modem})
+                    assignments[new_id] = moved
+                hardware_doc["assignments"] = assignments
                 atomic_json(self.hw_state_path, hardware_doc)
             status_doc = read_json(self.device_status_path)
             status_devices = status_doc.get("devices")

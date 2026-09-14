@@ -70,6 +70,51 @@ class DeviceMigrationTests(unittest.TestCase):
         self.app.migrate_device_ids([_modem("2c7c-0125-1-1.4", "1-1.4")])
         self.assertEqual(self._desired(), devices)
 
+    def test_late_identity_proof_collapses_an_already_configured_duplicate(self):
+        state = {"cellular_enabled": False, "vowifi_enabled": True,
+                 "flight_mode": True}
+        old_id, new_id = "2c7c-0125-1-1.2", "2c7c-0125-1-1.4"
+        self._write(self.app.device_desired_path,
+                    {"version": 3, "devices": {old_id: state, new_id: dict(state)}})
+        self._write(self.app.hw_state_path, {
+            "assignments": {
+                old_id: {"id": old_id, "usb_path": "1-1.2", "base_port": 35963},
+                new_id: {"id": new_id, "usb_path": "1-1.4", "base_port": 36219},
+            },
+        })
+        self._write(self.app.device_status_path, {
+            "devices": {old_id: {"present": False}, new_id: {"present": True}},
+        })
+        self._identity(old_id)
+        self._identity(new_id)
+
+        self.app.migrate_device_ids([_modem(new_id, "1-1.4")])
+
+        self.assertEqual(self._desired(), {new_id: state})
+        assignments = json.loads(self.app.hw_state_path.read_text())["assignments"]
+        self.assertEqual(set(assignments), {new_id})
+        status = json.loads(self.app.device_status_path.read_text())["devices"]
+        self.assertEqual(set(status), {new_id})
+        self.assertFalse((self.app.data / "modems" / f"{old_id}.json").exists())
+
+    def test_conflicting_preconfigured_duplicate_is_left_for_review(self):
+        old_id, new_id = "2c7c-0125-1-1.2", "2c7c-0125-1-1.4"
+        devices = {
+            old_id: {"cellular_enabled": False, "vowifi_enabled": True,
+                     "flight_mode": True},
+            new_id: {"cellular_enabled": True, "vowifi_enabled": False,
+                     "flight_mode": False},
+        }
+        self._write(self.app.device_desired_path,
+                    {"version": 3, "devices": dict(devices)})
+        self._identity(old_id)
+        self._identity(new_id)
+
+        self.app.migrate_device_ids([_modem(new_id, "1-1.4")])
+
+        self.assertEqual(self._desired(), devices)
+        self.assertTrue((self.app.data / "modems" / f"{old_id}.json").exists())
+
     def test_ambiguous_or_unrelated_devices_are_left_alone(self):
         devices = {"2c7c-0125-1-1.2": {"vowifi_enabled": True},
                    "2c7c-0125-1-1.3": {"vowifi_enabled": False}}

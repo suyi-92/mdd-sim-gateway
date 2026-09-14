@@ -1201,6 +1201,76 @@ modem.3gpp.registration-state : unknown
             self.assertTrue(marker.is_file())
             self.assertLessEqual(abs(time.time() - int(marker.read_text())), 2)
 
+    def test_full_service_restart_launches_the_supported_mddctl_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            mdd_orchestrator.atomic_json(app.root / "service-restart-request.json", {
+                "scope": "services", "requested_at": int(time.time()),
+            })
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                app.process_service_restart_request()
+
+            launch = next(args for args in calls if args[0] == "systemd-run")
+            self.assertIn("--property=Type=exec", launch)
+            self.assertEqual(launch[-2:], ["/usr/local/sbin/mddctl", "restart"])
+            self.assertNotIn("sh", launch)
+            status = mdd_orchestrator.read_json(
+                app.root / "service-restart-status.json")
+            self.assertEqual(status["state"], "running")
+            self.assertEqual(status["scope"], "services")
+
+    def test_full_service_restart_launch_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            mdd_orchestrator.atomic_json(app.root / "service-restart-request.json", {
+                "scope": "services", "requested_at": int(time.time()),
+            })
+            results = [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=1, stdout="", stderr="launch failed"),
+            ]
+
+            with patch("host.mdd_orchestrator.run", side_effect=results):
+                app.process_service_restart_request()
+
+            status = mdd_orchestrator.read_json(
+                app.root / "service-restart-status.json")
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_code"], "restart.error.launch")
+
+    def test_only_a_recent_service_restart_is_settled_as_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            status_path = app.root / "service-restart-status.json"
+
+            mdd_orchestrator.atomic_json(status_path, {
+                "state": "running", "scope": "services", "updated_at": 900,
+            })
+            with patch("host.mdd_orchestrator.time.time", return_value=1000):
+                app.settle_service_restart()
+            self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "success")
+
+            mdd_orchestrator.atomic_json(status_path, {
+                "state": "running", "scope": "services", "updated_at": 100,
+            })
+            with patch("host.mdd_orchestrator.time.time", return_value=1000):
+                app.settle_service_restart()
+            failed = mdd_orchestrator.read_json(status_path)
+            self.assertEqual(failed["state"], "failed")
+            self.assertEqual(failed["error_code"], "restart.error.failed")
+
 
 if __name__ == "__main__":
     unittest.main()

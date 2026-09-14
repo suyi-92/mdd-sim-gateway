@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 import hashlib
@@ -355,6 +356,116 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["cached"])
         self.assertEqual(result["ses"][0]["notifications"], [])
         self.assertEqual(cached["ses"][0]["notifications"], [{"seqNumber": 73}])
+
+    async def test_cached_chip_prefers_current_vpcd_metadata_over_stale_monitor_row(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        cached = {"ts": 200, "imei": "", "ses": [{
+            "id": "default", "profiles": [{"iccid": "profile-current"}],
+            "notifications": [],
+        }]}
+        with patch.object(main, "_esim_resolve_reader", return_value=(reader, 0)), \
+                patch.object(main, "_modem_identity_for_reader", return_value={
+                    "hardware_id": "modem-1", "channel_status": "ready",
+                    "iccid": "profile-current",
+                }), patch.object(main.hub, "cards", {
+                    reader: {"present": True, "iccid": "profile-stale", "matched": "9"},
+                }), patch.object(main, "_esim_cache_for_iccid",
+                                 return_value=cached) as cache_for:
+            result = await main.api_esim_chip_cached(reader=reader)
+
+        self.assertTrue(result["cached"])
+        cache_for.assert_called_once_with("profile-current")
+
+    async def test_unready_vpcd_metadata_never_borrows_the_previous_card_cache(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        with patch.object(main, "_esim_resolve_reader", return_value=(reader, 0)), \
+                patch.object(main, "_modem_identity_for_reader", return_value={
+                    "hardware_id": "modem-1", "channel_status": "allocating",
+                    "iccid": "profile-current",
+                }), patch.object(main.hub, "cards", {
+                    reader: {"present": True, "iccid": "profile-stale", "matched": "9"},
+                }), patch.object(main, "_esim_cache_for_iccid",
+                                 return_value=None) as cache_for:
+            result = await main.api_esim_chip_cached(reader=reader)
+
+        self.assertFalse(result["cached"])
+        cache_for.assert_not_called()
+
+    def test_vpcd_download_imei_comes_from_current_hardware_not_stale_line(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        with patch.object(main, "_modem_identity_for_reader", return_value={
+                    "hardware_id": "modem-1", "imei": "490154203237518",
+                }), patch.object(main.hub, "cards", {
+                    reader: {"present": True, "matched": "9"},
+                }), patch.object(main.cfg, "get_instance", return_value={
+                    "id": "9", "imei": "350000000000018",
+                }) as get_instance:
+            value = main._esim_imei_for_reader(reader)
+
+        self.assertEqual(value, "490154203237518")
+        get_instance.assert_not_called()
+
+    async def test_same_name_vpcd_replug_refreshes_binding_and_stops_only_its_claimant(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        stale_line = {"id": "9", "iccid": "profile-stale"}
+        with patch.object(main, "_modem_identity_for_reader", return_value={
+                    "hardware_id": "modem-1", "channel_status": "ready",
+                    "iccid": "profile-current",
+                }), patch.object(main.hub, "cards", {
+                    reader: {"present": True, "iccid": "profile-stale", "matched": "9"},
+                }), patch.object(main, "_find_running_by_reader",
+                                 return_value=stale_line), \
+                patch.object(main, "_stop_instance", new=AsyncMock()) as stop, \
+                patch.object(main, "_on_card_insert", new=AsyncMock()) as inserted:
+            changed = await main._reconcile_vpcd_card_identity(reader, 4)
+
+        self.assertTrue(changed)
+        stop.assert_awaited_once_with("9", "vpcd_identity_changed")
+        inserted.assert_awaited_once_with(reader, 4)
+
+    async def test_maintenance_window_still_reconciles_ready_vpcd_identity(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        announced = asyncio.Event()
+
+        async def broadcast(*_args, **_kwargs):
+            announced.set()
+
+        reconcile = AsyncMock(return_value=True)
+        with patch.object(main.card, "reader_states", return_value=[{
+                    "name": reader, "index": 4, "present": True,
+                }]), patch.object(main.hub, "cards", {
+                    reader: {"name": reader, "index": 4, "present": True,
+                             "iccid": "profile-stale"},
+                }), patch.object(main.hub, "lpa_busy", {}), \
+                patch.object(main, "_reconcile_vpcd_card_identity", reconcile), \
+                patch.object(main.hub, "broadcast",
+                             new=AsyncMock(side_effect=broadcast)), \
+                patch.object(main.os.path, "getmtime", return_value=999), \
+                patch.object(main.time, "time", return_value=1000):
+            monitor = asyncio.create_task(main.card_monitor())
+            try:
+                await asyncio.wait_for(announced.wait(), 1)
+            finally:
+                monitor.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await monitor
+
+        reconcile.assert_awaited_with(reader, 4)
+
+    async def test_unchanged_vpcd_identity_does_not_restart_or_reprobe(self):
+        reader = "VoWiFi Modem modem-1 00 00"
+        with patch.object(main, "_modem_identity_for_reader", return_value={
+                    "hardware_id": "modem-1", "channel_status": "ready",
+                    "iccid": "profile-current",
+                }), patch.object(main.hub, "cards", {
+                    reader: {"present": True, "iccid": "profile-current", "matched": "2"},
+                }), patch.object(main, "_find_running_by_reader") as claimed, \
+                patch.object(main, "_on_card_insert", new=AsyncMock()) as inserted:
+            changed = await main._reconcile_vpcd_card_identity(reader, 4)
+
+        self.assertFalse(changed)
+        claimed.assert_not_called()
+        inserted.assert_not_awaited()
 
     async def test_prepare_and_restore_preserve_the_exact_running_snapshot(self):
         lines = {
