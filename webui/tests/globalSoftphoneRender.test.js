@@ -11,6 +11,7 @@ test('authenticated shell can execute the global softphone first render', async 
   const server = await createServer({
     root: WEBUI_ROOT,
     appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
     server: { middlewareMode: true },
   })
   t.after(() => server.close())
