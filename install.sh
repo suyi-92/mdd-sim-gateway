@@ -815,7 +815,7 @@ prepare_build() {
   docker run --rm --network bridge -v "$source_dir/webui:/src:ro" -v "$temp/webui:/out" \
     "$NODE_BUILD_IMAGE" sh -euc '
       mkdir /work; cp /src/package.json /src/package-lock.json /src/index.html /src/vite.config.js /work/;
-      cp -a /src/src /src/public /work/; cd /work; npm ci; npm run build; cp -a dist/. /out/'
+      cp -a /src/src /src/public /src/tests /work/; cd /work; npm ci; npm run build; cp -a dist/. /out/'
   [[ -f "$temp/webui/index.html" ]] || die "WebUI build did not produce index.html"
 
   runtime_fp=$(engine_fingerprint "$source_dir" runtime)

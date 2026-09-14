@@ -176,6 +176,7 @@ class InstallerContractTests(unittest.TestCase):
 
     def test_webui_and_venv_are_staged_before_atomic_symlink_switch(self):
         self.assertIn('NODE_BUILD_IMAGE="node:22.14.0-bookworm-slim@sha256:', INSTALL)
+        self.assertIn("cp -a /src/src /src/public /src/tests /work/", INSTALL)
         self.assertIn("npm ci; npm run build", INSTALL)
         self.assertIn('python3 -m venv --clear "$temp/venv"', INSTALL)
         self.assertIn('mv -Tf "$source_dir/.venv.new"', INSTALL)
@@ -627,7 +628,7 @@ class MddctlContractTests(unittest.TestCase):
 class VersionContractTests(unittest.TestCase):
     def test_vmware_version_suffix(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version, "1.9.1-vmware.21")
+        self.assertEqual(version, "1.9.1-vmware.22")
         for path in (ROOT / "webui/package.json", ROOT / "webui/package-lock.json"):
             self.assertIn(f'"version": "{version}"', path.read_text(encoding="utf-8"))
 
