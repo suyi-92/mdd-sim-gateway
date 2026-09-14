@@ -239,6 +239,7 @@ const zh = {
   'Optional for VoWiFi calls. Outbound VoWiFi SMS stays disabled until an SMSC is available.': 'VoWiFi 通话不依赖此项；在获得 SMSC 前，VoWiFi 外发短信保持禁用。',
   'A smart-card reader has no hardware IMEI. MDD will omit DEVICE_IDENTITY; configure one only if it truthfully belongs to the equipment and your carrier requires it.': '智能卡读卡器没有硬件 IMEI。MDD 会省略 DEVICE_IDENTITY；只有该身份真实属于设备且运营商明确要求时才应配置。',
   'Device User-Agent (how the line identifies to the carrier)': '设备 User-Agent（线路向运营商报告的设备身份）',
+  'Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.': '留空则以 MDD-Sim-Gateway 身份标识。仅当运营商拒绝未知终端注册时才需要填写。',
   'Advanced IMS identity': '高级 IMS 身份',
   'Carrier defaults are applied automatically. Change these fields only when required by the carrier.': '系统会自动应用运营商默认值；仅在运营商明确要求时修改这些字段。',
   'Automatic carrier default': '自动使用运营商默认值', 'IMS access type': 'IMS 接入类型',

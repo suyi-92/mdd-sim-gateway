@@ -146,6 +146,27 @@ NODE_PATH=/tmp/mdd-device-ui-check/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/md
 
 该脚本只服务本地构建资产与虚构 API 响应，不连接生产服务；覆盖拔出、剩余设备选择、空状态、历史记录、重连、无写请求和宽/中/窄视口。截图默认位于 `/tmp/mdd-device-ui-check/results`。
 
+## 上游 1.9.4 集成回归
+
+以下测试覆盖本轮 1.9.2–1.9.4 融合，不接触真实线路或通知端点：
+
+- `tests/test_line_user_agent.py`：保存与 Engine 双重规整、默认值、64 字符上限和 Asterisk
+  配置注入防护；
+- `tests/test_cellular_sms.py`、`tests/test_cellular_sms_imsi_fallback.py`、
+  `tests/test_cellular_call.py`：长短信拼接、MMS WAP Push 精确/有界清理、只读诊断及 ICCID 缺失时
+  的 IMSI fallback；
+- `tests/test_failover.py`、`tests/test_line_lifecycle.py`、`tests/test_country_egress.py`：故障归因、
+  非可选/未知订阅节点账本和已运行 selector 保存免重启；
+- `tests/test_reader_apdu_compat.py`、`tests/test_iccid_probe_timeout.py`、
+  `tests/test_engine_reader_binding.py`：Control、PIN、SWu、IMS 的完整 ICCID 及共享严格 USIM 选择；
+- `tests/test_device_state.py`、`tests/test_device_instance_binding.py`：占位符、已分配 VPCD 槽、蜂窝
+  profile 默认路由保护及物理 IMEI 证明；
+- `tests/test_notify_push.py`、`tests/test_ui_vowifi_history.py`：独立通知线程池和换线/换范围/卸载后的
+  过期历史请求隔离。
+
+相关单测只证明控制逻辑。真实 MMS 对象删除、ML307X/DITO、Quectel bearer、SWu/IMS、通话和
+双向音频仍需按硬件矩阵单独验收。
+
 ## 上游 1.9.1 集成回归
 
 `tests/test_reader_binding_recovery.py` 复现“原生 SCR 遗留 modem 三路绑定，同时另一 modem

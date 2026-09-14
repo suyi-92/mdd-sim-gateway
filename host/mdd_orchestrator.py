@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+from copy import deepcopy
 import hashlib
 import http.client
 import ipaddress
@@ -372,6 +373,10 @@ EXIT_TEST_MAX_AGE_SECONDS = 90.0
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
 INPUT_WAKE_POLL_SECONDS = max(
     0.1, float(os.environ.get("MDD_INPUT_WAKE_POLL_INTERVAL", "0.5")))
+# A modem is plugged in so its SIM can be read; cellular data is a per-device capability, not
+# the box's route to the internet. Set this when the modem genuinely IS the only uplink.
+MODEM_MAY_PROVIDE_DEFAULT_ROUTE = os.environ.get(
+    "MDD_MODEM_ALLOW_DEFAULT_ROUTE", "").strip().lower() in {"1", "true", "yes", "on"}
 # How long a tty may stay unclaimed before the bridge stops waiting for ModemManager and talks
 # to the serial port itself. ModemManager needs on the order of ten to thirty seconds to probe
 # an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
@@ -858,10 +863,17 @@ class Orchestrator:
         self.bridges: dict[str, subprocess.Popen] = {}
         self.bridge_ports: dict[str, int] = {}
         self.last_proxy_fingerprint = ""
+        self.last_proxy_config: dict | None = None
         self.applied_cellular_backend: bool | None = None
         self.radio_states: dict[str, bool] = {}
         self.cellular_states: dict[str, dict] = {}
         self.data_attempt_at: dict[str, float] = {}
+        # Profiles already re-stamped with modem_profile_policy() this process. Correcting a
+        # legacy profile is a one-off; without this the data-off path would shell out to nmcli
+        # on every reconcile to rewrite settings that already say what we want.
+        self.modem_profile_policed: set[str] = set()
+        # Cleared whenever the cellular backend is up, so standing it back down re-sweeps.
+        self.modem_profiles_swept = False
         self.applied_timezone = ""
         self.obsolete_services_retired = False
         self.reader_config_path = Path(os.environ.get(
@@ -1576,6 +1588,22 @@ class Orchestrator:
         return match.group(1).strip() if match else ""
 
     @staticmethod
+    def normalize_iccid(value: str) -> str:
+        """Return a usable SIM ICCID from a ModemManager property, or "".
+
+        mmcli renders a property it could not read as the literal placeholder "--"
+        (observed when a module rejects the EF_ICCID read). That is "unknown", not an
+        identity: passed through, it reaches the control plane as a truthy ICCID that
+        matches no line, so the SIM never falls through to the PC/SC bridge that can
+        still read it. Validated like the bridge's own decoder: 18-20 digits from 89.
+        """
+        text = str(value or "").strip()
+        if not text or text.casefold() in {"--", "unknown", "none", "n/a"}:
+            return ""
+        digits = re.sub(r"\D", "", text)
+        return digits if digits.startswith("89") and 18 <= len(digits) <= 20 else ""
+
+    @staticmethod
     def normalize_msisdn(value: str) -> str:
         """Return a conservative E.164-like number from ModemManager OwnNumbers.
 
@@ -1624,7 +1652,8 @@ class Orchestrator:
         if sim_object and sim_object not in {"--", "/"}:
             sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"])
             if sim_detail.returncode == 0:
-                sim_iccid = self._kv(sim_detail.stdout or "", "sim.properties.iccid")
+                sim_iccid = self.normalize_iccid(
+                    self._kv(sim_detail.stdout or "", "sim.properties.iccid"))
         # Many USB modems keep their hardware power-state at "on" after
         # ModemManager --disable.  The generic state is the authoritative RF state.
         radio_enabled = power == "on" and state not in {
@@ -1682,39 +1711,63 @@ class Orchestrator:
                     profiles.append((parts[0].replace(r"\:", ":"), parts[2]))
         return profiles
 
-    def _set_cellular_profile_autoconnect(self, profile: str, enabled: bool) -> bool:
-        """Persist whether NetworkManager may recreate this managed data bearer.
+    @staticmethod
+    def modem_profile_policy() -> list[str]:
+        """nmcli properties that keep a modem's data profile from becoming the host uplink.
 
-        ``nmcli connection down`` blocks autoconnect only for the current device lifetime.  A
-        reboot or USB replug clears that transient block, so leaving the profile itself at
-        ``autoconnect=yes`` can briefly consume mobile data before the orchestrator reconciles
-        the saved OFF request.  Read before writing to avoid rewriting the profile every cycle.
+        Two separate things went wrong without them. The profile was created with autoconnect
+        on, so NetworkManager dialled it after a reboot however the operator had set this
+        modem's cellular-data switch -- the switch was silently not durable. And nothing
+        stopped the resulting connection from carrying the default route, which would send the
+        VoWiFi tunnel that authenticates this very SIM out through that SIM's own carrier.
+
+        Autoconnect stays off unconditionally: the orchestrator owns the desired state and
+        brings the profile up itself, so NetworkManager acting on its own can only contradict
+        the operator. The default-route guard is what MDD_MODEM_ALLOW_DEFAULT_ROUTE releases,
+        for a deployment whose only uplink really is the modem.
         """
-        target = "yes" if enabled else "no"
-        current = run(["nmcli", "-g", "connection.autoconnect",
-                       "connection", "show", profile])
-        if current.returncode:
-            self.log(f"could not read cellular profile autoconnect for {profile}: "
-                     f"{(current.stderr or current.stdout).strip()}")
+        policy = ["connection.autoconnect", "no"]
+        if not MODEM_MAY_PROVIDE_DEFAULT_ROUTE:
+            # never-default is preventive where deleting the route afterwards is corrective:
+            # the route is never installed, so there is no window in which it is live and no
+            # repeated deletion of something already gone. It also reverses with one nmcli
+            # call, which matters on a box reached over the network it is about to reconfigure.
+            policy += ["ipv4.never-default", "yes", "ipv6.never-default", "yes"]
+        return policy
+
+    def _police_modem_profile(self, profile: str) -> bool:
+        """Apply the managed profile policy once, retrying any failed write later."""
+        profile = str(profile or "")
+        if not profile:
             return False
-        if (current.stdout or "").strip().lower() == target:
+        if profile in self.modem_profile_policed:
             return True
-        result = run(["nmcli", "connection", "modify", profile,
-                      "connection.autoconnect", target])
-        if result.returncode:
-            self.log(f"could not set cellular profile autoconnect={target} for {profile}: "
-                     f"{(result.stderr or result.stdout).strip()}")
+        present = run(["nmcli", "connection", "show", profile])
+        if present.returncode:
             return False
+        outcome = run(["nmcli", "connection", "modify", profile,
+                       *self.modem_profile_policy()])
+        if outcome.returncode:
+            self.log(f"could not secure cellular profile {profile}: "
+                     f"{(outcome.stderr or outcome.stdout).strip()}")
+            return False
+        self.modem_profile_policed.add(profile)
         return True
 
     def ensure_modem_data(self, modem: dict, snapshot: dict) -> None:
         """Give each modem its own NetworkManager GSM profile and bearer."""
-        if not snapshot.get("powered") or snapshot.get("data_active"):
+        if not snapshot.get("powered"):
+            return
+        device_id = modem["id"]
+        profile = self.cellular_profile_name(device_id)
+        if snapshot.get("data_active"):
+            # An already-connected legacy profile is the urgent case: without correcting it
+            # here, its default route remains live indefinitely because no redial path runs.
+            self._police_modem_profile(profile)
             return
         registration = snapshot.get("registration")
         if registration not in {"home", "roaming", "registered"}:
             return
-        device_id = modem["id"]
         if time.monotonic() - self.data_attempt_at.get(device_id, 0) < 45:
             return
         self.data_attempt_at[device_id] = time.monotonic()
@@ -1724,13 +1777,12 @@ class Orchestrator:
         active = self._active_gsm_profiles()
         if any(device == primary for _name, device in active):
             return
-        profile = self.cellular_profile_name(device_id)
         apn = str(snapshot.get("apn") or "").strip()
         exists = run(["nmcli", "connection", "show", profile]).returncode == 0
         if not exists:
             command = ["nmcli", "connection", "add", "type", "gsm", "ifname", primary,
-                       "con-name", profile, "connection.autoconnect", "yes",
-                       "connection.autoconnect-retries", "0"]
+                       "con-name", profile, "connection.autoconnect-retries", "0",
+                       *self.modem_profile_policy()]
             if apn:
                 command.extend(["gsm.apn", apn, "gsm.auto-config", "no"])
             else:
@@ -1740,34 +1792,90 @@ class Orchestrator:
                 self.log(f"could not create cellular profile for {device_id}: "
                          f"{(result.stderr or result.stdout).strip()}")
                 return
+            self.modem_profile_policed.add(profile)
         else:
-            # Re-enable persistent activation before bringing up a profile that an earlier
-            # explicit OFF request made non-autoconnecting.
-            if not self._set_cellular_profile_autoconnect(profile, True):
-                return
+            # Re-stamped on every pass, not only at creation: profiles written by an older
+            # version carry autoconnect=yes and no default-route guard, and they outlive the
+            # upgrade. This is the only place that corrects them while data is wanted.
+            command = ["nmcli", "connection", "modify", profile, *self.modem_profile_policy()]
             if apn:
                 # A profile may have been created before the retained bearer APN became visible.
-                result = run(["nmcli", "connection", "modify", profile,
-                              "gsm.apn", apn, "gsm.auto-config", "no"])
-                if result.returncode:
-                    self.log(f"could not update cellular APN for {device_id}: "
-                             f"{(result.stderr or result.stdout).strip()}")
-                    return
+                command.extend(["gsm.apn", apn, "gsm.auto-config", "no"])
+            result = run(command)
+            if result.returncode:
+                self.log(f"could not update cellular profile for {device_id}: "
+                         f"{(result.stderr or result.stdout).strip()}")
+                return
+            self.modem_profile_policed.add(profile)
         result = run(["nmcli", "connection", "up", profile])
         if result.returncode:
             self.log(f"could not activate cellular profile for {device_id}: "
                      f"{(result.stderr or result.stdout).strip()}")
 
-    def disconnect_modem_data(self, modem: dict, snapshot: dict) -> None:
-        profile = self.cellular_profile_name(modem["id"])
-        if run(["nmcli", "connection", "show", profile]).returncode == 0:
-            # Persist OFF before dropping the live bearer. Otherwise NetworkManager can race
-            # the next boot/replug and recreate a billable data session on its own.
-            self._set_cellular_profile_autoconnect(profile, False)
+    def disconnect_modem_data(self, modem_or_snapshot: dict,
+                              snapshot: dict | None = None) -> None:
+        """Take this modem's data profile down and keep it down.
+
+        The profile is addressed by name rather than only by the port it is attached to. A
+        modem in a failed or SIM-less ModemManager state reports no primary port, so matching
+        on the port alone found nothing to do in exactly the state where an autoconnecting
+        profile is most likely to be dialling on its own.
+        """
+        modem = modem_or_snapshot if snapshot is not None else {}
+        snapshot = snapshot if snapshot is not None else modem_or_snapshot
+        profile = str(snapshot.get("profile") or "")
+        if not profile and modem.get("id"):
+            # Compatibility for an in-flight snapshot made before the profile field was
+            # published. Addressing by managed name remains safe even when no port exists.
+            profile = self.cellular_profile_name(modem["id"])
+        if profile and profile not in self.modem_profile_policed:
+            # Cellular data is off for this modem, so the profile must not come back by
+            # itself -- neither now nor after the next reboot. Once is enough: nothing else
+            # rewrites these properties behind us.
+            self._police_modem_profile(profile)
+        active = self._active_gsm_profiles()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
-        for name, device in self._active_gsm_profiles():
-            if primary and device == primary:
+        for name, device in active:
+            if name == profile or (primary and device == primary):
                 run(["nmcli", "connection", "down", name])
+
+    def police_orphaned_modem_profiles(self) -> None:
+        """Apply the profile policy to modem profiles nothing else is watching.
+
+        Every ensure/disconnect call sits behind ``through_modemmanager``, which is false
+        whenever no device wants cellular data. So the state an operator reaches by simply
+        turning cellular data off -- ModemManager stood down, the GSM profile left behind --
+        is the one state in which nothing corrects that profile, and a profile written by an
+        earlier version says "autoconnect: forever" in it. That is the most dangerous place
+        to leave it: the operator has said no, nothing is supervising, and NetworkManager
+        still dials on its own the moment the modem enumerates.
+
+        Swept once per stand-down rather than per cycle; profiles are only ever created by
+        ensure_modem_data, which polices them as it goes.
+        """
+        if self.modem_profiles_swept:
+            return
+        self.modem_profiles_swept = True
+        result = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        if result.returncode:
+            self.modem_profiles_swept = False
+            return
+        for line in (result.stdout or "").splitlines():
+            name, _, kind = line.rpartition(":")
+            name = name.replace(r"\:", ":")
+            if kind != "gsm" or not name.startswith("mdd-cell-"):
+                continue
+            if name in self.modem_profile_policed:
+                continue
+            outcome = run(["nmcli", "connection", "modify", name,
+                           *self.modem_profile_policy()])
+            if outcome.returncode:
+                self.log(f"could not secure leftover cellular profile {name}: "
+                         f"{(outcome.stderr or outcome.stdout).strip()}")
+                continue
+            self.modem_profile_policed.add(name)
+            self.log(f"secured leftover cellular profile {name} "
+                     "(no autoconnect, never the default route)")
 
     def apply_cellular_backend(self, enabled: bool, *, reset_modems: bool = True):
         """Apply the shared cellular backend required by one or more physical modems.
@@ -2766,6 +2874,24 @@ class Orchestrator:
         if fingerprint == self.last_proxy_fingerprint and self.singbox and self.singbox.poll() is None:
             self.isolate_country_tun_dns(config)
             return
+        if self.last_proxy_config is not None and self.singbox and self.singbox.poll() is None:
+            resumed_config = deepcopy(self.last_proxy_config)
+            selectors = {outbound.get("tag"): outbound
+                         for outbound in config.get("outbounds") or []
+                         if outbound.get("type") == "selector"}
+            for outbound in resumed_config.get("outbounds") or []:
+                tag = str(outbound.get("tag") or "")
+                current = selectors.get(tag)
+                if (outbound.get("type") == "selector" and tag.startswith("exit-")
+                        and current and current.get("default")
+                        and self.exit_resume.get(tag[len("exit-"):]) == current["default"]):
+                    outbound["default"] = current["default"]
+            if resumed_config == config:
+                atomic_json(self.generated, config)
+                self.last_proxy_fingerprint = fingerprint
+                self.last_proxy_config = deepcopy(config)
+                self.isolate_country_tun_dns(config)
+                return
         if self.singbox and self.singbox.poll() is None:
             # Also maintain the restored generation when a new candidate is rejected.
             self.isolate_country_tun_dns(read_json(self.generated))
@@ -2786,6 +2912,7 @@ class Orchestrator:
         if self.dry_run:
             atomic_json(self.generated, config)
             self.last_proxy_fingerprint = fingerprint
+            self.last_proxy_config = deepcopy(config)
             return
         binary = shutil.which(os.environ.get("MDD_SINGBOX_BIN", "sing-box"))
         if not binary:
@@ -2814,6 +2941,7 @@ class Orchestrator:
                 self.singbox = None
             raise RuntimeError("sing-box exited during startup")
         self.last_proxy_fingerprint = fingerprint
+        self.last_proxy_config = deepcopy(config)
 
         self.isolate_country_tun_dns(config)
 
@@ -3495,6 +3623,11 @@ class Orchestrator:
 
             self.apply_device_radios(discovered, active_desired,
                                      through_modemmanager=cellular_required)
+            if cellular_required:
+                self.modem_profiles_swept = False
+            else:
+                # Nothing above ran: every data path is gated on the backend being up.
+                self.police_orphaned_modem_profiles()
             # Country egress only exists to carry VoWiFi IKE/ePDG traffic.
             proxy_desired = self.proxy_reconcile_desired(
                 desired, line_egress_required, test_countries)

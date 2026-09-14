@@ -346,6 +346,10 @@ printf '%s\\n' fingerprint-ok
         self.assertIn("apt-mark hold libccid", patched)
         self.assertIn("scr-prime-driver.json", patched)
 
+    def test_fresh_install_includes_networkmanager_apn_provider_database(self):
+        packages = shell_function(INSTALL, "install_packages")
+        self.assertIn("mobile-broadband-provider-info", packages)
+
     @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
                      "SCR Prime reader validation runs in a supported Linux shell")
     def test_optional_scr_prime_validation_accepts_a_reader_without_a_card(self):
@@ -628,7 +632,7 @@ class MddctlContractTests(unittest.TestCase):
 class VersionContractTests(unittest.TestCase):
     def test_vmware_version_suffix(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version, "1.9.1-vmware.22")
+        self.assertEqual(version, "1.9.4-vmware.1")
         for path in (ROOT / "webui/package.json", ROOT / "webui/package-lock.json"):
             self.assertIn(f'"version": "{version}"', path.read_text(encoding="utf-8"))
 

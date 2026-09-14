@@ -91,6 +91,10 @@ def write_status(state, tries_left=None, reader=None, detail=None, iccid=None):
     log(f"status={state} tries_left={tries_left} detail={detail}")
 
 
+ICCID_BYTES = 10
+ICCID_MIN_DIGITS = 15
+
+
 def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
@@ -308,15 +312,20 @@ def _with_deadline(fn, timeout=None):
 
 
 def read_iccid(conn):
-    """Read the complete EF.ICCID only after both file selections have succeeded."""
+    """Read a complete, numeric EF.ICCID only after both selections succeed.
+
+    A short or non-BCD response is an unreadable card, not evidence that the reader holds a
+    different SIM. Returning None preserves that attribution rule.
+    """
     for command in ("00a40004023f0000", "00a40004022fe200"):
         _data, s1, s2 = _xfr(conn, toBytes(command))
         if (s1, s2) != (0x90, 0x00):
             return None
     data, s1, s2 = _xfr(conn, toBytes("00b000000a"))
-    if (s1, s2) != (0x90, 0x00) or len(data) != 10:
+    if (s1, s2) != (0x90, 0x00) or len(data) != ICCID_BYTES:
         return None
-    return swap_nibbles(bytes(data).hex()).rstrip("f")
+    iccid = swap_nibbles(bytes(data).hex()).rstrip("f")
+    return iccid if iccid.isdigit() and len(iccid) >= ICCID_MIN_DIGITS else None
 
 
 class WrongCard(Exception):

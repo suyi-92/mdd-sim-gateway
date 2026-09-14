@@ -166,9 +166,13 @@ def _modem_identity_for_reader(reader_name: str | None) -> dict | None:
             with open(path, encoding="utf-8") as handle:
                 identity = json.load(handle)
             if str(identity.get("hardware_id") or "") == hardware_id:
+                # A modem that never reports a 15-digit AT IMEI is a supported state -- the
+                # bridge publishes the identity with an empty IMEI on purpose. Discarding the
+                # whole record over it dropped the bridge's ICCID (so the card never matched a
+                # line and the reader binding never migrated) and collapsed the modem to the
+                # one-slot fallback below, putting PIN/SWu/IMS on a single VPCD reader.
                 imei = cfg.normalize_imei(identity.get("imei", ""))
-                if len(imei) == 15:
-                    return {**identity, "imei": imei}
+                return {**identity, "imei": imei if len(imei) == 15 else ""}
         except (OSError, ValueError, TypeError):
             continue
     # The generated reader can outlive bridge metadata across an unplug/restart.
@@ -2058,18 +2062,37 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         return failover.HOLD
     country = egress.line_country(inst)
     exits = (egress.status().get("exits") or {}).get(country) or {}
+    if (not cfg.get_settings().get("proxy", {}).get("enabled", False)
+            or exits.get("mode") != "subscription"):
+        # Direct, single-node and disabled routes have no pool to walk, so a ledger for them
+        # is stale by definition.
+        if hub.exit_ledgers.pop(iid, None) is not None:
+            _save_exit_ledgers()
+        return failover.HOLD
+    if not exits.get("node"):
+        # A subscription exit whose node is momentarily unknown: the host blanks it on every
+        # status cycle until the Clash API answers, so a slow query or a sing-box restart
+        # leaves it empty for one cycle. That says nothing about the exit — keep the walk
+        # (tried, exhausted, given_up) intact and judge again on the next freeze.
+        return failover.HOLD
     node = str(exits.get("node") or "")
     candidates = [str(name) for name in (exits.get("candidates") or [])]
     pinned = exits.get("selection") == "manual"
     peer_registered = _peer_line_registered(iid, country)
+    swu, retransmits = "", None
     try:
         swu = (engine.read_run_json(iid, "swu_status.json") or {}).get("state") or ""
-        retransmits = int((engine.ike_evidence(iid) or {}).get("retransmits") or 0)
     except Exception as exc:  # noqa
         log.debug("cannot read tunnel evidence for line %s: %r", iid, exc)
-        swu, retransmits = "", 0
+    try:
+        evidence = engine.ike_evidence(iid) or {}
+        if evidence.get("available", True) and evidence.get("retransmits") is not None:
+            retransmits = int(evidence["retransmits"])
+    except Exception as exc:
+        log.debug("cannot read IKE evidence for line %s: %r", iid, exc)
     verdict = failover.classify(swu, retransmits, stable_for,
-                                egress.RESELECT_MIN_STABLE_SECONDS)
+                                egress.RESELECT_MIN_STABLE_SECONDS,
+                                reason_code=st.get("reason_code") or "unknown")
     revision = egress.country_connection_revision(cfg.get_settings().get("proxy") or {}, country)
     previous = hub.exit_ledgers.get(iid) or {}
     if previous.get("config_revision") != revision:
@@ -2080,7 +2103,7 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
     ledger["config_revision"] = revision
     hub.exit_ledgers[iid] = ledger
     _save_exit_ledgers()
-    log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%d "
+    log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%s "
              "-> blames %s, action %s (node=%s strikes=%d tried=%d/%d peer=%s)",
              iid, st.get("reason_code"), stable_for, swu or "unknown", retransmits,
              verdict, action, node or "unknown", ledger.get("strikes") or 0,
@@ -2151,7 +2174,13 @@ async def cellular_sms_poller():
     scanner = cellular_sms.Scanner(local_sms_tracker=store)
     while True:
         try:
-            discovered = await asyncio.to_thread(scanner.discover, cfg.list_instances())
+            # One config read serves both the line list and the scanner's policy flag, so the
+            # operator's choice takes effect without restarting the control plane.
+            conf = await asyncio.to_thread(cfg.load)
+            scanner.drop_mms_wap_push = bool(
+                (conf.get("settings") or {}).get("drop_mms_wap_push", True))
+            discovered = await asyncio.to_thread(
+                scanner.discover, list((conf.get("instances") or {}).values()))
             for item in discovered:
                 rec = await asyncio.to_thread(
                     store.add_imported_message, item["fingerprint"], item["instance"],
@@ -3421,12 +3450,33 @@ async def _esim_restart_modem_bridge(
         503, f"timed out waiting for VPCD bridge rebuild (last stage: {last_state})")
 
 
+def _modem_active_slot_capacity(hardware_id: str, sibling_count: int) -> int:
+    """How many VPCD readers must carry the active profile for this modem.
+
+    Bridges may enumerate more pcscd reader names than logical channels they
+    allocated (ML307X exposes 00..03 while only 3 channels are ready).  Empty
+    trailing slots must not fail profile-switch recovery.
+    """
+    identity = (_device_identities().get(hardware_id)
+                or _modem_identity_for_reader(f"VoWiFi Modem {hardware_id} 00 00")
+                or {})
+    raw = (identity.get("channel_allocated")
+           or identity.get("channel_capacity")
+           or identity.get("slots")
+           or sibling_count)
+    try:
+        capacity = int(raw)
+    except (TypeError, ValueError):
+        capacity = sibling_count
+    return max(1, min(sibling_count, capacity))
+
+
 async def _esim_refresh_modem_readers(
     name: str,
     hardware_id: str,
     iccid: str,
 ) -> tuple[dict, list[str]]:
-    """Prove that every exposed slot now belongs to the requested active profile."""
+    """Prove that every allocated slot now belongs to the requested active profile."""
     last_error = ""
     for _attempt in range(max(1, ESIM_CARD_REFRESH_ATTEMPTS)):
         try:
@@ -3436,7 +3486,11 @@ async def _esim_refresh_modem_readers(
             siblings = [reader for reader in readers if reader in active_names]
             if not siblings:
                 raise RuntimeError("replacement VPCD readers are not enumerated")
-            primary_name = name if name in siblings else siblings[0]
+            # The VMware reader helper filters known logical-channel metadata. Keep the
+            # upstream capacity bound as a second guard for older bridge documents that expose
+            # only channel_allocated/channel_capacity.
+            active = siblings[:_modem_active_slot_capacity(hardware_id, len(siblings))]
+            primary_name = name if name in active else active[0]
             primary_idx = readers.index(primary_name)
             card_data = await asyncio.to_thread(sim.read_card, primary_idx)
             actual = str(card_data.iccid or "")
@@ -3447,7 +3501,7 @@ async def _esim_refresh_modem_readers(
             # bridge.  Keep proving every slot's ICCID, but avoid repeating the full IMSI,
             # carrier-files and SMSC scan on each serial channel: field measurements were
             # 7.7-8.7s per full scan versus about 1.4s for EF_ICCID alone.
-            for sibling in siblings:
+            for sibling in active:
                 if sibling == primary_name:
                     continue
                 idx = readers.index(sibling)
@@ -3457,7 +3511,7 @@ async def _esim_refresh_modem_readers(
                         f"{sibling} reports ICCID {actual or 'unknown'}, expected {iccid}")
             refreshed = []
             primary = None
-            for sibling in siblings:
+            for sibling in active:
                 idx = readers.index(sibling)
                 info = await _esim_refresh_card(
                     sibling, idx, card_data=card_data, auto_start=False, broadcast=False)
@@ -4240,7 +4294,7 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
     if not card_info:
         return inst
     imei, _device_id, _device_type = _hardware_imei_for_card(card_info, cards)
-    if imei and len(imei) != 15:
+    if len(imei) != 15:
         if _device_type == "reader":
             # A SIM moved from a modem to a plain reader must not keep presenting the modem's
             # identity.  Clear the stale snapshot and let swu_ike omit DEVICE_IDENTITY.
@@ -4251,6 +4305,10 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
                     "imei_source_device_id": _device_id,
                 })
             return inst
+        # A line snapshot is not current hardware evidence. In particular, a serial-less
+        # modem id contains its USB path, which another module can later occupy. The bridge
+        # already retains a verified IMEI across transient refresh failures while it owns the
+        # same open device; if that proof is unavailable, stop rather than reuse stale state.
         raise HTTPException(409, {
             "code": "hardware_imei_required",
             "message": "configure a 15-digit IMEI in Device > Hardware before starting VoWiFi",

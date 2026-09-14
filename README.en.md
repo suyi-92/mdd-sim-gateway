@@ -199,6 +199,27 @@ The project is GPL-3.0-only. The CCID patch is an LGPL-2.1-or-later derivative o
 [patches/ccid/README.md](patches/ccid/README.md), [NOTICE](NOTICE), and
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
+## VMware update based on 1.9.4
+
+`1.9.4-vmware.1` integrates the upstream 1.9.2–1.9.4 behavior: per-line, injection-safe
+SIP User-Agents; assembled cellular SMS import; bounded, configurable recognition and cleanup
+of MMS WAP Push notifications; and IMSI fallback only when ModemManager could not read an ICCID.
+A readable mismatched ICCID still fails closed.
+
+Recovery now moves an exit only with attributable network evidence, preserves an unknown
+subscription selector ledger, avoids restarting shared sing-box when the running node is merely
+persisted, and delivers notification destinations through a dedicated bounded worker pool. All
+Control/PIN/SWu/IMS ICCID paths require the complete BCD value. Managed cellular profiles neither
+autoconnect nor become the host default route by default, including legacy/no-port shutdown cases;
+the installer includes NetworkManager's APN provider database and managed Engines receive
+`SWU_TUN_MTU`.
+
+The existing shared strict USIM selector, allocated VPCD-slot filtering, and ML307X/DITO bridge
+metadata remain authoritative. A saved line IMEI is not substituted for current physical-hardware
+evidence; an IMEI already verified by the same live bridge may survive a transient refresh failure.
+Web auto-update, Release selection, Docker Control, Actions/prebuilt delivery, and ARM-only limits
+remain excluded.
+
 ## VMware update based on 1.9.1
 
 `1.9.1-vmware.1` integrates reader/PIN compatibility, late SMS completion and submission-report

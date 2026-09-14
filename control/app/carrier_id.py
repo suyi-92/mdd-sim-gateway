@@ -172,6 +172,16 @@ def lookup(identity: dict | None) -> dict | None:
     if not plmns:
         return None
     carriers, by_id, version = _database()
+    # Prefer the exact configured PLMN before trying the compatibility form for older MDD
+    # records that padded a two-digit MNC. Apply the same choice to local SPN rules so a
+    # stronger-looking fallback cannot override a real three-digit PLMN.
+    known_plmns = {value for carrier in carriers
+                   for attribute in carrier.get("attributes") or []
+                   for value in attribute.get("mccmnc_tuple") or []}
+    known_plmns.update(value for rule in _LOCAL_SPN_RULES
+                       for value in rule.get("plmns") or [])
+    selected_plmn = next((value for value in plmns if value in known_plmns), plmns[0])
+    plmns = [selected_plmn]
     carrier_identity = identity.get("carrier_identity") or {}
     spn = str(carrier_identity.get("spn") or "").strip().casefold()
     for rule in _LOCAL_SPN_RULES:

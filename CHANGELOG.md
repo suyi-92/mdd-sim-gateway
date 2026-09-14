@@ -2,6 +2,25 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.9.4-vmware.1] - 2026-09-14
+
+### Added
+- 增加每条线路独立 SIP User-Agent 设置；保存和 Engine 渲染统一做单行、可打印 ASCII、64 字符上限及 Asterisk 注入防护，留空继续使用 `MDD-Sim-Gateway`。
+
+### Fixed
+- 蜂窝长短信等待 ModemManager 完成拼接，忽略 `--` 与 `receiving`；仅在不可读正文同时含标准 MMS WAP Push 标记时按配置执行有界清理，只读诊断不删除对象。
+- ModemManager 无法读取 ICCID 时允许用 IMSI 匹配蜂窝短信和通话；可读但不同的 ICCID 继续拒绝回退。
+- 清理 AMI 连接失败后的 manager 心跳与重连任务，并把 `SWU_TUN_MTU` 传入受管 Engine。
+- 收紧恢复归因，仅凭可读的 IKE 网络无响应证据归咎出口；直连、单节点及暂时未知订阅节点不误换出口或重复耗尽通知。
+- 订阅节点未实际变化时不重启共享 sing-box；通知渠道改用独立的八线程有界投递池，运营商识别优先精确 PLMN。
+- Control、PIN、SWu 与 IMS 路径统一拒绝不完整、非数字或非法 BCD 的 ICCID，同时保留共享严格 USIM 选择器和已分配 VPCD 槽过滤。
+- 蜂窝 profile 禁止自动连接并默认禁止成为宿主默认路由；修复遗留 profile、无端口和后台关闭状态下的安全断开。
+
+### Changed
+- 基于上游 `1.9.4` 继续使用 VMware 原生 Control/WebUI、rootful Engine 和本地源码构建；安装依赖补充 `mobile-broadband-provider-info`。
+- 模块无实时 IMEI 时保留桥接发布的有效元数据，但不把线路旧 IMEI 当成当前物理硬件证明。
+- 继续移除网页/Release 更新、Docker Control、Actions、预编译交付和 ARM 专属限制。
+
 ## [1.9.1-vmware.2] - 2026-09-07
 
 ### Fixed
@@ -26,6 +45,145 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 - 明确独立仓库的合并、提交推送和快照前置流程，退役 Release/CI 部署入口继续保持删除。
 
 ## [Unreleased]
+
+## [1.9.4] - 2026-09-12
+
+### Added
+
+- A line can present its own SIP User-Agent, set under Advanced IMS identity. Carriers that
+  gate IMS registration on a terminal whitelist answer 403 to an unrecognised User-Agent, and
+  configuring the IMEI does not help -- that value only reaches the ePDG's DEVICE_IDENTITY.
+  Left empty a line still identifies as `MDD-Sim-Gateway`. The value is rendered into
+  `pjsip.conf`, so it is reduced to a single line of printable ASCII and capped at 64
+  characters ([#83](https://github.com/MddIdd/mdd-sim-gateway/issues/83)).
+
+### Fixed
+
+- A multi-part SMS is no longer imported twice, the first copy reading `--`. `mmcli` renders
+  the still-unassembled text of a multi-part message as its placeholder `--`, and the receive
+  scanner stored that as a body; when the remaining parts arrived the assembled text was
+  imported again as a separate message, because the import fingerprint covers the body. The
+  placeholder and ModemManager's `receiving` state now both count as "no readable text yet"
+  ([#84](https://github.com/MddIdd/mdd-sim-gateway/issues/84)).
+- A carrier MMS notification is deleted from ModemManager instead of holding modem/SIM SMS
+  storage indefinitely. It arrives on the SMS channel as a WAP Push carrying no readable text
+  and a binary WSP payload, so a gateway that never retrieves MMS can neither show nor forward
+  it and nothing else ever consumes it; on a SIM that receives them regularly the storage
+  eventually fills and no new SMS can arrive. Recognition requires both an unreadable text and
+  the standard `application/vnd.wap.mms-message` marker, so it keys on no carrier's sender
+  number, SMSC or MMSC host. Set `drop_mms_wap_push: false` under `settings` to keep the raw
+  objects ([#85](https://github.com/MddIdd/mdd-sim-gateway/issues/85)).
+
+## [1.9.3] - 2026-09-11
+
+### Fixed
+
+- An AMI connection that was refused no longer leaves its manager pinging a transport that
+  never opened. panoramisk schedules a pinger and a reconnect timer as soon as a manager is
+  created and the event loop keeps the object alive through them, so a failed connect logged
+  a send failure once per ping interval for as long as the control plane ran. Restarting the
+  control plane while the engine containers are still starting -- what an upgrade does --
+  was enough to trigger it.
+- Cellular SMS and calls can match a line by IMSI when ModemManager cannot read that SIM's
+  ICCID. A readable but different ICCID still fails closed instead of falling back to IMSI.
+- ML307X VoWiFi lines keep their allocated PIN, SWu and IMS reader slots across profile
+  switches and ignore extra unallocated VPCD readers. VMware preserves verified bridge
+  metadata across transient reads but does not substitute a saved line IMEI for current
+  physical-hardware evidence. Reselecting ADF.USIM after an IMSI-bound reader match
+  no longer calls an undefined helper, and now goes through the shared APDU exchange, so a
+  TPDU-level reader's `61xx` response is fetched rather than left pending for the next
+  command ([#74](https://github.com/MddIdd/mdd-sim-gateway/pull/74)).
+- `SWU_TUN_MTU` set on the control plane now reaches the engine containers it starts. The
+  engine has always read that variable to fix the `ipsec0` MTU, but a managed container was
+  given only its instance id and liveness period, so lowering the MTU for a carrier that
+  fragments changed nothing on any line the control plane started
+  ([#79](https://github.com/MddIdd/mdd-sim-gateway/pull/79)).
+- Installation now pulls in `mobile-broadband-provider-info`. A modem profile falls back to
+  `gsm.auto-config yes` when no bearer APN is visible, and that lookup reads the provider
+  database; without the package NetworkManager had no APN to dial, so cellular data could
+  not come up on a fresh install ([#80](https://github.com/MddIdd/mdd-sim-gateway/pull/80)).
+
+## [1.9.2] - 2026-09-08
+
+### Fixed
+
+- Missing tunnel evidence and local DNS, SIM, protocol or engine failures no longer count as
+  failed exit nodes. Unknown evidence does not trigger node changes or stalled-session cleanup,
+  and notifications no longer claim a clean tunnel when that has not been established.
+  Only a tunnel that went unanswered on the network (`tunnel_network`) with readable IKE
+  evidence now blames the exit. An ePDG that refuses the line before any EAP-AKA challenge
+  (`tunnel_not_authorized`), a setup failure with no clear cause, and a rekey that timed out
+  before the line had been stable for ten minutes are treated as inconclusive: the line keeps
+  rebuilding on its current exit and reports once after repeated failures instead of walking
+  the candidate pool. Previously an authorization refusal was attributed to the exit's source
+  address and moved the node; in practice those refusals have been carrier-side decisions
+  (location headers, IMEI binding, provisioning) that no other node fixes.
+- A partial or garbled EF.ICCID read is no longer treated as the card's identity. The control
+  plane, `pin_keeper`, `ami_usim` and `swu_ike` now require the full ten BCD bytes and an
+  all-digit value of at least fifteen digits; anything shorter reads as "could not identify
+  the card". Previously a truncated read decoded into a different number and could convict a
+  correctly bound reader as holding the wrong SIM, stranding the line
+  ([#69](https://github.com/MddIdd/mdd-sim-gateway/pull/69)).
+- Direct and non-selectable routes bypass the exit ledger instead of entering an hourly
+  candidate-exhaustion retry cycle. A subscription exit whose current node is momentarily
+  unknown (the host blanks it until the Clash API answers) keeps its ledger, so a freeze in
+  that window no longer restarts the candidate walk or repeats the exhaustion notification.
+- Persisting a subscription selector's already-active node no longer restarts the shared
+  sing-box process. Actual configuration changes and process failures still trigger a restart.
+- Notification destinations run independently on a dedicated, eight-worker delivery pool;
+  HTTP retries no longer hold the default executor or serialize the configured channels.
+- Carrier identification prefers an exact PLMN, including parent-network fallback, before
+  attempting compatibility with older zero-padded two-digit MNCs.
+- VoWiFi history ignores stale request successes and failures after a newer refresh, line
+  change or unmount, and clears the previous line's error when switching lines.
+- A SIM whose ICCID ModemManager could not read is treated as unidentified instead of as a
+  line that matches nothing. `mmcli` renders an unreadable property as the literal `--`;
+  that value reached the control plane as a live ICCID, so the modem never fell through to
+  the PC/SC bridge, which can still read the card over a logical channel.
+- A modem's cellular-data profile no longer autoconnects, and no longer offers the host a
+  default route. NetworkManager dialled the profile after a reboot however the operator had
+  set that modem's cellular-data switch, and nothing kept the result from carrying the
+  default route -- which would send the VoWiFi tunnel authenticating that very SIM out
+  through the SIM's own carrier. Profiles written by earlier versions are corrected in
+  place. Set `MDD_MODEM_ALLOW_DEFAULT_ROUTE=1` where the modem genuinely is the only uplink.
+- A cellular profile left behind by an earlier version is secured even when cellular data is
+  simply switched off. Every data path is gated on the ModemManager backend being up, so the
+  state an operator reaches by turning cellular data off -- backend stood down, profile left
+  behind -- was the one state in which nothing corrected a profile that still autoconnected
+  forever.
+- Turning cellular data off now reaches a modem that reports no port. The profile was matched
+  only by the port it was attached to, so a modem in a failed or SIM-less ModemManager state
+  -- the state in which an autoconnecting profile is most likely to be dialling on its own --
+  was left running.
+- A modem that reports no IMEI keeps its published bridge identity. The record was discarded
+  whenever the module never answered the AT IMEI query, which also dropped the bridge's ICCID
+  (so the card matched no line and the reader binding never migrated) and collapsed the modem
+  to a single VPCD slot, putting PIN, SWu and IMS on one reader.
+
+## [1.9.1] - 2026-09-04
+
+### Fixed
+
+- SIMs with no PIN could be reported as PIN-locked on v1.9.0, blocking VoWiFi with a prompt for a
+  PIN the card never asked for. v1.9.0 judged each SELECT by the GET RESPONSE that follows it, but
+  `61xx` already means the card accepted the command — a card that then declines to hand back the
+  response body made `SELECT ADF.USIM` read as a failure, so card reading stopped with every PIN
+  field unset. The APDU helper now reports the command's own verdict and returns whatever body it
+  could fetch, keeping the v1.9.0 support for APDU-level readers and T=1 cards rather than trading
+  one reader class for the other. The `6Cxx` length-correction retry also no longer drops the
+  command's data field, which turned a retried case-4 SELECT into a malformed command
+  ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+- A start refused by the SIM preflight showed only "Capability change failed: Conflict" because the
+  409 carried no human-readable message. The refusal now explains itself; when a PIN really is
+  required the WebUI prompts for it and retries the start, and when the card could not be read at
+  all the error says so instead of asking for a PIN that cannot help
+  ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+- Switching an eSIM profile while a line started could be reported as a misleading "no card". The
+  preflight now compares the live-read ICCID against the line's expected ICCID instead of relying
+  only on the sampled card-monitor cache, which lags inside a profile-switch window, and reports a
+  card mismatch naming both ICCIDs ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+
+## VMware-specific platform changes
 
 ### Added
 

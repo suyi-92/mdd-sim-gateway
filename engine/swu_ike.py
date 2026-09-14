@@ -6259,8 +6259,16 @@ def _with_deadline(fn, timeout=None):
     return box.get("value")
 
 
+_ICCID_BYTES = 10
+_ICCID_MIN_DIGITS = 15
+
+
 def read_iccid_at_index(reader_index):
-    """Read EF.ICCID from a reader index. No PIN needed; None when the card will not answer."""
+    """Read a complete numeric EF.ICCID, or None when the card is unreadable.
+
+    EF.ICCID is exactly ten BCD bytes. A short or non-digit result is not card identity
+    evidence and therefore cannot convict this reader as holding another SIM.
+    """
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect(disposition=SCARD_LEAVE_CARD)
@@ -6268,9 +6276,10 @@ def read_iccid_at_index(reader_index):
         connection.transmit(toBytes('00A40000023F00'))
         connection.transmit(toBytes('00A40000022FE2'))
         data, sw1, sw2 = connection.transmit(toBytes('00B000000A'))
-        if sw1 != 0x90:
+        if sw1 != 0x90 or len(data) != _ICCID_BYTES:
             return None
-        return bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
+        iccid = bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
+        return iccid if iccid.isdigit() and len(iccid) >= _ICCID_MIN_DIGITS else None
     finally:
         try:
             connection.disconnect()
@@ -6712,7 +6721,6 @@ def main():
     sa_list = ike_proposals_for_plmn(options.mcc, options.mnc)
     if (str(options.mcc).zfill(3), str(options.mnc).zfill(3)) == ("515", "066"):
         print("[swu_ike] DITO 515-66: using AES-CBC-128/SHA1/MODP-1024 IKE proposal")
-    
     try:
         destination_addr = socket.gethostbyname(options.destination_addr)
     except:

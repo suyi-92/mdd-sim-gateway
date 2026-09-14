@@ -300,6 +300,22 @@ Control 向 OpenAI 换取短期客户端密钥，浏览器再把单独的对方 
 [patches/ccid/README.md](patches/ccid/README.md)、[NOTICE](NOTICE) 和
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
 
+## 1.9.4 VMware 更新
+
+`1.9.4-vmware.1` 融合上游 1.9.2–1.9.4：支持每条线路自定义且防注入的 SIP User-Agent，
+修复蜂窝长短信占位符/拼接重复导入，并按标准 WAP Push 标记执行可关闭、有限次数的 MMS 通知
+清理；ICCID 不可读时仅允许用 IMSI 匹配蜂窝短信和通话，可读但不匹配仍拒绝。
+
+该版本同时收紧出口故障归因和未知订阅节点账本，避免无证据换出口；保存当前订阅节点不再重启
+共享 sing-box，通知通道使用独立有界线程池。ICCID 在 Control、PIN、SWu、IMS 四条路径都要求
+完整 10 字节 BCD 与纯数字结果；蜂窝 profile 默认不自动连接且不成为宿主默认路由，旧 profile
+和无端口关闭场景会被纠正。安装器增加 NetworkManager 自动 APN 所需的 provider 数据库，并把
+`SWU_TUN_MTU` 传给受管 Engine。
+
+ML307X/DITO 继续复用共享严格 USIM 选择器、已分配 VPCD 槽和桥接身份元数据。没有当前硬件 IMEI
+证明时不会直接借用线路旧快照；同一 bridge 生命周期内已经验证的硬件 IMEI 仍可跨短暂读取失败
+保留。网页自动更新、Release 选择、Docker Control、Actions/预编译交付和 ARM 专属限制仍不包含。
+
 ## 1.9.1 VMware 更新
 
 `1.9.1-vmware.22` 把 WebUI 测试一并复制到固定 Node 构建目录，并在测试目录缺失时立即失败，

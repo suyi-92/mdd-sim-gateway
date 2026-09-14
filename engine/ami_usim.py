@@ -164,6 +164,10 @@ def write_status(**kw):
     os.replace(tmp, os.path.join(RUNDIR, "usim_status.json"))
 
 
+ICCID_BYTES = 10
+ICCID_MIN_DIGITS = 15
+
+
 def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
@@ -258,15 +262,16 @@ def _with_deadline(fn, timeout=None):
 
 
 def read_iccid(conn):
-    """Read the complete EF.ICCID only after both file selections have succeeded."""
+    """Read a complete, numeric EF.ICCID only after both selections succeed."""
     for command in ("00a40004023f0000", "00a40004022fe200"):
         _data, s1, s2 = _xfr(conn, toBytes(command))
         if (s1, s2) != (0x90, 0x00):
             return None
     data, s1, s2 = _xfr(conn, toBytes("00b000000a"))
-    if (s1, s2) != (0x90, 0x00) or len(data) != 10:
+    if (s1, s2) != (0x90, 0x00) or len(data) != ICCID_BYTES:
         return None
-    return swap_nibbles(bytes(data).hex()).rstrip("f")
+    iccid = swap_nibbles(bytes(data).hex()).rstrip("f")
+    return iccid if iccid.isdigit() and len(iccid) >= ICCID_MIN_DIGITS else None
 
 
 def foreign_iccid(connection):
