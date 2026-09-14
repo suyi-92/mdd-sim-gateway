@@ -6259,10 +6259,6 @@ def _with_deadline(fn, timeout=None):
     return box.get("value")
 
 
-_ICCID_BYTES = 10
-_ICCID_MIN_DIGITS = 15
-
-
 def read_iccid_at_index(reader_index):
     """Read a complete numeric EF.ICCID, or None when the card is unreadable.
 
@@ -6276,10 +6272,10 @@ def read_iccid_at_index(reader_index):
         connection.transmit(toBytes('00A40000023F00'))
         connection.transmit(toBytes('00A40000022FE2'))
         data, sw1, sw2 = connection.transmit(toBytes('00B000000A'))
-        if sw1 != 0x90 or len(data) != _ICCID_BYTES:
+        if sw1 != 0x90 or len(data) != 10:
             return None
         iccid = bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
-        return iccid if iccid.isdigit() and len(iccid) >= _ICCID_MIN_DIGITS else None
+        return iccid if iccid.isdigit() and len(iccid) >= 15 else None
     finally:
         try:
             connection.disconnect()
