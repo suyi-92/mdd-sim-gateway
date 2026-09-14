@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
+import { deviceTitle } from '../deviceNames.js'
 import { waitForEsimLine } from '../esimRecovery.js'
 import { useI18n } from '../i18n.jsx'
 
@@ -865,7 +866,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
             onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
             {present.map((c) => (
               <option key={c.name} value={c.name}>
-                #{c.index} · {modemReaderGroup(c.name) || c.name}{c.iccid ? ` · ${c.iccid}` : ''}
+                #{c.index} · {deviceTitle(c, c.index || 0, t)}{c.iccid ? ` · ${c.iccid}` : ''}
               </option>
             ))}
           </select>

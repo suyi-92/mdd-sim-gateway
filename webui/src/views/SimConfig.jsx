@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
+import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
 
 const emptyInstance = () => ({
@@ -279,7 +280,17 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <h3>{t('SIM card')}</h3>
         <Field label={t('Reader')}>
           <select value={form.reader_index} disabled={!!targetDevice} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
-            {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
+            {readers.map((r, i) => {
+              const card = cards.find(item => item.name === r)
+              const belongsToTarget = targetDevice && (targetDevice.reader === r
+                || (targetDevice.device_type !== 'reader' && targetDevice.id && r.includes(targetDevice.id)))
+              const label = card
+                ? deviceTitle(card, i, t)
+                : belongsToTarget
+                  ? deviceTitle(targetDevice, i, t)
+                  : r
+              return <option key={i} value={i}>{i}: {label}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>
+            })}
             {readers.length === 0 && <option>{readersLoading ? `${t('Loading')}…` : t('No readers')}</option>}
           </select>
         </Field>

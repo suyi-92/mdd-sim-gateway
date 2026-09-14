@@ -85,6 +85,12 @@ class DeviceMigrationTests(unittest.TestCase):
         self._write(self.app.device_status_path, {
             "devices": {old_id: {"present": False}, new_id: {"present": True}},
         })
+        self._write(self.app.root / "devices-hardware.json", {
+            "version": 1,
+            "devices": {old_id: {"device_type": "modem",
+                                  "name": "USB modem",
+                                  "display_name": "Main modem"}},
+        })
         self._identity(old_id)
         self._identity(new_id)
 
@@ -96,6 +102,32 @@ class DeviceMigrationTests(unittest.TestCase):
         status = json.loads(self.app.device_status_path.read_text())["devices"]
         self.assertEqual(set(status), {new_id})
         self.assertFalse((self.app.data / "modems" / f"{old_id}.json").exists())
+        metadata = json.loads((self.app.root / "devices-hardware.json").read_text())
+        self.assertEqual(set(metadata["devices"]), {new_id})
+        self.assertEqual(metadata["devices"][new_id]["display_name"], "Main modem")
+
+    def test_conflicting_custom_names_prevent_automatic_duplicate_merge(self):
+        state = {"cellular_enabled": False, "vowifi_enabled": True,
+                 "flight_mode": True}
+        old_id, new_id = "2c7c-0125-1-1.2", "2c7c-0125-1-1.4"
+        devices = {old_id: state, new_id: dict(state)}
+        self._write(self.app.device_desired_path,
+                    {"version": 3, "devices": dict(devices)})
+        self._write(self.app.root / "devices-hardware.json", {
+            "version": 1,
+            "devices": {
+                old_id: {"device_type": "modem", "display_name": "Old label"},
+                new_id: {"device_type": "modem", "display_name": "New label"},
+            },
+        })
+        self._identity(old_id)
+        self._identity(new_id)
+
+        self.app.migrate_device_ids([_modem(new_id, "1-1.4")])
+
+        self.assertEqual(self._desired(), devices)
+        metadata = json.loads((self.app.root / "devices-hardware.json").read_text())
+        self.assertEqual(set(metadata["devices"]), {old_id, new_id})
 
     def test_conflicting_preconfigured_duplicate_is_left_for_review(self):
         old_id, new_id = "2c7c-0125-1-1.2", "2c7c-0125-1-1.4"

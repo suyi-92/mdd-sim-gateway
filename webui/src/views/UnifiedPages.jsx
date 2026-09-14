@@ -4,6 +4,7 @@ import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } f
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
+import { defaultDeviceName, deviceTitle } from '../deviceNames.js'
 import SimConfig from './SimConfig.jsx'
 import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
@@ -293,7 +294,6 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   </div>
 }
 
-function deviceTitle(d, index) { return d.name || d.label || d.model || `Device ${index + 1}` }
 function simName(d, t) {
   if (d.present === false) return t('Device not connected')
   return d.sim?.present === false ? t('No SIM inserted') : (d.sim?.name || d.carrier || d.operator || 'SIM')
@@ -331,13 +331,26 @@ function deviceIdentityLine(d, t) {
 function HardwarePanel({ device, refreshDevices, showToast }) {
   const { t } = useI18n()
   const [imei, setImei] = useState(device.imei || '')
-  const [saving, setSaving] = useState(false)
+  const [name, setName] = useState(device.display_name || '')
+  const [saving, setSaving] = useState('')
   useEffect(() => setImei(device.imei || ''), [device.id, device.imei])
+  useEffect(() => setName(device.display_name || ''), [device.id, device.display_name])
   const isReader = device.device_type === 'reader'
-  const save = async () => {
+  const saveName = async () => {
+    const value = String(name || '').trim()
+    if (value.length > 80) { showToast(t('Device name must be at most 80 characters')); return }
+    setSaving('name')
+    try {
+      await api.saveDeviceHardware(device.id, { name: value })
+      await refreshDevices()
+      showToast(t(value ? 'Device name saved' : 'Default device name restored'))
+    } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
+    finally { setSaving('') }
+  }
+  const saveImei = async () => {
     const digits = String(imei || '').replace(/\D/g, '')
     if (digits && digits.length !== 15) { showToast(t('IMEI must contain exactly 15 digits')); return }
-    setSaving(true)
+    setSaving('imei')
     try {
       const result = await api.saveDeviceHardware(device.id, { imei: digits })
       await refreshDevices()
@@ -345,7 +358,7 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
         ? (digits ? 'Hardware IMEI saved and the active line was restarted' : 'Hardware IMEI removed and the active line was restarted')
         : (digits ? 'Hardware IMEI saved' : 'Hardware IMEI removed')))
     } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
-    finally { setSaving(false) }
+    finally { setSaving('') }
   }
   const forget = async () => {
     if (device.present) { showToast(t('Disconnect this device before removing it')); return }
@@ -361,13 +374,21 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
     <p>{t('The device name identifies this hardware in the interface. Model and firmware appear only when the hardware reports them.')}</p>
   </div>
     <div className="u-details cols u-hardware-facts">
-      <div className="u-detail"><span>{t('Device name')}</span><b>{deviceTitle(device, 0)}</b></div>
+      <div className="u-detail"><span>{t('Device name')}</span><b>{deviceTitle(device, 0, t)}</b></div>
       <div className="u-detail"><span>{t('Device type')}</span><b>{deviceTypeName(device, t)}</b></div>
       {device.model && <div className="u-detail"><span>{t('Model')}</span><b>{device.model}</b></div>}
       {device.firmware && <div className="u-detail"><span>{t('Firmware version')}</span><b>{device.firmware}</b></div>}
       <div className="u-detail"><span>{t('Stable path')}</span><b>{stablePathName(device, t)}</b></div>
       <LogicalChannels value={device.logical_channels}/>
       {!isReader && <div className="u-detail"><span>IMEI</span><b>{device.imei_masked || t('Hardware did not report')}</b></div>}
+    </div>
+    <div className="u-hardware-action u-hardware-name">
+      <div className="u-hardware-action-copy"><h4>{t('Device name')}</h4>
+        <p>{t('This name is used everywhere this physical device appears. Clear it to restore the automatic name.')}</p>
+      </div>
+      <input maxLength={80} value={name} onChange={event => setName(event.target.value)}
+        placeholder={defaultDeviceName(device, 0, t)} />
+      <button className="btn btn-primary" disabled={!!saving} onClick={saveName}>{t('Save')}</button>
     </div>
     {isReader && <div className="u-hardware-action u-hardware-imei">
       <div className="u-hardware-action-copy"><h4>{t('Hardware IMEI')}</h4>
@@ -376,7 +397,7 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
       <input className="mono" inputMode="numeric" maxLength={18} value={imei}
         onChange={event => setImei(event.target.value.replace(/[^0-9 -]/g, ''))}
         placeholder={t('Optional 15-digit equipment IMEI')} />
-      <button className="btn btn-primary" disabled={saving} onClick={save}>{t('Save')}</button>
+      <button className="btn btn-primary" disabled={!!saving} onClick={saveImei}>{t('Save')}</button>
     </div>}
     <div className="u-hardware-action u-hardware-danger">
       <div className="u-hardware-action-copy"><h4>{t('Remove device record')}</h4>
@@ -412,7 +433,7 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
     {loadErrors?.devices && !visibleDevices.length ? <p className="u-error">{t('Loading failed')}</p> : pending ? <Discovering t={t} /> :
       !visibleDevices.length ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> :
       <div className="u-device-grid">{visibleDevices.map((d, i) => <div className="card u-device-card" key={d.id}>
-        <div className="u-card-head"><div><h2>{deviceTitle(d, i)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
+        <div className="u-card-head"><div><h2>{deviceTitle(d, i, t)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
         <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
           <div className="u-details"><div className="u-detail"><span>{t('Carrier')}</span><b>{carrierLabel(d, t)}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t) || d.proxy_node || t('Not connected')} /></b></div></div>
         </div><div className="u-card-foot"><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setCallSelected(String(d.instance_id)); setView('calls') }}>{t('Call')}</button><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('messages') }}>{t('Message')}</button><button className="btn btn-primary" onClick={() => { setSelectedDeviceId(d.id); setView('devices') }}>{t('Details')}</button></div>
@@ -437,8 +458,8 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
   if (discovering) return <Discovering t={t} />
   if (!d) return <>{historyToggle}<Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /></>
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('Cellular data (4G)')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
-  return <>{historyToggle}<div className="u-split"><aside className="card u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</aside>
-    <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d))}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
+  return <>{historyToggle}<div className="u-split"><aside className="card u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i,t)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</aside>
+    <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on cellular data to let the per-device ModemManager backend establish a data bearer.')} />}</div>}
@@ -1307,7 +1328,7 @@ export function DiagnosticsPage(props) {
   const clearHostAlerts = async () => { try { setClearingAlerts(true); await api.clearHostAlerts(); const next = { ...(system || {}), host_alerts: [] }; setSystem(next); props.setSystemMeta?.(s => ({ ...s, host_alerts: [] })); props.showToast(t('Host alerts cleared')) } catch (e) { props.showToast(e.message) } finally { setClearingAlerts(false) } }
   const run = async d => { try { const result = await api.deviceDiagnostics(d.id); setResults(x => ({ ...x, [d.id]: result })); props.showToast(result.ok ? t('Diagnostics passed') : t('Diagnostics found problems')) } catch (e) { props.showToast(e.message) } }
   return <div className="u-page u-diagnostics-page"><div className="u-tabs"><button className={tab === 'health' ? 'active' : ''} onClick={() => setTab('health')}>{t('Health')}</button><button className={tab === 'host' ? 'active' : ''} onClick={() => setTab('host')}>{t('Host')}{!!hostAlerts.length && <i className={`u-nav-dot ${hostAlerts.some(a => a.severity === 'critical') ? 'critical' : 'warning'}`} />}</button><button className={tab === 'logs' ? 'active' : ''} onClick={() => setTab('logs')}>{t('Live logs')}</button><button className={tab === 'bundle' ? 'active' : ''} onClick={() => setTab('bundle')}>{t('Support bundle')}</button></div>
-    {tab === 'health' && props.initialLoading ? <p role="status">{t('Loading')}…</p> : tab === 'health' && props.loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : tab === 'health' && <div className="u-device-grid">{devices.map((d, i) => <div className="card u-panel u-diagnostic-card" key={d.id}><h3>{deviceTitle(d, i)}</h3><div className="u-detail"><span>{t('Cellular data (4G)')}</span><Badge state={capability(d, 'cellular').actual} /></div><div className="u-detail"><span>VoWiFi / IMS</span><Badge state={capability(d, 'vowifi').actual} /></div><button className="btn btn-ghost u-diagnostic-action" onClick={() => run(d)}>{t('Run diagnostics')}</button>{results[d.id]?.checks?.map(check => <div className="u-detail" key={check.name}><span>{check.name}</span><b>{check.ok ? '✓' : '✕'} {check.detail}</b></div>)}</div>)}</div>}
+    {tab === 'health' && props.initialLoading ? <p role="status">{t('Loading')}…</p> : tab === 'health' && props.loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : tab === 'health' && <div className="u-device-grid">{devices.map((d, i) => <div className="card u-panel u-diagnostic-card" key={d.id}><h3>{deviceTitle(d, i, t)}</h3><div className="u-detail"><span>{t('Cellular data (4G)')}</span><Badge state={capability(d, 'cellular').actual} /></div><div className="u-detail"><span>VoWiFi / IMS</span><Badge state={capability(d, 'vowifi').actual} /></div><button className="btn btn-ghost u-diagnostic-action" onClick={() => run(d)}>{t('Run diagnostics')}</button>{results[d.id]?.checks?.map(check => <div className="u-detail" key={check.name}><span>{check.name}</span><b>{check.ok ? '✓' : '✕'} {check.detail}</b></div>)}</div>)}</div>}
     {tab === 'host' && <HostPanel host={host} alerts={hostAlerts} loading={hostLoading} clearing={clearingAlerts} onClear={clearHostAlerts} t={t} />}
     {tab === 'logs' && <Logs {...props} />}
     {tab === 'bundle' && <div className="card u-panel"><h2>{t('Redacted support bundle')}</h2><p>{t('Contains status, configuration shape and bounded logs. SIM identities, phone numbers, credentials and cryptographic material are removed.')}</p><div className="u-support-actions"><a className="btn btn-primary" href={api.supportBundleUrl}>{t('Download support bundle')}</a><div><b>{t('Found a problem or have a suggestion?')}</b><p>{t('Open a GitHub Issue. For faults, attach the redacted support bundle when appropriate.')}</p><a href={issueUrl} target="_blank" rel="noreferrer">{t('Submit an Issue')} ↗</a></div></div></div>}

@@ -341,6 +341,72 @@ class HotplugDraftPromotionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_scr_prime_defaults_hide_pcsc_serial_and_slot_suffixes(self):
+        first = "SCR Prime CCID Reader (fixture-a) 00 00"
+        second = "SCR Prime CCID Reader (fixture-b) 01 00"
+
+        self.assertEqual(main._default_reader_display_name(first),
+                         "3T Electronics SCR Prime reader")
+        self.assertEqual(main._default_reader_display_name(second),
+                         "3T Electronics SCR Prime reader")
+
+    def test_device_display_name_validation_is_bounded_and_reversible(self):
+        self.assertEqual(main._normalize_device_display_name("  Desk eSIM  "), "Desk eSIM")
+        self.assertEqual(main._normalize_device_display_name("   "), "")
+        with self.assertRaises(ValueError):
+            main._normalize_device_display_name("x" * 81)
+        with self.assertRaises(ValueError):
+            main._normalize_device_display_name("bad\nname")
+
+    def test_detected_reader_carries_default_and_custom_display_names(self):
+        raw = {"name": "SCR Prime CCID Reader (fixture) 00 00", "index": 0,
+               "reader_port": "1-1", "present": True}
+        reader_id = next(iter(main.device_state.native_reader_devices([
+            {**raw, "hardware_kind": "reader"},
+        ])))
+        with patch.object(main.device_state, "hardware", return_value={
+                    reader_id: {"device_type": "reader", "display_name": "Desk eSIM"},
+                }), patch.object(main.glob, "glob", return_value=[]), \
+                patch.object(main.cfg, "DATA_DIR", "/missing-fixture"):
+            card = main._with_detected_imei([raw])[0]
+
+        self.assertEqual(card["display_name"], "Desk eSIM")
+        self.assertEqual(card["default_name"], "3T Electronics SCR Prime reader")
+        self.assertEqual(card["hardware_id"], reader_id)
+        self.assertEqual(main._device_for_card(card, [card]), (reader_id, "reader"))
+
+    async def test_unified_device_uses_saved_display_name_and_keeps_raw_hardware_name(self):
+        raw_name = "SCR Prime CCID Reader (fixture) 00 00"
+        card = {"name": raw_name, "index": 0, "reader_port": "1-1",
+                "present": True, "hardware_kind": "reader",
+                "hardware_id": "reader-test", "display_name": "Desk eSIM",
+                "default_name": "3T Electronics SCR Prime reader"}
+        records = {"reader-test": {
+            "device_type": "reader", "name": raw_name,
+            "display_name": "Desk eSIM", "stable_path": "1-1",
+        }}
+        with patch.object(main, "_device_sources", return_value=({}, {}, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main.device_state, "native_reader_devices",
+                             return_value={"reader-test": card}), \
+                patch.object(main.device_state, "migrate_reader_records", return_value=[]), \
+                patch.object(main.device_state, "hardware", return_value=records), \
+                patch.object(main, "_hardware_imei_for_card",
+                             return_value=("", "reader-test", "reader")), \
+                patch.object(main.cfg, "get_settings", return_value={
+                    "proxy": {"exits": {}}, "rekey": {"minutes": 30, "ike_minutes": 150},
+                }), patch.object(main, "_carrier_description", return_value={}), \
+                patch.object(main.egress, "status", return_value={}), \
+                patch.object(main.egress, "line_country", return_value=""), \
+                patch.object(main.egress, "country_for_mcc", return_value=""):
+            device = (await main._unified_devices())[0]
+
+        self.assertEqual(device["name"], "Desk eSIM")
+        self.assertEqual(device["display_name"], "Desk eSIM")
+        self.assertEqual(device["default_name"], "3T Electronics SCR Prime reader")
+        self.assertEqual(device["hardware_name"], raw_name)
+
     async def test_manual_native_reader_provision_does_not_require_imei_or_smsc(self):
         card = main.sim.CardInfo(
             reader="Reader", reader_index=0, reader_port="1-1", present=True,
@@ -403,6 +469,57 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
             "id": "2", "imei": "", "imei_source_device_id": "reader-test",
             "imeisv": "",
         })
+
+    async def test_modem_display_name_is_editable_without_restarting_the_line(self):
+        device = {
+            "id": "modem-test", "device_type": "modem",
+            "name": "DJI/Quectel EC25", "default_name": "DJI/Quectel EC25",
+            "display_name": "", "hardware_name": "DJI/Quectel EC25",
+            "stable_path": "1-2", "instance_id": "16", "imei": "490154203237518",
+        }
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main.device_state, "set_hardware", return_value={
+                    "display_name": "Main modem", "imei": "490154203237518",
+                }) as set_hardware, patch.object(main.engine, "is_running") as running, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            result = await main.api_device_hardware("modem-test", {"name": " Main modem "})
+
+        self.assertEqual(result["name"], "Main modem")
+        self.assertEqual(result["display_name"], "Main modem")
+        set_hardware.assert_called_once_with("modem-test", {
+            "device_type": "modem", "name": "DJI/Quectel EC25",
+            "stable_path": "1-2", "display_name": "Main modem",
+        })
+        running.assert_not_called()
+
+    async def test_modem_name_edit_does_not_make_its_hardware_imei_editable(self):
+        device = {"id": "modem-test", "device_type": "modem",
+                  "name": "DJI/Quectel EC25", "imei": "490154203237518"}
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.api_device_hardware("modem-test", {"imei": "350000000000018"})
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_empty_display_name_restores_the_automatic_name(self):
+        device = {
+            "id": "reader-test", "device_type": "reader", "name": "Desk eSIM",
+            "display_name": "Desk eSIM", "default_name": "3T Electronics SCR Prime reader",
+            "hardware_name": "SCR Prime CCID Reader (fixture) 00 00",
+            "stable_path": "1-1", "instance_id": "2", "imei": "",
+        }
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main.device_state, "set_hardware", return_value={
+                    "display_name": "", "imei": "",
+                }), patch.object(main.engine, "is_running") as running, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            result = await main.api_device_hardware("reader-test", {"name": "  "})
+
+        self.assertEqual(result["name"], "3T Electronics SCR Prime reader")
+        self.assertEqual(result["display_name"], "")
+        running.assert_not_called()
 
 
 class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):

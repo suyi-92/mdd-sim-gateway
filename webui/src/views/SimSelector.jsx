@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react'
+import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
 
 // Per-page SIM/line picker for multi-SIM setups. Labels each line with the physical reader
@@ -10,7 +11,7 @@ import { useI18n } from '../i18n.jsx'
 // whose reader/card is unplugged is dropped from the dropdown (its config stays under SIM
 // Config and it reappears when the reader returns).
 export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line' }) {
-  const { t, language } = useI18n()
+  const { t } = useI18n()
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
   // PC/SC bridge has no card. Treat either source as live so 4G-only calls/SMS history
   // remains selectable.
@@ -20,11 +21,6 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
     String(d.instance_id || '') === String(i.id))
   const sourceFor = (i) => readerFor(i) || deviceFor(i)
   const live = instances.filter((i) => sourceFor(i))
-  const deviceName = (c) => {
-    if (!c) return t('Unknown device')
-    if (/SCR Prime/i.test(c.name || '')) return language === 'zh' ? '三体电子 SCR Prime 读卡器' : '3T Electronics SCR Prime reader'
-    return c.display_name || c.modem_name || c.name || t('Unknown device')
-  }
   const lineName = (i) => i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
   const numberTail = (i) => String(i.msisdn || '').replace(/\D/g, '').slice(-4)
 
@@ -43,10 +39,11 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
         {!id && <option value="">{t('— select —')}</option>}
         {live.map((i) => {
           const c = sourceFor(i)
+          const physical = deviceFor(i) || c
           const tail = numberTail(i)
           const statusLabel = i.status?.presentation?.label || i.status?.label
           const st = statusLabel ? ` — ${t(statusLabel)}` : ''
-          return <option key={i.id} value={i.id}>{deviceName(c)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
+          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}
       </select>
       {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}

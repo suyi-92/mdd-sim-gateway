@@ -3103,6 +3103,19 @@ class Orchestrator:
             old_imei, new_imei = imei(old_id), imei(new_id)
             if not old_imei or not new_imei or old_imei != new_imei:
                 continue
+            device_metadata_path = self.root / "devices-hardware.json"
+            device_metadata = read_json(device_metadata_path)
+            metadata_records = device_metadata.get("devices") or {}
+            if not isinstance(metadata_records, dict):
+                metadata_records = {}
+            old_display_name = str(
+                (metadata_records.get(old_id) or {}).get("display_name") or "")
+            new_display_name = str(
+                (metadata_records.get(new_id) or {}).get("display_name") or "")
+            if old_display_name and new_display_name and old_display_name != new_display_name:
+                # Conflicting labels are operator input. Do not silently choose one while
+                # collapsing hardware records, even when the modem identity itself matches.
+                continue
             if new_id in configured:
                 # Discovery can persist the new USB-path id before its bridge has published
                 # the IMEI needed to prove migration.  Once both identity files prove this is
@@ -3126,6 +3139,19 @@ class Orchestrator:
                     assignments[new_id] = moved
                 hardware_doc["assignments"] = assignments
                 atomic_json(self.hw_state_path, hardware_doc)
+            if old_id in metadata_records:
+                old_record = dict(metadata_records.pop(old_id))
+                current_record = dict(metadata_records.get(new_id) or {})
+                merged_record = {**old_record, **current_record,
+                                 "device_type": "modem",
+                                 "stable_path": str(modem.get("usb_path") or ""),
+                                 "updated_at": int(time.time())}
+                if not current_record.get("display_name") and old_record.get("display_name"):
+                    merged_record["display_name"] = old_record["display_name"]
+                metadata_records[new_id] = merged_record
+                device_metadata.update(version=1, updated_at=int(time.time()),
+                                       devices=metadata_records)
+                atomic_json(device_metadata_path, device_metadata)
             status_doc = read_json(self.device_status_path)
             status_devices = status_doc.get("devices")
             if isinstance(status_devices, dict) and old_id in status_devices:

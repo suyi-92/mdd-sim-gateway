@@ -5,6 +5,7 @@ import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Messages from './views/Messages.jsx'
 import Esim from './views/Esim.jsx'
 import Keepalive from './views/Keepalive.jsx'
+import { deviceTitle } from './deviceNames.js'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage, physicallyPresentDevices } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
@@ -112,6 +113,7 @@ export default function App() {
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
   const [authState, setAuthState] = useState(null)
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
+  const namedHardware = useRef({ devices: [], cards: [] })
   const refreshInFlight = useRef(false)
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('theme', theme) }, [theme])
@@ -187,6 +189,7 @@ export default function App() {
   },[expireAuth])
   useEffect(()=>{ api.authStatus().then(s=>{ setCsrf(s.csrf); setAuthState(s) }).catch(()=>setAuthState({configured:true,authenticated:false})) },[])
   useEffect(()=>{ if(authState?.authenticated) refresh() },[authState?.authenticated]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(()=>{ namedHardware.current={devices,cards} },[devices,cards])
   useEffect(()=>{ if(!authState?.authenticated)return;
     const load=()=>api.systemStatus().then(status=>setSystemMeta(s=>({...s,...status}))).catch(()=>{})
     load(); const timer=setInterval(load,60*1000); return()=>clearInterval(timer) },[authState?.authenticated])
@@ -210,10 +213,13 @@ export default function App() {
     // from it immediately instead of leaving the page empty until the next 10s poll.
     if(msg.type==='cards'){setCards(msg.cards||[]);refresh()}
     if(msg.type==='engine'&&['card_removed','reader_lost','reader_added','reader_removed'].includes(msg.event)){
-      const name=msg.args?.[0]
+      const rawName=msg.args?.[0]
+      const known=(namedHardware.current.devices||[]).find(d=>d.reader===rawName||(d.id&&String(rawName||'').includes(String(d.id))))
+        ||(namedHardware.current.cards||[]).find(c=>c.name===rawName)
+      const name=rawName?deviceTitle(known||{name:rawName},0,t):''
       showToast({card_removed:t('SIM removed — line stopped'),reader_lost:t('Reader unplugged — line stopped'),reader_added:`${t('Card reader connected')}${name?`: ${name}`:''}`,reader_removed:`${t('Card reader disconnected')}${name?`: ${name}`:''}`}[msg.event])
     }
-    if(['device','capability','cellular','engine'].includes(msg.type)) refresh()
+    if(['device','hardware','capability','cellular','engine'].includes(msg.type)) refresh()
     wsEvents.current.handlers.forEach(h=>h(msg))
     if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:msg.message.peer}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))

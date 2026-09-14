@@ -362,12 +362,35 @@ def _modem_card_representative(siblings: list[dict]) -> dict:
             or siblings[0])
 
 
+DEVICE_DISPLAY_NAME_MAX = 80
+
+
+def _default_reader_display_name(raw_name: str) -> str:
+    """Return one stable product-facing name without PC/SC serial/slot suffixes."""
+    if re.search(r"SCR[\s_-]*Prime", str(raw_name or ""), re.I):
+        return "3T Electronics SCR Prime reader"
+    return "Smart-card reader"
+
+
+def _normalize_device_display_name(value) -> str:
+    """Validate an optional operator label; an empty value restores the default."""
+    if not isinstance(value, str):
+        raise ValueError("device name must be text")
+    name = value.strip()
+    if len(name) > DEVICE_DISPLAY_NAME_MAX:
+        raise ValueError(f"device name must be at most {DEVICE_DISPLAY_NAME_MAX} characters")
+    if any(not char.isprintable() for char in name):
+        raise ValueError("device name must not contain control characters")
+    return name
+
+
 def _with_detected_imei(cards: list[dict]) -> list[dict]:
     """Annotate native readers and collapse a modem's internal VPCD slots into one device."""
     enriched = []
     consumed = set()
     modem_identities = []
     assignment_names = {}
+    hardware_records = device_state.hardware()
     try:
         with open(os.path.join(cfg.DATA_DIR, "orchestrator", "hardware-state.json"),
                   encoding="utf-8") as handle:
@@ -398,10 +421,6 @@ def _with_detected_imei(cards: list[dict]) -> list[dict]:
         if hardware_id and not identity:
             identity = {"hardware_id": hardware_id, "slots": 1}
         if identity:
-            imei = cfg.normalize_imei(identity.get("imei", ""))
-            if len(imei) == 15:
-                card_info["imei"] = imei
-                card_info["imei_source"] = "modem"
             count = max(1, int(identity.get("slots") or 1))
             hwid = str(identity.get("hardware_id") or "")
             siblings = [dict(c) for c in cards if
@@ -414,14 +433,26 @@ def _with_detected_imei(cards: list[dict]) -> list[dict]:
                 # the first slot as the whole modem made a known card disappear from the
                 # aggregated view and prevented the guarded hotplug auto-start from finding it.
                 card_info = dict(_modem_card_representative(siblings))
-                card_info["hardware_kind"] = "modem"
-                card_info["hardware_id"] = identity.get("hardware_id") or identity.get("modem")
-                card_info["display_name"] = (assignment_names.get(hwid)
-                                             or "Cellular modem")
-                card_info["virtual_slots"] = [
-                    {"index": c.get("index"), "name": c.get("name")} for c in siblings[:count]]
+            imei = cfg.normalize_imei(identity.get("imei", ""))
+            if len(imei) == 15:
+                card_info["imei"] = imei
+                card_info["imei_source"] = "modem"
+            card_info["hardware_kind"] = "modem"
+            card_info["hardware_id"] = identity.get("hardware_id") or identity.get("modem")
+            record = hardware_records.get(hwid) or {}
+            card_info["display_name"] = str(record.get("display_name") or "")
+            card_info["default_name"] = (assignment_names.get(hwid)
+                                         or "Cellular modem")
+            card_info["virtual_slots"] = [
+                {"index": c.get("index"), "name": c.get("name")} for c in siblings[:count]]
         else:
             card_info["hardware_kind"] = "reader"
+            reader_devices = device_state.native_reader_devices([card_info])
+            reader_id = next(iter(reader_devices), "")
+            record = hardware_records.get(reader_id) or {}
+            card_info["hardware_id"] = reader_id
+            card_info["display_name"] = str(record.get("display_name") or "")
+            card_info["default_name"] = _default_reader_display_name(card_info.get("name"))
         card_info["country"] = egress.country_for_mcc(card_info.get("mcc"))
         enriched.append(card_info)
     return enriched
@@ -4142,12 +4173,15 @@ def _device_for_card(card_info: dict, cards: list[dict] | None = None) -> tuple[
     """Return (device_id, device_type) for a live card-monitor entry."""
     cards = cards or hub.cards_list()
     hardware_id = str(card_info.get("hardware_id") or "")
-    if card_info.get("hardware_kind") == "modem" and hardware_id:
+    hardware_kind = str(card_info.get("hardware_kind") or "")
+    if hardware_kind == "reader" and hardware_id:
+        return hardware_id, "reader"
+    if hardware_kind == "modem" and hardware_id:
         return hardware_id, "modem"
     name = str(card_info.get("name") or "")
-    hardware_id = hardware_id or device_state.vpcd_modem_hardware_id(name)
-    if hardware_id:
-        return hardware_id, "modem"
+    modem_id = device_state.vpcd_modem_hardware_id(name)
+    if modem_id:
+        return modem_id, "modem"
     port = str(card_info.get("reader_port") or "")
     for device_id, candidate in device_state.native_reader_devices(cards).items():
         if ((name and candidate.get("name") == name)
@@ -4465,13 +4499,23 @@ async def _unified_devices() -> list[dict]:
                                 if is_draft else [])
         provisioning_warnings = (_provisioning_warnings(
             inst or {}, card_info, hardware_imei, hardware_type) if inst else [])
+        if is_native_reader:
+            hardware_name = str(card_info.get("name") or hardware_record.get("name") or "")
+            default_name = (card_info.get("default_name")
+                            or _default_reader_display_name(hardware_name))
+        else:
+            hardware_name = str(assignment.get("name") or observed.get("name")
+                                or identity.get("model") or hardware_record.get("name") or "")
+            default_name = (card_info.get("default_name") or hardware_name
+                            or "Cellular modem")
+        display_name = str(hardware_record.get("display_name")
+                           or card_info.get("display_name") or "").strip()
         result.append({
             "id": device_id, "device_type": "reader" if is_native_reader else "modem",
-            "name": (card_info.get("display_name") or card_info.get("name")
-                     or hardware_record.get("name") or "Smart-card reader"
-                     if is_native_reader else
-                     assignment.get("name") or observed.get("name")
-                     or hardware_record.get("name") or "Cellular modem"),
+            "name": display_name or default_name,
+            "display_name": display_name,
+            "default_name": default_name,
+            "hardware_name": hardware_name,
             "present": device_present,
             "model": identity.get("model") or observed.get("model") or "",
             "firmware": identity.get("firmware") or observed.get("firmware") or "",
@@ -4540,27 +4584,46 @@ async def api_devices():
 
 @app.put("/api/devices/{device_id}/hardware")
 async def api_device_hardware(device_id: str, body: dict):
-    """Save user-managed physical hardware identity (currently native-reader IMEI)."""
-    if set(body or {}) - {"imei"}:
-        raise HTTPException(400, "only imei can be changed")
+    """Save an operator display name and, for native readers, optional hardware IMEI."""
+    body = body or {}
+    if not body or set(body) - {"name", "imei"}:
+        raise HTTPException(400, "provide name and/or imei only")
     device = next((item for item in await _unified_devices() if item["id"] == device_id), None)
     if not device:
         raise HTTPException(404, "no such physical device")
-    if device.get("device_type") != "reader":
+    is_reader = device.get("device_type") == "reader"
+    if "imei" in body and not is_reader:
         raise HTTPException(400, "a modem reports its hardware IMEI automatically")
-    raw = str((body or {}).get("imei") or "").strip()
-    imei = cfg.normalize_imei(raw)
-    if raw and len(imei) != 15:
-        raise HTTPException(422, "IMEI must contain exactly 15 digits")
-    record = device_state.set_hardware(device_id, {
-        "device_type": "reader", "name": device.get("name") or "Smart-card reader",
-        "stable_path": device.get("stable_path") or "", "imei": imei})
+    try:
+        display_name = (_normalize_device_display_name(body["name"])
+                        if "name" in body else None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    imei = cfg.normalize_imei(device.get("imei", ""))
+    patch = {
+        "device_type": "reader" if is_reader else "modem",
+        # Keep the raw name separate: reader-record migration uses it as hardware evidence.
+        "name": (device.get("hardware_name") or
+                 (device_state.hardware().get(device_id) or {}).get("name") or
+                 device.get("default_name") or device.get("name") or
+                 ("Smart-card reader" if is_reader else "Cellular modem")),
+        "stable_path": device.get("stable_path") or "",
+    }
+    if display_name is not None:
+        patch["display_name"] = display_name
+    if "imei" in body:
+        raw = str(body.get("imei") or "").strip()
+        imei = cfg.normalize_imei(raw)
+        if raw and len(imei) != 15:
+            raise HTTPException(422, "IMEI must contain exactly 15 digits")
+        patch["imei"] = imei
+    record = device_state.set_hardware(device_id, patch)
 
     # A running line renders the device identity inside its container. Apply a hardware
     # change immediately to the SIM currently inserted in this reader.
     iid = str(device.get("instance_id") or "")
     applied = False
-    if iid:
+    if iid and "imei" in body:
         inst = cfg.get_instance(iid) or {}
         previous_imeisv = str(inst.get("imeisv") or "")
         svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
@@ -4576,7 +4639,11 @@ async def api_device_hardware(device_id: str, body: dict):
             hub.reset_health(iid, "configuration_restart")
             applied = True
     await hub.broadcast({"type": "hardware", "device": device_id})
-    return {"ok": True, "imei_masked": _masked_identifier(record.get("imei")),
+    saved_display_name = str(record.get("display_name") or "")
+    return {"ok": True,
+            "name": saved_display_name or device.get("default_name") or device.get("name"),
+            "display_name": saved_display_name,
+            "imei_masked": _masked_identifier(record.get("imei")),
             "applied": applied}
 
 
