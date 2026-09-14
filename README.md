@@ -302,6 +302,9 @@ Control 向 OpenAI 换取短期客户端密钥，浏览器再把单独的对方 
 
 ## 1.9.1 VMware 更新
 
+`1.9.1-vmware.20` 修复 AI 字幕版本中全局软电话漏导入 React `useCallback` 导致认证后白屏，
+并增加实际执行全局软电话首次渲染的回归测试。
+
 `1.9.1-vmware.19` 增加浏览器 VoWiFi 通话 AI 实时字幕：按需把对方独立音轨接入 OpenAI
 Realtime Translation，同时显示源语言原文与中文译文；长期 API key 留在 Control，浏览器只取
 短期密钥，字幕不落盘且故障不影响通话。

@@ -96,7 +96,8 @@ class LiveTranslationProviderTests(unittest.TestCase):
 class BrowserLiveTranslationTests(unittest.TestCase):
     def test_remote_track_sidecar_and_transcript_event_contract(self):
         completed = subprocess.run(
-            [NODE, "--test", "webui/tests/liveTranslation.test.js"],
+            [NODE, "--test", "webui/tests/liveTranslation.test.js",
+             "webui/tests/globalSoftphoneRender.test.js"],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=15,
         )
