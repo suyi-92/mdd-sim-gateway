@@ -2,6 +2,7 @@
 import JsSIP from 'jssip'
 import { releaseAudioSink } from './audio-sink.js'
 import { rewriteLocalSdpForMediaHost } from './media-sdp.js'
+import { LiveTranslation } from './live-translation.js'
 
 // Surface JsSIP internals in the console to aid troubleshooting (registration, ICE, etc.)
 try { JsSIP.debug.enable('JsSIP:*') } catch {}
@@ -22,6 +23,7 @@ export class Softphone {
     this._rec = null
     this._recCtx = null
     this._recChunks = []
+    this._translation = null
     this.mediaHost = ''
   }
 
@@ -161,8 +163,8 @@ export class Softphone {
     // 'ended' (BYE received/sent) and 'failed' (setup error / non-2xx) are the terminal
     // events. Always null the session and tell the view so the UI resets to idle even if
     // only one of them fires.
-    session.on('ended', (d) => { if (this.session === session) this.session = null; this.emit('ended', { cause: d && d.cause }) })
-    session.on('failed', (d) => { if (this.session === session) this.session = null; this.emit('failed', { cause: d && d.cause }) })
+    session.on('ended', (d) => { this.stopLiveTranslation(); if (this.session === session) this.session = null; this.emit('ended', { cause: d && d.cause }) })
+    session.on('failed', (d) => { this.stopLiveTranslation(); if (this.session === session) this.session = null; this.emit('failed', { cause: d && d.cause }) })
     session.on('peerconnection', (ev) => {
       const pc = ev.peerconnection
       // ontrack fires as the remote audio track arrives. te.streams[0] is the usual source,
@@ -230,6 +232,7 @@ export class Softphone {
 
   hangup() {
     const s = this.session
+    this.stopLiveTranslation()
     if (s) {
       this.session = null
       try { s.terminate() } catch {}
@@ -267,6 +270,47 @@ export class Softphone {
     if (!this.session) return
     try { muted ? this.session.mute({ audio: true }) : this.session.unmute({ audio: true }) } catch {}
   }
+
+  remoteAudioTrack() {
+    try {
+      return this.session?.connection?.getReceivers()
+        .map((receiver) => receiver.track)
+        .find((track) => track && track.kind === 'audio' && track.readyState !== 'ended') || null
+    } catch { return null }
+  }
+
+  async waitForRemoteAudioTrack(timeoutMs = 2500) {
+    const deadline = Date.now() + timeoutMs
+    let track = this.remoteAudioTrack()
+    while (!track && this.session && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      track = this.remoteAudioTrack()
+    }
+    return track
+  }
+
+  async startLiveTranslation(clientSecret, onEvent) {
+    this.stopLiveTranslation()
+    const remoteTrack = await this.waitForRemoteAudioTrack()
+    if (!remoteTrack) throw new Error('live_translation.remote_audio_unavailable')
+    const translation = new LiveTranslation(onEvent)
+    this._translation = translation
+    try {
+      await translation.start(remoteTrack, clientSecret)
+    } catch (error) {
+      if (this._translation === translation) this._translation = null
+      translation.stop()
+      throw error
+    }
+  }
+
+  stopLiveTranslation() {
+    const translation = this._translation
+    this._translation = null
+    try { translation?.stop() } catch {}
+  }
+
+  get translating() { return !!this._translation }
 
   // ---- call recording: mix local mic + remote audio and record to a downloadable blob ----
   async startRecording() {
@@ -309,6 +353,7 @@ export class Softphone {
     // is swallowed by emit() and cannot clobber a newly-started line's state.
     this._dead = true
     this.hangup()
+    this.stopLiveTranslation()
     if (this._rec) { try { this._rec.stop() } catch {}; this._rec = null }
     if (this.ua) { try { this.ua.stop() } catch {} this.ua = null }
     if (this.remoteAudio) {

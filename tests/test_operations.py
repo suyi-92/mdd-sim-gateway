@@ -80,6 +80,7 @@ class OperationsTests(unittest.TestCase):
         value = operations.redact({
             "pin": "1234",
             "nested": {"token": "secret"},
+            "api_key": "fixture-private-api-key",
             "note": "call +441234567890",
             "subscription_url": "https://example.test/sub?token=secret",
             "headers_json": '{"Authorization":"Bearer secret"}',
@@ -87,6 +88,7 @@ class OperationsTests(unittest.TestCase):
         })
         self.assertEqual(value["pin"], "<redacted>")
         self.assertEqual(value["nested"]["token"], "<redacted>")
+        self.assertEqual(value["api_key"], "<redacted>")
         self.assertNotIn("441234567890", value["note"])
         self.assertTrue(all("secret" not in str(value[key]).lower()
                             for key in ("subscription_url", "headers_json")))
@@ -169,6 +171,7 @@ class OperationsTests(unittest.TestCase):
             "telegram": {"bot_token": "secret"},
             "proxy": {"subscription_url": "https://example.test/sub?token=url-secret"},
             "webhook": {"headers_json": '{"Authorization":"Bearer header-secret"}'},
+            "live_translation": {"enabled": True, "api_key": "fixture-live-translation-key"},
             "feishu": {
                 "url": "https://open.feishu.cn/open-apis/bot/v2/hook/private-token",
                 "secret": "feishu-signing-secret",
@@ -198,6 +201,7 @@ class OperationsTests(unittest.TestCase):
             self.assertNotIn("Operations", settings)
             self.assertNotIn("header-secret", settings)
             self.assertNotIn("url-secret", settings)
+            self.assertNotIn("fixture-live-translation-key", settings)
             self.assertNotIn("001122", log)
             self.assertEqual(status["imei"], "<redacted>")
 

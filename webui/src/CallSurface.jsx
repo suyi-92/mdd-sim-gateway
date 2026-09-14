@@ -1,4 +1,5 @@
 import React from 'react'
+import { LiveSubtitlePanel, subtitleButtonLabel } from './LiveSubtitles.jsx'
 
 export const CALL_KEYS = [
   ['1', ''], ['2', 'ABC'], ['3', 'DEF'],
@@ -7,11 +8,12 @@ export const CALL_KEYS = [
   ['*', ''], ['0', ''], ['#', ''],
 ]
 
-function ActionButton({ icon, label, tone = 'neutral', onClick, active = false, pulse = false }) {
+function ActionButton({ icon, label, tone = 'neutral', onClick, active = false, pulse = false,
+  disabled = false }) {
   return (
     <div className="u-call-action">
       <button type="button" className={`u-call-action-button is-${tone}${active ? ' is-active' : ''}${pulse ? ' is-pulsing' : ''}`}
-        aria-label={label} aria-pressed={active || undefined} onClick={onClick}>
+        aria-label={label} aria-pressed={active || undefined} disabled={disabled} onClick={onClick}>
         {icon}
       </button>
       <span>{label}</span>
@@ -57,6 +59,8 @@ export default function CallSurface({
   onHangup,
   onToggleMute,
   onToggleKeypad,
+  subtitles,
+  onToggleSubtitles,
   onTone,
   onOpenCalls,
   t = (value) => value,
@@ -89,6 +93,10 @@ export default function CallSurface({
         <DtmfKeypad value={dtmfSeq} onTone={onTone} t={t} />
       )}
 
+      {state === 'active' && subtitles?.phase !== 'idle' && (
+        <LiveSubtitlePanel subtitles={subtitles} t={t} compact={!embedded} />
+      )}
+
       <div className="u-call-actions">
         {state === 'incoming' && (
           <>
@@ -105,6 +113,9 @@ export default function CallSurface({
               tone="primary" active={muted} onClick={onToggleMute} />
             {canDtmf && <ActionButton icon="⌨" label={t('Keypad')} tone="violet"
               active={keypad} onClick={onToggleKeypad} />}
+            {subtitles?.available && <ActionButton icon="文" label={subtitleButtonLabel(subtitles, t)}
+              tone="primary" active={['connecting', 'active', 'reconnecting'].includes(subtitles.phase)}
+              onClick={onToggleSubtitles} />}
             <ActionButton icon="✕" label={t('Hangup')} tone="danger" onClick={onHangup} />
           </>
         )}

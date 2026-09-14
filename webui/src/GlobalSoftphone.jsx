@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { api } from './api.js'
 import { Softphone as Phone } from './softphone.js'
 import CallSurface from './CallSurface.jsx'
+import { useLiveSubtitles } from './LiveSubtitles.jsx'
 import { useI18n } from './i18n.jsx'
 
 // Keep incoming-call registration independent of the page the administrator happens to be
@@ -28,6 +29,11 @@ export default function GlobalSoftphone({
   const [keypad, setKeypad] = useState(false)
   const [dtmfSeq, setDtmfSeq] = useState('')
   const [duration, setDuration] = useState(0)
+  const getActivePhone = useCallback(() => {
+    const current = callRef.current
+    return current ? phones.current.get(current.id) : null
+  }, [])
+  const subtitles = useLiveSubtitles(getActivePhone, call?.state === 'active')
 
   const setCall = (next) => {
     callRef.current = typeof next === 'function' ? next(callRef.current) : next
@@ -162,6 +168,7 @@ export default function GlobalSoftphone({
   }
   const surface = <CallSurface call={call} line={call.line} duration={clock} muted={muted}
     keypad={keypad} dtmfSeq={dtmfSeq} embedded={embedded}
+    subtitles={subtitles} onToggleSubtitles={subtitles.toggle}
     onAnswer={answer} onDecline={decline} onHangup={hangup} onToggleMute={toggleMute}
     onToggleKeypad={() => setKeypad((value) => !value)} onTone={pressTone}
     onOpenCalls={onOpenCalls} t={t} />

@@ -102,6 +102,13 @@ DEFAULTS = {
         "vm_enabled": False,
         "vm_ring_seconds": 25,
         "vm_max_seconds": 120,
+        # Optional browser-side OpenAI Realtime Translation. The long-lived key stays in this
+        # owner-only config; Control gives an authenticated browser only a short-lived client
+        # secret after the operator explicitly starts subtitles during a call.
+        "live_translation": {
+            "enabled": False,
+            "api_key": "",
+        },
         # Country-aware outer ePDG routing. Disabled preserves the legacy host routing until the
         # host-side orchestrator is installed/configured. When enabled, a line fails closed if
         # its SIM country has no healthy exit (unless that country explicitly selects direct).
@@ -409,8 +416,10 @@ def load() -> dict:
             })
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
-        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults"):
-            saved = data.get("settings", {}).get(key, {}) or {}
+        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults",
+                    "live_translation"):
+            candidate = data.get("settings", {}).get(key, {}) or {}
+            saved = candidate if isinstance(candidate, dict) else {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
         # Proxy profiles were introduced after the original single-subscription/country-form
         # layout.  Expose a lossless v2 view immediately, but do not rewrite config.yaml until

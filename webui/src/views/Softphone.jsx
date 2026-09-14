@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { api } from '../api.js'
 import { Softphone as Phone } from '../softphone.js'
 import CallSurface, { DialKeypad, DtmfKeypad } from '../CallSurface.jsx'
+import { LiveSubtitlePanel, subtitleButtonLabel, useLiveSubtitles } from '../LiveSubtitles.jsx'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
@@ -151,6 +152,9 @@ export default function Softphone({
   // Persistent, DOM-rendered <audio> sink. One stable element (primed on the first click via
   // unlockAudio) is what makes remote WebRTC audio play under Chrome/Edge autoplay policy.
   const audioRef = useRef(null)
+  const getPhone = useCallback(() => phone.current, [])
+  const subtitles = useLiveSubtitles(
+    getPhone, call?.state === 'active' && call?.transport === 'vowifi' && !call?.serviceCode)
   const externallyOwnedCall = Boolean(id && globalCallLineId !== null
     && String(globalCallLineId) === String(id))
   const selectedDevice = devices.find((device) => device.present === true
@@ -580,6 +584,7 @@ export default function Softphone({
         <CallSurface call={call} line={selected?.name} duration={fmtDur(dur)} muted={muted}
           keypad={keypad} dtmfSeq={dtmfSeq}
           canDtmf={call.transport !== 'cellular' && !call.serviceCode}
+          subtitles={subtitles} onToggleSubtitles={subtitles.toggle}
           onAnswer={answer} onDecline={decline} onHangup={hangup} onToggleMute={toggleMute}
           onToggleKeypad={() => setKeypad((value) => !value)} onTone={pressDTMF}
           onOpenCalls={() => setView?.('calls')} t={t} />
@@ -675,6 +680,7 @@ export default function Softphone({
               {call.transport === 'cellular' && <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 5 }}>{t('Cellular call connected · browser audio unavailable')}</div>}
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
+            <LiveSubtitlePanel subtitles={subtitles} t={t} />
             {call.transport !== 'cellular' && !call.serviceCode && keypad && (
               <DtmfKeypad value={dtmfSeq} onTone={pressDTMF} t={t} />
             )}
@@ -684,6 +690,8 @@ export default function Softphone({
             {call.transport !== 'cellular' && !call.serviceCode && <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
               <RoundBtn icon={muted ? '🔇' : '🎙'} label={t(muted ? 'Unmute' : 'Mute')} color="#60a5fa" onClick={toggleMute} active={muted} />
               <RoundBtn icon="⌨" label={t('Keypad')} color="#a78bfa" onClick={() => setKeypad((v) => !v)} active={keypad} />
+              {subtitles.available && <RoundBtn icon="文" label={subtitleButtonLabel(subtitles, t)} color="#3b82f6"
+                onClick={subtitles.toggle} active={['connecting', 'active', 'reconnecting'].includes(subtitles.phase)} />}
               <RoundBtn icon="⏺" label={t(recording ? 'Stop' : 'Record')} color={RED} onClick={toggleRecord} active={recording} />
             </div>}
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: 6 }}>

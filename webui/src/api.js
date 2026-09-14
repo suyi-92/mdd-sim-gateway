@@ -143,6 +143,8 @@ export const api = {
 
   settings: () => j('GET', '/api/settings'),
   saveSettings: (patch) => j('PUT', '/api/settings', patch),
+  liveTranslationStatus: () => j('GET', '/api/live-translation/status'),
+  createLiveTranslationSession: () => j('POST', '/api/live-translation/session', {}),
   egressStatus: () => j('GET', '/api/egress/status'),
   testEgress: (country) => j('POST', `/api/egress/${encodeURIComponent(country)}/test`, {}),
   testProxyProfile: (profileId, profile) => j('POST', `/api/egress/profile/${encodeURIComponent(profileId)}/test`, profile || {}),

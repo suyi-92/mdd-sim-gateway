@@ -112,6 +112,8 @@ lsusb、pcsc_scan、mmcli 和网络输出。测试不得真实修改开发机 sy
 - SCR USB/PCSC/ATR/hotplug；
 - Quectel tty/WWAN/modem/bearer；
 - 两线路 IMS、呼入呼出、双向音频、短信；
+- 配置测试 API key 后，宽、中、窄三种浏览器宽度下分别验证字幕启动/停止、原文与中文增量、
+  AI 断网/拒绝/限流不影响原通话，以及挂断后翻译 PeerConnection 已释放；
 - VM reboot 与 Windows host reboot。
 
 结果和发行版镜像、内核、libccid、ModemManager、NetworkManager、Docker 版本一起记录。未执行

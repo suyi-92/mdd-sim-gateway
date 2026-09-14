@@ -32,7 +32,8 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
-               sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
+               sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd,
+               live_translation)
 from .version import VERSION
 from . import stability
 from . import ims_recovery
@@ -4878,14 +4879,23 @@ async def api_device_capabilities(device_id: str, body: dict):
 # ----------------------------- settings -----------------------------
 
 
+def _client_settings(settings: dict) -> dict:
+    """Settings view for authenticated browsers, with the OpenAI key kept server-side."""
+    result = {key: value for key, value in settings.items() if key != "system_name"}
+    result["live_translation"] = live_translation.public_config(
+        settings.get("live_translation"))
+    return result
+
+
 @app.get("/api/settings")
 def api_get_settings():
-    return {key: value for key, value in cfg.get_settings().items() if key != "system_name"}
+    return _client_settings(cfg.get_settings())
 
 
 @app.put("/api/settings")
 def api_put_settings(body: dict):
-    previous_proxy = (cfg.get_settings().get("proxy") or {}) if "proxy" in body else None
+    previous_settings = cfg.get_settings()
+    previous_proxy = (previous_settings.get("proxy") or {}) if "proxy" in body else None
     body = {key: (cfg.clean_notification_events(value)
                   if key in {"webhook", "telegram", "pushplus", "feishu"}
                   and isinstance(value, dict) else value)
@@ -4895,6 +4905,12 @@ def api_put_settings(body: dict):
     if "max_sim_lines" in body:
         try:
             body["max_sim_lines"] = cfg.validate_sim_line_limit(body["max_sim_lines"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    if "live_translation" in body:
+        try:
+            body["live_translation"] = live_translation.normalize_config(
+                body["live_translation"], previous_settings.get("live_translation"))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     proxy = body.get("proxy")
@@ -5014,7 +5030,26 @@ def api_put_settings(body: dict):
                 _queue_saved_proxy_change, previous_proxy)
         else:
             _queue_changed_country_exits(previous_proxy, saved.get("proxy") or {})
-    return {key: value for key, value in saved.items() if key != "system_name"}
+    return _client_settings(saved)
+
+
+@app.get("/api/live-translation/status")
+def api_live_translation_status():
+    return live_translation.status(cfg.get_settings().get("live_translation"))
+
+
+@app.post("/api/live-translation/session")
+async def api_live_translation_session():
+    settings = cfg.get_settings().get("live_translation")
+    safety_identifier = hashlib.sha256(
+        f"mdd-live-translation:{cfg.internal_event_token()}".encode("utf-8")
+    ).hexdigest()
+    try:
+        result = await asyncio.to_thread(
+            live_translation.create_client_secret, settings, safety_identifier)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except live_translation.LiveTranslationError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
 
 
 @app.get("/api/egress/status")

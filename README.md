@@ -261,6 +261,18 @@ check，再生成 root-only `tar.gz`、SHA-256 和不含秘密的 manifest；随
 安装器不会宽泛重写 UFW/nftables。以上是无冲突时的默认值；安装时会根据已有线路和真实
 TCP/UDP 占用计算两条线路的精确清单。未指定 `--configure-firewall` 时只打印，不写规则。
 
+## AI 实时字幕
+
+浏览器 VoWiFi 通话可选显示对方讲话的原文和实时中文翻译。先在“系统设置 → 通话与 VoWiFi”
+填写 OpenAI API key 并启用功能；通话接通后点击“字幕”才会开始，关闭字幕或挂断立即结束会话。
+蜂窝模块的实验性呼叫没有浏览器音频，因此不提供字幕。
+
+长期 API key 只保存在 root-only 网关配置中，设置 API 不会把它返回浏览器。每次开启字幕时，
+Control 向 OpenAI 换取短期客户端密钥，浏览器再把单独的对方 WebRTC 音轨发送到
+`gpt-realtime-translate`；本机麦克风不会进入该翻译会话，网关也不保存音频或字幕。此功能需要
+浏览器能够直连 OpenAI、账户具备对应 API 权限，并会产生 OpenAI API 费用。AI 连接或识别失败
+只关闭字幕，不中断原通话。
+
 ## 验收状态
 
 仓库内的静态、Python 和 WebUI 门禁可自动运行，但下面各项只能在真实 VMware 客户机和硬件
@@ -289,6 +301,10 @@ TCP/UDP 占用计算两条线路的精确清单。未指定 `--configure-firewal
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
 
 ## 1.9.1 VMware 更新
+
+`1.9.1-vmware.19` 增加浏览器 VoWiFi 通话 AI 实时字幕：按需把对方独立音轨接入 OpenAI
+Realtime Translation，同时显示源语言原文与中文译文；长期 API key 留在 Control，浏览器只取
+短期密钥，字幕不落盘且故障不影响通话。
 
 `1.9.1-vmware.18` 统一物理设备名称：大疆模块默认显示为 `DJI/Quectel EC25`，所有
 SCR Prime 默认显示为“三体电子 SCR Prime 读卡器”，不再在概览、设备列表、线路选择和

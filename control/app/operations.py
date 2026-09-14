@@ -20,7 +20,7 @@ from . import config as cfg
 
 
 _SECRET_KEYS = re.compile(
-    r"pin|puk|password|secret|token|credential|imsi|iccid|imei|msisdn|eid|"
+    r"pin|puk|password|secret|token|credential|api_key|imsi|iccid|imei|msisdn|eid|"
     r"carrier_identity|gid1|gid2|\bspn\b|subscription|proxy_url|webhook_url|headers?|"
     r"activation|matching_id|confirmation|smdp|ims_home_domain",
     re.I,
