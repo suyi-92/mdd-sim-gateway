@@ -768,7 +768,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={
                     "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
                 patch.object(main, "_cached_line_status", return_value=None), \
-                patch.object(main.egress, "status", return_value={"lines": {}}), \
+                patch.object(main.egress, "status", return_value={
+                    "lines": {"3": {"node": "GB Fixture", "mode": "manual", "ready": True}},
+                    "exits": {"GB": {}}}), \
                 patch.object(main.egress, "line_country", return_value="GB"), \
                 patch.object(main.egress, "country_for_mcc", return_value="GB"):
             devices = await main._unified_devices()
@@ -780,6 +782,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["sim"]["carrier"]["name"], "O2")
         self.assertEqual(device["sim"]["carrier"]["plmn"], "234-10")
         self.assertEqual(device["instance_id"], "3")
+        self.assertEqual(device["egress"]["node"], "GB Fixture")
+        self.assertEqual(device["egress"]["mode"], "manual")
+        self.assertTrue(device["egress"]["ready"])
         self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
 
     async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):

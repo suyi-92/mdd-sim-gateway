@@ -4436,6 +4436,7 @@ async def _unified_devices() -> list[dict]:
     shared = observed_doc.get("shared") or {}
 
     settings = cfg.get_settings()
+    egress_snapshot = egress.status()
     configured_exits = settings.get("proxy", {}).get("exits", {}) or {}
     available_countries = sorted(country for country, value in configured_exits.items()
                                  if isinstance(value, dict) and value.get("enabled", False))
@@ -4589,6 +4590,10 @@ async def _unified_devices() -> list[dict]:
                             or "Cellular modem")
         display_name = str(hardware_record.get("display_name")
                            or card_info.get("display_name") or "").strip()
+        route_country = egress.line_country(inst or card_info)
+        line_route = (egress_snapshot.get("lines") or {}).get(
+            str(inst["id"]) if inst else "", {})
+        country_route = (egress_snapshot.get("exits") or {}).get(route_country, {})
         result.append({
             "id": device_id, "device_type": "reader" if is_native_reader else "modem",
             "name": display_name or default_name,
@@ -4620,17 +4625,17 @@ async def _unified_devices() -> list[dict]:
                            (cfg.get_settings().get("rekey") or {}).get("minutes", 30)),
                        "ike_rekey_minutes": (inst or {}).get("ike_rekey_minutes",
                            (cfg.get_settings().get("rekey") or {}).get("ike_minutes", 150))},
-            "egress": {"node": (egress.status().get("lines") or {}).get(
-                str(inst["id"]) if inst else "", {}).get("node") or "",
+            "egress": {"node": line_route.get("node") or "",
+                "mode": line_route.get("mode") or "",
+                "ready": bool(line_route.get("ready")),
                 # The picker lives on the settings page, so without these the device page shows
                 # a node that silently disagrees with what the operator chose.
-                **{key: ((egress.status().get("exits") or {}).get(
-                    egress.line_country(inst or card_info), {}).get(key) or "")
+                **{key: (country_route.get(key) or "")
                    for key in ("pinned_node", "pin_mode", "selection",
                                # Why the exit moved, and whether the pinned node is still
                                # serving a cooldown — otherwise a mismatch looks arbitrary.
                                "last_change", "pinned_cooldown_seconds")},
-                "country": egress.line_country(inst or card_info),
+                "country": route_country,
                 "detected_country": egress.country_for_mcc((inst or card_info).get("mcc")),
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},

@@ -1,0 +1,135 @@
+// Browser acceptance against local fixture APIs only; never contacts the installed gateway.
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const http = require('node:http')
+const path = require('node:path')
+const { chromium } = require('playwright')
+
+const root = path.resolve(__dirname, '..')
+const dist = path.join(root, 'webui/dist')
+const output = process.env.MDD_UI_TEST_OUTPUT || '/tmp/mdd-communication-line-details'
+fs.mkdirSync(output, { recursive: true })
+
+const instances = [
+  { id: '1', name: 'Desk line', mcc: '234', mnc: '33', msisdn: '+447700900357', enabled: true,
+    status: { state: 'OK', label: 'Working', presentation: { label: 'Working' } } },
+  { id: '2', name: 'Travel line', mcc: '310', mnc: '280', msisdn: '+15555557654', enabled: true,
+    status: { state: 'OK', label: 'Working', presentation: { label: 'Working' } } },
+]
+const cards = instances.map((line, index) => ({
+  name: `Fixture reader ${index + 1}`, index, present: true, matched: line.id,
+}))
+const devices = [
+  { id: 'reader-1', instance_id: '1', device_type: 'reader', present: true,
+    name: '3T Electronics SCR Prime reader', sim: { present: true, number: '+447700900357',
+      carrier: { name: 'Fixture Mobile', home_network: 'EE', current_network: 'Visited Network', plmn: '234-33' } },
+    egress: { country: 'gb', detected_country: 'gb', node: 'GB Fixture Node', mode: 'manual', ready: true },
+    capabilities: { vowifi: { desired: true, actual: 'on' } } },
+  { id: 'reader-2', instance_id: '2', device_type: 'reader', present: true,
+    name: 'Travel reader', sim: { present: true, number: '+15555557654',
+      carrier: { name: 'Fixture Wireless', home_network: 'Fixture Host', plmn: '310-280' } },
+    egress: { country: 'us', detected_country: 'us', node: '', mode: 'direct', ready: true },
+    capabilities: { vowifi: { desired: true, actual: 'on' } } },
+]
+
+const writes = []
+const json = (response, value, status = 200) => {
+  response.writeHead(status, { 'Content-Type': 'application/json' })
+  response.end(JSON.stringify(value))
+}
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://localhost')
+  if (url.pathname.startsWith('/api/')) {
+    if (request.method !== 'GET') writes.push([request.method, url.pathname])
+    const values = {
+      '/api/auth/status': { configured: true, authenticated: true, csrf: 'fixture-only' },
+      '/api/instances': { instances }, '/api/cards': { cards },
+      '/api/devices': { devices, discovering: false },
+      '/api/system/status': { version: 'fixture', repository_url: 'https://example.invalid/repo' },
+    }
+    if (/\/softphone$/.test(url.pathname)) return json(response, { enabled: false })
+    if (/\/calls$/.test(url.pathname)) return json(response, { calls: [] })
+    if (/\/voicemails$/.test(url.pathname)) return json(response, { voicemails: [] })
+    if (/\/messages\/threads$/.test(url.pathname)) return json(response, { threads: [] })
+    if (/\/messages\/binary$/.test(url.pathname)) return json(response, { payloads: [] })
+    return json(response, values[url.pathname] || {})
+  }
+  const file = path.resolve(dist, '.' + (url.pathname === '/' ? '/index.html' : url.pathname))
+  if (!file.startsWith(dist + path.sep) || !fs.existsSync(file)) {
+    response.writeHead(404); response.end(); return
+  }
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }
+  response.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream' })
+  fs.createReadStream(file).pipe(response)
+})
+server.on('upgrade', (_request, socket) => socket.destroy())
+
+;(async () => {
+  let browser
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const origin = `http://127.0.0.1:${server.address().port}`
+    browser = await chromium.launch({ headless: true,
+      ...(process.env.MDD_BROWSER_EXECUTABLE
+        ? { executablePath: process.env.MDD_BROWSER_EXECUTABLE }
+        : {}) })
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+    await context.route('**/*', route => route.request().url().startsWith(origin + '/') ? route.continue() : route.abort())
+    await context.addInitScript(() => {
+      localStorage.setItem('mdd-language', 'zh')
+      window.WebSocket = class extends EventTarget {
+        static OPEN = 1
+        constructor() { super(); this.readyState = 1; queueMicrotask(() => this.onopen?.(new Event('open'))) }
+        send() {}
+        close() { this.readyState = 3 }
+      }
+    })
+    const page = await context.newPage()
+    const errors = []
+    page.on('pageerror', error => errors.push(error.message))
+
+    const verifyFirstLine = async view => {
+      const details = page.locator('.u-line-selector-meta:visible')
+      await details.getByText('Fixture Mobile (234-33)', { exact: true }).waitFor()
+      const text = await details.innerText()
+      for (const expected of ['运营商', '线路名称', '号码', '国家', '承载网络', '网络线路',
+        'Desk line', '••••0357', '英国 (GB)', 'Visited Network · EE', 'GB Fixture Node']) {
+        assert.ok(text.includes(expected), `${view} missing ${expected}`)
+      }
+      assert.equal((await page.locator('body').innerText()).includes('+447700900357'), false)
+    }
+
+    await page.goto(origin + '/#/calls')
+    await verifyFirstLine('calls')
+    await page.locator('.u-line-selector:visible select').selectOption('2')
+    const callDetails = page.locator('.u-line-selector-meta:visible')
+    await callDetails.getByText('Travel line', { exact: true }).waitFor()
+    const switched = await callDetails.innerText()
+    for (const expected of ['Fixture Wireless (310-280)', '••••7654', '美国 (US)',
+      'Fixture Host', '明确直连']) assert.ok(switched.includes(expected), `switched calls missing ${expected}`)
+    assert.equal((await page.locator('body').innerText()).includes('+15555557654'), false)
+
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `calls overflow at ${width}px`)
+      await page.screenshot({ path: path.join(output, `calls-${width}.png`), fullPage: true, animations: 'disabled' })
+    }
+
+    await page.goto(origin + '/#/messages')
+    await verifyFirstLine('messages')
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `messages overflow at ${width}px`)
+      await page.screenshot({ path: path.join(output, `messages-${width}.png`), fullPage: true, animations: 'disabled' })
+    }
+
+    assert.deepEqual(errors, [])
+    assert.deepEqual(writes, [])
+    console.log('PASS: call/message line details, switching, number privacy, and 1440/900/390px layouts; fixture API only')
+  } finally {
+    if (browser) await browser.close()
+    await new Promise(resolve => server.close(resolve))
+  }
+})().catch(error => { console.error(error); process.exitCode = 1 })

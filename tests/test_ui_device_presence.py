@@ -24,6 +24,14 @@ class DevicePresenceTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "JavaScript behavior checks require Node.js")
+    def test_communication_line_details_are_complete_and_number_safe(self):
+        result = subprocess.run(
+            [shutil.which("node"), "--test", str(ROOT / "tests/webui_sim_line_details.mjs")],
+            text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_device_page_uses_the_tested_selection_and_clears_stale_selection(self):
         source = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text()
         page = source.split("export function DevicesPage(", 1)[1].split("\nfunction CountryExitControl(", 1)[0]

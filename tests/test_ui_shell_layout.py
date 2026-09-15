@@ -83,11 +83,16 @@ class PageRhythmTests(unittest.TestCase):
 
     def test_shared_line_and_transport_selectors_keep_text_and_controls_aligned(self):
         self.assertIn('className="card u-line-selector"', SIM_SELECTOR)
+        self.assertIn('className="u-line-selector-meta"', SIM_SELECTOR)
+        self.assertEqual(SOFTPHONE.count("showDetails"), 2)
+        self.assertEqual(MESSAGES.count("showDetails"), 2)
         self.assertIn('className="u-inline-field u-call-route-field"', SOFTPHONE)
         self.assertIn('className="u-inline-field u-message-route-field"', MESSAGES)
         self.assertIn('className="u-inline-field u-esim-reader-field"', ESIM)
         self.assertIn("grid-template-columns:max-content minmax(0,1fr)", css_rule(".u-inline-field"))
-        self.assertIn("minmax(0,680px)", css_rule(".u-line-selector"))
+        self.assertIn("grid-template-columns:max-content minmax(0,1fr) max-content", css_rule(".u-line-selector"))
+        self.assertIn("grid-column:1/-1", css_rule(".u-line-selector-meta"))
+        self.assertIn("repeat(auto-fit,minmax(140px,1fr))", css_rule(".u-line-selector-meta"))
 
     def test_esim_reader_selector_collapses_one_modems_logical_slots(self):
         self.assertIn("function collapseEsimReaders(cards)", ESIM)
