@@ -108,8 +108,10 @@ def classify_ike(iid: str) -> tuple[str, str]:
         return "tunnel_rekey_send_error", REASONS["tunnel_rekey_send_error"]
     # ePDG refused the IKE_AUTH identity BEFORE any EAP-AKA challenge (SIM never queried). This
     # is an authorization/subscription/geo decision, not a SIM/PIN fault — classify it distinctly
-    # so the UI doesn't wrongly blame the SIM. swu_ike logs a clear marker for this case.
-    if "before any eap-aka challenge" in low or "authentication_failed before" in low or \
+    # so the UI doesn't wrongly blame the SIM. New Engines publish the 3GPP no-retry policy in
+    # swu_status.json; retain the log markers for older Engine snapshots and partial status writes.
+    if swu.get("reason_policy") == "no_retry" or \
+            "before any eap-aka challenge" in low or "authentication_failed before" in low or \
             "not provisioned for vowifi" in low:
         return "tunnel_not_authorized", REASONS["tunnel_not_authorized"]
     if terminal == "no_eap_challenge" or \

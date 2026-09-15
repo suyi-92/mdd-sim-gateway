@@ -52,6 +52,23 @@ wait_pin() {
 }
 wait_pin || true
 
+swu_retry_allowed() {
+  local policy
+  policy=$(python3 - "$MDD_RUNDIR/swu_status.json" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+except (OSError, TypeError, ValueError):
+    value = {}
+print(value.get("reason_policy") or "")
+PY
+)
+  [[ "$policy" != "no_retry" ]]
+}
+
 # --- 3. Bring up the SWu (python IKEv2/IPsec) tunnel, supervised ------------------
 log "starting SWu IKEv2 tunnel (epdg=$SWU_EPDG apn=$SWU_APN reader=$USIM_READER_INDEX port=${USIM_READER_PORT:-none})..."
 rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
@@ -79,6 +96,10 @@ rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
         --current "$MDD_RUNDIR/charon.log" \
         --archive-dir /logs/ike
     rc=${PIPESTATUS[0]}
+    if ! swu_retry_allowed; then
+      log "swu_ike stopped after a terminal carrier rejection; waiting for manager or operator action"
+      while true; do sleep 3600; done
+    fi
     log "swu_ike exited (rc=$rc); reconnecting in ${backoff}s"
     sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 60 ] && backoff=60
   done

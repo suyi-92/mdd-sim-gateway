@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,37 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+ROOT = Path(__file__).resolve().parent.parent
+ENTRYPOINT = (ROOT / "engine/entrypoint.sh").read_text(encoding="utf-8")
+
+
+def shell_function(source: str, name: str) -> str:
+    start = source.index(f"{name}() {{")
+    end = source.find("\n}\n\n", start)
+    if end < 0:
+        raise AssertionError(f"could not bound shell function {name}")
+    return source[start:end] + "\n}\n"
+
+
 class EnginePathTests(unittest.TestCase):
+    def test_terminal_carrier_reject_disables_internal_swu_retry(self):
+        helper = shell_function(ENTRYPOINT, "swu_retry_allowed")
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "swu_status.json"
+            script = helper + '\nMDD_RUNDIR="$1"\nswu_retry_allowed\n'
+            for value, expected in (({"reason_policy": "no_retry"}, 1),
+                                    ({"reason_policy": "backoff"}, 0), ({}, 0)):
+                status.write_text(json.dumps(value), encoding="utf-8")
+                result = subprocess.run(
+                    ["bash", "-c", script, "entrypoint-test", temporary], check=False)
+                self.assertEqual(result.returncode, expected, value)
+
+        guard = 'if ! swu_retry_allowed; then'
+        reconnect = 'log "swu_ike exited (rc=$rc); reconnecting in ${backoff}s"'
+        self.assertIn(guard, ENTRYPOINT)
+        self.assertLess(ENTRYPOINT.index(guard), ENTRYPOINT.index(reconnect))
+        self.assertIn('while true; do sleep 3600; done', ENTRYPOINT)
+
     def test_native_control_uses_the_same_runtime_and_host_data_path(self):
         engine = self.engine_module()
         with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "DATA_DIR", temporary):

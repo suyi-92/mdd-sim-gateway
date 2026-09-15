@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -1343,6 +1344,43 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(health["next_retry_at"], before + 160)
                 self.assertLess(health["next_retry_at"], before + 170)
                 self.assertNotIn("9", main.hub.exit_ledgers)
+
+    async def test_carrier_no_retry_reject_stops_without_exit_failover_or_rebuild(self):
+        iid = "terminal-reject"
+        inst = {"id": iid, "enabled": True, "mcc": "310", "mnc": "280"}
+        st = {
+            "state": "TUNNEL_DOWN", "label": "Not connected",
+            "reason_code": "tunnel_not_authorized", "reason": "Carrier rejected access.",
+            "detail": {},
+        }
+        main.hub.reset_health(iid, None)
+        try:
+            with patch.object(main.engine, "capture_and_stop") as stop, \
+                    patch.object(main, "_judge_exit_failure") as judge, \
+                    patch.object(main, "_record_lifecycle") as lifecycle, \
+                    patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop:
+                result = main.apply_health(iid, inst, dict(st), "container-generation")
+                await asyncio.sleep(0.05)
+                repeated = main.apply_health(iid, inst, dict(st), "container-generation")
+                await asyncio.sleep(0.05)
+
+            health = main.hub.health[iid]
+            self.assertEqual(result["state"], "ERROR")
+            self.assertTrue(result["frozen"])
+            self.assertIsNone(result["automatic_retry_in"])
+            self.assertEqual(repeated["reason_code"], "tunnel_not_authorized")
+            self.assertIsNone(health["next_retry_at"])
+            self.assertFalse(health["auto_retrying"])
+            stop.assert_called_once_with(
+                iid, inst, "health-freeze:tunnel_not_authorized", "container-generation")
+            judge.assert_not_called()
+            lifecycle.assert_called_once_with(
+                iid, "recovery_cancelled", "tunnel_not_authorized",
+                retry_count=3, card_present=True)
+            drop.assert_awaited_once_with(iid)
+        finally:
+            main.hub.health.pop(iid, None)
+            main.hub.status_cache.pop(iid, None)
 
     def test_empty_or_missing_ike_logs_are_explicitly_unavailable(self):
         with tempfile.TemporaryDirectory() as temp:

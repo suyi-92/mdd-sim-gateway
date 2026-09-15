@@ -2673,6 +2673,26 @@ def apply_health(iid, inst, st, container_id: str | None = None):
             retry_count=h.get("retry_count"), card_present=True)
         return _frozen(h, st, rmax)
 
+    if st.get("reason_code") == "tunnel_not_authorized":
+        # 3GPP TS 24.302 no-retry rejects describe durable carrier policy for this SIM/PLMN,
+        # not a transient path failure. Stop after the first conclusive response: repeatedly
+        # rebuilding the same container cannot change the subscription, can hammer the ePDG,
+        # and misleadingly makes the UI alternate between "setting up" and the real rejection.
+        h["retry_count"] = rmax
+        h["frozen_code"] = st["reason_code"]
+        h["frozen_reason"] = st["reason"]
+        h["next_retry_at"] = None
+        h["auto_retrying"] = False
+        _record_lifecycle(
+            iid, "recovery_cancelled", st["reason_code"],
+            retry_count=h.get("retry_count"), card_present=True)
+        if container_id:
+            asyncio.create_task(asyncio.to_thread(
+                engine.capture_and_stop, iid, inst,
+                f"health-freeze:{st['reason_code']}", container_id))
+        asyncio.create_task(hub.drop_ami(str(iid)))
+        return _frozen(h, st, rmax)
+
     # Asterisk has already spent a complete SIP transaction proving that this established
     # P-CSCF session no longer answers.  If AMI also proves no call is active, skip the generic
     # retry budget and rebuild the exact container generation.  Missing logs, missing AMI, an

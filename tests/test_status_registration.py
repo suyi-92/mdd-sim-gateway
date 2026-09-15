@@ -92,6 +92,20 @@ class RegistrationStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, "tunnel_child_rekey_timeout")
         self.assertIn("CHILD_SA", reason)
 
+    async def test_machine_readable_no_retry_reject_is_not_tunnel_setup(self):
+        with patch.multiple(
+                status.engine,
+                charon_log=lambda _iid, _tail=400: "received IKE_AUTH (1)",
+                usim_status=lambda _iid: {},
+                read_run_json=lambda _iid, _name: {
+                    "state": "DOWN",
+                    "reason_code": "NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED",
+                    "reason_policy": "no_retry",
+                }):
+            code, reason = status.classify_ike("1")
+        self.assertEqual(code, "tunnel_not_authorized")
+        self.assertIn("not provisioned", reason)
+
     async def test_missing_eap_challenge_has_an_actionable_tunnel_reason(self):
         with patch.multiple(
                 status.engine,
