@@ -12,9 +12,8 @@ export function lineDisplayName(line = {}, t = value => value) {
     || t('Line {number}', { number: line.id || '?' })
 }
 
-export function maskedLineNumber(value, t = text => text) {
-  const digits = clean(value).replace(/\D/g, '')
-  return digits ? `••••${digits.slice(-4)}` : t('Number unavailable')
+export function lineNumber(value, t = text => text) {
+  return clean(value) || t('Number unavailable')
 }
 
 export function countryDisplayName(value, language = 'en', t = text => text) {
@@ -51,7 +50,7 @@ export function communicationLineDetails(line = {}, device = {}, t = value => va
   return {
     carrier: carrierLabel,
     line: lineDisplayName(line, t),
-    number: maskedLineNumber(line.msisdn || device?.sim?.number, t),
+    number: lineNumber(line.msisdn || device?.sim?.number, t),
     country: countryDisplayName(countryCode, language, t),
     network,
     networkRoute: networkRoute || t('Not connected'),

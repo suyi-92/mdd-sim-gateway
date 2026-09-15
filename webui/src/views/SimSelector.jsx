@@ -1,7 +1,8 @@
 import React, { useEffect } from 'react'
+import CopyableText from '../CopyableText.jsx'
 import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
-import { communicationLineDetails, lineDisplayName, maskedLineNumber } from '../simLineDetails.js'
+import { communicationLineDetails, lineDisplayName, lineNumber } from '../simLineDetails.js'
 
 // Per-page SIM/line picker for multi-SIM setups. Labels each line with the physical reader
 // it currently occupies (from the detected-cards state) so it's clear which reader's engine
@@ -11,7 +12,7 @@ import { communicationLineDetails, lineDisplayName, maskedLineNumber } from '../
 // Only lines whose physical reader is currently PRESENT are listed — a provisioned line
 // whose reader/card is unplugged is dropped from the dropdown (its config stays under SIM
 // Config and it reappears when the reader returns).
-export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false }) {
+export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false, showToast }) {
   const { t, language } = useI18n()
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
   // PC/SC bridge has no card. Treat either source as live so 4G-only calls/SMS history
@@ -35,7 +36,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   const currentDevice = deviceFor(current) || sourceFor(current)
   const details = showDetails ? communicationLineDetails(current, currentDevice, t, language) : null
   const detailFields = details ? [
-    ['Carrier', details.carrier], ['Line name', details.line], ['Number', details.number],
+    ['Carrier', details.carrier], ['Line name', details.line], ['Number', details.number, true],
     ['Country', details.country], ['Home network', details.network],
     ['Network route', details.networkRoute],
   ] : []
@@ -49,12 +50,16 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
           const physical = deviceFor(i) || c
           const statusLabel = i.status?.presentation?.label || i.status?.label
           const st = statusLabel ? ` — ${t(statusLabel)}` : ''
-          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineDisplayName(i, t)} · {maskedLineNumber(i.msisdn, t)}{st}</option>
+          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineDisplayName(i, t)} · {lineNumber(i.msisdn || physical?.sim?.number, t)}{st}</option>
         })}
       </select>
       {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}
       {details && <dl className="u-line-selector-meta" aria-label={t('Current line details')}>
-        {detailFields.map(([name, value]) => <div key={name}><dt>{t(name)}</dt><dd title={value}>{value}</dd></div>)}
+        {detailFields.map(([name, value, copyable]) => <div key={name}><dt>{t(name)}</dt><dd title={copyable ? undefined : value}>
+          {copyable && value !== t('Number unavailable')
+            ? <CopyableText value={value} showToast={showToast}>{value}</CopyableText>
+            : value}
+        </dd></div>)}
       </dl>}
     </div>
   )

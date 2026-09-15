@@ -4,6 +4,7 @@ import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } f
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
+import CopyableText from '../CopyableText.jsx'
 import { defaultDeviceName, deviceTitle } from '../deviceNames.js'
 import SimConfig from './SimConfig.jsx'
 import Logs from './Logs.jsx'
@@ -320,11 +321,14 @@ function deviceSimLine(d, t, language) {
   const country = d.egress?.detected_country || d.egress?.country
   return country ? `${name} · ${countryName(country, language)}` : name
 }
-function deviceIdentityLine(d, t) {
-  if (d.present === false) return t('Device not connected')
-  if (d.sim?.present === false) return t('No SIM inserted')
-  const number = d.sim?.number || d.number
-  return `${simName(d, t)} · ${number || t('SIM detected')}`
+function DeviceIdentityLine({ device, showToast }) {
+  const { t } = useI18n()
+  if (device.present === false) return t('Device not connected')
+  if (device.sim?.present === false) return t('No SIM inserted')
+  const number = device.sim?.number || device.number
+  return <>{simName(device, t)} · {number
+    ? <CopyableText value={number} showToast={showToast}>{number}</CopyableText>
+    : t('SIM detected')}</>
 }
 
 
@@ -433,7 +437,7 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
     {loadErrors?.devices && !visibleDevices.length ? <p className="u-error">{t('Loading failed')}</p> : pending ? <Discovering t={t} /> :
       !visibleDevices.length ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> :
       <div className="u-device-grid">{visibleDevices.map((d, i) => <div className="card u-device-card" key={d.id}>
-        <div className="u-card-head"><div><h2>{deviceTitle(d, i, t)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
+        <div className="u-card-head"><div><h2>{deviceTitle(d, i, t)}</h2><p><DeviceIdentityLine device={d} showToast={showToast} /></p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
         <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
           <div className="u-details"><div className="u-detail"><span>{t('Carrier')}</span><b>{carrierLabel(d, t)}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t) || d.proxy_node || t('Not connected')} /></b></div></div>
         </div><div className="u-card-foot"><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setCallSelected(String(d.instance_id)); setView('calls') }}>{t('Call')}</button><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('messages') }}>{t('Message')}</button><button className="btn btn-primary" onClick={() => { setSelectedDeviceId(d.id); setView('devices') }}>{t('Details')}</button></div>

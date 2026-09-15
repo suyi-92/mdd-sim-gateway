@@ -13,7 +13,7 @@ fs.mkdirSync(output, { recursive: true })
 const instances = [
   { id: '1', name: 'Desk line', mcc: '234', mnc: '33', msisdn: '+447700900357', enabled: true,
     status: { state: 'OK', label: 'Working', presentation: { label: 'Working' } } },
-  { id: '2', name: 'Travel line', mcc: '310', mnc: '280', msisdn: '+15555557654', enabled: true,
+  { id: '2', name: 'Travel line', mcc: '310', mnc: '280', msisdn: '+1555**7654#', enabled: true,
     status: { state: 'OK', label: 'Working', presentation: { label: 'Working' } } },
 ]
 const cards = instances.map((line, index) => ({
@@ -26,7 +26,7 @@ const devices = [
     egress: { country: 'gb', detected_country: 'gb', node: 'GB Fixture Node', mode: 'manual', ready: true },
     capabilities: { vowifi: { desired: true, actual: 'on' } } },
   { id: 'reader-2', instance_id: '2', device_type: 'reader', present: true,
-    name: 'Travel reader', sim: { present: true, number: '+15555557654',
+    name: 'Travel reader', sim: { present: true, number: '+1555**7654#',
       carrier: { name: 'Fixture Wireless', home_network: 'Fixture Host', plmn: '310-280' } },
     egress: { country: 'us', detected_country: 'us', node: '', mode: 'direct', ready: true },
     capabilities: { vowifi: { desired: true, actual: 'on' } } },
@@ -74,6 +74,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
         ? { executablePath: process.env.MDD_BROWSER_EXECUTABLE }
         : {}) })
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin })
     await context.route('**/*', route => route.request().url().startsWith(origin + '/') ? route.continue() : route.abort())
     await context.addInitScript(() => {
       localStorage.setItem('mdd-language', 'zh')
@@ -93,10 +94,12 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await details.getByText('Fixture Mobile (234-33)', { exact: true }).waitFor()
       const text = await details.innerText()
       for (const expected of ['运营商', '线路名称', '号码', '国家', '承载网络', '网络线路',
-        'Desk line', '••••0357', '英国 (GB)', 'Visited Network · EE', 'GB Fixture Node']) {
+        'Desk line', '+447700900357', '英国 (GB)', 'Visited Network · EE', 'GB Fixture Node']) {
         assert.ok(text.includes(expected), `${view} missing ${expected}`)
       }
-      assert.equal((await page.locator('body').innerText()).includes('+447700900357'), false)
+      const number = details.getByRole('button', { name: '复制号码' })
+      await number.click()
+      assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
     }
 
     await page.goto(origin + '/#/calls')
@@ -105,9 +108,10 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const callDetails = page.locator('.u-line-selector-meta:visible')
     await callDetails.getByText('Travel line', { exact: true }).waitFor()
     const switched = await callDetails.innerText()
-    for (const expected of ['Fixture Wireless (310-280)', '••••7654', '美国 (US)',
+    for (const expected of ['Fixture Wireless (310-280)', '+1555**7654#', '美国 (US)',
       'Fixture Host', '明确直连']) assert.ok(switched.includes(expected), `switched calls missing ${expected}`)
-    assert.equal((await page.locator('body').innerText()).includes('+15555557654'), false)
+    await callDetails.getByRole('button', { name: '复制号码' }).click()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+1555**7654#')
 
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
@@ -125,9 +129,22 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.screenshot({ path: path.join(output, `messages-${width}.png`), fullPage: true, animations: 'disabled' })
     }
 
+    await page.goto(origin + '/#/overview')
+    const overviewNumber = page.locator('.u-device-card').first().getByRole('button', { name: '复制号码' })
+    await overviewNumber.waitFor()
+    assert.equal(await overviewNumber.innerText(), '+447700900357')
+    await overviewNumber.click()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `overview overflow at ${width}px`)
+      await page.screenshot({ path: path.join(output, `overview-${width}.png`), fullPage: true, animations: 'disabled' })
+    }
+
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [])
-    console.log('PASS: call/message line details, switching, number privacy, and 1440/900/390px layouts; fixture API only')
+    console.log('PASS: horizontal call/message line details, exact number copy, overview copy, and 1440/900/390px layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))

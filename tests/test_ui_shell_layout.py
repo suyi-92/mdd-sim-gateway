@@ -92,7 +92,10 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("grid-template-columns:max-content minmax(0,1fr)", css_rule(".u-inline-field"))
         self.assertIn("grid-template-columns:max-content minmax(0,1fr) max-content", css_rule(".u-line-selector"))
         self.assertIn("grid-column:1/-1", css_rule(".u-line-selector-meta"))
-        self.assertIn("repeat(auto-fit,minmax(140px,1fr))", css_rule(".u-line-selector-meta"))
+        self.assertIn("repeat(6,minmax(0,1fr))", css_rule(".u-line-selector-meta"))
+        self.assertIn("display:flex", css_rule(".u-line-selector-meta>div"))
+        self.assertIn("<CopyableText value={value}", SIM_SELECTOR)
+        self.assertIn("<CopyableText value={number}", UNIFIED)
 
     def test_esim_reader_selector_collapses_one_modems_logical_slots(self):
         self.assertIn("function collapseEsimReaders(cards)", ESIM)

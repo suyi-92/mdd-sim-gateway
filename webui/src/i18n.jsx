@@ -321,7 +321,7 @@ const zh = {
   'This line does not have an available cellular modem.': '此线路当前没有可用的蜂窝通信模块。',
   'Delivery unknown': '送达状态未知',
   'SMS submission timed out; delivery is unknown. Do not retry automatically.': '短信提交超时，送达状态未知；请勿立即重试，以免重复发送。',
-  Copied: '已复制', 'Copy failed': '复制失败', Disabled: '已禁用', Profile: '配置文件', Rename: '重命名', Nickname: '昵称',
+  Copied: '已复制', 'Copy failed': '复制失败', 'Copy phone number': '复制号码', 'Click to copy phone number': '点击复制号码', Disabled: '已禁用', Profile: '配置文件', Rename: '重命名', Nickname: '昵称',
   'Renaming writes to the eSIM. Line {id} will stop briefly and restart after the attempt. Any current call will end.': '重命名需要写入 eSIM。线路 {id} 将短暂停止，操作结束后会尝试恢复；当前通话会中断。',
   'Stop line and rename': '停止线路并重命名',
   'Stopping the line to rename…': '正在停止线路以重命名…',

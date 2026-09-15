@@ -187,7 +187,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   if (loadErrors?.instances && !id) return <p className="u-error">{tr('Loading failed')}</p>
   if (!id) return (
     <div>
-      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} showDetails />
+      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} showDetails showToast={showToast} />
       <div style={{ color: 'var(--text-dim)' }}>{tr('Select a SIM / line to view and send messages.')}</div>
     </div>
   )
@@ -195,7 +195,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   return (
     <div className="u-communication-page">
       <div style={{ flexShrink: 0 }}>
-        <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} showDetails />
+        <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} showDetails showToast={showToast} />
       </div>
       <div className="u-messages-layout">
       <div className="card u-message-thread-list" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
