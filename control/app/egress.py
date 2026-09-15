@@ -483,12 +483,20 @@ def test_proxy_profile(profile: dict, timeout: float = 24.0) -> int:
 
 
 def _atomic_json(path: str, value: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(temporary, path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _read_json(path: str) -> dict:

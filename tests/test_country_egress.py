@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import socket
@@ -18,6 +19,21 @@ from host.mdd_orchestrator import (Orchestrator, clash_outbound, node_needs_xray
 
 
 class CountryEgressTests(unittest.TestCase):
+    def test_concurrent_desired_state_writes_use_independent_staging_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "desired.json"
+
+            def publish(index):
+                egress._atomic_json(str(target), {
+                    "version": 1, "writer": index, "payload": [index] * 64})
+
+            with ThreadPoolExecutor(max_workers=8) as workers:
+                list(workers.map(publish, range(32)))
+
+            document = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(document["payload"], [document["writer"]] * 64)
+            self.assertEqual(list(Path(temp).glob(".desired.json.*.tmp")), [])
+
     def test_native_control_country_probe_uses_the_loopback_socks_address(self):
         self.assertEqual(orch.COUNTRY_PROXY_LISTEN, "127.0.0.1")
         with tempfile.TemporaryDirectory() as temp:
