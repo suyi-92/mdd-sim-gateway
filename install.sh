@@ -775,10 +775,24 @@ expected = {
     "source_commit": sha, "version": version, "image": image,
     "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
     "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
-    "image_id": image_id, "image_size": int(image_size), "webui_hash": webui_hash,
+    "image_id": image_id, "webui_hash": webui_hash,
     "asterisk_modules": modules["count"], "asterisk_modules_sha256": modules["sha256"],
 }
 if any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit(1)
+# Docker may report a manifest-list's compressed size before the selected platform is
+# unpacked and its expanded size afterwards, while the immutable image ID stays identical.
+# Keep both size values bounded metadata; image ID, labels and source fingerprints above
+# remain the identity checks.
+manifest_size = value.get("image_size")
+try:
+    actual_size = int(image_size)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+max_image_size = 100 * 1024 ** 3
+if (not isinstance(manifest_size, int) or isinstance(manifest_size, bool)
+        or not 0 < manifest_size <= max_image_size
+        or not 0 < actual_size <= max_image_size):
     raise SystemExit(1)
 if not str(value.get("asterisk", "")).startswith("Asterisk "):
     raise SystemExit(1)

@@ -300,6 +300,14 @@ printf '%s\\n' fingerprint-ok
         prepare = shell_function(INSTALL, "prepare_build")
         self.assertIn("docker build --pull --no-cache", prepare)
 
+    def test_engine_identity_does_not_treat_docker_size_presentation_as_a_digest(self):
+        verify = shell_function(INSTALL, "verify_prepared_build")
+        self.assertIn('"image_id": image_id, "webui_hash": webui_hash', verify)
+        self.assertNotIn('"image_id": image_id, "image_size": int(image_size)', verify)
+        self.assertIn('manifest_size = value.get("image_size")', verify)
+        self.assertIn('max_image_size = 100 * 1024 ** 3', verify)
+        self.assertIn('not 0 < actual_size <= max_image_size', verify)
+
     def test_staged_venv_is_relocated_before_the_ready_marker(self):
         prepare = shell_function(INSTALL, "prepare_build")
         moved = prepare.index('mv "$temp" "$build_root"')
