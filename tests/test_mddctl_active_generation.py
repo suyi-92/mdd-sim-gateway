@@ -169,7 +169,9 @@ class ActiveGenerationFixture:
             self.data_state.read_bytes(),
         )
 
-    def validation_result(self) -> subprocess.CompletedProcess[str]:
+    def validation_result(
+        self, bootstrap_verify_installer: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         functions = "\n\n".join(
             shell_function(MDDCTL, name)
             for name in (
@@ -183,6 +185,7 @@ class ActiveGenerationFixture:
 set -Eeuo pipefail
 {functions}
 die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+warn() {{ :; }}
 docker() {{
   [[ "$1" == image && "$2" == inspect && "$3" == "$ENGINE_STABLE_IMAGE" ]] || return 91
   cat "$stable_revision_file"
@@ -194,6 +197,7 @@ stable_revision_file=$4
 ORIGIN_URL={ORIGIN_URL!r}
 BRANCH=vmware
 ENGINE_STABLE_IMAGE=mdd-sim-gateway/engine:latest
+BOOTSTRAP_VERIFY_INSTALLER=$5
 ACTIVE_GENERATION_COMMIT=
 ACTIVE_GENERATION_BUILD=
 validate_managed_checkout
@@ -202,7 +206,8 @@ printf '%s|%s|%s\\n' "$(managed_checkout_status_kind)" "$ACTIVE_GENERATION_COMMI
 """
         return run(
             ["bash", "-c", script, "active-generation", str(self.repo), str(self.state),
-             str(self.cache), str(self.stable_revision)],
+             str(self.cache), str(self.stable_revision),
+             str(bootstrap_verify_installer) if bootstrap_verify_installer else ""],
             check=False,
         )
 
@@ -260,6 +265,29 @@ class ActiveGenerationValidationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected_kind = "legacy-activation-links" if legacy else "clean"
                 self.assertTrue(result.stdout.startswith(f"{expected_kind}|{fixture.sha}|"))
+
+    def test_downloaded_compatibility_verifier_can_validate_a_clean_legacy_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ActiveGenerationFixture(Path(directory))
+            (fixture.repo / "install.sh").write_text(
+                "#!/bin/sh\nexit 87\n", encoding="ascii"
+            )
+            run(["git", "add", "install.sh"], cwd=fixture.repo)
+            run(["git", "commit", "-m", "legacy verifier"], cwd=fixture.repo)
+            fixture.sha = run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+            (fixture.state / "active-commit").write_text(f"{fixture.sha}\n", encoding="ascii")
+            fixture.build = fixture.make_build(fixture.sha)
+            for component in ("venv", "webui"):
+                fixture.link(component).unlink()
+                os.symlink(fixture.build / component, fixture.link(component))
+            fixture.stable_revision.write_text(f"{fixture.sha}\n", encoding="ascii")
+            compatibility = fixture.root / "downloaded-install.sh"
+            compatibility.write_text(VERIFY_INSTALLER, encoding="utf-8")
+
+            before = fixture.snapshot()
+            result = fixture.validation_result(compatibility)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fixture.snapshot(), before)
 
     def test_each_link_rejects_missing_directory_dangling_relative_outside_and_other_commit(self):
         mutations = ("missing", "directory", "dangling", "relative", "outside", "other-commit")

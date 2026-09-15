@@ -79,17 +79,22 @@ done
 [[ "$BRANCH" == vmware ]] || die "managed branch metadata is invalid"
 MDDCTL_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 MDDCTL_SOURCE_ROOT=$(cd -- "$MDDCTL_SOURCE_DIR/.." && pwd -P)
-# The installed manager is copied to /usr/local/sbin and therefore uses the helper in the
-# managed checkout.  A streamed bootstrap runs scripts/mddctl from its fully verified download;
-# prefer that sibling helper so an old checkout can bootstrap an archive-format safety fix
-# before the checkout itself is fast-forwarded.
+# The installed manager is copied to /usr/local/sbin and therefore uses helpers in the managed
+# checkout. A streamed bootstrap runs scripts/mddctl from its fully verified download; retain
+# those sibling helpers so an old checkout can bootstrap a compatible verifier or archive-format
+# safety fix before the checkout itself is fast-forwarded.
 if [[ -e "$MDDCTL_SOURCE_ROOT/.git" && -f "$MDDCTL_SOURCE_DIR/mdd_archive.py" \
       && ! -L "$MDDCTL_SOURCE_DIR/mdd_archive.py" ]]; then
   ARCHIVE_TOOL="$MDDCTL_SOURCE_DIR/mdd_archive.py"
 else
   ARCHIVE_TOOL="$INSTALL_DIR/scripts/mdd_archive.py"
 fi
-readonly MDDCTL_SOURCE_DIR MDDCTL_SOURCE_ROOT ARCHIVE_TOOL
+BOOTSTRAP_VERIFY_INSTALLER=""
+if [[ -e "$MDDCTL_SOURCE_ROOT/.git" && -f "$MDDCTL_SOURCE_ROOT/install.sh" \
+      && ! -L "$MDDCTL_SOURCE_ROOT/install.sh" ]]; then
+  BOOTSTRAP_VERIFY_INSTALLER="$MDDCTL_SOURCE_ROOT/install.sh"
+fi
+readonly MDDCTL_SOURCE_DIR MDDCTL_SOURCE_ROOT ARCHIVE_TOOL BOOTSTRAP_VERIFY_INSTALLER
 ACTIVE_GENERATION_COMMIT=""
 ACTIVE_GENERATION_BUILD=""
 UPDATE_OLD=""
@@ -550,8 +555,18 @@ validate_active_generation() {
       die "active $component link resolves outside its exact commit build"
   done
 
-  bash "$INSTALL_DIR/install.sh" verify --source "$INSTALL_DIR" --build-root "$build" --sha "$head" || \
-    die "active build identity verification failed"
+  if ! bash "$INSTALL_DIR/install.sh" verify --source "$INSTALL_DIR" --build-root "$build" --sha "$head"; then
+    if [[ -z ${BOOTSTRAP_VERIFY_INSTALLER:-} \
+          || "$BOOTSTRAP_VERIFY_INSTALLER" == "$INSTALL_DIR/install.sh" \
+          || ! -f "$BOOTSTRAP_VERIFY_INSTALLER" || -L "$BOOTSTRAP_VERIFY_INSTALLER" ]]; then
+      die "active build identity verification failed"
+    fi
+    if ! bash "$BOOTSTRAP_VERIFY_INSTALLER" verify --source "$INSTALL_DIR" \
+      --build-root "$build" --sha "$head"; then
+      die "active build identity verification failed"
+    fi
+    warn "installed build verifier rejected the active generation; the downloaded compatibility verifier accepted its exact identity"
+  fi
   stable_commit=$(docker image inspect "$ENGINE_STABLE_IMAGE" \
     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
   [[ "$stable_commit" == "$head" ]] || die "stable Engine image does not match active HEAD"
