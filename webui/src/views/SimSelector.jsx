@@ -41,8 +41,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   const details = showDetails ? communicationLineDetails(current, currentDevice, t, language) : null
   const detailFields = details ? [
     ['Carrier', details.carrier], ['Line name', details.line], ['Number', details.number, true],
-    ['Country', details.country], ['Home network', details.network],
-    ['Network route', details.networkRoute],
+    ['Country', details.country], ['Network route', details.networkRoute],
   ] : []
   return (
     <div className="card u-line-selector">

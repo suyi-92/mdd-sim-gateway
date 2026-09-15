@@ -93,10 +93,12 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       const details = page.locator('.u-line-selector-meta:visible')
       await details.getByText('Fixture Mobile (234-33)', { exact: true }).waitFor()
       const text = await details.innerText()
-      for (const expected of ['运营商', '线路名称', '号码', '国家', '承载网络', '网络线路',
-        'Desk line', '+447700900357', '英国 (GB)', 'Visited Network · EE', 'GB Fixture Node']) {
+      for (const expected of ['运营商', '线路名称', '号码', '国家', '网络线路',
+        'Desk line', '+447700900357', '英国 (GB)', 'GB Fixture Node']) {
         assert.ok(text.includes(expected), `${view} missing ${expected}`)
       }
+      assert.equal(text.includes('承载网络'), false)
+      assert.equal(text.includes('Visited Network · EE'), false)
       const number = details.getByRole('button', { name: '复制号码' })
       await number.click()
       assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
@@ -112,7 +114,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await callDetails.getByText('Travel line', { exact: true }).waitFor()
     const switched = await callDetails.innerText()
     for (const expected of ['Fixture Wireless (310-280)', '+1555**7654#', '美国 (US)',
-      'Fixture Host', '明确直连']) assert.ok(switched.includes(expected), `switched calls missing ${expected}`)
+      '明确直连']) assert.ok(switched.includes(expected), `switched calls missing ${expected}`)
     await callDetails.getByRole('button', { name: '复制号码' }).click()
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+1555**7654#')
     const switchedOption = await page.locator('.u-line-selector:visible select option:checked').innerText()
@@ -126,6 +128,18 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       `wide selector must retain the vmware.2 680px width: ${selectBox.width}`)
     assert.ok(detailsBox.x >= selectBox.x + selectBox.width,
       'wide layout must place the added details after the unchanged selector')
+    await page.setViewportSize({ width: 3420, height: 900 })
+    const detailBoxes = await callDetails.locator(':scope > div').evaluateAll(nodes => nodes.map(node => {
+      const box = node.getBoundingClientRect()
+      return { left: box.left, right: box.right }
+    }))
+    assert.equal(detailBoxes.length, 5)
+    assert.ok(detailBoxes.at(-1).right - detailBoxes[0].left < 1000,
+      'wide details should stay compact instead of distributing across all empty space')
+    for (let index = 1; index < detailBoxes.length; index += 1) {
+      assert.ok(detailBoxes[index].left - detailBoxes[index - 1].right <= 21,
+        'adjacent details should use only the compact configured gap')
+    }
     await page.setViewportSize({ width: 1440, height: 900 })
     const mediumSelectBox = await page.locator('.u-line-selector:visible select').boundingBox()
     assert.ok(mediumSelectBox.width >= 679 && mediumSelectBox.width <= 681,
@@ -161,7 +175,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
 
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [])
-    console.log('PASS: vmware.2 selector width/masking, adjacent details, exact copy, and 3420/2048/1440/900/390px layouts; fixture API only')
+    console.log('PASS: five compact details, vmware.2 selector masking, exact copy, and 3420/2048/1440/900/390px layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))

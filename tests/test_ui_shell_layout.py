@@ -94,10 +94,12 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("width:680px", css_rule(".u-line-selector>select"))
         self.assertIn("grid-column:4", css_rule(".u-line-selector-meta"))
         self.assertIn("grid-row:1", css_rule(".u-line-selector-meta"))
-        self.assertIn("repeat(6,minmax(0,1fr))", css_rule(".u-line-selector-meta"))
+        self.assertIn("display:flex", css_rule(".u-line-selector-meta"))
+        self.assertIn("justify-content:flex-start", css_rule(".u-line-selector-meta"))
         self.assertIn("display:flex", css_rule(".u-line-selector-meta>div"))
         self.assertIn("const numberTail =", SIM_SELECTOR)
         self.assertIn("` · ••••${tail}`", SIM_SELECTOR)
+        self.assertNotIn("['Home network', details.network]", SIM_SELECTOR)
         self.assertIn("<CopyableText value={value}", SIM_SELECTOR)
         self.assertIn("<CopyableText value={number}", UNIFIED)
 
