@@ -2,7 +2,7 @@ import React, { useEffect } from 'react'
 import CopyableText from '../CopyableText.jsx'
 import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
-import { communicationLineDetails, lineDisplayName, lineNumber } from '../simLineDetails.js'
+import { communicationLineDetails } from '../simLineDetails.js'
 
 // Per-page SIM/line picker for multi-SIM setups. Labels each line with the physical reader
 // it currently occupies (from the detected-cards state) so it's clear which reader's engine
@@ -23,6 +23,10 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
     String(d.instance_id || '') === String(i.id))
   const sourceFor = (i) => readerFor(i) || deviceFor(i)
   const live = instances.filter((i) => sourceFor(i))
+  // Keep the selector text exactly as it was in 1.9.4-vmware.2. The richer, full
+  // identity belongs to the adjacent details and must not widen or unmask this control.
+  const lineName = (i) => i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
+  const numberTail = (i) => String(i.msisdn || '').replace(/\D/g, '').slice(-4)
 
   // Calls/Messages own their useful default: choose the first live line here instead of in
   // App, where a global default could leak an unrelated line into a device's SIM tab.
@@ -48,9 +52,10 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
         {live.map((i) => {
           const c = sourceFor(i)
           const physical = deviceFor(i) || c
+          const tail = numberTail(i)
           const statusLabel = i.status?.presentation?.label || i.status?.label
           const st = statusLabel ? ` — ${t(statusLabel)}` : ''
-          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineDisplayName(i, t)} · {lineNumber(i.msisdn || physical?.sim?.number, t)}{st}</option>
+          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}
       </select>
       {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}

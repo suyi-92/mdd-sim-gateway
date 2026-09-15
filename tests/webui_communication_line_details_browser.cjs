@@ -100,6 +100,9 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       const number = details.getByRole('button', { name: '复制号码' })
       await number.click()
       assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
+      const selectedOption = await page.locator('.u-line-selector:visible select option:checked').innerText()
+      assert.ok(selectedOption.includes('••••0357'), `${view} selector must keep its masked number`)
+      assert.equal(selectedOption.includes('+447700900357'), false)
     }
 
     await page.goto(origin + '/#/calls')
@@ -112,8 +115,22 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       'Fixture Host', '明确直连']) assert.ok(switched.includes(expected), `switched calls missing ${expected}`)
     await callDetails.getByRole('button', { name: '复制号码' }).click()
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+1555**7654#')
+    const switchedOption = await page.locator('.u-line-selector:visible select option:checked').innerText()
+    assert.ok(switchedOption.includes('••••7654'))
+    assert.equal(switchedOption.includes('+1555**7654#'), false)
 
-    for (const width of [1440, 900, 390]) {
+    await page.setViewportSize({ width: 2048, height: 900 })
+    const selectBox = await page.locator('.u-line-selector:visible select').boundingBox()
+    const detailsBox = await callDetails.boundingBox()
+    assert.ok(selectBox.width >= 679 && selectBox.width <= 681,
+      `wide selector must retain the vmware.2 680px width: ${selectBox.width}`)
+    assert.ok(detailsBox.x >= selectBox.x + selectBox.width,
+      'wide layout must place the added details after the unchanged selector')
+    await page.setViewportSize({ width: 1440, height: 900 })
+    const mediumSelectBox = await page.locator('.u-line-selector:visible select').boundingBox()
+    assert.ok(mediumSelectBox.width >= 679 && mediumSelectBox.width <= 681,
+      `medium selector must retain the vmware.2 680px width: ${mediumSelectBox.width}`)
+    for (const width of [3420, 2048, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `calls overflow at ${width}px`)
@@ -122,7 +139,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
 
     await page.goto(origin + '/#/messages')
     await verifyFirstLine('messages')
-    for (const width of [1440, 900, 390]) {
+    for (const width of [3420, 2048, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `messages overflow at ${width}px`)
@@ -135,7 +152,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await overviewNumber.innerText(), '+447700900357')
     await overviewNumber.click()
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
-    for (const width of [1440, 900, 390]) {
+    for (const width of [3420, 2048, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `overview overflow at ${width}px`)
@@ -144,7 +161,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
 
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [])
-    console.log('PASS: horizontal call/message line details, exact number copy, overview copy, and 1440/900/390px layouts; fixture API only')
+    console.log('PASS: vmware.2 selector width/masking, adjacent details, exact copy, and 3420/2048/1440/900/390px layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))
