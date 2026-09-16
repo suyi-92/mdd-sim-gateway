@@ -16,6 +16,7 @@ KEEPALIVE = (ROOT / "webui/src/views/Keepalive.jsx").read_text(encoding="utf-8")
 LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
 MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
 CELLULAR_PRESENTATION = (ROOT / "webui/src/cellularPresentation.js").read_text(encoding="utf-8")
+CONTROL_MAIN = (ROOT / "control/app/main.py").read_text(encoding="utf-8")
 SIM_CONFIG = (ROOT / "webui/src/views/SimConfig.jsx").read_text(encoding="utf-8")
 SIM_SELECTOR = (ROOT / "webui/src/views/SimSelector.jsx").read_text(encoding="utf-8")
 SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
@@ -224,6 +225,21 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("No data bearer", CELLULAR_PRESENTATION)
         self.assertIn("d.cellular.packet_service === 'attached'", UNIFIED)
         self.assertIn("registeredCellular\n      || (c.reason", UNIFIED)
+
+    def test_cellular_network_selection_is_scanned_confirmed_and_responsive(self):
+        self.assertIn("api.scanCellularNetworks(device.id)", UNIFIED)
+        self.assertIn("api.selectCellularNetwork(device.id", UNIFIED)
+        self.assertIn("Scanning cellular networks temporarily interrupts", UNIFIED)
+        self.assertIn("Manual selection chooses a visited operator", UNIFIED)
+        self.assertIn("device.sim?.present === false", UNIFIED)
+        feedback = css_rule(".u-cellular-network-feedback")
+        self.assertIn("min-height:20px", feedback)
+        controls = css_rule(".u-cellular-network-controls")
+        self.assertIn("minmax(240px,1fr)", controls)
+
+    def test_modemmanager_sim_presence_overrides_stale_bridge_card(self):
+        self.assertIn("host_cell.get(\"sim_present\") is True", CONTROL_MAIN)
+        self.assertIn("sim_present = host_cell.get(\"sim_present\") is True", CONTROL_MAIN)
 
     def test_retained_sms_reimport_has_confirmation_and_fixed_feedback(self):
         self.assertIn("api.reimportCellularMessages(forId)", MESSAGES)

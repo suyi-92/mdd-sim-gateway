@@ -297,6 +297,104 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   </div>
 }
 
+function CellularNetworkControl({ device, refreshDevices, showToast }) {
+  const { t } = useI18n()
+  const saved = device.cellular_network || {}
+  const [mode, setMode] = useState(saved.mode === 'manual' ? 'manual' : 'automatic')
+  const [operatorId, setOperatorId] = useState(saved.operator_id || '')
+  const [networks, setNetworks] = useState([])
+  const [busy, setBusy] = useState('')
+  const [feedback, setFeedback] = useState('')
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    setMode(saved.mode === 'manual' ? 'manual' : 'automatic')
+    setOperatorId(saved.operator_id || '')
+    setNetworks([]); setFeedback(''); setFailed(false); setBusy('')
+  }, [device.id])
+  const simMissing = device.sim?.present === false
+  const dataActive = !!device.cellular?.data_active
+  const flightMode = capability(device, 'flight').desired
+  const unavailable = simMissing || dataActive || flightMode || !device.cellular
+  const options = [...networks]
+  if (operatorId && !options.some(item => item.operator_id === operatorId)) {
+    options.unshift({ operator_id: operatorId, name: operatorId,
+      access_technology: '', status: 'unknown' })
+  }
+  const scan = async () => {
+    if (unavailable || busy) return
+    if (!window.confirm(t('Scanning cellular networks temporarily interrupts registration and may take several minutes. Continue?'))) return
+    setBusy('scan'); setFeedback(''); setFailed(false)
+    try {
+      const result = await api.scanCellularNetworks(device.id)
+      const found = result.networks || []
+      setNetworks(found)
+      const current = found.find(item => item.status === 'current')
+      if (mode === 'manual' && !operatorId && current) setOperatorId(current.operator_id)
+      setFeedback(found.length
+        ? t('Found {count} cellular networks.', { count: found.length })
+        : t('No cellular networks were returned by the modem.'))
+    } catch (error) {
+      setFailed(true); setFeedback(`${t('Network scan failed')}: ${error.message}`)
+    } finally { setBusy('') }
+  }
+  const apply = async () => {
+    if (unavailable || busy || (mode === 'manual' && !operatorId)) return
+    const selected = options.find(item => item.operator_id === operatorId)
+    const label = mode === 'automatic' ? t('Automatic network selection')
+      : `${selected?.name || operatorId} (${operatorId})`
+    if (!window.confirm(t('Register this modem using {network}? Cellular service will briefly disconnect.', { network: label }))) return
+    setBusy('apply'); setFeedback(''); setFailed(false)
+    try {
+      await api.selectCellularNetwork(device.id, {
+        mode, operator_id: mode === 'manual' ? operatorId : '',
+      })
+      setFeedback(t('Cellular network selection applied: {network}.', { network: label }))
+      showToast?.(t('Cellular network selection applied'))
+      await refreshDevices?.()
+    } catch (error) {
+      setFailed(true); setFeedback(`${t('Network selection failed')}: ${error.message}`)
+    } finally { setBusy('') }
+  }
+  const blocked = simMissing ? t('Insert a readable SIM before selecting a network.')
+    : dataActive ? t('Turn off cellular data before selecting a network.')
+    : flightMode ? t('Turn off flight mode before selecting a network.') : ''
+  return <div className="u-cellular-network">
+    <h3>{t('Cellular network selection')}</h3>
+    <div className="u-cellular-network-controls">
+      <label className="u-inline-field"><span>{t('Selection mode')}</span>
+        <select value={mode} disabled={!!busy || unavailable}
+          onChange={event => setMode(event.target.value)}>
+          <option value="automatic">{t('Automatic')}</option>
+          <option value="manual">{t('Manual')}</option>
+        </select>
+      </label>
+      {mode === 'manual' && <label className="u-inline-field u-cellular-network-list"><span>{t('Available network')}</span>
+        <select value={operatorId} disabled={!!busy || unavailable}
+          onChange={event => setOperatorId(event.target.value)}>
+          <option value="">{t('Scan to select a network')}</option>
+          {options.map(item => <option key={item.operator_id} value={item.operator_id}
+            disabled={item.status === 'forbidden'}>
+            {item.name} ({item.operator_id}){item.access_technology ? ` · ${item.access_technology.toUpperCase()}` : ''}{item.status === 'forbidden' ? ` · ${t('Forbidden')}` : ''}
+          </option>)}
+        </select>
+      </label>}
+      <div className="u-cellular-network-actions">
+        <button className="btn btn-ghost" disabled={!!busy || unavailable} onClick={scan}>
+          {busy === 'scan' ? `${t('Scanning')}…` : t('Scan networks')}
+        </button>
+        <button className="btn btn-primary"
+          disabled={!!busy || unavailable || (mode === 'manual' && !operatorId)} onClick={apply}>
+          {busy === 'apply' ? `${t('Applying')}…` : t('Apply network')}
+        </button>
+      </div>
+    </div>
+    <div className={`u-cellular-network-feedback${failed ? ' is-error' : ''}`} role="status">
+      {blocked || feedback || '\u00a0'}
+    </div>
+    <p className="u-note">{t('Manual selection chooses a visited operator (PLMN), not an individual physical cell tower.')}</p>
+  </div>
+}
+
 function simName(d, t) {
   if (d.present === false) return t('Device not connected')
   return d.sim?.present === false ? t('No SIM inserted') : (d.sim?.name || d.carrier || d.operator || 'SIM')
@@ -468,7 +566,21 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
     <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
-      {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Access technology')}</span><b>{String(d.cellular.access_technology || '').toUpperCase() || t('Waiting')}</b></div><div className="u-detail"><span>{t('Packet service')}</span><b>{d.cellular.packet_service === 'attached' ? t('Attached') : d.cellular.packet_service === 'detached' ? t('Detached') : t('Waiting')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on cellular data to let the per-device ModemManager backend establish a data bearer.')} />}</div>}
+      {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>
+        {d.cellular ? <div className="u-details cols">
+          <div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div>
+          <div className="u-detail"><span>{t('Access technology')}</span><b>{String(d.cellular.access_technology || '').toUpperCase() || t('Waiting')}</b></div>
+          <div className="u-detail"><span>{t('Packet service')}</span><b>{d.cellular.packet_service === 'attached' ? t('Attached') : d.cellular.packet_service === 'detached' ? t('Detached') : t('Waiting')}</b></div>
+          <div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}{d.cellular.operator_code ? ` (${d.cellular.operator_code})` : ''}</b></div>
+          <div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div>
+          <div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div>
+          <div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div>
+          <div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div>
+          <div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div>
+          <div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div>
+        </div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on cellular data to let the per-device ModemManager backend establish a data bearer.')} />}
+        <CellularNetworkControl device={d} refreshDevices={refreshDevices} showToast={showToast}/>
+      </div>}
       {tab==='vowifi' && <div className="card u-panel"><h3>VoWiFi</h3><CountryExitControl device={d} refresh={refresh} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><VowifiHistory instanceId={d.instance_id} subscribe={subscribe}/><div className="u-details cols"><div className="u-detail"><span>ePDG / IKE</span><b>{typeof d.vowifi?.epdg === 'object' ? (d.vowifi.epdg.ike_reason || (d.vowifi.epdg.pcscf ? t('Tunnel connected') : t('Waiting'))) : (d.vowifi?.epdg || d.status?.state || t('Not connected'))}</b></div><div className="u-detail"><span>IMS / SIP</span><b>{d.vowifi?.ims || d.status?.label || t('Not connected')}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t)} /></b></div><div className="u-detail"><span>{t('Rekey')}</span><b>{d.vowifi?.rekey_minutes ?? 30} {t('minutes')}</b></div><div className="u-detail"><span>{t('IKE rekey')}</span><b>{d.vowifi?.ike_rekey_minutes ?? 150} {t('minutes')}</b></div></div>{!!d.egress?.pinned_node && d.egress.pinned_node !== d.egress.node && !!exitChangeReason(d.egress, t, language) && <p className="u-note u-proxy-node-text"><ProxyNodeName text={exitChangeReason(d.egress, t, language)} /></p>}<p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
       {tab==='hardware' && <HardwarePanel device={d} refreshDevices={refreshDevices} showToast={showToast}/>}
     </section></div></>

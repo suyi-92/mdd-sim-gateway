@@ -828,6 +828,11 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
                            (existing.get("carrier_identity") or {}))
     if (subscriber_changed or carrier_changed) and "ims_home_domain" not in inst:
         inst["ims_home_domain"] = ""
+    if subscriber_changed:
+        # A visited-network preference belongs to the SIM subscription, not the USB modem.
+        # Never carry one card's manual PLMN onto a replacement card inserted in that line.
+        inst["cellular_network_mode"] = "automatic"
+        inst["cellular_operator_id"] = ""
     merged = {**existing, **inst}
     if clear_modem_readers:
         # Internal, identity-proven migration to a native reader. Remove keys atomically;

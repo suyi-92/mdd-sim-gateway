@@ -754,7 +754,8 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         observed = {"devices": {"modem-a": {
             "present": True,
             "actual": {"cellular_radio_enabled": True, "vowifi_bridge_active": False},
-            "cellular": {"available": True, "sim_iccid": "live-card",
+            "cellular": {"available": True, "sim_present": True,
+                         "sim_iccid": "live-card",
                          "registration": "roaming", "operator": "Visited Network",
                          "radio_enabled": True, "data_active": True}}}}
         line = {"id": "3", "name": "Home SIM", "iccid": "live-card",
@@ -786,6 +787,41 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["egress"]["mode"], "manual")
         self.assertTrue(device["egress"]["ready"])
         self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
+
+    async def test_modemmanager_sim_missing_overrides_a_stale_vpcd_card(self):
+        desired = {"devices": {"modem-a": {
+            "cellular_enabled": False, "vowifi_enabled": False, "flight_mode": False}}}
+        observed = {"devices": {"modem-a": {
+            "present": True,
+            "actual": {"cellular_radio_enabled": False, "vowifi_bridge_active": False},
+            "cellular": {"available": True, "sim_present": False,
+                         "sim_iccid": "", "state": "failed",
+                         "failed_reason": "sim-missing", "registration": "unknown",
+                         "radio_enabled": False, "data_active": False}}}}
+        stale_card = {"present": True, "iccid": "removed-card",
+                      "hardware_id": "modem-a", "hardware_kind": "modem"}
+        line = {"id": "3", "name": "Removed SIM", "iccid": "removed-card",
+                "mcc": "515", "mnc": "02", "enabled": False}
+        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[stale_card]), \
+                patch.object(main.cfg, "list_instances", return_value=[line]), \
+                patch.object(main.device_state, "native_reader_devices", return_value={}), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main.cfg, "get_settings", return_value={
+                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
+                patch.object(main, "_cached_line_status", return_value=None), \
+                patch.object(main.egress, "status", return_value={"lines": {}}), \
+                patch.object(main.egress, "line_country", return_value="PH"), \
+                patch.object(main.egress, "country_for_mcc", return_value="PH"):
+            devices = await main._unified_devices()
+
+        self.assertEqual(len(devices), 1)
+        self.assertFalse(devices[0]["sim"]["present"])
+        self.assertEqual(devices[0]["cellular"]["registration"], "unknown")
+        self.assertEqual(devices[0]["capabilities"]["cellular"], {
+            "desired": False, "actual": "off", "reason": "No SIM inserted"})
+        self.assertEqual(devices[0]["capabilities"]["flight"]["actual"], "off")
 
     async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):
         desired = {"devices": {"modem-a": {

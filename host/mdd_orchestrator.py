@@ -1194,6 +1194,8 @@ class Orchestrator:
             target_data_active = bool(wanted.get("cellular_enabled")) and not bool(
                 wanted.get("flight_mode"))
             observed_data_active = bool(cellular_state.get("data_active"))
+            sim_missing = (cellular_state.get("sim_present") is False
+                           and cellular_state.get("failed_reason") == "sim-missing")
             # The bridge is no longer a VoWiFi actual: it runs for every present modem so
             # the card stays reachable. Comparing it against the VoWiFi switch would park
             # every switched-off modem in "stopping" forever.
@@ -1205,7 +1207,8 @@ class Orchestrator:
             degraded = self._degraded.get(device_id, "")
             device_transitioning = bool(transitioning or (not degraded and
                 present and (target_data_active != observed_data_active or
-                             (backend_active and radio_enabled is not None and
+                             (not sim_missing and backend_active
+                              and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
                              (not self._serial_mode
                               and not bool(wanted.get("flight_mode"))
@@ -1643,13 +1646,18 @@ class Orchestrator:
     def modem_snapshot(self, modem: dict) -> dict:
         obj = self.modemmanager_modem_for_tty(modem.get("tty") or "")
         if not obj:
-            return {"available": False, "registration": "unknown", "data_active": False}
+            return {"available": False, "registration": "unknown", "data_active": False,
+                    "sim_present": False, "sim_iccid": "", "msisdn": ""}
         detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
         if detail.returncode:
-            return {"available": False, "registration": "unknown", "data_active": False}
+            return {"available": False, "registration": "unknown", "data_active": False,
+                    "sim_present": False, "sim_iccid": "", "msisdn": ""}
         text = detail.stdout or ""
         power = self._kv(text, "modem.generic.power-state").lower()
         state = self._kv(text, "modem.generic.state").lower()
+        failed_reason = self._kv(text, "modem.generic.state-failed-reason").lower()
+        if failed_reason in {"--", "unknown", "none", "n/a"}:
+            failed_reason = ""
         primary = self._kv(text, "modem.generic.primary-port")
         ports = re.findall(r"modem\.generic\.ports\.value\[\d+\]\s*:\s*([^ ]+) \(([^)]+)\)", text)
         network_port = next((name for name, kind in ports if kind == "net"), "")
@@ -1663,7 +1671,10 @@ class Orchestrator:
         sim_iccid = ""
         sim_mcc = ""
         sim_object = self._kv(text, "modem.generic.sim")
-        if sim_object and sim_object not in {"--", "/"}:
+        sim_present = bool(sim_object and sim_object not in {"--", "/"})
+        if failed_reason == "sim-missing":
+            sim_present = False
+        if sim_present:
             sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"])
             if sim_detail.returncode == 0:
                 sim_iccid = self.normalize_iccid(
@@ -1671,8 +1682,11 @@ class Orchestrator:
                 sim_imsi = re.sub(
                     r"\D", "", self._kv(sim_detail.stdout or "", "sim.properties.imsi"))
                 sim_mcc = sim_imsi[:3] if len(sim_imsi) >= 5 else ""
-        msisdn = next((number for raw in own_numbers
-                       if (number := self.normalize_msisdn(raw, sim_mcc))), "")
+        if not sim_present:
+            registration = "unknown"
+        msisdn = (next((number for raw in own_numbers
+                        if (number := self.normalize_msisdn(raw, sim_mcc))), "")
+                  if sim_present else "")
         # Many USB modems keep their hardware power-state at "on" after
         # ModemManager --disable.  The generic state is the authoritative RF state.
         radio_enabled = power == "on" and state not in {
@@ -1680,6 +1694,13 @@ class Orchestrator:
         operator = self._kv(text, "modem.3gpp.operator-name")
         if operator.casefold() in {"--", "unknown", "none", "n/a"}:
             operator = ""
+        operator_code = re.sub(
+            r"\D", "", self._kv(text, "modem.3gpp.operator-code"))
+        if len(operator_code) not in {5, 6}:
+            operator_code = ""
+        if not sim_present:
+            operator = ""
+            operator_code = ""
         access_technologies = re.findall(
             r"^modem\.generic\.access-technologies\.value\[\d+\]\s*:\s*(.*?)\s*$",
             text, re.MULTILINE)
@@ -1689,11 +1710,15 @@ class Orchestrator:
         packet_service = self._kv(text, "modem.3gpp.packet-service-state").lower()
         if packet_service in {"--", "unknown", "none", "n/a"}:
             packet_service = ""
+        if not sim_present:
+            access_technology = ""
+            packet_service = ""
         snapshot = {
             "available": True, "mm_object": obj, "powered": power == "on",
             "radio_enabled": radio_enabled,
-            "state": state, "registration": registration,
-            "operator": operator,
+            "state": state, "failed_reason": failed_reason,
+            "registration": registration, "operator": operator,
+            "operator_code": operator_code,
             "access_technology": access_technology,
             "packet_service": packet_service,
             "signal": int(signal) if signal.isdigit() else None,
@@ -1705,6 +1730,7 @@ class Orchestrator:
             # The control plane uses the ICCID pair as a fail-closed match before it
             # copies OwnNumbers into a line configuration.
             "msisdn": msisdn, "sim_iccid": sim_iccid,
+            "sim_present": sim_present,
         }
         bearer_paths = re.findall(r"modem\.generic\.bearers\.value\[\d+\]\s*:\s*(\S+)", text)
         for bearer in bearer_paths:
@@ -2143,9 +2169,26 @@ class Orchestrator:
             if through_modemmanager:
                 obj = self.modemmanager_modem_for_tty(modem["tty"])
                 if not obj:
+                    self.cellular_states[device_id] = {
+                        "available": False, "registration": "unknown",
+                        "data_active": False, "sim_present": False,
+                        "sim_iccid": "", "msisdn": "",
+                    }
                     continue
                 snapshot = self.modem_snapshot(modem)
+                # Publish the current ModemManager generation before trying to change it.
+                # A SIM hot-removal recreates the object; if --enable then fails with
+                # sim-missing, retaining the old registered snapshot invents a card that is
+                # no longer present and keeps the UI bound to a dead object path.
+                self.cellular_states[device_id] = snapshot
                 observed = snapshot.get("radio_enabled") if snapshot.get("available") else None
+                if observed is not None:
+                    self.radio_states[device_id] = bool(observed)
+                if snapshot.get("failed_reason") == "sim-missing":
+                    # There is no radio action that can repair an absent card. Retrying
+                    # --enable every reconcile only floods the journal and, before the
+                    # snapshot assignment above, was what kept the removed card looking live.
+                    continue
                 if observed == radio_enabled:
                     self.radio_states[device_id] = radio_enabled
                     if radio_enabled and data_enabled:

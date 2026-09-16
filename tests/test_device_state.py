@@ -380,6 +380,7 @@ modem.generic.power-state : on
 modem.generic.access-technologies.value[1] : lte
 modem.generic.signal-quality.value : 77
 modem.3gpp.operator-name : Example
+modem.3gpp.operator-code : 310260
 modem.3gpp.registration-state : roaming
 modem.3gpp.packet-service-state : attached
 modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/9
@@ -413,6 +414,8 @@ bearer.stats.tx-bytes : 456
             self.assertEqual(value["rx_bytes"], 123)
             self.assertEqual(value["msisdn"], "+12025550100")
             self.assertEqual(value["sim_iccid"], "8901000000000000001")
+            self.assertTrue(value["sim_present"])
+            self.assertEqual(value["operator_code"], "310260")
             self.assertEqual(value["access_technology"], "lte")
             self.assertEqual(value["packet_service"], "attached")
 
@@ -592,6 +595,86 @@ modem.generic.power-state : on
                                   "host.mdd_orchestrator.run", side_effect=fake_run):
                 value = app.modem_snapshot({"id": "modem-c", "tty": "/dev/ttyUSB7"})
         self.assertEqual(value["sim_iccid"], "")
+        self.assertTrue(value["sim_present"])
+
+    def test_sim_missing_snapshot_clears_cached_registration_and_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            detail = """modem.generic.primary-port : ttyUSB2
+modem.generic.sim : --
+modem.generic.own-numbers.value[1] : 639000000000
+modem.generic.state : failed
+modem.generic.state-failed-reason : sim-missing
+modem.generic.power-state : on
+modem.generic.access-technologies.value[1] : lte
+modem.3gpp.operator-name : Cached Operator
+modem.3gpp.operator-code : 46001
+modem.3gpp.registration-state : roaming
+modem.3gpp.packet-service-state : attached
+"""
+            with patch.object(app, "modemmanager_modem_for_tty",
+                              return_value="/org/freedesktop/ModemManager1/Modem/1"), patch(
+                                  "host.mdd_orchestrator.run",
+                                  return_value=SimpleNamespace(
+                                      returncode=0, stdout=detail, stderr="")):
+                value = app.modem_snapshot({"id": "modem-a", "tty": "/dev/ttyUSB2"})
+        self.assertTrue(value["available"])
+        self.assertFalse(value["sim_present"])
+        self.assertEqual(value["sim_iccid"], "")
+        self.assertEqual(value["msisdn"], "")
+        self.assertEqual(value["registration"], "unknown")
+        self.assertEqual(value["operator"], "")
+        self.assertEqual(value["operator_code"], "")
+        self.assertEqual(value["access_technology"], "")
+        self.assertEqual(value["packet_service"], "")
+
+    def test_sim_missing_replaces_previous_snapshot_without_radio_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            app.cellular_states["modem-a"] = {
+                "available": True, "sim_present": True, "sim_iccid": "old-card",
+                "state": "registered", "registration": "roaming"}
+            missing = {
+                "available": True, "sim_present": False, "sim_iccid": "",
+                "msisdn": "", "state": "failed", "failed_reason": "sim-missing",
+                "registration": "unknown", "radio_enabled": False,
+                "data_active": False,
+            }
+            run = Mock(return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="SIM missing"))
+            with patch.object(app, "modemmanager_modem_for_tty",
+                              return_value="/org/freedesktop/ModemManager1/Modem/1"), patch.object(
+                                  app, "modem_snapshot", return_value=missing), patch(
+                                      "host.mdd_orchestrator.run",
+                                      run):
+                app.apply_device_radios(
+                    [{"id": "modem-a", "tty": "/dev/ttyUSB2"}],
+                    {"modem-a": {"cellular_enabled": False, "flight_mode": False}},
+                    through_modemmanager=True)
+        self.assertEqual(app.cellular_states["modem-a"], missing)
+        self.assertFalse(app.radio_states["modem-a"])
+        run.assert_not_called()
+
+    def test_sim_missing_is_a_settled_state_not_an_endless_radio_transition(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.root.mkdir(parents=True)
+            app.cellular_states["modem-a"] = {
+                "available": True, "sim_present": False,
+                "failed_reason": "sim-missing", "data_active": False}
+            app.radio_states["modem-a"] = False
+            desired = {"modem-a": {"cellular_enabled": False,
+                                     "vowifi_enabled": False,
+                                     "flight_mode": False}}
+            assignments = {"modem-a": {"name": "Fixture modem",
+                                         "tty": "/dev/ttyUSB2"}}
+            with patch.object(app, "service_active", return_value=True), patch.object(
+                    app, "modemmanager_modem_for_tty",
+                    return_value="/org/freedesktop/ModemManager1/Modem/1"):
+                app.publish_device_status(desired, assignments)
+            status = device_state._read(str(app.device_status_path), {})
+        self.assertFalse(status["devices"]["modem-a"]["transitioning"])
 
     def test_modem_number_normalization_rejects_placeholders_and_status_text(self):
         self.assertEqual(Orchestrator.normalize_msisdn("--"), "")

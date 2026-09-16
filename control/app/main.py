@@ -33,7 +33,7 @@ from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd,
-               live_translation)
+               live_translation, cellular_network)
 from .version import VERSION
 from . import stability
 from . import ims_recovery
@@ -4750,6 +4750,7 @@ async def _unified_devices() -> list[dict]:
                     cell_actual, cell_reason = "error", "Cellular radio is not enabled"
                 cellular_view = {
                     "registration": registration, "operator": host_cell.get("operator") or "",
+                    "operator_code": host_cell.get("operator_code") or "",
                     "access_technology": host_cell.get("access_technology") or "",
                     "packet_service": host_cell.get("packet_service") or "",
                     "signal": host_cell.get("signal"), "apn": host_cell.get("apn") or "",
@@ -4774,7 +4775,8 @@ async def _unified_devices() -> list[dict]:
         # bridge.  A connected cellular modem can have a readable SIM even when
         # every virtual reader slot is empty or VoWiFi is disabled.
         live_modem_iccid = (str(host_cell.get("sim_iccid") or "")
-                            if device_present and not is_native_reader else "")
+                            if device_present and not is_native_reader
+                            and host_cell.get("sim_present") is True else "")
         if live_modem_iccid and not card_info:
             card_info = {
                 "present": True, "iccid": live_modem_iccid,
@@ -4802,9 +4804,26 @@ async def _unified_devices() -> list[dict]:
         bridge_active = bool(actual_state.get("vowifi_bridge_active"))
         logical_channels = (None if is_native_reader else
                             device_state.logical_channel_view(identity, bridge_active))
+        if is_native_reader:
+            sim_present = bool(card_info.get("present"))
+        elif host_cell.get("available"):
+            # ModemManager's current SIM object/failure reason outranks a VPCD card cache.
+            # A hot removal recreates the MM object and can leave the old bridge identity
+            # visible briefly; presenting that as an inserted card is materially wrong.
+            sim_present = host_cell.get("sim_present") is True
+        elif shared.get("modemmanager_active"):
+            # During an MM object-generation change there is no current card proof. The old
+            # bridge cache must not fill that gap with the SIM removed from the prior object.
+            sim_present = False
+        else:
+            sim_present = bool(card_info.get("present"))
         if not device_present:
             cell_actual, cell_reason = "off", "Device not connected"
             flight_actual, flight_available = "off", False
+        elif not is_native_reader and host_cell.get("available") and not sim_present:
+            cell_actual, cell_reason = "off", "No SIM inserted"
+            flight_actual = "on" if flight_desired else "off"
+            flight_available = not serial_only
         else:
             flight_actual = ("unsupported" if is_native_reader or serial_only else
                              "on" if flight_desired and not radio_on else
@@ -4852,9 +4871,13 @@ async def _unified_devices() -> list[dict]:
             "sim": {"name": (((inst or {}).get("name")
                              or (cellular_view or {}).get("operator") or "SIM") if inst else ""),
                     "number": (inst or {}).get("msisdn") or "",
-                    "present": bool(card_info.get("present")),
+                    "present": sim_present,
                     "carrier": carrier},
             "cellular": cellular_view,
+            "cellular_network": {
+                "mode": str((inst or {}).get("cellular_network_mode") or "automatic"),
+                "operator_id": str((inst or {}).get("cellular_operator_id") or ""),
+            },
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
                        "ims": ((line_status or {}).get("presentation") or {}).get("label")
                               or (line_status or {}).get("label") or "",
@@ -5016,6 +5039,72 @@ async def api_device_cellular(device_id: str):
         raise HTTPException(404, "no such physical device")
     return {"device_id": device_id, "capability": device["capabilities"]["cellular"],
             "cellular": device.get("cellular")}
+
+
+def _cellular_network_target(device_id: str) -> tuple[dict, dict, str]:
+    """Resolve one live modem to its current MM object and configured SIM line."""
+    observed = (device_state.status().get("devices") or {}).get(str(device_id))
+    if not observed or not observed.get("present"):
+        raise HTTPException(404, "no such connected cellular modem")
+    cellular = observed.get("cellular") or {}
+    if not cellular.get("available"):
+        raise HTTPException(409, "ModemManager has no usable object for this modem")
+    if cellular.get("sim_present") is not True:
+        raise HTTPException(409, "insert a readable SIM before selecting a cellular network")
+    if bool((observed.get("desired") or {}).get("flight_mode")) \
+            or bool((observed.get("actual") or {}).get("flight_mode_active")):
+        raise HTTPException(409, "turn off flight mode before selecting a cellular network")
+    if cellular.get("data_active"):
+        raise HTTPException(409, "turn off cellular data before selecting a cellular network")
+    modem_path = str(observed.get("mm_object") or cellular.get("mm_object") or "")
+    if not cellular_network.MODEM_PATH_RE.fullmatch(modem_path):
+        raise HTTPException(409, "the current ModemManager object is unavailable")
+    inst = _match_instance_by_iccid(str(cellular.get("sim_iccid") or ""))
+    if not inst:
+        raise HTTPException(409, "the inserted SIM is not configured as a line")
+    return observed, inst, modem_path
+
+
+@app.post("/api/devices/{device_id}/cellular/networks/scan")
+async def api_device_cellular_network_scan(device_id: str):
+    """Scan the selected modem only; never guess or expose a network not reported by MM."""
+    async with capability_lock:
+        _observed, _inst, modem_path = _cellular_network_target(device_id)
+        try:
+            networks = await asyncio.to_thread(cellular_network.scan, modem_path)
+        except cellular_network.CellularNetworkError as exc:
+            raise HTTPException(503, str(exc)) from exc
+    return {"device_id": device_id, "networks": networks}
+
+
+@app.put("/api/devices/{device_id}/cellular/network")
+async def api_device_cellular_network_select(device_id: str, body: dict):
+    """Request automatic registration or one exact scanned MCC/MNC on this modem."""
+    body = body or {}
+    mode = str(body.get("mode") or "").lower()
+    operator_id = str(body.get("operator_id") or "").strip()
+    if set(body) - {"mode", "operator_id"}:
+        raise HTTPException(400, "provide mode and optional operator_id only")
+    if mode not in {"automatic", "manual"}:
+        raise HTTPException(400, "mode must be automatic or manual")
+    if mode == "manual" and not cellular_network.OPERATOR_ID_RE.fullmatch(operator_id):
+        raise HTTPException(400, "manual mode requires a 5-6 digit operator MCC/MNC")
+    async with capability_lock:
+        _observed, inst, modem_path = _cellular_network_target(device_id)
+        try:
+            selection = await asyncio.to_thread(
+                cellular_network.register, modem_path,
+                mode=mode, operator_id=operator_id)
+        except cellular_network.CellularNetworkError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        await asyncio.to_thread(cfg.upsert_instance, {
+            "id": str(inst["id"]),
+            "cellular_network_mode": selection["mode"],
+            "cellular_operator_id": selection["operator_id"],
+        })
+    await hub.broadcast({"type": "cellular", "device": device_id,
+                         "network_selection": selection})
+    return {"ok": True, "device_id": device_id, **selection}
 
 
 @app.post("/api/devices/{device_id}/diagnostics")

@@ -29,7 +29,8 @@ const devices = [
     name: 'Travel modem', sim: { present: true, number: '+1555**7654#',
       carrier: { name: 'Fixture Wireless', home_network: 'Fixture Host', plmn: '310-280' } },
     cellular: { registration: 'roaming', access_technology: 'lte', operator: 'Visited Fixture',
-      signal: 78, packet_service: 'attached', data_active: false },
+      operator_code: '46001', signal: 78, packet_service: 'attached', data_active: false },
+    cellular_network: { mode: 'automatic', operator_id: '' },
     egress: { country: 'us', detected_country: 'us', node: '', mode: 'direct', ready: true },
     capabilities: { cellular: { desired: false, actual: 'off',
       reason: 'Mobile data is disconnected; the modem radio can remain registered to the cellular network.' },
@@ -58,6 +59,15 @@ const server = http.createServer((request, response) => {
     if (/\/messages\/binary$/.test(url.pathname)) return json(response, { payloads: [] })
     if (/\/messages\/reimport-cellular$/.test(url.pathname)) {
       return json(response, { ok: true, imported: 2, retained: 2 })
+    }
+    if (/\/cellular\/networks\/scan$/.test(url.pathname)) {
+      return json(response, { networks: [
+        { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
+        { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
+      ] })
+    }
+    if (/\/cellular\/network$/.test(url.pathname)) {
+      return json(response, { ok: true, mode: 'manual', operator_id: '46000' })
     }
     return json(response, values[url.pathname] || {})
   }
@@ -196,9 +206,31 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.screenshot({ path: path.join(output, `device-status-${width}.png`), fullPage: true, animations: 'disabled' })
     }
 
+    await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '扫描网络' }).click()
+    await page.getByText('发现 2 个蜂窝网络。', { exact: true }).waitFor()
+    await page.getByLabel('选择方式').selectOption('manual')
+    await page.getByLabel('可用网络').selectOption('46000')
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '应用网络' }).click()
+    await page.getByText('已应用蜂窝网络选择：China Mobile (46000)。', { exact: true }).waitFor()
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `cellular network selection overflow at ${width}px`)
+      await page.screenshot({ path: path.join(output, `cellular-network-${width}.png`), fullPage: true, animations: 'disabled' })
+      await page.locator('.u-cellular-network').screenshot({
+        path: path.join(output, `cellular-network-panel-${width}.png`), animations: 'disabled' })
+    }
+
     assert.deepEqual(errors, [])
-    assert.deepEqual(writes, [['POST', '/api/instances/2/messages/reimport-cellular']])
-    console.log('PASS: line details, retained-SMS confirmation, registered-without-bearer status, and wide/narrow layouts; fixture API only')
+    assert.deepEqual(writes, [
+      ['POST', '/api/instances/2/messages/reimport-cellular'],
+      ['POST', '/api/devices/modem-2/cellular/networks/scan'],
+      ['PUT', '/api/devices/modem-2/cellular/network'],
+    ])
+    console.log('PASS: line details, retained-SMS confirmation, cellular network selection, registered-without-bearer status, and wide/narrow layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))

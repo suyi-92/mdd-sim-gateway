@@ -62,6 +62,20 @@ class ProductBoundaryTests(unittest.TestCase):
             self.assertFalse(saved["device_defaults"]["cellular_enabled"])
             self.assertTrue(saved["device_defaults"]["vowifi_enabled"])
 
+    def test_replacement_sim_cannot_inherit_manual_visited_network(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            config.upsert_instance({
+                "id": "1", "iccid": "card-a",
+                "cellular_network_mode": "manual", "cellular_operator_id": "46000"})
+            replaced = config.upsert_instance({
+                "id": "1", "iccid": "card-b",
+                # A stale/full client payload must not carry the old SIM's PLMN choice.
+                "cellular_network_mode": "manual", "cellular_operator_id": "23415",
+            })
+            self.assertEqual(replaced["cellular_network_mode"], "automatic")
+            self.assertEqual(replaced["cellular_operator_id"], "")
+
     def test_stale_remote_controls_are_removed_on_load_and_save(self):
         temp, paths = self.temp_config()
         with temp, paths:
