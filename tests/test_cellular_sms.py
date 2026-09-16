@@ -245,6 +245,58 @@ class CellularSmsTests(unittest.TestCase):
         rows = scanner.discover(LINE)
         self.assertEqual([row["body"] for row in rows], ["part one and part two"])
 
+    def test_stale_incomplete_inbound_sms_is_deleted_after_one_day(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        received_at = cellular_sms._timestamp(detail[0]["properties"]["timestamp"])
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: TEST_EPOCH,
+            wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS)
+
+        self.assertEqual(scanner.discover(LINE), [])
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_recent_incomplete_sms_is_preserved_for_assembly(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        received_at = cellular_sms._timestamp(detail[0]["properties"]["timestamp"])
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: TEST_EPOCH,
+            wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS - 1)
+
+        self.assertEqual(scanner.discover(LINE), [])
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_preserved_record_delete_requires_same_modemmanager_generation(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "hello"},
+            "properties": {"pdu-type": "deliver", "state": "received",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        epoch = [TEST_EPOCH]
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: epoch[0])
+        record = scanner.discover(LINE)[0]
+        epoch[0] = "b" * 64
+
+        self.assertFalse(scanner.delete_preserved(record))
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        epoch[0] = TEST_EPOCH
+        self.assertTrue(scanner.delete_preserved(record))
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
     def test_mms_wap_push_notification_is_deleted_instead_of_imported(self):
         calls = []
         runner = sms_runner([wap_push_sms()], calls=calls)
@@ -728,6 +780,17 @@ class CellularSmsTests(unittest.TestCase):
                 restarted = cellular_sms.Scanner(
                     runner, local_sms_tracker=store, epoch_getter=lambda: current_epoch[0])
                 self.assertEqual(restarted.discover(instances), [])
+                cleanup = restarted.discover(instances, include_local_cleanup=True)
+                self.assertEqual(len(cleanup), 1)
+                self.assertTrue(cleanup[0]["_local_only"])
+                self.assertFalse(store.local_modem_sms_is_preserved(
+                    "10", "card-i", TEST_EPOCH, modem, sms,
+                    cellular_sms._content_hash("6700", "BAL")))
+                message = store.local_modem_sms_message(result["_reservation_id"])
+                store.set_message_status(message["id"], "sent", None)
+                self.assertTrue(store.local_modem_sms_is_preserved(
+                    "10", "card-i", TEST_EPOCH, modem, sms,
+                    cellular_sms._content_hash("6700", "BAL")))
 
                 # Reusing the same numeric object path for different content remains importable.
                 with cellular_sms._local_sms_lock:
@@ -779,6 +842,28 @@ class CellularSmsTests(unittest.TestCase):
 
 
 class CellularSmsReimportStoreTests(unittest.TestCase):
+    def test_legacy_import_table_gains_message_binding_before_cleanup_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE message_imports (fingerprint TEXT PRIMARY KEY, "
+                    "instance TEXT NOT NULL, imported_ts INTEGER NOT NULL)")
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                with sqlite3.connect(db_path) as connection:
+                    columns = {row[1] for row in connection.execute(
+                        "PRAGMA table_info(message_imports)")}
+                    indexes = {row[1] for row in connection.execute(
+                        "PRAGMA index_list(message_imports)")}
+                    triggers = {row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger'")}
+                self.assertIn("message_id", columns)
+                self.assertIn("idx_message_imports_message", indexes)
+                self.assertIn("message_import_message_deleted", triggers)
+
     def test_empty_history_can_atomically_restore_retained_cellular_sms(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -804,6 +889,11 @@ class CellularSmsReimportStoreTests(unittest.TestCase):
                         "SELECT COUNT(*) FROM messages WHERE instance='3'").fetchone()[0], 2)
                     self.assertEqual(connection.execute(
                         "SELECT COUNT(*) FROM message_imports WHERE instance='3'").fetchone()[0], 2)
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM message_imports "
+                        "WHERE instance='3' AND message_id IS NOT NULL").fetchone()[0], 2)
+                self.assertTrue(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
 
     def test_visible_history_blocks_reimport_without_changing_markers(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -819,6 +909,110 @@ class CellularSmsReimportStoreTests(unittest.TestCase):
                 with sqlite3.connect(db_path) as connection:
                     self.assertEqual(connection.execute(
                         "SELECT COUNT(*) FROM message_imports WHERE instance='3'").fetchone()[0], 1)
+
+    def test_deleted_history_is_not_eligible_for_automatic_modem_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                store.clear_messages("3")
+                self.assertFalse(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+                with sqlite3.connect(db_path) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT message_id FROM message_imports "
+                        "WHERE fingerprint=?", ("a" * 64,)).fetchone()[0])
+
+    def test_legacy_marker_claims_only_one_unambiguous_visible_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE message_imports SET message_id=NULL WHERE fingerprint=?",
+                        ("a" * 64,))
+                    connection.commit()
+                self.assertTrue(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE message_imports SET message_id=NULL WHERE fingerprint=?",
+                        ("a" * 64,))
+                    connection.execute(
+                        "INSERT INTO messages(instance,direction,peer,body,status,ts,transport) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        ("3", "in", "+15550001", "old", "ok", 1, "cellular"))
+                    connection.commit()
+                self.assertFalse(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+
+
+class CellularSmsPublishTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_local_send_releases_object_without_duplicate_import(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "out",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular", "_local_only": True,
+                "_modem_iccid": "card-a", "_modem_path": MODEM,
+                "_sms_path": SMS, "_daemon_epoch": TEST_EPOCH}
+        scanner = Mock()
+        with patch.object(main.store, "local_modem_sms_is_preserved",
+                          return_value=True) as preserved, \
+                patch.object(main.store, "add_imported_message") as add, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            imported = await main._publish_cellular_sms([item], scanner)
+        self.assertEqual(imported, 0)
+        preserved.assert_called_once_with(
+            "3", "card-a", TEST_EPOCH, MODEM, SMS,
+            cellular_sms._content_hash("+15550001", "hello"))
+        add.assert_not_called()
+        broadcast.assert_not_awaited()
+        scanner.delete_preserved.assert_called_once_with(item)
+
+    async def test_fresh_durable_import_releases_its_modem_copy(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular", "_modem_path": MODEM,
+                "_sms_path": SMS, "_daemon_epoch": TEST_EPOCH}
+        record = {"id": 7, "instance": "3", "direction": "in",
+                  "peer": "+15550001", "body": "hello", "status": "ok",
+                  "error": None, "ts": 1, "transport": "cellular"}
+        scanner = Mock()
+        scanner.delete_preserved.return_value = True
+        with patch.object(main.store, "add_imported_message", return_value=record), \
+                patch.object(main.store, "imported_cellular_message_is_preserved",
+                             return_value=True) as preserved, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            imported = await main._publish_cellular_sms([item], scanner, notify=False)
+        self.assertEqual(imported, 1)
+        broadcast.assert_awaited_once()
+        preserved.assert_called_once_with(
+            "a" * 64, "3", "in", "+15550001", "hello", 1, "cellular")
+        scanner.delete_preserved.assert_called_once_with(item)
+
+    async def test_existing_marker_retries_cleanup_only_with_visible_copy(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular"}
+        scanner = Mock()
+        with patch.object(main.store, "add_imported_message", return_value=None), \
+                patch.object(main.store, "imported_cellular_message_is_preserved",
+                             side_effect=[True, False]), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            self.assertEqual(
+                await main._publish_cellular_sms([item], scanner, notify=False), 0)
+            self.assertEqual(
+                await main._publish_cellular_sms([item], scanner, notify=False), 0)
+        broadcast.assert_not_awaited()
+        scanner.delete_preserved.assert_called_once_with(item)
 
 
 class CellularSmsReimportApiTests(unittest.IsolatedAsyncioTestCase):

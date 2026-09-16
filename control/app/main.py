@@ -2346,23 +2346,43 @@ def _save_host_alert_state(state: dict) -> None:
         log.debug("cannot persist host alert state: %r", exc)
 
 
-async def _publish_cellular_sms(discovered: list[dict], *, notify: bool = True) -> int:
-    """Persist discovered modem SMS and publish them without exposing their contents in logs."""
+async def _publish_cellular_sms(discovered: list[dict], scanner: cellular_sms.Scanner,
+                                *, notify: bool = True) -> int:
+    """Persist modem SMS, publish it, then release only its proven durable modem copy."""
     imported = 0
     for item in discovered:
+        if item.get("_local_only"):
+            preserved = await asyncio.to_thread(
+                store.local_modem_sms_is_preserved,
+                item["instance"], item.get("_modem_iccid") or "",
+                item.get("_daemon_epoch") or "", item.get("_modem_path") or "",
+                item.get("_sms_path") or "",
+                cellular_sms._content_hash(item["peer"], item["body"]))
+            if preserved:
+                await asyncio.to_thread(scanner.delete_preserved, item)
+            continue
         rec = await asyncio.to_thread(
             store.add_imported_message, item["fingerprint"], item["instance"],
             item["direction"], item["peer"], item["body"], item["ts"],
             item["transport"])
-        if not rec:
-            continue
-        imported += 1
-        await hub.broadcast({"type": "sms", "instance": rec["instance"],
-                             "message": rec})
-        if notify and rec["direction"] == "in":
-            await asyncio.to_thread(_harvest_allowance_reply, rec["instance"], rec["peer"])
-            _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
-                           rec["peer"], rec["body"])
+        if rec:
+            imported += 1
+            await hub.broadcast({"type": "sms", "instance": rec["instance"],
+                                 "message": rec})
+            if notify and rec["direction"] == "in":
+                await asyncio.to_thread(
+                    _harvest_allowance_reply, rec["instance"], rec["peer"])
+                _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
+                               rec["peer"], rec["body"])
+        # A failed delete is retried on later polls. Old markers whose visible history was
+        # cleared are deliberately not eligible until the explicit re-import path restores
+        # an exact row, so automatic storage maintenance cannot undo the operator's choice.
+        preserved = await asyncio.to_thread(
+            store.imported_cellular_message_is_preserved,
+            item["fingerprint"], item["instance"], item["direction"],
+            item["peer"], item["body"], item["ts"], item["transport"])
+        if preserved:
+            await asyncio.to_thread(scanner.delete_preserved, item)
     return imported
 
 
@@ -2378,8 +2398,9 @@ async def cellular_sms_poller():
                 scanner.drop_mms_wap_push = bool(
                     (conf.get("settings") or {}).get("drop_mms_wap_push", True))
                 discovered = await asyncio.to_thread(
-                    scanner.discover, list((conf.get("instances") or {}).values()))
-                await _publish_cellular_sms(discovered)
+                    scanner.discover, list((conf.get("instances") or {}).values()),
+                    include_local_cleanup=True)
+                await _publish_cellular_sms(discovered, scanner)
         except Exception as exc:  # noqa
             log.debug("cellular SMS poll failed: %r", exc)
         await asyncio.sleep(5)

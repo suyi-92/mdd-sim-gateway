@@ -66,7 +66,8 @@ def init():
                 CREATE TABLE IF NOT EXISTS message_imports (
                     fingerprint TEXT PRIMARY KEY,
                     instance TEXT NOT NULL,
-                    imported_ts INTEGER NOT NULL
+                    imported_ts INTEGER NOT NULL,
+                    message_id INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS local_modem_sms (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +263,19 @@ def init():
                 c.execute("ALTER TABLE messages ADD COLUMN transport TEXT DEFAULT 'vowifi'")
             except Exception:
                 pass
+            try:
+                # Bind a modem fingerprint to the exact visible row that preserves its
+                # contents. Cleanup may delete the modem copy only while this row exists.
+                c.execute("ALTER TABLE message_imports ADD COLUMN message_id INTEGER")
+            except Exception:
+                pass
+            c.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_message_imports_message "
+                "ON message_imports(message_id) WHERE message_id IS NOT NULL")
+            c.execute(
+                "CREATE TRIGGER IF NOT EXISTS message_import_message_deleted "
+                "AFTER DELETE ON messages BEGIN "
+                "UPDATE message_imports SET message_id=NULL WHERE message_id=OLD.id; END")
             try:
                 c.execute("ALTER TABLE calls ADD COLUMN transport TEXT DEFAULT 'vowifi'")
             except Exception:
@@ -676,9 +690,63 @@ def add_imported_message(fingerprint: str, instance: str, direction: str, peer: 
             (str(instance), direction, peer, body, "ok", int(ts), transport),
         )
         mid = cur.lastrowid
+        c.execute("UPDATE message_imports SET message_id=? WHERE fingerprint=?",
+                  (int(mid), fingerprint))
     return {"id": mid, "instance": str(instance), "direction": direction,
             "peer": peer, "body": body, "status": "ok", "error": None,
             "ts": int(ts), "transport": transport}
+
+
+def imported_cellular_message_is_preserved(fingerprint: str, instance: str,
+                                            direction: str, peer: str, body: str,
+                                            ts: int, transport: str = "cellular") -> bool:
+    """Whether a modem SMS has an exact, durable visible row and may be removed.
+
+    Older databases have markers without ``message_id``. Claim one only when its complete
+    record matches exactly one unclaimed visible row. Ambiguous duplicates and history the
+    operator already deleted fail closed and stay on the modem for explicit recovery.
+    """
+    fingerprint = str(fingerprint or "").lower()
+    iid = str(instance)
+    if (len(fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in fingerprint)
+            or direction not in {"in", "out"}
+            or not isinstance(peer, str) or not isinstance(body, str) or not body.strip()
+            or isinstance(ts, bool) or not isinstance(ts, int) or ts < 0
+            or transport != "cellular"):
+        return False
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        marker = c.execute(
+            "SELECT message_id FROM message_imports WHERE fingerprint=? AND instance=?",
+            (fingerprint, iid),
+        ).fetchone()
+        if not marker:
+            return False
+        params = (iid, direction, peer, body, int(ts), transport)
+        if marker["message_id"] is not None:
+            return c.execute(
+                "SELECT 1 FROM messages WHERE id=? AND instance=? AND direction=? "
+                "AND peer=? AND body=? AND ts=? AND transport=? LIMIT 1",
+                (int(marker["message_id"]), *params),
+            ).fetchone() is not None
+        candidates = c.execute(
+            "SELECT m.id FROM messages m "
+            "LEFT JOIN message_imports i ON i.message_id=m.id "
+            "WHERE m.instance=? AND m.direction=? AND m.peer=? AND m.body=? "
+            "AND m.ts=? AND m.transport=? AND i.message_id IS NULL "
+            "ORDER BY m.id LIMIT 2",
+            params,
+        ).fetchall()
+        if len(candidates) != 1:
+            return False
+        message_id = int(candidates[0]["id"])
+        claimed = c.execute(
+            "UPDATE message_imports SET message_id=? "
+            "WHERE fingerprint=? AND instance=? AND message_id IS NULL",
+            (message_id, fingerprint, iid),
+        )
+        return claimed.rowcount == 1
 
 
 def reimport_cellular_messages(instance: str, records: list[dict]) -> list[dict] | None:
@@ -726,13 +794,14 @@ def reimport_cellular_messages(instance: str, records: list[dict]) -> list[dict]
         restored = []
         now = int(time.time())
         for fingerprint, direction, peer, body, ts in prepared:
-            c.execute(
-                "INSERT INTO message_imports(fingerprint,instance,imported_ts) VALUES(?,?,?)",
-                (fingerprint, iid, now))
             cur = c.execute(
                 "INSERT INTO messages(instance,direction,peer,body,status,ts,transport) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (iid, direction, peer, body, "ok", ts, "cellular"))
+            c.execute(
+                "INSERT INTO message_imports"
+                "(fingerprint,instance,imported_ts,message_id) VALUES(?,?,?,?)",
+                (fingerprint, iid, now, int(cur.lastrowid)))
             restored.append({
                 "id": cur.lastrowid, "instance": iid, "direction": direction,
                 "peer": peer, "body": body, "status": "ok", "error": None,
@@ -1148,6 +1217,30 @@ def local_modem_sms_message(reservation_id: int) -> dict | None:
             "WHERE l.id=? LIMIT 1", (int(reservation_id),),
         ).fetchone()
     return dict(row) if row else None
+
+
+def local_modem_sms_is_preserved(instance: str, iccid: str, daemon_epoch: str,
+                                 modem_path: str, sms_path: str,
+                                 content_hash: str) -> bool:
+    """Whether a locally-created modem object has a final durable history row."""
+    content_hash = str(content_hash or "").lower()
+    if (not str(instance) or not str(iccid) or not str(daemon_epoch)
+            or not str(modem_path) or not str(sms_path)
+            or len(content_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in content_hash)):
+        return False
+    with _lock, _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM local_modem_sms l "
+            "JOIN messages m ON m.id=l.message_id "
+            "WHERE l.instance=? AND l.iccid=? AND l.daemon_epoch=? "
+            "AND l.modem_path=? AND l.sms_path=? AND l.content_hash=? "
+            "AND l.cancelled=0 AND m.instance=l.instance AND m.direction='out' "
+            "AND m.transport='cellular' "
+            "AND m.status IN ('sent','delivered','unknown','failed') LIMIT 1",
+            (str(instance), str(iccid), str(daemon_epoch), str(modem_path),
+             str(sms_path), content_hash),
+        ).fetchone() is not None
 
 
 def is_local_modem_sms(daemon_epoch: str, iccid: str, modem_path: str, sms_path: str,
