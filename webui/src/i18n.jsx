@@ -3,6 +3,10 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Card read timed out; waiting for the reader session to finish': '读卡超时，正在等待该读卡会话释放',
+  'Unconfirmed': '未确认',
+  'Card identity not confirmed': '当前卡身份尚未确认',
+  'Cached profile list': '缓存配置文件列表',
   'Device list is out of date; retrying': '设备列表尚未更新，正在重试',
   'Last device update: {time}': '上次设备更新：{time}',
   'Request timed out': '请求超时',

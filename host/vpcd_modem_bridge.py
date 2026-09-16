@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 try:
     import serial
@@ -272,6 +273,7 @@ class ModemCard:
             except ModemError:
                 pass
         iccid = self._iccid_from_card()
+        verified = bool(iccid)
         if not iccid:
             for command in ("AT+CCID", "AT+ICCID"):
                 try:
@@ -281,7 +283,8 @@ class ModemCard:
                         break
                 except ModemError:
                     pass
-        return {"imei": imei, "iccid": iccid}
+        return {"imei": imei, "iccid": iccid, "iccid_verified": verified,
+                "iccid_source": "card" if verified else ("baseband_cache" if iccid else "unknown")}
 
     def close_channel(self, channel):
         try:
@@ -542,7 +545,11 @@ def main():
     card = (ModemManagerCard(args.modemmanager, debug=args.debug)
             if args.modemmanager else ModemCard(args.modem, debug=args.debug))
     identity = card.identity()
+    with open(f"/proc/{os.getpid()}/stat", encoding="ascii") as handle:
+        bridge_start = handle.read().rsplit(")", 1)[1].split()[19]
     static_metadata = {
+        "bridge_start": bridge_start,
+        "bridge_generation": uuid.uuid4().hex,
         "version": 1,
         # Lets the orchestrator prove that a ready metadata document came from the
         # replacement bridge, rather than accepting the previous process's last write.

@@ -134,7 +134,7 @@ function StatePill({ state, pending = false }) {
       background: pending ? '#fef3c7' : enabled ? '#dcfce7' : 'var(--hover)',
       color: pending ? '#92400e' : enabled ? '#166534' : 'var(--text-dim)',
     }}>
-      {t(pending ? 'Switching…' : enabled ? 'Enabled' : 'Disabled')}
+      {t(pending ? 'Switching…' : enabled ? 'Enabled' : String(state || '').toLowerCase() === 'disabled' ? 'Disabled' : 'Unconfirmed')}
     </span>
   )
 }
@@ -481,6 +481,17 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }, [present, reader])
 
   const selectedCard = present.find((c) => c.name === reader)
+  const identityKey = JSON.stringify([reader, selectedCard?.iccid,
+    selectedCard?.generation])
+  const session = useRef({ key: identityKey, serial: 0, mounted: true })
+  if (session.current.key !== identityKey) {
+    session.current = { key: identityKey, serial: session.current.serial + 1, mounted: true }
+  }
+  const requestSerial = useRef(0)
+  useEffect(() => {
+    session.current.mounted = true
+    return () => { session.current.mounted = false; requestSerial.current += 1 }
+  }, [])
   const matchedInst = useMemo(
     () => instanceForCard(selectedCard, instances),
     [selectedCard, instances],
@@ -517,6 +528,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }, [])
 
   useEffect(() => {
+    setLoading(false)
+    setBusyOp('')
     setSes([])
     setMeta({ imei: '' })
     setLoaded(false)
@@ -526,7 +539,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     setRenameTarget(null)
     setRenameStatus(null)
     setProfileSwitch(null)
-  }, [reader])
+  }, [identityKey])
 
   // Without a fresh read, show the gateway's persisted last read for this card (matched
   // server-side by the inserted card's ICCID) so switching profiles does not force a
@@ -534,23 +547,28 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   useEffect(() => {
     if (loaded || loading || ses.length || !reader) return
     let cancelled = false
+    const owner = session.current
     api.esimChipCached(reader).then((r) => {
-      if (cancelled || !r?.cached) return
+      if (cancelled || owner !== session.current || !owner.mounted || !r?.cached) return
       setSes(r.ses || [])
       setMeta({ imei: r.imei || '' })
       setCachedAt((r.ts || 0) * 1000)
     }).catch(() => {})
     return () => { cancelled = true }
-  }, [loaded, loading, ses.length, reader, selectedCard?.iccid])
+  }, [loaded, loading, ses.length, reader, identityKey])
 
   const loadAll = useCallback(async () => {
-    if (!reader) return
+    if (!reader || session.current.key !== identityKey) return
+    const owner = session.current
+    const serial = ++requestSerial.current
+    const current = () => owner === session.current && owner.mounted && serial === requestSerial.current
     setLoading(true)
     setErr('')
     setSes([])
     setMeta({ imei: '' })
     try {
       const st = await api.esimStatus()
+      if (!current()) return
       setStatus(st)
       setStatusError(false)
       setStatusLoading(false)
@@ -561,6 +579,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       }
       // One call loads every SE (chip + profiles + notifications).
       const c = await api.esimChip(reader)
+      if (!current()) return
       const list = c.ses || []
       setSes(list)
       setMeta({ imei: c.imei || '' })
@@ -578,6 +597,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setLoaded(true)
       setCachedAt(0)
     } catch (e) {
+      if (!current()) return
       // Non-eUICC cards surface as a calm empty state, not a red error banner.
       setEmptyReason(isNoCardError(e.message) ? 'no-card' : 'not-euicc')
       setErr(isNonEuiccError(e.message) || isNoCardError(e.message) ? '' : e.message)
@@ -585,14 +605,16 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setMeta({ imei: '' })
       setLoaded(true)
     } finally {
-      setLoading(false)
+      if (current()) setLoading(false)
     }
-  }, [reader, t])
+  }, [reader, identityKey, t])
 
   /** One-click profile switch: stops the running line first when needed; the line matching
    * the newly enabled profile is started again by auto-provisioning. Works from the cached
    * view, so no fresh exclusive read is required. */
   const switchProfile = async (p, se) => {
+    const owner = session.current
+    const current = () => owner === session.current && owner.mounted
     const title = profileDisplayName(p, t('Profile'))
     const target = seTarget(reader, se)
     if (lineRunning && matchedInst) {
@@ -606,10 +628,14 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (lineRunning && matchedInst) {
         await api.stop(matchedInst.id)
       }
+      if (!current()) return
       const res = await api.esimEnable(p.iccid, target)
+      if (!current()) return
       // The confirmed WebSocket event normally updates this as soon as lpac succeeds. Keep
       // the response path as a fallback for a reconnecting browser.
-      setSes((list) => withEnabledProfile(list, p.iccid))
+      if (res?.card?.identity_state === 'confirmed' && res.card.iccid === p.iccid) {
+        setSes((list) => withEnabledProfile(list, p.iccid))
+      }
       if (res?.recovery_error) {
         // The eUICC switched but the line did not come back on its own — say exactly
         // that, so the user starts the line instead of retrying an already-done switch.
@@ -628,20 +654,21 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       }
       await refresh?.()
     } catch (e) {
+      if (!current()) return
       showToast?.(e.message)
       setErr(e.message)
       setProfileSwitch({ iccid: p.iccid, phase: 'error' })
       // The request can fail after the card already switched; resync from the gateway's
       // persisted view instead of leaving the stale optimistic-free state on screen.
       api.esimChipCached(reader).then((r) => {
-        if (r?.cached) {
+        if (current() && r?.cached) {
           setSes(r.ses || [])
           setCachedAt((r.ts || 0) * 1000)
           setLoaded(false)
         }
       }).catch(() => {})
     }
-    setBusyOp('')
+    if (current()) setBusyOp('')
   }
 
   const requestLoad = useCallback(async () => {
@@ -690,7 +717,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
 
   useEffect(() => {
     if (!subscribe) return undefined
+    const owner = session.current
     return subscribe((msg) => {
+      if (owner !== session.current || !owner.mounted) return
+      if (msg.generation != null && msg.generation !== selectedCard?.generation) return
       if (msg.type === 'esim_notifications') {
         if (reader && msg.reader && msg.reader !== reader) return
         setSes((list) => list.map((se) => {
@@ -707,7 +737,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       }
       if (msg.type === 'esim_profile') {
         if (reader && msg.reader && msg.reader !== reader) return
-        if (msg.profile_state === 'enabled' && msg.iccid) {
+        if (msg.profile_state === 'enabled' && msg.iccid === selectedCard?.iccid) {
           setSes((list) => withEnabledProfile(list, msg.iccid))
         }
         if (msg.event === 'switching') {
@@ -763,44 +793,54 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         setDl((d) => ({ ...(d || {}), event: 'cancelling' }))
       }
     })
-  }, [subscribe, reader, loadAll, refresh, showToast, t])
+  }, [subscribe, reader, identityKey, selectedCard?.iccid, selectedCard?.generation, loadAll, refresh, showToast, t])
 
   const stopLine = async () => {
+    const owner = session.current
+    const current = () => owner === session.current && owner.mounted
     if (!matchedInst) return
     setBusyOp('stop')
     try {
       await api.stop(matchedInst.id)
+      if (!current()) return
       showToast?.(t('Line {id} stopped', { id: matchedInst.id }))
       await refresh?.()
     } catch (e) {
+      if (!current()) return
       showToast?.(e.message)
     }
-    setBusyOp('')
+    if (current()) setBusyOp('')
   }
 
   const runProfileOp = async (label, fn) => {
+    const owner = session.current
+    const current = () => owner === session.current && owner.mounted
     if (switchActive) return
     setBusyOp(label)
     try {
       await fn()
+      if (!current()) return
       showToast?.(t('{action} OK', { action: t(label) }))
       await loadAll()
       await refresh?.()
     } catch (e) {
+      if (!current()) return
       showToast?.(e.message)
       setErr(e.message)
     }
-    setBusyOp('')
+    if (current()) setBusyOp('')
   }
 
   const saveNickname = async (nick) => {
     if (!renameTarget || renameBusy.current || busyOp || switchActive || loading) return
+    const owner = session.current
+    const current = () => owner === session.current && owner.mounted
     renameBusy.current = true
     const { se, profile, runningLine } = renameTarget
     const target = seTarget(reader, se)
     const runningId = lineRunning && matchedInst && String(matchedInst.id) === String(runningLine?.id)
       ? matchedInst.id : null
-    const feedback = (message, error = '') => setRenameStatus({ iccid: profile.iccid, seId: se.id, message, error })
+    const feedback = (message, error = '') => current() && setRenameStatus({ iccid: profile.iccid, seId: se.id, message, error })
     let stopped = false, renamed = false, readerReady = true, failure = '', resumeFailure = ''
     setBusyOp('Nickname')
     setErr('')
@@ -810,8 +850,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         await api.stop(runningId)
         stopped = true
       }
+      if (!current()) return
       feedback(t('Saving…'))
       const result = await api.esimNickname(profile.iccid, nick, target)
+      if (!current()) return
       renamed = true
       if (result.reader_ready === false || result.recovery_error) {
         readerReady = false
@@ -827,7 +869,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       failure = e.message
       if (e.data?.detail?.reader_recovery_failed) readerReady = false
     } finally {
-      if (stopped && readerReady) {
+      if (stopped && readerReady && current()) {
         feedback(t('Restarting the original line…'))
         try {
           await api.start(runningId)
@@ -837,12 +879,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         }
         catch (e) { resumeFailure = t('Line {id} could not restart: {error}', { id: runningId, error: e.message }) }
       }
+      if (!current()) { renameBusy.current = false; return }
       const message = [renamed ? t('Profile renamed.') : failure, resumeFailure].filter(Boolean).join(' ')
       feedback(message, [failure, resumeFailure].filter(Boolean).join(' '))
       if (renamed) setRenameTarget(null)
       showToast?.(message)
       try { await refresh?.() } catch { /* The operation result stays in its profile row. */ }
-      setBusyOp('')
+      if (current()) setBusyOp('')
       renameBusy.current = false
     }
   }
@@ -899,6 +942,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         </div>
       )}
 
+      <div role="status" style={{ minHeight: 24, minWidth: 0 }}>
+        {loading ? t('Loading…') : selectedCard?.identity_state === 'failed' ? t('Card read timed out; waiting for the reader session to finish')
+          : selectedCard?.identity_state === 'pending'
+          ? t('Card identity not confirmed') : cachedAt > 0 ? t('Cached profile list') : ''}
+      </div>
       {err && (
         <div className="card" style={{ padding: 14, color: '#b91c1c', borderColor: '#fecaca' }}>
           {err}
@@ -1062,7 +1110,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                   ) : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {seProfiles.map((p) => {
-                        const enabled = String(p.profileState || '').toLowerCase() === 'enabled'
+                        const enabled = !['pending', 'failed'].includes(selectedCard?.identity_state) && String(p.profileState || '').toLowerCase() === 'enabled'
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
@@ -1072,9 +1120,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                             border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
                             borderRadius: 12, padding: '12px 14px',
                             background: enabled ? 'color-mix(in srgb, var(--primary) 6%, var(--panel))' : 'transparent',
-                            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+                            display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 12,
                           }}>
-                            <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{ minWidth: 0, flex: '1 1 140px' }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                                 <span title={title} style={{
                                   fontWeight: 700, fontSize: 14, overflow: 'hidden',
@@ -1082,7 +1130,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                 }}>
                                   {title}
                                 </span>
-                                <StatePill state={p.profileState}
+                                <StatePill state={['pending', 'failed'].includes(selectedCard?.identity_state) ? 'unknown' : p.profileState}
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={renameFeedback ? 'status' : undefined} title={renameFeedback?.message} style={{

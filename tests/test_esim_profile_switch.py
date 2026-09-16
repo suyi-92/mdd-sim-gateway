@@ -1,3 +1,4 @@
+from bridge_identity_fixture import verified_bridge
 import asyncio
 import tempfile
 import unittest
@@ -52,14 +53,14 @@ class BridgeRestartHandshakeTests(unittest.TestCase):
             self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "spawned")
 
             mdd_orchestrator.atomic_json(identity_path, {
-                "bridge_pid": 22, "channel_status": "ready", "channel_allocated": 3,
+                **verified_bridge(), "bridge_pid": 22, "channel_status": "ready", "channel_allocated": 3,
                 "iccid": "profile-old",
             })
             app.finish_bridge_restart_requests({"modem-1", "modem-2"})
             self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "spawned")
 
             mdd_orchestrator.atomic_json(identity_path, {
-                "bridge_pid": 22, "channel_status": "ready", "channel_allocated": 3,
+                **verified_bridge(), "bridge_pid": 22, "channel_status": "ready", "channel_allocated": 3,
                 "iccid": "profile-target",
             })
             app.finish_bridge_restart_requests({"modem-1", "modem-2"})
@@ -97,6 +98,9 @@ class BridgeRestartHandshakeTests(unittest.TestCase):
 
 
 class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(main.cfg, 'upsert_instance', side_effect=lambda value, **kw: value))
+
     def test_modem_reader_list_ignores_the_driver_spare_slot(self):
         readers = [
             "VoWiFi Modem modem-1 00 00",
@@ -366,7 +370,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         }]}
         with patch.object(main, "_esim_resolve_reader", return_value=(reader, 0)), \
                 patch.object(main, "_modem_identity_for_reader", return_value={
-                    "hardware_id": "modem-1", "channel_status": "ready",
+                    **verified_bridge(), "hardware_id": "modem-1", "channel_status": "ready",
                     "iccid": "profile-current",
                 }), patch.object(main.hub, "cards", {
                     reader: {"present": True, "iccid": "profile-stale", "matched": "9"},
@@ -410,7 +414,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         reader = "VoWiFi Modem modem-1 00 00"
         stale_line = {"id": "9", "iccid": "profile-stale"}
         with patch.object(main, "_modem_identity_for_reader", return_value={
-                    "hardware_id": "modem-1", "channel_status": "ready",
+                    **verified_bridge(), "hardware_id": "modem-1", "channel_status": "ready",
                     "iccid": "profile-current",
                 }), patch.object(main.hub, "cards", {
                     reader: {"present": True, "iccid": "profile-stale", "matched": "9"},
@@ -422,7 +426,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(changed)
         stop.assert_awaited_once_with("9", "vpcd_identity_changed")
-        inserted.assert_awaited_once_with(reader, 4)
+        inserted.assert_awaited_once_with(reader, 4, verify=True)
 
     async def test_maintenance_window_still_reconciles_ready_vpcd_identity(self):
         reader = "VoWiFi Modem modem-1 00 00"
@@ -456,10 +460,11 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_unchanged_vpcd_identity_does_not_restart_or_reprobe(self):
         reader = "VoWiFi Modem modem-1 00 00"
         with patch.object(main, "_modem_identity_for_reader", return_value={
-                    "hardware_id": "modem-1", "channel_status": "ready",
+                    **verified_bridge(), "hardware_id": "modem-1", "channel_status": "ready",
                     "iccid": "profile-current",
                 }), patch.object(main.hub, "cards", {
-                    reader: {"present": True, "iccid": "profile-current", "matched": "2"},
+                    reader: {"present": True, "iccid": "profile-current", "matched": "2",
+                             "bridge_generation": "fixture-session"},
                 }), patch.object(main, "_find_running_by_reader") as claimed, \
                 patch.object(main, "_on_card_insert", new=AsyncMock()) as inserted:
             changed = await main._reconcile_vpcd_card_identity(reader, 4)

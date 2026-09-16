@@ -1,5 +1,6 @@
 """A migrated native reader must survive an unrelated modem's eSIM switch."""
 import copy
+from bridge_identity_fixture import verified_bridge
 import json
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ class ReaderBindingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.readers = [*self.names, self.native_name]
         for hardware, iccid in (("old-modem", OLD), ("current-modem", TARGET)):
             (self.root / "modems" / f"{hardware}.json").write_text(json.dumps({
-                "hardware_id": hardware, "iccid": iccid, "imei": "490154203237518", "slots": 3,
+                **verified_bridge(), "hardware_id": hardware, "iccid": iccid, "imei": "490154203237518", "slots": 3,
             }))
         self.target = {"id": "target", "iccid": TARGET, "enabled": True,
                        "reader_index": 1, "reader_port": "", "imei_source_device_id": "old-modem",
@@ -144,7 +145,7 @@ class ReaderBindingRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_hotplug_cleans_old_channels_even_when_port_and_index_already_match(self):
         self.instances["native"]["reader_index"] = 3
-        card = SimpleNamespace(iccid=NATIVE, imsi="001010000000001", mcc="001", mnc="01",
+        card = SimpleNamespace(reader=self.native_name, iccid=NATIVE, imsi="001010000000001", mcc="001", mnc="01",
                                pin_enabled=False, pin_tries=3, smsc="", carrier_identity={})
         with patch.object(main.usbreader, "port_for_index", return_value="3-2"), \
                 patch.object(main, "_find_running_by_reader", return_value=None), \

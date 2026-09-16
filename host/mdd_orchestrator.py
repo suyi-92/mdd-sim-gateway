@@ -1012,6 +1012,10 @@ class Orchestrator:
                 continue
             if int(identity.get("channel_allocated") or 0) < 1:
                 continue
+            if (identity.get("iccid_verified") is not True
+                    or identity.get("iccid_source") != "card"
+                    or not 0 <= now - float(identity.get("updated_at") or 0) <= 180):
+                continue
             expected = str(request.get("expected_iccid_sha256") or "")
             actual = str(identity.get("iccid") or "")
             if expected and hashlib.sha256(actual.encode()).hexdigest() != expected:

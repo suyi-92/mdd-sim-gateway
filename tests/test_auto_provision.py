@@ -1,3 +1,4 @@
+from bridge_identity_fixture import verified_bridge
 import asyncio
 import unittest
 from types import SimpleNamespace
@@ -570,10 +571,10 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
             wrong = Path(tmp) / "wrong.json"
             right = Path(tmp) / "right.json"
             wrong.write_text(json.dumps({
-                "hardware_id": "modem-a", "iccid": "wrong-card",
+                **verified_bridge(), "hardware_id": "modem-a", "iccid": "wrong-card",
             }))
             right.write_text(json.dumps({
-                "hardware_id": "modem-b", "iccid": wanted,
+                **verified_bridge(), "hardware_id": "modem-b", "iccid": wanted,
             }))
             paths.return_value = [str(wrong), str(right)]
             expected = {
@@ -615,9 +616,7 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
         start.assert_called_once_with(
             corrected, {}, dev_mounts=False, reason="auto-recover:test")
 
-    @patch.object(main, "_modem_identity_for_reader", return_value={
-        "hardware_id": "wrong-modem", "iccid": "wrong-card",
-    })
+    @patch.object(main, "_live_vpcd_iccid", return_value="wrong-card")
     def test_live_modem_reader_name_does_not_hide_wrong_card(self, _identity):
         inst = {
             "id": "2", "iccid": "8944110000000000000",
@@ -650,7 +649,7 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(main.hub.cards.clear)
         with patch.object(main.card, "reader_states", return_value=states), \
                 patch.object(main, "_modem_identity_for_reader", return_value={
-                    "hardware_id": "new", "iccid": old["iccid"], "slots": 3}), \
+                    **verified_bridge(), "hardware_id": "new", "iccid": old["iccid"], "slots": 3}), \
                 patch.object(main, "_match_instance_by_iccid", return_value=old), \
                 patch.object(main, "_modem_reader_binding", return_value=binding), \
                 patch.object(main.cfg, "upsert_instance",
@@ -664,7 +663,7 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seeded["matched"], "2")
         self.assertEqual(seeded["iccid"], old["iccid"])
 
-    async def test_metadata_match_migrates_reader_group_without_discovery_apdu(self):
+    async def test_known_iccid_still_reads_subscription_before_migrating_reader_group(self):
         old = {
             "id": "2", "iccid": "8944110000000000000", "imsi": "234330123456789",
             "mcc": "234", "mnc": "33", "smsc": "+447700900000",
@@ -682,19 +681,23 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(main.hub.cards.clear)
         with patch.object(main.usbreader, "port_for_index", return_value=None), \
                 patch.object(main, "_modem_identity_for_reader", return_value={
-                    "hardware_id": "new", "iccid": old["iccid"], "slots": 3}), \
+                    **verified_bridge(), "hardware_id": "new", "iccid": old["iccid"], "slots": 3}), \
                 patch.object(main, "_match_instance_by_iccid", return_value=old), \
                 patch.object(main, "_modem_reader_binding", return_value=binding), \
                 patch.object(main.cfg, "upsert_instance",
                              return_value={**old, **binding}) as upsert, \
-                patch.object(main.sim, "read_card") as read_card, \
+                patch.object(main.sim, "read_card", return_value=main.sim.CardInfo(
+                    "VoWiFi Modem new 00 01", 5, True, iccid=old["iccid"],
+                    imsi="001010000000001", mcc="001", mnc="01", smsc="")) as read_card, \
+                patch.object(main, "_find_running_by_reader", return_value=None), \
                 patch.object(main, "_auto_start_hotplugged_line",
                              new=AsyncMock()) as auto_start:
             await main._on_card_insert("VoWiFi Modem new 00 01", 5)
             await asyncio.sleep(0)
 
-        read_card.assert_not_called()
-        upsert.assert_called_once_with({"id": "2", **binding})
+        read_card.assert_called_once_with(5)
+        self.assertEqual(upsert.call_args.args[0]["mcc"], "001")
+        self.assertEqual(upsert.call_args.args[0]["swu_reader"], binding["swu_reader"])
         auto_start.assert_awaited_once_with("2")
         self.assertEqual(main.hub.cards["VoWiFi Modem new 00 01"]["matched"], "2")
 

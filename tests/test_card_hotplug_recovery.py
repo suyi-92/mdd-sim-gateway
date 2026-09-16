@@ -133,6 +133,8 @@ class HotplugExitRetryTests(unittest.IsolatedAsyncioTestCase):
         self.inst = {'id': 'fixture', 'enabled': True, 'iccid': 'fixture-card'}
         self.cards = [{'present': True, 'iccid': 'fixture-card'}]
         self.enterContext(patch.object(main.hub, 'hotplug_starts', set()))
+        self.enterContext(patch.object(main.hub, 'hotplug_pending', {}))
+        self.enterContext(patch.object(main.hub, 'hotplug_epochs', {}))
         self.sleep = self.enterContext(patch.object(main.asyncio, 'sleep', new=AsyncMock()))
         self.enterContext(patch.object(main.cfg, 'get_instance', return_value=self.inst))
         self.enterContext(patch.object(main.cfg, 'get_settings', return_value={}))
@@ -143,8 +145,22 @@ class HotplugExitRetryTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(main.hub, 'broadcast', new=AsyncMock()))
         self.enterContext(patch.object(main.hub, 'reset_health'))
         self.enterContext(patch.object(main, '_record_lifecycle'))
-        self.start = self.enterContext(patch.object(main, '_start_engine_checked'))
+        self.start = self.enterContext(patch.object(main, '_start_instance', new=AsyncMock()))
         self.cold_exit = main.HTTPException(503, {'code': 'egress_unavailable'})
+
+    async def test_native_enabled_line_ignores_new_device_default(self):
+        with patch.object(main.device_state, 'desired', return_value={
+                'defaults': {'vowifi_enabled': False}}):
+            await main._auto_start_hotplugged_line('fixture')
+        self.start.assert_called_once()
+
+    async def test_busy_reader_never_reconciles_old_identity(self):
+        name = 'VoWiFi Modem fixture 00 00'
+        with patch.dict(main.hub.lpa_busy, {name: True}), \
+                patch.object(main, '_live_vpcd_iccid', return_value='new-card'), \
+                patch.object(main, '_on_card_insert', new=AsyncMock()) as insert:
+            self.assertFalse(await main._reconcile_vpcd_card_identity(name, 0))
+        insert.assert_not_awaited()
 
     async def test_cold_exit_gets_bounded_retries_then_starts(self):
         self.start.side_effect = [self.cold_exit, self.cold_exit, 'container']
@@ -153,7 +169,7 @@ class HotplugExitRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [6, 5, 5])
 
     async def test_removal_during_retry_cancels_start(self):
-        def failed(*args):
+        def failed(*args, **kwargs):
             self.cards.clear()
             raise self.cold_exit
         self.start.side_effect = failed
@@ -161,7 +177,7 @@ class HotplugExitRetryTests(unittest.IsolatedAsyncioTestCase):
         self.start.assert_called_once()
 
     async def test_disabling_the_line_during_retry_is_respected(self):
-        def failed(*args):
+        def failed(*args, **kwargs):
             self.inst['enabled'] = False
             raise self.cold_exit
         self.start.side_effect = failed
@@ -173,6 +189,26 @@ class HotplugExitRetryTests(unittest.IsolatedAsyncioTestCase):
         await main._auto_start_hotplugged_line('fixture')
         self.assertEqual(self.start.call_count, 6)
         self.assertNotIn('fixture', main.hub.hotplug_starts)
+
+    async def test_late_exit_readiness_is_retried_from_stopped_health(self):
+        self.start.side_effect = self.cold_exit
+        await main._auto_start_hotplugged_line('fixture')
+        pending = main.hub.hotplug_pending['fixture']
+        with patch.object(main.time, 'monotonic', return_value=pending['retry_at'] + 1), \
+                patch.object(main, '_auto_start_hotplugged_line', new=AsyncMock()) as restart:
+            main.apply_health('fixture', self.inst, {'state': 'STOPPED'})
+            await __import__('asyncio').sleep(0)
+            # create_task was scheduled; run it after leaving the patched sleep.
+        import asyncio
+        await asyncio.get_running_loop().run_in_executor(None, lambda: None)
+        restart.assert_awaited_once_with('fixture')
+
+    async def test_user_stop_invalidates_inflight_hotplug_intent(self):
+        async def stopped(_delay):
+            main.hub.hotplug_epochs['fixture'] = 1
+        self.sleep.side_effect = stopped
+        await main._auto_start_hotplugged_line('fixture')
+        self.start.assert_not_awaited()
 
     async def test_card_and_pin_errors_are_not_retried_as_network_errors(self):
         self.start.side_effect = main.HTTPException(409, {'code': 'pin_invalid'})

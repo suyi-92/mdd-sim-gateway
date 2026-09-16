@@ -125,6 +125,31 @@ def _carrier_identity_update(value) -> dict:
     return result
 
 
+def _verified_subscription_update(inst: dict, value) -> dict:
+    """Apply a complete direct-card subscription, preserving operator configuration."""
+    get = value.get if isinstance(value, dict) else lambda k, d=None: getattr(value, k, d)
+    if (not get("iccid") or str(get("iccid")) != str(inst.get("iccid"))
+            or not get("imsi") or not get("mcc") or not get("mnc")
+            or get("transport_error", False)):
+        return {}
+    result = {key: get(key) or "" for key in ("imsi", "mcc", "mnc", "smsc")}
+    result.update(carrier_identity=_carrier_identity(value), mnc_len=get("mnc_len"))
+    if inst.get("imsi") and inst.get("imsi") != get("imsi"):
+        result["ims_home_domain"] = ""
+        if inst.get("msisdn_source") in {"ims", "modemmanager", "sim"}:
+            result.update(msisdn="", msisdn_source="")
+    return result
+
+
+def _identity_pending(info: dict, reason: str) -> None:
+    attempts = int(info.get("identity_attempts") or 0) + 1
+    delay = min(60, 2 ** min(attempts, 6))
+    info.update(identity_state="failed" if reason == "read_timeout" else "pending", identity_reason=reason,
+                identity_attempts=attempts, identity_retry_at=time.monotonic() + delay)
+    log.info("card identity pending generation=%s reason=%s retry_seconds=%s",
+             info.get("generation", 0), reason, delay)
+
+
 def _carrier_description(inst: dict | None, card_info: dict | None,
                          cellular: dict | None = None) -> dict:
     """Resolve a safe display value; never return IMSI, ICCID, SPN or GID."""
@@ -238,6 +263,8 @@ def _live_modem_binding_for_instance(inst: dict) -> dict:
                 identity = json.load(handle)
         except (OSError, ValueError, TypeError):
             continue
+        if not _bridge_card_evidence(identity):
+            continue
         if str(identity.get("iccid") or "").strip() != wanted:
             continue
         hardware_id = str(identity.get("hardware_id") or "").strip()
@@ -266,7 +293,8 @@ def _live_native_binding_for_instance(inst: dict) -> dict:
     """Use a positive card identity and current reader enumeration, never an old index."""
     wanted = str(inst.get("iccid") or "")
     candidates = {str(card.get("name")): card for card in hub.cards.values()
-                  if wanted and card.get("present") and card.get("iccid") == wanted
+                  if wanted and card.get("present") and card.get("identity_state") not in {"pending", "failed"}
+                  and card.get("iccid") == wanted
                   and card.get("name") and not str(card["name"]).startswith("Virtual PCD")
                   and not device_state.vpcd_modem_hardware_id(card["name"])}
     if not candidates:
@@ -312,13 +340,11 @@ def _refresh_instance_reader_binding(inst: dict, *, persist: bool = True) -> dic
 
 
 def _bootstrap_saved_modem_cards() -> list[str]:
-    """Recover known modem-backed lines before the APDU card monitor starts.
+    """Seed historical lines from fresh bridge ICCID evidence, pending a subscription read.
 
-    The bridge metadata is written only after the modem answers its identity commands and
-    contains the current ICCID.  Combining that with passive PC/SC presence is sufficient to
-    restore a saved line's generated reader names after its USB hardware id changes.  Seeding
-    the monitor cache here also prevents its first scan from issuing a redundant discovery APDU
-    for a known SIM -- important on virtualised serial modems where that probe can block.
+    The metadata proves the profile ICCID and reader group, not its IMSI/MCC. Automatic
+    startup must wait for the monitor to verify that subscription, including same-ICCID
+    multi-IMSI changes, before it can render Engine input.
     """
     try:
         states = card.reader_states()
@@ -334,7 +360,7 @@ def _bootstrap_saved_modem_cards() -> list[str]:
         identity = _modem_identity_for_reader(name)
         iccid = str((identity or {}).get("iccid") or "")
         inst = _match_instance_by_iccid(iccid)
-        if not identity or not iccid or inst is None:
+        if not identity or not _bridge_card_evidence(identity) or not iccid or inst is None:
             continue
         binding = _modem_reader_binding(name)
         update = {"id": str(inst["id"]), **binding}
@@ -343,6 +369,8 @@ def _bootstrap_saved_modem_cards() -> list[str]:
             inst = cfg.upsert_instance(update)
         hub.cards[name] = {
             **state,
+            "identity_state": "pending", "identity_reason": "subscription_unverified",
+            "identity_retry_at": 0, "generation": 0,
             "iccid": iccid,
             "imsi": inst.get("imsi"),
             "matched": inst["id"],
@@ -362,7 +390,8 @@ def _bootstrap_saved_modem_cards() -> list[str]:
 def _modem_card_representative(siblings: list[dict]) -> dict:
     """Pick the slot that carries the best current SIM identity for a modem group."""
     return (next((item for item in siblings
-                  if item.get("present") and item.get("iccid")), None)
+                  if item.get("present") and item.get("iccid")
+                  and item.get("identity_state") not in {"pending", "pin_required", "failed"}), None)
             or next((item for item in siblings if item.get("present")), None)
             or siblings[0])
 
@@ -578,6 +607,11 @@ class Hub:
         self.esim_switch_locks: dict[str, asyncio.Lock] = {}
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
+        self.instance_locks: dict[str, asyncio.Lock] = {}
+        self.card_probes: dict[str, asyncio.Task] = {}
+        self.manual_stops: set[str] = set()
+        self.hotplug_epochs: dict[str, int] = {}
+        self.hotplug_pending: dict[str, dict] = {}
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
         self.esim_line_recoveries: set[str] = set()  # one post-switch starter per line
         # When each line last became healthy, so a failure can be attributed. A line that
@@ -702,6 +736,7 @@ class Hub:
 hub = Hub()
 capability_lock = asyncio.Lock()
 PCSC_MAINTENANCE_WINDOW_SECONDS = 45
+CARD_PROBE_TIMEOUT_SECONDS = 8
 
 
 def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
@@ -780,7 +815,51 @@ def _find_running_by_reader(
     return None
 
 
-async def _on_card_insert(name, idx):
+async def _on_card_insert(name, idx, *, verify=False):
+    """Bound monitor latency while retaining reader ownership until an APDU finishes."""
+    active = hub.card_probes.get(name)
+    if active and not active.done():
+        return
+
+    async def probe():
+        lock = hub.reader_lock(name)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.05)
+        except asyncio.TimeoutError:
+            info = hub.cards.setdefault(name, {"name": name, "index": idx, "present": True})
+            _identity_pending(info, "reader_busy")
+            return
+        retire = []
+        try:
+            await _on_card_insert_locked(name, idx, verify=verify, retire=retire)
+        finally:
+            lock.release()
+        # Engine starts acquire their instance lock before their reader lock. Retire an
+        # old card's line only after releasing reader ownership, in that same lock order.
+        for iid in retire:
+            await _stop_instance(iid, "card_identity_changed")
+
+    task = asyncio.create_task(probe())
+    hub.card_probes[name] = task
+
+    def finished(done):
+        if hub.card_probes.get(name) is done:
+            hub.card_probes.pop(name, None)
+        if not done.cancelled() and done.exception():
+            log.warning("card identity coordinator failed error_type=%s", type(done.exception()).__name__)
+
+    task.add_done_callback(finished)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=CARD_PROBE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        info = hub.cards.get(name)
+        if info:
+            _identity_pending(info, "read_timeout")
+        # Do not cancel the to_thread read and release its lock: the native PC/SC call
+        # would keep running and the next retry could race it. One owned read per reader.
+
+
+async def _on_card_insert_locked(name, idx, *, verify=False, retire=None):
     info = {"index": idx, "name": name, "present": True, "iccid": None,
             "pin_enabled": None, "pin_tries": None, "matched": None, "imsi": None,
             "mcc": None, "mnc": None, "mnc_len": None, "smsc": None,
@@ -792,34 +871,18 @@ async def _on_card_insert(name, idx):
         info["reader_port"] = await asyncio.to_thread(usbreader.port_for_index, idx)
     except Exception as e:  # noqa
         log.debug("reader_port resolve failed for idx %s: %r", idx, e)
-    # The serial bridge publishes the modem's current ICCID before it exposes the VPCD
-    # readers.  Reuse that authoritative identity for an already-provisioned line instead of
-    # issuing a discovery APDU.  Some virtualised EC25/QDC507 stacks can leave an idle PC/SC
-    # probe blocked indefinitely; waiting for it here prevents the first monitor scan, reader
-    # binding migration and automatic engine start.  Unknown/new SIMs still take the normal
-    # APDU path below so their IMSI, carrier and PIN state can be provisioned.
-    modem_identity = _modem_identity_for_reader(name)
-    metadata_iccid = str((modem_identity or {}).get("iccid") or "")
-    metadata_inst = _match_instance_by_iccid(metadata_iccid)
-    if metadata_inst is not None:
-        info.update(
-            iccid=metadata_iccid,
-            imsi=metadata_inst.get("imsi"),
-            matched=metadata_inst["id"],
-            smsc=metadata_inst.get("smsc"),
-            mcc=metadata_inst.get("mcc"),
-            mnc=metadata_inst.get("mnc"),
-            mnc_len=metadata_inst.get("mnc_len"),
-            carrier_identity=metadata_inst.get("carrier_identity") or {},
-        )
-        update = {"id": str(metadata_inst["id"]), **_modem_reader_binding(name)}
-        if any(metadata_inst.get(key) != value
-               for key, value in update.items() if key != "id"):
-            metadata_inst = await asyncio.to_thread(cfg.upsert_instance, update)
-        hub.cards[name] = info
-        log.info("card inserted reader=%s (%s) identity=metadata matched=%s",
-                 idx, name, info["matched"])
-        asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
+    previous = hub.cards.get(name) or {}
+    info.update(generation=int(previous.get("generation") or 1),
+                identity_attempts=previous.get("identity_attempts", 0),
+                identity_state="pending")
+    if verify:
+        info.update({key: previous.get(key) for key in
+                     ("iccid", "imsi", "matched", "mcc", "mnc", "smsc")})
+    hub.cards[name] = info
+    if hub.lpa_busy.get(name):
+        info.update({key: previous.get(key) for key in
+                     ("iccid", "imsi", "matched", "mcc", "mnc", "smsc")})
+        _identity_pending(info, "lpa_busy")
         return
     # A running engine may already hold this card (manager restart, or pcscd flapped
     # while the engine kept running) — probing it could clash with the engine's card
@@ -829,55 +892,64 @@ async def _on_card_insert(name, idx):
     # profile enable/disable triggers eUICC REFRESH that looks like remove+insert.
     inst = await asyncio.to_thread(
         _find_running_by_reader, name, info.get("reader_port"), require_port_match=True)
-    if inst is not None:
-        info.update(iccid=inst.get("iccid"), imsi=inst.get("imsi"), matched=inst["id"],
+    if inst is not None and not verify:
+        info.update(identity_state="confirmed", identity_source="running_session",
+                    verified_at=time.time(), iccid=inst.get("iccid"), imsi=inst.get("imsi"), matched=inst["id"],
                     smsc=inst.get("smsc"), mcc=inst.get("mcc"), mnc=inst.get("mnc"),
                     mnc_len=inst.get("mnc_len"),
                     carrier_identity=inst.get("carrier_identity") or {})
-    elif hub.lpa_busy.get(name):
-        prev = hub.cards.get(name) or {}
-        info.update(iccid=prev.get("iccid"), imsi=prev.get("imsi"),
-                    matched=prev.get("matched"), smsc=prev.get("smsc"),
-                    mcc=prev.get("mcc"), mnc=prev.get("mnc"),
-                    mnc_len=prev.get("mnc_len"),
-                    carrier_identity=prev.get("carrier_identity") or {},
-                    pin_enabled=prev.get("pin_enabled"), pin_tries=prev.get("pin_tries"))
-        log.info("card insert during LPA busy — skipping probe reader=%s", name)
     else:
-        lock = hub.reader_lock(name)
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.05)
-        except asyncio.TimeoutError:
-            prev = hub.cards.get(name) or {}
-            info.update(iccid=prev.get("iccid"), imsi=prev.get("imsi"),
-                        matched=prev.get("matched"), smsc=prev.get("smsc"),
-                        mcc=prev.get("mcc"), mnc=prev.get("mnc"),
-                        mnc_len=prev.get("mnc_len"),
-                        carrier_identity=prev.get("carrier_identity") or {})
-            hub.cards[name] = info
-            log.debug("card probe skipped — reader lock busy: %s", name)
-            return
-        try:
-            c = await _probe_inserted_card(name, idx, info.get("reader_port"))
+            c = (await asyncio.to_thread(sim.read_card, idx) if (verify or previous.get("identity_attempts"))
+                 else await _probe_inserted_card(name, idx, info.get("reader_port")))
+            if hub.cards.get(name) is not info:
+                return
+            if c.reader != name or hub.lpa_busy.get(name):
+                _identity_pending(info, "reader_changed")
+                return
+            if not c.iccid or getattr(c, "transport_error", False):
+                _identity_pending(info, "card_unreadable")
+                return
+            if previous and any(previous.get(key) != getattr(c, key, None)
+                                for key in ("iccid", "imsi")):
+                info["generation"] = int(previous.get("generation") or 0) + 1
+            bridge = _modem_identity_for_reader(name) or {}
+            if _bridge_card_evidence(bridge) and bridge.get("iccid") == c.iccid:
+                info["bridge_generation"] = bridge.get("bridge_generation")
+            claimed = inst
+            if claimed and str(claimed.get("iccid") or "") != str(c.iccid):
+                if retire is not None:
+                    retire.append(str(claimed["id"]))
+            info.update(identity_state="confirmed", identity_source="card", identity_attempts=0,
+                        identity_retry_at=None, identity_reason="", verified_at=time.time())
             idx = getattr(c, "reader_index", idx)
             info["index"] = idx
-            info.update(iccid=c.iccid, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
+            info.update(iccid=c.iccid, matched=None, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
                         imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
                         mnc_len=getattr(c, "mnc_len", None), smsc=c.smsc,
                         carrier_identity=_carrier_identity(c))
+            if not c.imsi:
+                locked_inst = _match_instance_by_iccid(c.iccid)
+                info["matched"] = locked_inst["id"] if locked_inst else None
+                if c.pin_enabled:
+                    info.update(identity_state="pin_required", identity_reason="pin_required")
+                else:
+                    _identity_pending(info, "subscription_unreadable")
+                return
         except Exception as e:  # noqa
-            log.debug("card probe failed: %r", e)
-        finally:
-            lock.release()
+            _identity_pending(info, "read_failed")
+            return
         inst = _match_instance_by_iccid(info["iccid"])
         if inst:
             info["matched"] = inst["id"]
-            info["imsi"] = info["imsi"] or inst.get("imsi")
+
             # A SIM line follows the card, not the reader it occupied previously. Refresh
             # the live binding immediately on hotplug so a swap cannot leave a native USB
             # port pinned on a line that has moved into a modem (or vice versa).
             modem_identity = _modem_identity_for_reader(name)
-            update = {"id": str(inst["id"]), **_carrier_identity_update(info)}
+            subscription_changed = bool(inst.get("imsi") and info.get("imsi")
+                                        and inst["imsi"] != info["imsi"])
+            update = {"id": str(inst["id"]), **_verified_subscription_update(inst, info)}
             if modem_identity:
                 # Refresh every field, not only reader_index.  A replugged serial-less modem
                 # receives a new hardware id, so all three generated reader names change.  The
@@ -893,6 +965,14 @@ async def _on_card_insert(name, idx):
                     inst = await asyncio.to_thread(cfg.upsert_instance, update, clear_modem_readers=True)
                 else:
                     inst = await asyncio.to_thread(cfg.upsert_instance, update)
+            if subscription_changed and inst.get("enabled", True):
+                settings = cfg.get_settings().get("proxy") or {}
+                hub.egress_updates[str(inst["id"])] = {
+                    "revision": egress.country_exit_revision(settings, egress.line_country(inst)),
+                    "running": False, "retry_at": 0.0,
+                }
+                hub._msisdn_checked.pop(str(inst["id"]), None)
+                hub._msisdn_tries.pop(str(inst["id"]), None)
         elif info.get("iccid") and cfg.card_auto_create_suppressed(info["iccid"]):
             # The user explicitly deleted this SIM line while the card was still inserted.
             # Keep it visibly unconfigured, but do not immediately recreate the record behind
@@ -906,11 +986,32 @@ async def _on_card_insert(name, idx):
             inst = await asyncio.to_thread(_ensure_card_draft, info)
             if inst:
                 info["matched"] = inst["id"]
+    if hub.cards.get(name) is not info:
+        return
     hub.cards[name] = info
     log.info("card inserted reader=%s (%s) identity=%s matched=%s", idx, name,
              "available" if info["iccid"] else "unknown", info["matched"])
     if info.get("matched"):
         asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
+
+
+def _bridge_card_evidence(identity: dict) -> bool:
+    """A recent direct-card read from the still-live bridge, never AT cache."""
+    try:
+        if (identity.get("iccid_verified") is not True
+                or identity.get("iccid_source") != "card"
+                or identity.get("channel_status") != "ready"
+                or not identity.get("iccid")
+                or not 0 <= time.time() - float(identity.get("updated_at", 0)) <= 180):
+            return False
+        pid = int(identity.get("bridge_pid") or 0)
+        if pid <= 0:
+            return False
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            start = handle.read().rsplit(")", 1)[1].split()[19]
+        return str(identity.get("bridge_start") or "") == start
+    except (OSError, ValueError, TypeError, IndexError):
+        return False
 
 
 def _live_vpcd_iccid(name: str) -> str:
@@ -921,12 +1022,12 @@ def _live_vpcd_iccid(name: str) -> str:
     the card monitor's in-memory row after a PC/SC maintenance window hid the remove/add edge.
     """
     hardware_id = device_state.vpcd_modem_hardware_id(name)
-    if not hardware_id:
+    if not hardware_id or hub.lpa_busy.get(name):
         return ""
     identity = _modem_identity_for_reader(name) or {}
     if str(identity.get("hardware_id") or hardware_id) != hardware_id:
         return ""
-    if str(identity.get("channel_status") or "ready") != "ready":
+    if not _bridge_card_evidence(identity):
         return ""
     return str(identity.get("iccid") or "")
 
@@ -937,7 +1038,10 @@ def _current_reader_iccid(name: str) -> str:
         # Returning no identity is safer than lending this reader the previous card's cache
         # while a replacement bridge is still allocating channels.
         return _live_vpcd_iccid(name)
-    return str((hub.cards.get(name) or {}).get("iccid") or "")
+    info = hub.cards.get(name) or {}
+    if info.get("identity_state") not in (None, "confirmed") or hub.lpa_busy.get(name):
+        return ""
+    return str(info.get("iccid") or "")
 
 
 async def _reconcile_vpcd_card_identity(name: str, idx: int) -> bool:
@@ -948,11 +1052,20 @@ async def _reconcile_vpcd_card_identity(name: str, idx: int) -> bool:
     reader name and ``present`` bit unchanged.  Compare the bridge's current card identity after
     the window and run the ordinary insertion path when it changed.
     """
+    if hub.lpa_busy.get(name) or hub.reader_lock(name).locked():
+        return False
+    row = hub.cards.get(name) or {}
+    if (row.get("identity_state") in {"pending", "failed"}
+            and time.monotonic() < float(row.get("identity_retry_at") or 0)):
+        return False
     current_iccid = _live_vpcd_iccid(name)
     if not current_iccid:
         return False
     previous = hub.cards.get(name) or {}
-    if str(previous.get("iccid") or "") == current_iccid:
+    identity = _modem_identity_for_reader(name) or {}
+    bridge_generation = identity.get("bridge_generation")
+    if (str(previous.get("iccid") or "") == current_iccid
+            and previous.get("bridge_generation") == bridge_generation):
         return False
 
     # Stop only a line that proves it is still using this exact reader.  The stale card row's
@@ -964,7 +1077,8 @@ async def _reconcile_vpcd_card_identity(name: str, idx: int) -> bool:
 
     log.info("VPCD card identity changed after reader re-enumeration; refreshing binding "
              "reader=%s", name)
-    await _on_card_insert(name, idx)
+    await _on_card_insert(name, idx, verify=True)
+    hub.cards.get(name, {})["bridge_generation"] = bridge_generation
     return True
 
 
@@ -1000,9 +1114,12 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
     if iid in hub.hotplug_starts:
         return
     hub.hotplug_starts.add(iid)
+    epoch = hub.hotplug_epochs.get(iid, 0)
     try:
         for attempt in range(6):
             await asyncio.sleep(6 if attempt == 0 else 5)
+            if hub.hotplug_epochs.get(iid, 0) != epoch:
+                return
             inst = cfg.get_instance(iid)
             if not inst or await asyncio.to_thread(engine.is_running, iid):
                 return
@@ -1022,30 +1139,38 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
                              ", ".join(inst.get("auto_provision_missing") or []))
                     return
 
-            device_id, device_type = _device_for_card(card_info, cards)
-            desired = device_state.desired()
-            wanted = ((desired.get("devices") or {}).get(device_id)
-                      or desired.get("defaults") or {})
-            if not wanted.get("vowifi_enabled", True):
+            allowed, _ = _line_auto_start_allowed(inst)
+            if not allowed:
+                hub.hotplug_pending.pop(iid, None)
                 return
-            if not inst.get("enabled", True):
+            if hub.health_for(iid).get("frozen_code") in {
+                    "pin_wrong", "pin_invalid", "pin_blocked", "pin_required"}:
                 return
             try:
-                await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
-                                        os.environ.get("MDD_DEV_MOUNTS", "") == "1")
+                await _start_instance(iid, health_reason="hotplug_start",
+                                      engine_reason="hotplug", automatic_epoch=epoch)
             except HTTPException as exc:
                 if (isinstance(exc.detail, dict) and exc.detail.get("code") == "egress_unavailable"
-                        and attempt < 5):
+                        ):
                     _record_lifecycle(iid, "recovery_scheduled", "egress_unavailable",
                                       retry_count=attempt + 1, delay_seconds=5, card_present=True)
-                    continue
+                    if attempt < 5:
+                        continue
+                    hub.hotplug_pending[iid] = {
+                        "epoch": epoch, "iccid": inst.get("iccid"),
+                        "retry_at": time.monotonic() + 60,
+                    }
+                    _record_lifecycle(iid, "recovery_scheduled", "egress_unavailable",
+                                      retry_count=6, delay_seconds=60, card_present=True)
+                    return
                 raise
+            hub.hotplug_pending.pop(iid, None)
             hub.reset_health(iid, "hotplug_start")
             await hub.broadcast({"type": "engine", "instance": iid, "event": "hotplug_started",
                                  "args": []})
             return
     except Exception as exc:  # noqa
-        log.warning("hotplug auto-start failed for %s: %s", iid, getattr(exc, "detail", exc))
+        log.warning("hotplug auto-start failed for %s code=%s", iid, _recovery_failure_code(exc))
     finally:
         hub.hotplug_starts.discard(iid)
 
@@ -1058,16 +1183,19 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
     therefore re-check the live card monitor and the physical device's VoWiFi desired state.
     Explicit user starts keep their existing PIN/card preflight and actionable API errors.
     """
-    if not inst.get("enabled", True):
+    if not inst.get("enabled", True) or str(inst.get("id")) in hub.manual_stops:
         return False, "line_disabled"
     iid = str(inst.get("id") or "")
     iccid = str(inst.get("iccid") or "")
     cards = hub.cards_list()
     card_info = next((item for item in cards if item.get("present") and (
         (iccid and str(item.get("iccid") or "") == iccid)
-        or str(item.get("matched") or "") == iid)), None)
+        or (not iccid and str(item.get("matched") or "") == iid))), None)
     if card_info is None:
         return False, "no_card"
+    if (card_info.get("identity_state") not in (None, "confirmed")
+            or hub.lpa_busy.get(card_info.get("name"))):
+        return False, "identity_pending"
     device_id, device_type = _device_for_card(card_info, cards)
     # A native reader has no entry in device-desired.json: its VoWiFi switch is the line's
     # ``enabled`` flag checked above. Falling through to the global device default here made
@@ -1202,6 +1330,10 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
     Returns True when a running line was stopped."""
     name, idx = entry.get("name", ""), entry.get("index")
     matched, iccid = entry.get("matched"), entry.get("iccid")
+    if matched:
+        hub.manual_stops.discard(str(matched))
+        hub.hotplug_pending.pop(str(matched), None)
+        hub.hotplug_epochs[str(matched)] = hub.hotplug_epochs.get(str(matched), 0) + 1
     if iccid:
         await asyncio.to_thread(cfg.unsuppress_card, iccid)
     if not reader_unplugged:
@@ -1255,6 +1387,7 @@ async def card_monitor():
     card.wait_for_change (PnP-aware SCardGetStatusChange), so hotplug is reflected
     near-instantly without hammering pcscd."""
     first = True
+    maintenance_readers = set()
     while True:
         try:
             states = await asyncio.to_thread(card.reader_states)
@@ -1281,6 +1414,7 @@ async def card_monitor():
             except OSError:
                 pass
             if maintenance:
+                maintenance_readers.update(hub.cards)
                 # A same-name VPCD reader can already be back with a new bridge-published SIM
                 # while the broader remove/add stream is intentionally suppressed.  Ready
                 # metadata is safe to reconcile now and prevents the UI from borrowing the old
@@ -1312,6 +1446,8 @@ async def card_monitor():
                 # LPA holds the reader exclusively and enable/disable triggers REFRESH
                 # (looks like remove+insert). Keep last-known state; skip insert/remove.
                 if hub.lpa_busy.get(name):
+                    if entry is not None:
+                        entry.update(identity_state="pending", identity_reason="lpa_busy", identity_retry_at=0)
                     if entry is None:
                         hub.cards[name] = {**st, "iccid": None, "matched": None,
                                            "imsi": None, "pin_enabled": None,
@@ -1328,7 +1464,7 @@ async def card_monitor():
                         await hub.broadcast({"type": "engine", "instance": "",
                                              "event": "reader_added", "args": [name]})
                     if st["present"]:
-                        await _on_card_insert(name, st["index"])
+                        await _on_card_insert(name, st["index"], verify=not first)
                     else:
                         hub.cards[name] = {**st, "iccid": None, "matched": None,
                                            "imsi": None, "pin_enabled": None,
@@ -1353,9 +1489,18 @@ async def card_monitor():
                         changed = True
                         continue
                     if st["present"]:
-                        await _on_card_insert(name, st["index"])
+                        await _on_card_insert(name, st["index"], verify=not first)
                     else:
                         await _on_card_remove(entry)
+                    changed = True
+                    continue
+                if st["present"] and (name in maintenance_readers or (
+                        entry.get("identity_state") == "confirmed"
+                        and time.time() - float(entry.get("verified_at") or time.time()) >= 60) or (
+                        entry.get("identity_state") in {"pending", "failed"}
+                        and time.monotonic() >= float(entry.get("identity_retry_at") or 0))):
+                    maintenance_readers.discard(name)
+                    await _on_card_insert(name, st["index"], verify=True)
                     changed = True
                     continue
                 if st["present"] and await _reconcile_vpcd_card_identity(name, st["index"]):
@@ -2655,6 +2800,19 @@ def apply_health(iid, inst, st, container_id: str | None = None):
             asyncio.create_task(_auto_recover_instance(iid, inst, max(60, rint * 4)))
         return _frozen(h, st, rmax)
     if state == "STOPPED":
+        pending = hub.hotplug_pending.get(str(iid))
+        if pending:
+            allowed, reason = _line_auto_start_allowed(inst)
+            if (not allowed or pending.get("iccid") != inst.get("iccid")
+                    or pending.get("epoch") != hub.hotplug_epochs.get(str(iid), 0)):
+                hub.hotplug_pending.pop(str(iid), None)
+            else:
+                st = {**st, "reason_code": "egress_unavailable",
+                      "reason": "Waiting for the selected country exit before retrying.",
+                      "automatic_retry_in": max(0, int(pending["retry_at"] - now))}
+                if now >= pending["retry_at"] and iid not in hub.hotplug_starts:
+                    pending["retry_at"] = now + 60
+                    asyncio.create_task(_auto_start_hotplugged_line(str(iid)))
         st["retry"] = {"count": 0, "max": rmax}
         return st
     if state == "NO_CARD":
@@ -3095,9 +3253,12 @@ async def api_verify_pin(body: dict):
                                   smsc=c.smsc, reader_port=c.reader_port,
                                   carrier_identity=_carrier_identity(c))
                 inst = _match_instance_by_iccid(c.iccid)
-                if inst and _carrier_identity_update(c):
+                if inst and _verified_subscription_update(inst, c):
                     await asyncio.to_thread(cfg.upsert_instance, {
-                        "id": str(inst["id"]), **_carrier_identity_update(c)})
+                        "id": str(inst["id"]), **_verified_subscription_update(inst, c)})
+                card_entry.update(identity_state="confirmed", identity_source="card",
+                                  identity_reason="", identity_retry_at=None,
+                                  verified_at=time.time())
                 card_entry["matched"] = inst["id"] if inst else None
                 hub.cards[c.reader] = card_entry
                 res["card"] = _client_card_info(card_entry)
@@ -3244,11 +3405,17 @@ async def _esim_refresh_card(
     attempts: int = 1,
 ):
     """Re-probe USIM identity after profile enable/disable/download and broadcast."""
-    info = hub.cards.get(name) or {"index": idx, "name": name, "present": True}
+    info = dict(hub.cards.get(name) or {"index": idx, "name": name, "present": True})
     try:
         c = card_data if card_data is not None else await _esim_probe_card(
             idx, expect_iccid=expect_iccid, attempts=attempts)
+        if (not c.iccid or not c.imsi or getattr(c, "transport_error", False)
+                or (expect_iccid and c.iccid != expect_iccid)):
+            raise RuntimeError("target identity not confirmed")
         info.update(
+            identity_state="confirmed", identity_source="card", verified_at=time.time(),
+            generation=int(info.get("generation") or 0) + 1, identity_attempts=0,
+            identity_retry_at=None, identity_reason="",
             present=True, index=idx, name=name,
             iccid=c.iccid, imsi=c.imsi, mcc=c.mcc, mnc=c.mnc,
             mnc_len=getattr(c, "mnc_len", None),
@@ -3256,9 +3423,9 @@ async def _esim_refresh_card(
             carrier_identity=_carrier_identity(c),
         )
         inst = _match_instance_by_iccid(c.iccid)
-        if inst and _carrier_identity_update(c):
+        if inst and _verified_subscription_update(inst, c):
             inst = await asyncio.to_thread(cfg.upsert_instance, {
-                "id": str(inst["id"]), **_carrier_identity_update(c)})
+                "id": str(inst["id"]), **_verified_subscription_update(inst, c)})
         if not inst and c.iccid and not cfg.card_auto_create_suppressed(c.iccid):
             # REFRESH arrives while lpa_busy is set, so the normal card-insert callback
             # deliberately keeps the previous ICCID and cannot create/start the newly active
@@ -3268,10 +3435,13 @@ async def _esim_refresh_card(
     except Exception as e:  # noqa
         log.debug("post-LPA card refresh failed: %r", e)
         info.update(index=idx, name=name, present=True)
+        _identity_pending(info, "refresh_failed")
     hub.cards[name] = info
     if broadcast:
         await hub.broadcast({"type": "cards", "cards": _client_cards()})
-    if auto_start and info.get("matched"):
+    if expect_iccid and info.get("identity_state") != "confirmed":
+        raise HTTPException(409, {"code": "card_unreadable", "message": "Target profile identity is not confirmed."})
+    if auto_start and info.get("matched") and info.get("identity_state") == "confirmed":
         asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
     return info
 
@@ -3528,13 +3698,14 @@ async def _esim_refresh_modem_readers(
                 actual = str(await asyncio.to_thread(sim.read_iccid, idx) or "")
                 if actual != str(iccid):
                     raise RuntimeError(
-                        f"{sibling} reports ICCID {actual or 'unknown'}, expected {iccid}")
+                        "allocated SIM slot does not match the target profile")
             refreshed = []
             primary = None
             for sibling in active:
                 idx = readers.index(sibling)
                 info = await _esim_refresh_card(
-                    sibling, idx, card_data=card_data, auto_start=False, broadcast=False)
+                    sibling, idx, card_data=card_data, auto_start=False, broadcast=False,
+                    expect_iccid=iccid)
                 refreshed.append(sibling)
                 if sibling == name or primary is None:
                     primary = info
@@ -3599,7 +3770,8 @@ async def _esim_profile_event(
     reason_code: str = "",
 ) -> None:
     """Publish a profile-scoped update to authenticated clients already allowed its ICCID."""
-    payload = {"type": "esim_profile", "reader": reader, "iccid": iccid, "event": event}
+    payload = {"type": "esim_profile", "reader": reader, "iccid": iccid, "event": event,
+               "generation": (hub.cards.get(reader) or {}).get("generation")}
     if profile_state:
         payload["profile_state"] = profile_state
     if reason_code:
@@ -3655,7 +3827,7 @@ async def _esim_start_profile_line(
                     card_info.get("present")
                     and str(card_info.get("iccid") or "") == str(iccid)
                     for card_info in hub.cards.values())
-                if (not inst or not inst.get("enabled", True)
+                if (not inst or not inst.get("enabled", True) or iid in hub.manual_stops
                         or str(inst.get("iccid") or "") != str(iccid) or not current):
                     _record_lifecycle(
                         iid, "recovery_cancelled", "profile_changed",
@@ -3739,6 +3911,9 @@ async def _esim_run(
         finally:
             if not keep_busy:
                 hub.lpa_busy.pop(name, None)
+                info = hub.cards.get(name)
+                if info and (not refresh or info.get("identity_state") != "confirmed"):
+                    _identity_pending(info, "lpa_finished")
 
 
 @app.get("/api/cards")
@@ -3855,8 +4030,7 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
         live_name = bool(bound_name and bound_name in sim.list_readers())
     except Exception:
         live_name = False
-    modem_identity = _modem_identity_for_reader(bound_name) if live_name else None
-    modem_iccid = str((modem_identity or {}).get("iccid") or "").strip()
+    modem_iccid = _live_vpcd_iccid(bound_name) if live_name else ""
     if modem_iccid and modem_iccid != want:
         return {
             "reader": (inst.get("swu_reader") or inst.get("pin_reader")
@@ -5687,13 +5861,14 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
                     and str(item.get("iccid") or "") == str(inst.get("iccid"))]
     if inserted and inst.get("iccid") and not replacements:
         await asyncio.to_thread(cfg.suppress_card_until_removal, inst["iccid"])
-    await asyncio.to_thread(engine.stop, iid)
-    await hub.drop_ami(iid)
+    hub.manual_stops.add(str(iid))
+    await _stop_instance(str(iid), "line_deleted")
     hub.status_cache.pop(str(iid), None)
     hub.status_sampled_at.pop(str(iid), None)
     hub.health.pop(str(iid), None)
     hub._msisdn_tries.pop(str(iid), None)
     cfg.delete_instance(iid)
+    hub.manual_stops.discard(str(iid))
     await asyncio.to_thread(engine.delete_instance_data, iid)
     deleted_messages = deleted_calls = 0
     if delete_history:
@@ -5722,13 +5897,20 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
             "deleted_messages": deleted_messages, "deleted_calls": deleted_calls}
 
 
-async def _start_instance(
+async def _start_instance(iid: str, body: dict | None = None, **options):
+    lock = hub.instance_locks.setdefault(str(iid), asyncio.Lock())
+    async with lock:
+        return await _start_instance_locked(iid, body, **options)
+
+
+async def _start_instance_locked(
     iid: str,
     body: dict | None = None,
     *,
     pin_preflight_proof: dict | None = None,
     health_reason: str = "user_requested",
     engine_reason: str = "manual",
+    automatic_epoch: int | None = None,
 ):
     """Start (or restart) a line. Actively checks the SIM PIN state first: if the card
     requires a PIN and we have no valid saved one, the start is refused with a structured
@@ -5738,6 +5920,17 @@ async def _start_instance(
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
+
+    def automatic_current():
+        latest = cfg.get_instance(iid)
+        return (latest and hub.hotplug_epochs.get(iid, 0) == automatic_epoch
+                and _line_auto_start_allowed(latest)[0])
+
+    if automatic_epoch is not None and not automatic_current():
+        raise HTTPException(409, {"code": "recovery_cancelled"})
+    identity_snapshot = [(c.get("name"), c.get("generation"), c.get("iccid"))
+                         for c in hub.cards_list() if c.get("present")
+                         and c.get("iccid") == inst.get("iccid")]
 
     # eSIM-profile-switch guard: never start a line whose reader now holds a different
     # identity — EAP-AKA with mismatched IMSI/keys is guaranteed to be rejected by the
@@ -5762,6 +5955,14 @@ async def _start_instance(
         _raise_preflight_block(str(iid), pf)
     if supplied:
         inst = cfg.upsert_instance({"id": str(iid), "pin": supplied})
+
+    if automatic_epoch is not None:
+        current_snapshot = [(c.get("name"), c.get("generation"), c.get("iccid"))
+                            for c in hub.cards_list() if c.get("present")
+                            and c.get("iccid") == inst.get("iccid")]
+        if not automatic_current() or identity_snapshot != current_snapshot:
+            raise HTTPException(409, {"code": "recovery_cancelled"})
+        inst = cfg.get_instance(iid)
 
     settings = cfg.get_settings()
     dev = os.environ.get("MDD_DEV_MOUNTS", "") == "1"
@@ -5792,6 +5993,8 @@ async def _start_instance(
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid, health_reason)
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
+    if automatic_epoch is not None and not automatic_current():
+        raise HTTPException(409, {"code": "recovery_cancelled"})
     cid = await asyncio.to_thread(
         _start_engine_checked, inst, settings, dev_mounts=dev, reason=engine_reason)
     asyncio.create_task(push_status(str(iid)))
@@ -5801,6 +6004,7 @@ async def _start_instance(
 @app.post("/api/instances/{iid}/start")
 async def api_instance_start(iid: str, body: dict | None = None):
     """Public line start always performs the active SIM/PIN preflight."""
+    hub.manual_stops.discard(str(iid))
     return await _start_instance(iid, body)
 
 
@@ -5857,6 +6061,16 @@ async def _stop_instance(iid: str, cancel_reason: str) -> dict:
     """Stop one engine without pretending every internal stop disabled VoWiFi."""
     # Cancel frozen cooldown intent before stopping. Otherwise a pending health recovery can
     # recreate the line after the explicit/manual operation.
+    if cancel_reason == "user_requested":
+        hub.manual_stops.add(iid)
+    hub.hotplug_epochs[iid] = hub.hotplug_epochs.get(iid, 0) + 1
+    hub.hotplug_pending.pop(iid, None)
+    lock = hub.instance_locks.setdefault(str(iid), asyncio.Lock())
+    async with lock:
+        return await _stop_instance_locked(iid, cancel_reason)
+
+
+async def _stop_instance_locked(iid: str, cancel_reason: str) -> dict:
     hub.reset_health(iid, cancel_reason)
     await asyncio.to_thread(engine.stop, iid)
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
@@ -7400,11 +7614,11 @@ def _esim_cache_store(ses: list, imei: str):
 def _esim_cache_for_iccid(iccid: str) -> dict | None:
     if not iccid:
         return None
-    for entry in _esim_cache_load().values():
-        for se in entry.get("ses") or []:
-            if any(p.get("iccid") == iccid for p in (se.get("profiles") or [])):
-                return entry
-    return None
+    matches = [entry for entry in _esim_cache_load().values()
+               if any(p.get("iccid") == iccid for se in entry.get("ses") or []
+                      for p in se.get("profiles") or [])]
+    # A duplicated identity across cached eUICCs is not evidence of which SE is present.
+    return matches[0] if len(matches) == 1 else None
 
 
 def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
@@ -7493,11 +7707,14 @@ async def _esim_notifications_changed(
     seq: int | None = None,
     *,
     event: str = "processed",
+    generation: int | None = None,
 ) -> None:
     """Update the server cache and remove the same notification from open browser views."""
+    if generation is None:
+        generation = (hub.cards.get(reader) or {}).get("generation")
     await asyncio.to_thread(_esim_cache_remove_notifications, cache_iccid, se_id, seq)
     payload = {"type": "esim_notifications", "reader": reader,
-               "se_id": str(se_id or ""), "event": event}
+               "se_id": str(se_id or ""), "event": event, "generation": generation}
     if seq is not None:
         payload["seq"] = int(seq)
     await hub.broadcast(payload)
@@ -7509,8 +7726,9 @@ def _esim_notifications_processed_callback(
     se_id: str | None,
 ):
     """Return a callback lpac invokes only after send-and-autoremove succeeds."""
+    generation = (hub.cards.get(reader) or {}).get("generation")
     async def processed():
-        await _esim_notifications_changed(reader, cache_iccid, se_id)
+        await _esim_notifications_changed(reader, cache_iccid, se_id, generation=generation)
 
     return processed
 
@@ -7528,9 +7746,25 @@ async def api_esim_chip_cached(reader_index: int = 0, reader: str | None = None)
         return {"ok": True, "cached": False, "reader": name, "reader_index": idx}
     # Also sanitize caches written by an older release. Pending notifications cannot be
     # confirmed without touching the card and must never be presented as current cached state.
-    cached_ses = [{**se, "notifications": []} for se in (entry.get("ses") or [])]
+    # A saved profile list is not a fresh active-profile assertion. Only calibrate the
+    # unique SE containing this directly verified ICCID; other SEs remain unknown.
+    ses = entry.get("ses") or []
+    matches = [se for se in ses if any(p.get("iccid") == iccid
+                                     for p in se.get("profiles") or [])]
+    unique = len(matches) == 1 and bool(matches[0].get("eid"))
+    cached_ses = []
+    for se in ses:
+        confirmed = unique and se is matches[0]
+        profiles = [{**p, "cachedProfileState": p.get("profileState"),
+                     "profileState": ("enabled" if p.get("iccid") == iccid else "disabled")
+                     if confirmed else "unknown"}
+                    for p in se.get("profiles") or []]
+        cached_ses.append({**se, "notifications": [], "profiles": profiles,
+                           "active_state_verified": confirmed})
     return {"ok": True, "cached": True, "reader": name, "reader_index": idx,
-            "ses": cached_ses, "imei": entry.get("imei") or "",
+            "ses": cached_ses, "active_state_verified": unique,
+            "generation": (hub.cards.get(name) or {}).get("generation"),
+            "imei": entry.get("imei") or "",
             "ts": entry.get("ts") or 0}
 
 
@@ -7590,6 +7824,10 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
     switch_key, hardware_id = _esim_switch_identity(name)
     async with hub.esim_switch_lock(switch_key):
+        requested_target = _match_instance_by_iccid(iccid)
+        if requested_target:
+            # Explicitly selecting this profile is new start intent; a later Stop still wins.
+            hub.manual_stops.discard(str(requested_target["id"]))
         # Native readers have no host bridge to recycle and retain the established path.
         if not hardware_id:
             se = await asyncio.to_thread(
@@ -7608,6 +7846,9 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 await _esim_restore_profile_switch(previous)
                 await _esim_profile_event(name, iccid, "switch_failed")
                 raise
+            target = _match_instance_by_iccid(iccid)
+            if target and str(target["id"]) not in hub.manual_stops:
+                await asyncio.to_thread(cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
             await _esim_profile_event(
                 name, iccid, "enabled", profile_state="enabled")
@@ -7809,12 +8050,13 @@ async def api_esim_download(body: dict):
     se_id = se["id"]
     aid = se.get("aid")
 
+    generation = (hub.cards.get(name) or {}).get("generation")
     async def _job():
         try:
             async with hub.reader_lock(name):
                 try:
                     await hub.broadcast({
-                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "started", "step": "started", "imei": imei,
                     })
 
@@ -7823,7 +8065,7 @@ async def api_esim_download(body: dict):
                         step = (event or {}).get("step") or ""
                         data = (event or {}).get("data")
                         msg = {
-                            "type": "esim_download", "reader": name, "reader_index": idx,
+                            "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                             "se_id": se_id, "event": "progress", "step": step,
                         }
                         if isinstance(data, dict):
@@ -7849,14 +8091,14 @@ async def api_esim_download(body: dict):
                     )
                     await _esim_refresh_card(name, idx)
                     await hub.broadcast({
-                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "completed", "step": "completed",
                         "result": result, "card": hub.cards.get(name),
                     })
                 except lpa.LpaError as e:
                     # lpac puts the failing function name in message (e.g. es9p_authenticate_client).
                     err = {
-                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "error",
                         "step": (e.message or "").strip() or None,
                         "error": e.user_message(),
@@ -7865,7 +8107,7 @@ async def api_esim_download(body: dict):
                 except Exception as e:  # noqa
                     log.exception("esim download failed")
                     await hub.broadcast({
-                        "type": "esim_download", "reader": name, "reader_index": idx,
+                        "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "error", "error": str(e),
                     })
         finally:
