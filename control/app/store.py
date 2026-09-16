@@ -681,6 +681,66 @@ def add_imported_message(fingerprint: str, instance: str, direction: str, peer: 
             "ts": int(ts), "transport": transport}
 
 
+def reimport_cellular_messages(instance: str, records: list[dict]) -> list[dict] | None:
+    """Atomically restore retained modem SMS after the operator cleared this line's history.
+
+    ``None`` means visible history is not empty and no marker was changed. Every accepted row
+    is scoped to the requested line and cellular transport; malformed scanner output fails the
+    whole transaction rather than weakening the durable dedupe boundary.
+    """
+    iid = str(instance)
+    prepared = []
+    seen = set()
+    for value in records:
+        if not isinstance(value, dict) or str(value.get("instance")) != iid:
+            raise ValueError("cellular re-import record belongs to another line")
+        fingerprint = str(value.get("fingerprint") or "").lower()
+        if (len(fingerprint) != 64 or any(ch not in "0123456789abcdef" for ch in fingerprint)
+                or fingerprint in seen):
+            raise ValueError("invalid cellular re-import fingerprint")
+        direction = str(value.get("direction") or "")
+        peer, body = value.get("peer"), value.get("body")
+        ts = value.get("ts")
+        if (direction not in {"in", "out"} or not isinstance(peer, str)
+                or not isinstance(body, str) or not body.strip()
+                or isinstance(ts, bool) or not isinstance(ts, int) or ts < 0
+                or value.get("transport") != "cellular"):
+            raise ValueError("invalid cellular re-import record")
+        seen.add(fingerprint)
+        prepared.append((fingerprint, direction, peer, body, ts))
+
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT 1 FROM messages WHERE instance=? LIMIT 1", (iid,)).fetchone():
+            return None
+        if prepared:
+            placeholders = ",".join("?" for _ in prepared)
+            fingerprints = [item[0] for item in prepared]
+            conflict = c.execute(
+                f"SELECT 1 FROM message_imports WHERE instance<>? "
+                f"AND fingerprint IN ({placeholders}) LIMIT 1",
+                (iid, *fingerprints)).fetchone()
+            if conflict:
+                raise ValueError("cellular re-import fingerprint belongs to another line")
+        c.execute("DELETE FROM message_imports WHERE instance=?", (iid,))
+        restored = []
+        now = int(time.time())
+        for fingerprint, direction, peer, body, ts in prepared:
+            c.execute(
+                "INSERT INTO message_imports(fingerprint,instance,imported_ts) VALUES(?,?,?)",
+                (fingerprint, iid, now))
+            cur = c.execute(
+                "INSERT INTO messages(instance,direction,peer,body,status,ts,transport) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (iid, direction, peer, body, "ok", ts, "cellular"))
+            restored.append({
+                "id": cur.lastrowid, "instance": iid, "direction": direction,
+                "peer": peer, "body": body, "status": "ok", "error": None,
+                "ts": ts, "transport": "cellular",
+            })
+    return restored
+
+
 ALLOWANCE_FIELDS = ("balance", "valid_until", "sms_remaining", "data_remaining",
                     "voice_remaining", "activated_at")
 

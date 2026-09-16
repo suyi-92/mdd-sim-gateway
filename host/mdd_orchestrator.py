@@ -72,6 +72,11 @@ DEFAULT_DEVICE_CAPABILITIES = {
     "vowifi_enabled": True,
     "flight_mode": True,
 }
+# ModemManager OwnNumbers is only a hint and may omit the international ``+``. Add it only
+# where the SIM's home MCC and the reported leading digits independently agree. Keep this map
+# deliberately narrow: an unmatched value is preserved for IMS/manual confirmation rather than
+# guessing that an arbitrary national number is already international.
+MCC_CALLING_PREFIXES = {"515": "63"}
 
 
 def read_json(path: Path) -> dict:
@@ -1608,7 +1613,7 @@ class Orchestrator:
         return digits if digits.startswith("89") and 18 <= len(digits) <= 20 else ""
 
     @staticmethod
-    def normalize_msisdn(value: str) -> str:
+    def normalize_msisdn(value: str, home_mcc: str = "") -> str:
         """Return a conservative E.164-like number from ModemManager OwnNumbers.
 
         Modems commonly add spaces, dashes or parentheses.  Reject placeholders and
@@ -1622,7 +1627,13 @@ class Orchestrator:
             return ""
         number = ("+" if text.startswith("+") else "") + re.sub(r"\D", "", text)
         digits = number.lstrip("+")
-        return number if 5 <= len(digits) <= 20 else ""
+        if not 5 <= len(digits) <= 20:
+            return ""
+        prefix = MCC_CALLING_PREFIXES.get(str(home_mcc or "").strip())
+        if (not number.startswith("+") and prefix and digits.startswith(prefix)
+                and 10 <= len(digits) <= 15):
+            number = "+" + digits
+        return number
 
     @staticmethod
     def cellular_profile_name(device_id: str) -> str:
@@ -1649,15 +1660,19 @@ class Orchestrator:
         own_numbers = re.findall(
             r"^modem\.generic\.own-numbers\.value\[\d+\]\s*:\s*(.*?)\s*$",
             text, re.MULTILINE)
-        msisdn = next((number for raw in own_numbers
-                       if (number := self.normalize_msisdn(raw))), "")
         sim_iccid = ""
+        sim_mcc = ""
         sim_object = self._kv(text, "modem.generic.sim")
         if sim_object and sim_object not in {"--", "/"}:
             sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"])
             if sim_detail.returncode == 0:
                 sim_iccid = self.normalize_iccid(
                     self._kv(sim_detail.stdout or "", "sim.properties.iccid"))
+                sim_imsi = re.sub(
+                    r"\D", "", self._kv(sim_detail.stdout or "", "sim.properties.imsi"))
+                sim_mcc = sim_imsi[:3] if len(sim_imsi) >= 5 else ""
+        msisdn = next((number for raw in own_numbers
+                       if (number := self.normalize_msisdn(raw, sim_mcc))), "")
         # Many USB modems keep their hardware power-state at "on" after
         # ModemManager --disable.  The generic state is the authoritative RF state.
         radio_enabled = power == "on" and state not in {
@@ -1665,11 +1680,22 @@ class Orchestrator:
         operator = self._kv(text, "modem.3gpp.operator-name")
         if operator.casefold() in {"--", "unknown", "none", "n/a"}:
             operator = ""
+        access_technologies = re.findall(
+            r"^modem\.generic\.access-technologies\.value\[\d+\]\s*:\s*(.*?)\s*$",
+            text, re.MULTILINE)
+        access_technology = "/".join(
+            value.strip().lower() for value in access_technologies
+            if value.strip().lower() not in {"", "--", "unknown", "none", "n/a"})
+        packet_service = self._kv(text, "modem.3gpp.packet-service-state").lower()
+        if packet_service in {"--", "unknown", "none", "n/a"}:
+            packet_service = ""
         snapshot = {
             "available": True, "mm_object": obj, "powered": power == "on",
             "radio_enabled": radio_enabled,
             "state": state, "registration": registration,
             "operator": operator,
+            "access_technology": access_technology,
+            "packet_service": packet_service,
             "signal": int(signal) if signal.isdigit() else None,
             "primary_port": primary, "network_interface": network_port,
             "data_active": state == "connected", "apn": "", "ip": "",

@@ -15,6 +15,7 @@ CALL_SURFACE = (ROOT / "webui/src/CallSurface.jsx").read_text(encoding="utf-8")
 KEEPALIVE = (ROOT / "webui/src/views/Keepalive.jsx").read_text(encoding="utf-8")
 LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
 MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
+CELLULAR_PRESENTATION = (ROOT / "webui/src/cellularPresentation.js").read_text(encoding="utf-8")
 SIM_CONFIG = (ROOT / "webui/src/views/SimConfig.jsx").read_text(encoding="utf-8")
 SIM_SELECTOR = (ROOT / "webui/src/views/SimSelector.jsx").read_text(encoding="utf-8")
 SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
@@ -215,6 +216,22 @@ class PageRhythmTests(unittest.TestCase):
                 ("u-stop-action", ESIM)):
             self.assertIn(class_name, source)
             self.assertIn(f".{class_name}", CSS)
+
+    def test_cellular_status_separates_registration_from_the_data_bearer(self):
+        self.assertIn("cellularRegistrationDetail", UNIFIED)
+        self.assertIn("Roaming registered", CELLULAR_PRESENTATION)
+        self.assertIn("access_technology", CELLULAR_PRESENTATION)
+        self.assertIn("No data bearer", CELLULAR_PRESENTATION)
+        self.assertIn("d.cellular.packet_service === 'attached'", UNIFIED)
+        self.assertIn("registeredCellular\n      || (c.reason", UNIFIED)
+
+    def test_retained_sms_reimport_has_confirmation_and_fixed_feedback(self):
+        self.assertIn("api.reimportCellularMessages(forId)", MESSAGES)
+        self.assertIn("window.confirm(tr('Re-import SMS still retained", MESSAGES)
+        self.assertIn('u-message-reimport-feedback', MESSAGES)
+        self.assertIn('role="status"', MESSAGES)
+        feedback = css_rule(".u-message-reimport-feedback")
+        self.assertIn("min-height:20px", feedback)
 
 
 if __name__ == "__main__":

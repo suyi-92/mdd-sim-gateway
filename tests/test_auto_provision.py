@@ -556,6 +556,31 @@ class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
         drop_ami.assert_awaited_once_with("2")
         restart.assert_called_once_with(corrected, {}, False)
 
+    async def test_modemmanager_hint_can_gain_a_verified_country_prefix(self):
+        current = {"id": "2", "iccid": "card-fixture", "msisdn": "639000000000",
+                   "msisdn_source": "modemmanager"}
+        with patch.object(main.device_state, "status", return_value={"devices": {"modem": {
+                "cellular": {"msisdn": "+639000000000", "sim_iccid": "card-fixture"}}}}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=current), \
+                patch.object(main.cfg, "upsert_instance", return_value={
+                    **current, "msisdn": "+639000000000"}) as upsert, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()), \
+                patch.object(main.hub, "ami", {}):
+            await main.sync_modem_msisdns()
+        upsert.assert_called_once_with({
+            "id": "2", "msisdn": "+639000000000", "msisdn_source": "modemmanager"})
+
+    async def test_modemmanager_sync_never_overwrites_a_manual_number(self):
+        current = {"id": "2", "iccid": "card-fixture", "msisdn": "+639000000001",
+                   "msisdn_source": "manual"}
+        with patch.object(main.device_state, "status", return_value={"devices": {"modem": {
+                "cellular": {"msisdn": "+639000000000", "sim_iccid": "card-fixture"}}}}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=current), \
+                patch.object(main.cfg, "upsert_instance") as upsert, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main.sync_modem_msisdns()
+        upsert.assert_not_called()
+
 
 class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
     @patch.object(main, "_modem_reader_binding")

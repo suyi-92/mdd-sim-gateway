@@ -586,6 +586,9 @@ class Hub:
         # ``auto`` requests must not both decide that the preferred route is unavailable and
         # submit the same user action through different transports.
         self.sms_send_locks: dict[str, asyncio.Lock] = {}
+        # The background importer and an explicit retained-SMS re-import must not race while
+        # replacing durable fingerprints. SQLite remains the final atomic dedupe boundary.
+        self.cellular_sms_lock = asyncio.Lock()
         # Per-line exit failover ledger. Persisted: a control-plane restart must not
         # re-announce a give-up it already reported, nor re-walk an exhausted pool.
         self.exit_ledgers: dict[str, dict] = _load_exit_ledgers()
@@ -1763,9 +1766,17 @@ async def sync_modem_msisdns():
         if not msisdn or not sim_iccid:
             continue
         inst = _match_instance_by_iccid(sim_iccid)
-        if not inst or inst.get("msisdn"):
+        if not inst:
             continue
         iid = str(inst["id"])
+        stored = str(inst.get("msisdn") or "").strip()
+        source = str(inst.get("msisdn_source") or "")
+        # A manual/IMS identity is authoritative. A ModemManager hint may be corrected later
+        # when host-side MCC evidence proves that only the leading international '+' was lost.
+        if stored and source != "modemmanager":
+            continue
+        if stored == msisdn and source == "modemmanager":
+            continue
         cfg.upsert_instance({"id": iid, "msisdn": msisdn,
                              "msisdn_source": "modemmanager"})
         client = hub.ami.get(iid)
@@ -2335,32 +2346,40 @@ def _save_host_alert_state(state: dict) -> None:
         log.debug("cannot persist host alert state: %r", exc)
 
 
+async def _publish_cellular_sms(discovered: list[dict], *, notify: bool = True) -> int:
+    """Persist discovered modem SMS and publish them without exposing their contents in logs."""
+    imported = 0
+    for item in discovered:
+        rec = await asyncio.to_thread(
+            store.add_imported_message, item["fingerprint"], item["instance"],
+            item["direction"], item["peer"], item["body"], item["ts"],
+            item["transport"])
+        if not rec:
+            continue
+        imported += 1
+        await hub.broadcast({"type": "sms", "instance": rec["instance"],
+                             "message": rec})
+        if notify and rec["direction"] == "in":
+            await asyncio.to_thread(_harvest_allowance_reply, rec["instance"], rec["peer"])
+            _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
+                           rec["peer"], rec["body"])
+    return imported
+
+
 async def cellular_sms_poller():
     """Import SMS received by the 4G modem even when its VoWiFi engine is stopped."""
     scanner = cellular_sms.Scanner(local_sms_tracker=store)
     while True:
         try:
-            # One config read serves both the line list and the scanner's policy flag, so the
-            # operator's choice takes effect without restarting the control plane.
-            conf = await asyncio.to_thread(cfg.load)
-            scanner.drop_mms_wap_push = bool(
-                (conf.get("settings") or {}).get("drop_mms_wap_push", True))
-            discovered = await asyncio.to_thread(
-                scanner.discover, list((conf.get("instances") or {}).values()))
-            for item in discovered:
-                rec = await asyncio.to_thread(
-                    store.add_imported_message, item["fingerprint"], item["instance"],
-                    item["direction"], item["peer"], item["body"], item["ts"],
-                    item["transport"])
-                if not rec:
-                    continue
-                await hub.broadcast({"type": "sms", "instance": rec["instance"],
-                                     "message": rec})
-                if rec["direction"] == "in":
-                    await asyncio.to_thread(_harvest_allowance_reply, rec["instance"],
-                                            rec["peer"])
-                    _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
-                                   rec["peer"], rec["body"])
+            async with hub.cellular_sms_lock:
+                # One config read serves both the line list and the scanner's policy flag, so
+                # the operator's choice takes effect without restarting the control plane.
+                conf = await asyncio.to_thread(cfg.load)
+                scanner.drop_mms_wap_push = bool(
+                    (conf.get("settings") or {}).get("drop_mms_wap_push", True))
+                discovered = await asyncio.to_thread(
+                    scanner.discover, list((conf.get("instances") or {}).values()))
+                await _publish_cellular_sms(discovered)
         except Exception as exc:  # noqa
             log.debug("cellular SMS poll failed: %r", exc)
         await asyncio.sleep(5)
@@ -4710,6 +4729,8 @@ async def _unified_devices() -> list[dict]:
                     cell_actual, cell_reason = "error", "Cellular radio is not enabled"
                 cellular_view = {
                     "registration": registration, "operator": host_cell.get("operator") or "",
+                    "access_technology": host_cell.get("access_technology") or "",
+                    "packet_service": host_cell.get("packet_service") or "",
                     "signal": host_cell.get("signal"), "apn": host_cell.get("apn") or "",
                     "ip": host_cell.get("ip") or "",
                     "data_active": bool(host_cell.get("data_active")),
@@ -6212,6 +6233,49 @@ async def api_messages_delete(iid: str, body: dict):
         raise HTTPException(400, "provide ids, peer, or all")
     await hub.broadcast({"type": "sms", "instance": str(iid), "deleted": n})
     return {"ok": True, "deleted": n}
+
+
+@app.post("/api/instances/{iid}/messages/reimport-cellular")
+async def api_messages_reimport_cellular(iid: str, body: dict):
+    """Restore displayable SMS still retained by this line's live cellular modem.
+
+    Existing history must be empty. This prevents a recovery action from duplicating rows that
+    are already visible, while the exact line-id confirmation keeps one line from resetting
+    another line's durable deletion markers.
+    """
+    if str(body.get("confirm_id") or "") != str(iid):
+        raise HTTPException(400, "confirm_id must exactly match the SIM line id")
+    inst = cfg.get_instance(iid)
+    if not inst:
+        raise HTTPException(404, "no such instance")
+    instances = cfg.list_instances()
+    modem_path, problem = await asyncio.to_thread(
+        cellular_sms.modem_for_instance, instances, iid)
+    if not modem_path:
+        raise HTTPException(409, {"code": "cellular_unavailable", "message": problem})
+    async with hub.cellular_sms_lock:
+        settings = cfg.get_settings()
+        scanner = cellular_sms.Scanner(
+            local_sms_tracker=store,
+            drop_mms_wap_push=bool(settings.get("drop_mms_wap_push", True)))
+        discovered = await asyncio.to_thread(scanner.discover, [inst])
+        try:
+            restored = await asyncio.to_thread(
+                store.reimport_cellular_messages, iid, discovered)
+        except ValueError:
+            raise HTTPException(409, {
+                "code": "message_import_conflict",
+                "message": "Retained modem SMS are already associated with another line.",
+            }) from None
+        if restored is None:
+            raise HTTPException(409, {
+                "code": "message_history_not_empty",
+                "message": "Clear this line's visible message history before re-importing retained modem SMS.",
+            })
+        for rec in restored:
+            await hub.broadcast({"type": "sms", "instance": rec["instance"],
+                                 "message": rec})
+    return {"ok": True, "imported": len(restored), "retained": len(discovered)}
 
 
 SMS_RESP_RE = re.compile(r"Received SIP response")

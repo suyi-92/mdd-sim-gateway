@@ -312,6 +312,16 @@ def _find_modem(iccid: str, runner, timeout: float, *,
     return None, "No cellular modem matches this line's ICCID or IMSI."
 
 
+def modem_for_instance(instances: list[dict], instance_id, runner=subprocess.run,
+                       timeout: float = 10.0) -> tuple[str | None, str | None]:
+    """Resolve one configured line to its live modem without exposing subscriber identity."""
+    iccid = _instance_iccid(instances, instance_id)
+    if not iccid:
+        return None, "The line has no configured ICCID."
+    return _find_modem(iccid, runner, timeout,
+                       imsi=_instance_imsi(instances, instance_id))
+
+
 def _created_sms_path(result) -> str:
     doc = _decode_json(result)
     modem = doc.get("modem") or {}

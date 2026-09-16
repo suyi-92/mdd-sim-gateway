@@ -25,11 +25,15 @@ const devices = [
       carrier: { name: 'Fixture Mobile', home_network: 'EE', current_network: 'Visited Network', plmn: '234-33' } },
     egress: { country: 'gb', detected_country: 'gb', node: 'GB Fixture Node', mode: 'manual', ready: true },
     capabilities: { vowifi: { desired: true, actual: 'on' } } },
-  { id: 'reader-2', instance_id: '2', device_type: 'reader', present: true,
-    name: 'Travel reader', sim: { present: true, number: '+1555**7654#',
+  { id: 'modem-2', instance_id: '2', device_type: 'modem', present: true,
+    name: 'Travel modem', sim: { present: true, number: '+1555**7654#',
       carrier: { name: 'Fixture Wireless', home_network: 'Fixture Host', plmn: '310-280' } },
+    cellular: { registration: 'roaming', access_technology: 'lte', operator: 'Visited Fixture',
+      signal: 78, packet_service: 'attached', data_active: false },
     egress: { country: 'us', detected_country: 'us', node: '', mode: 'direct', ready: true },
-    capabilities: { vowifi: { desired: true, actual: 'on' } } },
+    capabilities: { cellular: { desired: false, actual: 'off',
+      reason: 'Mobile data is disconnected; the modem radio can remain registered to the cellular network.' },
+      flight: { desired: false, actual: 'off' }, vowifi: { desired: true, actual: 'on' } } },
 ]
 
 const writes = []
@@ -52,6 +56,9 @@ const server = http.createServer((request, response) => {
     if (/\/voicemails$/.test(url.pathname)) return json(response, { voicemails: [] })
     if (/\/messages\/threads$/.test(url.pathname)) return json(response, { threads: [] })
     if (/\/messages\/binary$/.test(url.pathname)) return json(response, { payloads: [] })
+    if (/\/messages\/reimport-cellular$/.test(url.pathname)) {
+      return json(response, { ok: true, imported: 2, retained: 2 })
+    }
     return json(response, values[url.pathname] || {})
   }
   const file = path.resolve(dist, '.' + (url.pathname === '/' ? '/index.html' : url.pathname))
@@ -153,6 +160,10 @@ server.on('upgrade', (_request, socket) => socket.destroy())
 
     await page.goto(origin + '/#/messages')
     await verifyFirstLine('messages')
+    await page.locator('.u-line-selector:visible select').selectOption('2')
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '重新导入模块保留短信' }).click()
+    await page.getByText('已重新导入 2 条模块保留短信。', { exact: true }).waitFor()
     for (const width of [3420, 2048, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
@@ -173,9 +184,21 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.screenshot({ path: path.join(output, `overview-${width}.png`), fullPage: true, animations: 'disabled' })
     }
 
+    await page.goto(origin + '/#/devices')
+    await page.getByText('Travel modem', { exact: true }).click()
+    const registered = page.getByText(
+      '漫游已注册 · LTE · Visited Fixture · 信号 78% · 无数据承载', { exact: true })
+    await registered.waitFor()
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `device status overflow at ${width}px`)
+      await page.screenshot({ path: path.join(output, `device-status-${width}.png`), fullPage: true, animations: 'disabled' })
+    }
+
     assert.deepEqual(errors, [])
-    assert.deepEqual(writes, [])
-    console.log('PASS: five compact details, vmware.2 selector masking, exact copy, and 3420/2048/1440/900/390px layouts; fixture API only')
+    assert.deepEqual(writes, [['POST', '/api/instances/2/messages/reimport-cellular']])
+    console.log('PASS: line details, retained-SMS confirmation, registered-without-bearer status, and wide/narrow layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))

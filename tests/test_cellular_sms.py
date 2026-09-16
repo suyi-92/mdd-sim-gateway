@@ -1,12 +1,13 @@
 import json
+import asyncio
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from control.app import cellular_sms, store
+from control.app import cellular_sms, main, store
 
 TEST_EPOCH = "a" * 64
 MODEM = "/org/freedesktop/ModemManager1/Modem/0"
@@ -775,6 +776,83 @@ class CellularSmsTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(calls[0][0][0], "busctl")
         self.assertEqual(calls[0][1]["timeout"], 3)
+
+
+class CellularSmsReimportStoreTests(unittest.TestCase):
+    def test_empty_history_can_atomically_restore_retained_cellular_sms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                store.clear_messages("3")
+                records = [
+                    {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                     "peer": "+15550001", "body": "old", "ts": 1,
+                     "transport": "cellular"},
+                    {"fingerprint": "b" * 64, "instance": "3", "direction": "in",
+                     "peer": "+15550002", "body": "new", "ts": 2,
+                     "transport": "cellular"},
+                ]
+                restored = store.reimport_cellular_messages("3", records)
+                self.assertEqual(len(restored), 2)
+                with sqlite3.connect(db_path) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM messages WHERE instance='3'").fetchone()[0], 2)
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM message_imports WHERE instance='3'").fetchone()[0], 2)
+
+    def test_visible_history_blocks_reimport_without_changing_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "visible", 1, "cellular")
+                result = store.reimport_cellular_messages("3", [])
+                self.assertIsNone(result)
+                with sqlite3.connect(db_path) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM message_imports WHERE instance='3'").fetchone()[0], 1)
+
+
+class CellularSmsReimportApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reimport_requires_exact_line_confirmation(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.api_messages_reimport_cellular("3", {"confirm_id": "2"})
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_reimport_is_scoped_and_does_not_send_old_message_notifications(self):
+        inst = {"id": "3", "iccid": "card-a", "imsi": "00101"}
+        discovered = [{"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                       "peer": "+15550001", "body": "retained", "ts": 1,
+                       "transport": "cellular"}]
+        restored = [{"id": 7, **{key: value for key, value in discovered[0].items()
+                                  if key != "fingerprint"}, "status": "ok", "error": None}]
+        scanner = Mock()
+        scanner.discover.return_value = discovered
+        with patch.object(main.cfg, "get_instance", return_value=inst), \
+                patch.object(main.cfg, "list_instances", return_value=[inst]), \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main.cellular_sms, "modem_for_instance",
+                             return_value=(MODEM, None)), \
+                patch.object(main.cellular_sms, "Scanner", return_value=scanner), \
+                patch.object(main.store, "reimport_cellular_messages",
+                             return_value=restored) as reimport, \
+                patch.object(main.hub, "cellular_sms_lock", asyncio.Lock()), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast, \
+                patch.object(main, "_dispatch_push") as push:
+            result = await main.api_messages_reimport_cellular("3", {"confirm_id": "3"})
+        self.assertEqual(result, {"ok": True, "imported": 1, "retained": 1})
+        scanner.discover.assert_called_once_with([inst])
+        reimport.assert_called_once_with("3", discovered)
+        broadcast.assert_awaited_once()
+        push.assert_not_called()
 
 
 if __name__ == "__main__":

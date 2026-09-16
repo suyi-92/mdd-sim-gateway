@@ -377,9 +377,11 @@ modem.generic.ports.value[1] : cdc-wdm1 (qmi)
 modem.generic.ports.value[2] : wwan1 (net)
 modem.generic.state : connected
 modem.generic.power-state : on
+modem.generic.access-technologies.value[1] : lte
 modem.generic.signal-quality.value : 77
 modem.3gpp.operator-name : Example
 modem.3gpp.registration-state : roaming
+modem.3gpp.packet-service-state : attached
 modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/9
 """
             bearer = """bearer.status.connected : yes
@@ -393,7 +395,8 @@ bearer.stats.tx-bytes : 456
                     return SimpleNamespace(returncode=0, stdout=modem_detail, stderr="")
                 if args[:2] == ["mmcli", "-i"]:
                     return SimpleNamespace(returncode=0,
-                                           stdout="sim.properties.iccid : 8901000000000000001\n",
+                                           stdout=("sim.properties.iccid : 8901000000000000001\n"
+                                                   "sim.properties.imsi : 31001\n"),
                                            stderr="")
                 if args[:2] == ["mmcli", "-b"]:
                     return SimpleNamespace(returncode=0, stdout=bearer, stderr="")
@@ -410,6 +413,8 @@ bearer.stats.tx-bytes : 456
             self.assertEqual(value["rx_bytes"], 123)
             self.assertEqual(value["msisdn"], "+12025550100")
             self.assertEqual(value["sim_iccid"], "8901000000000000001")
+            self.assertEqual(value["access_technology"], "lte")
+            self.assertEqual(value["packet_service"], "attached")
 
     def _orchestrator_calls(self, method, snapshot, *, exists=True, active=(), **kwargs):
         with tempfile.TemporaryDirectory() as temp:
@@ -592,6 +597,16 @@ modem.generic.power-state : on
         self.assertEqual(Orchestrator.normalize_msisdn("--"), "")
         self.assertEqual(Orchestrator.normalize_msisdn("not available"), "")
         self.assertEqual(Orchestrator.normalize_msisdn("+44 7700-900123"), "+447700900123")
+
+    def test_ph_modem_number_adds_plus_only_when_mcc_and_prefix_agree(self):
+        self.assertEqual(Orchestrator.normalize_msisdn("63 900-000-0000", "515"),
+                         "+639000000000")
+        self.assertEqual(Orchestrator.normalize_msisdn("63 900-000-0000", "460"),
+                         "639000000000")
+        self.assertEqual(Orchestrator.normalize_msisdn("0900-000-0000", "515"),
+                         "09000000000")
+        self.assertEqual(Orchestrator.normalize_msisdn("63" + "1" * 14, "515"),
+                         "63" + "1" * 14)
 
     def test_modem_snapshot_retains_apn_from_disconnected_bearer(self):
         with tempfile.TemporaryDirectory() as temp:

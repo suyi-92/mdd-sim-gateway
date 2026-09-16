@@ -211,6 +211,8 @@ export const api = {
   runKeepalive: (id) => j('POST', `/api/instances/${id}/keepalive/run`),
   // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
   deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
+  reimportCellularMessages: (id) => j(
+    'POST', `/api/instances/${id}/messages/reimport-cellular`, { confirm_id: String(id) }),
 
   voicemails: (id) => j('GET', `/api/instances/${id}/voicemails`),
   // Served as audio/wav by the control plane; the <audio> element fetches it directly
