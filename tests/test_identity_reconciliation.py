@@ -96,6 +96,87 @@ class CardRetryTests(unittest.IsolatedAsyncioTestCase):
                              (False, 'identity_pending'))
         lock.release()
 
+    async def test_forced_verify_reuses_running_engine_identity_without_apdu(self):
+        import asyncio
+        name = 'fixture-reader'
+        inst = {'id': 'line', 'iccid': 'fixture-card', 'imsi': '001010000000001',
+                'mcc': '001', 'mnc': '01', 'smsc': '', 'carrier_identity': {}}
+        previous = {'name': name, 'index': 0, 'present': True, 'iccid': 'fixture-card',
+                    'matched': 'line', 'identity_state': 'confirmed', 'generation': 1}
+        with patch.object(main.hub, 'cards', {name: previous}), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                patch.object(main, '_find_running_by_reader', return_value=inst), \
+                patch.object(main.engine, 'read_run_json', return_value={
+                    'state': 'PIN_DISABLED', 'reader': name, 'iccid': 'fixture-card'}), \
+                patch.object(main.sim, 'read_card') as read, \
+                patch.object(main, '_probe_inserted_card', new=AsyncMock()) as cold, \
+                patch.object(main, '_auto_start_hotplugged_line', new=AsyncMock()) as start:
+            await main._on_card_insert_locked(name, 0, verify=True, retire=[])
+            await asyncio.sleep(0)
+            observed = dict(main.hub.cards[name])
+        read.assert_not_called()
+        cold.assert_not_awaited()
+        start.assert_awaited_once_with('line')
+        self.assertEqual(observed['identity_state'], 'confirmed')
+        self.assertEqual(observed['identity_source'], 'running_session')
+
+    async def test_running_identity_change_stops_owner_before_idle_reprobe(self):
+        name = 'fixture-reader'
+        inst = {'id': 'line', 'iccid': 'old-card', 'imsi': '001010000000001'}
+        previous = {'name': name, 'index': 0, 'present': True, 'iccid': 'old-card',
+                    'matched': 'line', 'identity_state': 'confirmed', 'generation': 1}
+        with patch.object(main.hub, 'cards', {name: previous}), \
+                patch.object(main.hub, 'reader_locks', {}), \
+                patch.object(main.hub, 'card_probes', {}), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                patch.object(main, '_find_running_by_reader', return_value=inst), \
+                patch.object(main.engine, 'read_run_json', return_value={
+                    'state': 'WRONG_CARD', 'reader': name, 'iccid': 'replacement-card'}), \
+                patch.object(main.sim, 'read_card') as read, \
+                patch.object(main, '_probe_inserted_card', new=AsyncMock()) as cold, \
+                patch.object(main, '_stop_instance', new=AsyncMock()) as stop:
+            await main._on_card_insert(name, 0, verify=True)
+            observed = dict(main.hub.cards[name])
+        read.assert_not_called()
+        cold.assert_not_awaited()
+        stop.assert_awaited_once_with('line', 'card_identity_changed')
+        self.assertEqual(observed['identity_state'], 'pending')
+        self.assertEqual(observed['identity_reason'], 'running_identity_changed')
+
+    async def test_missing_running_status_waits_without_falling_through_to_apdu(self):
+        name = 'fixture-reader'
+        inst = {'id': 'line', 'iccid': 'fixture-card', 'imsi': '001010000000001'}
+        previous = {'name': name, 'index': 0, 'present': True, 'iccid': 'fixture-card',
+                    'matched': 'line', 'identity_state': 'confirmed', 'generation': 1}
+        with patch.object(main.hub, 'cards', {name: previous}), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                patch.object(main, '_find_running_by_reader', return_value=inst), \
+                patch.object(main.engine, 'read_run_json', return_value=None), \
+                patch.object(main.sim, 'read_card') as read, \
+                patch.object(main, '_probe_inserted_card', new=AsyncMock()) as cold:
+            await main._on_card_insert_locked(name, 0, verify=True, retire=[])
+            observed = dict(main.hub.cards[name])
+        read.assert_not_called()
+        cold.assert_not_awaited()
+        self.assertEqual(observed['identity_state'], 'pending')
+        self.assertEqual(observed['identity_reason'], 'running_card_unavailable')
+
+    def test_confirmed_identity_has_no_periodic_apdu_retry(self):
+        with patch.object(main.time, 'monotonic', return_value=100):
+            self.assertFalse(main._identity_retry_due({
+                'identity_state': 'confirmed', 'identity_retry_at': 0,
+                'verified_at': main.time.time() - 3600,
+            }))
+            self.assertFalse(main._identity_retry_due({
+                'identity_state': 'pending', 'identity_retry_at': 101,
+            }))
+            self.assertTrue(main._identity_retry_due({
+                'identity_state': 'pending', 'identity_retry_at': 99,
+            }))
+
 
 class CachedProfileEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_current_card_calibrates_only_its_unique_se(self):

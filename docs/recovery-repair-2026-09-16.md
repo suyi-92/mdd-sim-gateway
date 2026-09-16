@@ -2,7 +2,8 @@
 
 开发基线：`vmware` / `4fabd94e3d9f2379b4251f65e257d284237cafe4` / `1.9.4-vmware.6`。
 开始时工作树干净。开发阶段仅修改开发 checkout，未变更正式配置、驱动、服务和线路。
-后续用户已授权提交、推送和受管更新；交付版本为 `1.9.4-vmware.7`。
+后续用户已授权提交、推送和受管更新；`1.9.4-vmware.7` 部署后暴露实机回归，修复目标版本为
+`1.9.4-vmware.8`。
 
 ## 源码证据与处理
 
@@ -57,10 +58,31 @@ DJI/Quectel 原 profile 与 PH profile 切换三轮及另一条健康线路隔�
 具备条件后再独立验证普通号码呼入/呼出、双向音频和短信。
 本轮自动测试和构建不能替代这些验收；未操作生产也不能据此宣称现场已经恢复。
 
+## 1.9.4-vmware.7 实机回归与 .8 修复
+
+`.7` 正式激活后，Control 对所有已确认 reader 每 60 秒执行完整 APDU 身份复核。该路径用
+`verify=True` 绕过了运行中 Engine 的 reader 所有权保护，真实 SCR Prime 因第二个卡会话出现
+`card_unreadable`、假移除和 Engine 重建；同一轮询也反复连接 VPCD slot，最终出现 channel reset
+失败及基带 `PhoneFailure`。首次失败前没有 eSIM/profile 写请求，USB 设备仍在场。
+
+`.8` 删除已确认卡的定时 APDU 轮询，只保留首次发现、真实 present 边沿、maintenance 后检查和
+未确认身份退避。强制检查命中运行中 Engine 时读取其 `pin_status` 已发布的实时 ICCID，不再打开
+第二个 PC/SC 会话；现场 ICCID 不一致时先按既有锁顺序停止旧 Engine，再由空闲 reader 完整重探。
+这样保留换卡 fail-closed 语义，同时避免干扰 Engine、VPCD bridge、IKE 和 SIP 的成组 APDU。
+
+`.8` 已通过 Shell 语法、Python compileall、差异格式和订阅者标识扫描；身份协调目标测试 16 项、
+完整 Python unittest 1481 项（2 项环境跳过）通过。WebUI 锁文件安装、10 项 prebuild 测试和 Vite
+生产构建通过，npm 审计无漏洞。提交专属 amd64 `--pull --no-cache` Engine 构建通过：版本
+`1.9.4-vmware.8`、Architecture `amd64`、Asterisk 20.7.0、128 项模块及摘要、runtime/base 指纹、
+Python 依赖和 `/dev/net/tun + NET_ADMIN` 最小门禁均匹配。正式更新与实机稳定性结果仍待执行，
+不沿用 `.7` 的构建或运行结果。
+
 ## 交付阶段
 
-用户已授权推送并更新。提交前远端刷新成功，开发基线与 `origin/vmware` 无分叉。
-当前执行环境的 `no-new-privileges` 阻止 sudo 提权，`sudo -n /usr/local/sbin/mddctl doctor --json`
-在预检阶段被拒绝；正式更新与部署后验收因此未执行，不能记为已部署。
-不通过其他入口绕过权限限制；需在允许 sudo 的本机终端执行受管 `sudo mddctl update --yes`。
-前述无缓存镜像验证属于开发基线版本，正式交付提交的产物必须由受管更新重新构建并核验。
+用户在允许 sudo 的普通终端执行受管更新后，`.7` 于 2026-09-16 11:28 激活；正式 Engine、Control
+和 WebUI 均切到该提交。随后只读现场证据确认上述周期 APDU 实机回归，不能把 systemd active、
+HTTPS 200 或短暂重新注册当作健康验收。
+
+用户已授权完整修复、推送并再次受管更新。`.8` 提交前远端刷新成功，开发分支与
+`origin/vmware` 无分叉；正式更新仍只能从允许 sudo 的普通终端运行
+`sudo /usr/local/sbin/mddctl update --yes`，不得手工改正式 checkout、数据或激活 symlink。

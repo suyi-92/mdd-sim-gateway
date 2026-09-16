@@ -150,6 +150,12 @@ def _identity_pending(info: dict, reason: str) -> None:
              info.get("generation", 0), reason, delay)
 
 
+def _identity_retry_due(info: dict) -> bool:
+    """Retry only an unresolved read; confirmed cards are edge-driven, never polled."""
+    return (info.get("identity_state") in {"pending", "failed"}
+            and time.monotonic() >= float(info.get("identity_retry_at") or 0))
+
+
 def _carrier_description(inst: dict | None, card_info: dict | None,
                          cellular: dict | None = None) -> dict:
     """Resolve a safe display value; never return IMSI, ICCID, SPN or GID."""
@@ -877,7 +883,8 @@ async def _on_card_insert_locked(name, idx, *, verify=False, retire=None):
                 identity_state="pending")
     if verify:
         info.update({key: previous.get(key) for key in
-                     ("iccid", "imsi", "matched", "mcc", "mnc", "smsc")})
+                     ("iccid", "imsi", "matched", "mcc", "mnc", "mnc_len", "smsc",
+                      "carrier_identity", "pin_enabled", "pin_tries")})
     hub.cards[name] = info
     if hub.lpa_busy.get(name):
         info.update({key: previous.get(key) for key in
@@ -885,14 +892,31 @@ async def _on_card_insert_locked(name, idx, *, verify=False, retire=None):
         _identity_pending(info, "lpa_busy")
         return
     # A running engine may already hold this card (manager restart, or pcscd flapped
-    # while the engine kept running) — probing it could clash with the engine's card
-    # access. Always map the reader to the running instance whose pin_keeper reports
-    # using THIS reader name first, and only probe when no running engine claims it.
+    # while the engine kept running) — probing it would race the Engine's multi-APDU
+    # transactions. Always map the reader to the running instance whose pin_keeper reports
+    # using THIS reader name first, including maintenance verification and failed-read retries.
+    # pin_keeper already publishes the ICCID it read while opening its held connection; use
+    # that non-invasive evidence to detect a replacement card. If it differs, retire the old
+    # Engine after releasing this reader lock and let the ordinary pending retry perform the
+    # complete subscription read only after the reader is idle.
     # Also skip probing while an LPA (lpac) operation holds the reader exclusively —
     # profile enable/disable triggers eUICC REFRESH that looks like remove+insert.
     inst = await asyncio.to_thread(
         _find_running_by_reader, name, info.get("reader_port"), require_port_match=True)
-    if inst is not None and not verify:
+    if inst is not None:
+        pin_status = await asyncio.to_thread(
+            engine.read_run_json, str(inst["id"]), "pin_status.json") or {}
+        expected_iccid = str(inst.get("iccid") or "").strip()
+        running_iccid = str(pin_status.get("iccid") or "").strip()
+        if running_iccid and expected_iccid and running_iccid != expected_iccid:
+            _identity_pending(info, "running_identity_changed")
+            if retire is not None:
+                retire.append(str(inst["id"]))
+            return
+        if (not pin_status or str(pin_status.get("state") or "")
+                in {"NO_CARD", "NO_READER", "ERROR", "WRONG_CARD"}):
+            _identity_pending(info, "running_card_unavailable")
+            return
         info.update(identity_state="confirmed", identity_source="running_session",
                     verified_at=time.time(), iccid=inst.get("iccid"), imsi=inst.get("imsi"), matched=inst["id"],
                     smsc=inst.get("smsc"), mcc=inst.get("mcc"), mnc=inst.get("mnc"),
@@ -1494,11 +1518,8 @@ async def card_monitor():
                         await _on_card_remove(entry)
                     changed = True
                     continue
-                if st["present"] and (name in maintenance_readers or (
-                        entry.get("identity_state") == "confirmed"
-                        and time.time() - float(entry.get("verified_at") or time.time()) >= 60) or (
-                        entry.get("identity_state") in {"pending", "failed"}
-                        and time.monotonic() >= float(entry.get("identity_retry_at") or 0))):
+                if st["present"] and (name in maintenance_readers
+                                      or _identity_retry_due(entry)):
                     maintenance_readers.discard(name)
                     await _on_card_insert(name, st["index"], verify=True)
                     changed = True
