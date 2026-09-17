@@ -66,6 +66,7 @@ const server = http.createServer((request, response) => {
       '/api/devices': { devices, discovering },
       '/api/instances': { instances: [] },
       '/api/cards': { cards: [] },
+      '/api/devices/modem-fixture/cellular/network-operation': { context: 'fixture-context', networks: [], operation: null },
       '/api/system/status': { version: 'fixture', repository_url: 'https://example.invalid/repo' },
     }
     response.writeHead(200, { 'Content-Type': 'application/json' })
@@ -115,7 +116,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const sidebarAfter = await page.locator('.u-device-sidebar').boundingBox()
     assert.equal(sidebarAfter.height, sidebarBefore.height, 'discovery feedback must keep its reserved height')
     await page.getByRole('button', { name: '硬件', exact: true }).click()
-    const deviceDetection = page.locator('.u-hardware-detection').getByRole('button', { name: '重新检测此设备', exact: true })
+    const deviceDetection = page.locator('.u-device-toolbar .u-device-rescan').getByRole('button', { name: '重新检测此设备', exact: true })
     const detectionBefore = await deviceDetection.boundingBox()
     assert.ok(detectionBefore.width <= 130, 'single-device action must stay compact')
     assert.equal(await page.locator('.u-device-sidebar-footer button').count(), 0)
@@ -132,7 +133,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false,
         `device content is clipped at ${width}px`)
       await page.screenshot({ path: path.join(output, `detection-controls-${width}.png`), fullPage: true, animations: 'disabled' })
-      await page.locator('.u-hardware-detection').screenshot({
+      await page.locator('.u-device-toolbar .u-device-rescan').screenshot({
         path: path.join(output, `device-detection-row-${width}.png`), animations: 'disabled' })
     }
     await page.screenshot({ path: path.join(output, 'connected.png'), fullPage: true, animations: 'disabled' })

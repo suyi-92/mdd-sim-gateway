@@ -27,7 +27,25 @@ class CellularNetworkCommandTests(unittest.TestCase):
 
     def transaction(self, scan_reply, selection="+COPS: 0", restore_reply=None):
         return [self.metadata(), self.cops_reply(selection), self.cops_reply(""),
-                scan_reply, restore_reply if restore_reply is not None else self.cops_reply("")]
+                scan_reply, *self.restore_replies(selection, restore_reply)]
+
+    def restore_replies(self, selection="+COPS: 0", restore_reply=None):
+        reply = restore_reply if restore_reply is not None else self.cops_reply("")
+        if selection.startswith("+COPS: 4"):
+            return [reply]
+        manual = selection.startswith("+COPS: 1")
+        operator = selection.split('"')[1] if manual else "00101"
+        state = lambda value, code: self.reply(json.dumps({"modem": {"3gpp": {
+            "registration-state": value, "operator-code": code}}}))
+        return ([state("idle", "")] if not manual else []) + [
+            self.reply(), self.cops_reply(""), reply,
+            *([state("idle", "")] if reply.returncode else [state("roaming", operator)] * 3),
+            self.metadata(), self.cops_reply("+COPS: 2" if reply.returncode else selection),
+        ]
+
+    @staticmethod
+    def at_commands(runner):
+        return [c.args[0][-2] for c in runner.call_args_list if c.args[0][0] == "busctl"]
 
     def test_scan_parser_merges_technologies_and_orders_current_first(self):
         output = """  ---------------------
@@ -72,9 +90,9 @@ class CellularNetworkCommandTests(unittest.TestCase):
             "org.freedesktop.ModemManager1", MODEM,
             "org.freedesktop.ModemManager1.Modem", "Command", "su", "AT+COPS=?", "315"])
         self.assertEqual(kwargs["timeout"], 345)
-        self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
-                         ["AT+COPS?", "AT+COPS=2", "AT+COPS=?", "AT+COPS=0"])
-        sleeper.assert_called_once_with(3)
+        self.assertEqual(self.at_commands(runner),
+                         ["AT+COPS?", "AT+COPS=2", "AT+COPS=?", "AT+COPS=2", "AT+COPS=0", "AT+COPS?"])
+        self.assertEqual(sleeper.call_count, 3)
         self.assertEqual(result[0]["status"], "current")
         self.assertEqual(result[0]["access_technology"], "lte")
 
@@ -136,7 +154,7 @@ class CellularNetworkCommandTests(unittest.TestCase):
             runner = Mock(side_effect=self.transaction(reply))
             with self.subTest(reply=reply), self.assertRaises(cellular_network.CellularNetworkError):
                 cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
-            self.assertEqual(runner.call_args.args[0][-2], "AT+COPS=0")
+            self.assertIn("AT+COPS=0", self.at_commands(runner))
 
     def test_invalid_path_never_reaches_mm_or_at(self):
         runner = Mock()
@@ -149,8 +167,8 @@ class CellularNetworkCommandTests(unittest.TestCase):
             self.reply(stderr="Call failed: Operation not allowed\n", returncode=1)))
         with self.assertRaisesRegex(cellular_network.CellularNetworkError, "The modem rejected the scan"):
             cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
-        self.assertEqual(len(runner.call_args_list), 5)
-        self.assertEqual(runner.call_args.args[0][-2], "AT+COPS=0")
+        self.assertEqual(self.at_commands(runner).count("AT+COPS=?"), 1)
+        self.assertIn("AT+COPS=0", self.at_commands(runner))
 
     def test_manual_selection_is_restored_exactly_after_success_or_failure(self):
         for mode in [1, 4]:
@@ -164,24 +182,26 @@ class CellularNetworkCommandTests(unittest.TestCase):
                             cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
                     else:
                         self.assertEqual(cellular_network.scan(MODEM, runner=runner, sleeper=Mock()), [])
-                    self.assertEqual(runner.call_args.args[0][-2], f'AT+COPS={mode},2,"001001"')
+                    self.assertIn(f'AT+COPS={mode},2,"001001"', self.at_commands(runner))
 
     def test_failed_deregistration_still_restores_without_starting_scan(self):
         for failure in [self.reply(stderr="rejected", returncode=1),
                         subprocess.TimeoutExpired("busctl", 90)]:
             runner = Mock(side_effect=[self.metadata(), self.cops_reply("+COPS: 0"),
-                                       failure, self.cops_reply("")])
+                                       failure, *self.restore_replies()])
             with self.subTest(failure=failure), self.assertRaises(cellular_network.CellularNetworkError):
                 cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
-            self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
-                             ["AT+COPS?", "AT+COPS=2", "AT+COPS=0"])
+            self.assertNotIn("AT+COPS=?", self.at_commands(runner))
+            self.assertIn("AT+COPS=0", self.at_commands(runner))
 
     def test_restore_failure_cannot_be_reported_as_scan_success(self):
         runner = Mock(side_effect=self.transaction(
             self.cops_reply('+COPS: (1,"Fixture","F","00101",7)'),
             restore_reply=self.reply(stderr="restore failed", returncode=1)))
-        with self.assertRaisesRegex(cellular_network.CellularNetworkError, "Restoring cellular registration failed"):
+        with self.assertRaises(cellular_network.CellularScanError) as caught:
             cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+        self.assertEqual(caught.exception.detail["networks"][0]["name"], "Fixture")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "failed")
 
     def test_unrestorable_selection_and_deregistered_mode_are_never_changed(self):
         for selection in ['+COPS: 1,0,"Fixture Mobile",7', "+COPS: 2", "+COPS: 1",
@@ -191,6 +211,16 @@ class CellularNetworkCommandTests(unittest.TestCase):
             self.assertEqual(cellular_network.scan(MODEM, runner=runner, sleeper=Mock()), [])
             self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
                              ["AT+COPS?", "AT+COPS=?"])
+
+    def test_incomplete_manual_mode_can_use_the_same_lines_saved_operator(self):
+        replies = self.transaction(self.cops_reply('+COPS: (1,"Fixture","F","00101",7)'),
+                                   selection='+COPS: 1,2,"00101",7')
+        replies[1] = self.cops_reply("+COPS: 1")
+        runner = Mock(side_effect=replies)
+        result = cellular_network.scan(MODEM, runner=runner, sleeper=Mock(),
+                                       previous={"mode": "manual", "operator_id": "00101"})
+        self.assertEqual(result[0]["name"], "Fixture")
+        self.assertIn('AT+COPS=1,2,"00101"', self.at_commands(runner))
 
     def test_registration_accepts_only_automatic_or_exact_plmn(self):
         calls = []
@@ -434,7 +464,7 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cellular_network, "scan", return_value=networks) as scan:
             result = await main.api_device_cellular_network_scan("modem-a")
         self.assertEqual(result, {"device_id": "modem-a", "networks": networks})
-        scan.assert_called_once_with(MODEM)
+        scan.assert_called_once_with(MODEM, previous={"mode": "automatic", "operator_id": ""})
 
     async def test_manual_selection_persists_only_after_registration(self):
         line = {"id": "3", "iccid": "card-a"}

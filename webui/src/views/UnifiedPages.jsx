@@ -1,7 +1,8 @@
 import { physicallyPresentDevices, deviceSelection } from '../devicePresence'
 export { physicallyPresentDevices } from '../devicePresence'
-import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useCallback, useSyncExternalStore } from 'react'
 import { api } from '../api.js'
+import { cellularNetworkState } from '../cellularNetworkState.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
 import CopyableText from '../CopyableText.jsx'
@@ -300,45 +301,67 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
 function CellularNetworkControl({ device, refreshDevices, showToast }) {
   const { t } = useI18n()
   const saved = device.cellular_network || {}
-  const [mode, setMode] = useState(saved.mode === 'manual' ? 'manual' : 'automatic')
-  const [operatorId, setOperatorId] = useState(saved.operator_id || '')
-  const [networks, setNetworks] = useState([])
-  const [busy, setBusy] = useState('')
-  const [feedback, setFeedback] = useState('')
-  const [failed, setFailed] = useState(false)
-  const [scanned, setScanned] = useState(false)
-  const clearFeedback = () => { setFeedback(''); setFailed(false) }
-  useEffect(() => {
-    setMode(saved.mode === 'manual' ? 'manual' : 'automatic')
-    setOperatorId(saved.operator_id || '')
-    setNetworks([]); setScanned(false); clearFeedback(); setBusy('')
-  }, [device.id])
+  cellularNetworkState.ensure(device)
+  const state = useSyncExternalStore(
+    useCallback(listener => cellularNetworkState.subscribe(device.id, listener), [device.id]),
+    useCallback(() => cellularNetworkState.get(device.id), [device.id]),
+  )
+  const { mode, operatorId, networks, operation } = state
+  const busy = operation?.state === 'running' ? operation.action : ''
+  const report = operation && operation.id !== state.dismissed
+  const failed = report && operation.state === 'failed'
+  const partial = report && operation.state === 'partial'
+  const scanned = networks.length > 0 || (operation?.action === 'scan' && operation.state === 'success')
+  const edit = patch => cellularNetworkState.edit(device.id, patch)
   const simMissing = device.sim?.present === false
   const dataActive = !!device.cellular?.data_active
   const flightMode = capability(device, 'flight').desired
   const backendMissing = !device.cellular
   const unavailable = simMissing || dataActive || flightMode || backendMissing
+    || state.loading || state.readError || state.blocked
   const options = [...networks]
   if (operatorId && !options.some(item => item.operator_id === operatorId)) {
-    options.unshift({ operator_id: operatorId, name: operatorId,
-      access_technology: '', status: 'unknown' })
+    const current = device.cellular?.operator_code === operatorId ? device.cellular : null
+    options.unshift({ operator_id: operatorId,
+      name: current?.operator || (saved.operator_id === operatorId && saved.operator_name) || t('Saved network'),
+      access_technology: current?.access_technology || saved.access_technology || '', status: 'saved' })
+  }
+  const recoveryText = value => value?.state === 'restored' ? t('Previous network selection restored.')
+    : value?.state === 'pending' ? t('Previous selection restored; searching for service.')
+    : value?.state === 'failed' ? t('Recovery failed. Apply automatic selection to reconnect.') : ''
+  let feedback = ''
+  if (report) {
+    if (busy) feedback = t(busy === 'scan' ? 'Scanning nearby networks. The modem may take several minutes.'
+      : 'Waiting for the modem to confirm registration…')
+    else if (operation.state === 'success') {
+      if (operation.action === 'scan') feedback = t(networks.length ? 'Found {count} cellular networks.'
+        : 'No cellular networks were returned by the modem.', { count: networks.length })
+      else {
+        const code = operation.result?.registration?.operator_id || operation.selection?.operator_id
+        const selected = options.find(item => item.operator_id === code)
+        feedback = t('Connected to {network}.', { network: selected?.name && selected.name !== code
+          ? `${selected.name} (${code})` : code || t('Automatic network selection') })
+      }
+    } else {
+      const detail = operation.error || {}
+      const messages = {
+        network_timeout: 'The selected network did not accept registration in time. Try another network or automatic selection.',
+        denied: 'Registration was rejected. This SIM may not have roaming access to that network.',
+        no_service: 'The selected network is not providing service to this SIM. Try another network or automatic selection.',
+        not_registered: 'The modem has not registered on the selected network.',
+        unavailable: 'The modem is unavailable. Re-detect this device and try again.',
+        interrupted: 'The gateway restarted. The previous operation could not be confirmed; check the current device state.',
+        device_changed: 'The device or SIM changed. Refresh its state before trying again.',
+      }
+      feedback = partial ? `${t('Found {count} cellular networks.', { count: networks.length })} ${recoveryText(detail.recovery)}`
+        : `${t(messages[detail.code] || (operation.action === 'scan' ? 'Network scan failed'
+          : 'Network selection failed. Try automatic selection or re-detect this device.'))} ${recoveryText(detail.recovery)}`.trim()
+    }
   }
   const scan = async () => {
-    if (unavailable || busy) return
+    if (unavailable || busy || mode !== 'manual') return
     if (!window.confirm(t('Scanning cellular networks temporarily interrupts registration and may take several minutes. Continue?'))) return
-    setBusy('scan'); setFeedback(t('Scanning nearby networks. The modem may take several minutes.')); setFailed(false)
-    try {
-      const result = await api.scanCellularNetworks(device.id)
-      const found = result.networks || []
-      setNetworks(found); setScanned(true)
-      const current = found.find(item => item.status === 'current')
-      if (mode === 'manual' && !operatorId && current) setOperatorId(current.operator_id)
-      setFeedback(found.length
-        ? t('Found {count} cellular networks.', { count: found.length })
-        : t('No cellular networks were returned by the modem.'))
-    } catch (error) {
-      setFailed(true); setFeedback(`${t('Network scan failed')}: ${t(error.message)}`)
-    } finally { setBusy('') }
+    await cellularNetworkState.start(device.id, 'scan')
   }
   const apply = async () => {
     if (unavailable || busy || (mode === 'manual' && !operatorId)) return
@@ -346,33 +369,12 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
     const label = mode === 'automatic' ? t('Automatic network selection')
       : `${selected?.name || operatorId} (${operatorId})`
     if (!window.confirm(t('Register this modem using {network}? Cellular service will briefly disconnect.', { network: label }))) return
-    setBusy('apply'); setFeedback(t('Waiting for the modem to confirm registration…')); setFailed(false)
-    try {
-      const result = await api.selectCellularNetwork(device.id, {
-        mode, operator_id: mode === 'manual' ? operatorId : '',
-      })
-      setFeedback(t('Connected to {network}.', { network: result.registration?.operator_id || label }))
-      showToast?.(t('Cellular network selection applied'))
-    } catch (error) {
-      const detail = error.data?.detail || {}
-      const messages = {
-        network_timeout: 'The selected network did not accept registration in time. Try another network or automatic selection.',
-        denied: 'Registration was rejected. This SIM may not have roaming access to that network.',
-        no_service: 'The selected network is not providing service to this SIM. Try another network or automatic selection.',
-        not_registered: 'The modem has not registered on the selected network.',
-        unavailable: 'The modem is unavailable. Re-detect this device and try again.',
-      }
-      const recovery = detail.recovery?.state
-      const recovered = recovery === 'restored' ? t('Previous network selection restored.')
-        : recovery === 'pending' ? t('Previous selection restored; searching for service.')
-        : recovery === 'failed' ? t('Recovery failed. Apply automatic selection to reconnect.') : ''
-      setFailed(true); setFeedback(`${t(messages[detail.code] || 'Network selection failed. Try automatic selection or re-detect this device.')} ${recovered}`.trim())
-    } finally {
-      setBusy('')
-      try { await refreshDevices?.() } catch { /* The confirmed operation result remains visible. */ }
-    }
+    await cellularNetworkState.start(device.id, 'apply', { mode, operator_id: mode === 'manual' ? operatorId : '' })
   }
-  const blocked = backendMissing ? t('Re-detect this device to restore ModemManager before scanning networks.')
+  const blocked = state.loading ? t('Loading network operation…')
+    : state.readError ? t('Network operation status is unavailable. Retrying…')
+    : state.blocked ? t('Another device operation is running. Please wait.')
+    : backendMissing ? t('Re-detect this device to restore ModemManager before scanning networks.')
     : simMissing ? t('Insert a readable SIM before selecting a network.')
     : dataActive ? t('Turn off cellular data before selecting a network.')
     : flightMode ? t('Turn off flight mode before selecting a network.') : ''
@@ -384,14 +386,14 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
       <div className="u-network-mode" role="group" aria-label={t('Selection mode')}>
         {['automatic', 'manual'].map(value => <button key={value} type="button"
           aria-pressed={mode === value} disabled={!!busy || unavailable}
-          onClick={() => { setMode(value); clearFeedback() }}>
+          onClick={() => edit({ mode: value })}>
           {t(value === 'automatic' ? 'Automatic' : 'Manual')}
         </button>)}
       </div>
       <div className="u-cellular-network-actions">
-        {mode === 'manual' && <button className="btn btn-ghost" disabled={!!busy || unavailable} onClick={scan}>
+        <button className="btn btn-ghost" disabled={!!busy || unavailable || mode !== 'manual'} onClick={scan}>
           {busy === 'scan' ? `${t('Scanning')}…` : t('Scan networks')}
-        </button>}
+        </button>
         <button className="btn btn-primary"
           disabled={!!busy || unavailable || (mode === 'manual' && (!operatorId || options.find(item => item.operator_id === operatorId)?.status === 'forbidden'))} onClick={apply}>
           {busy === 'apply' ? `${t('Applying')}…` : t('Apply network')}
@@ -402,20 +404,20 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
       {options.map(item => <button type="button" key={item.operator_id} role="radio"
         aria-checked={operatorId === item.operator_id} className="u-network-option"
         disabled={!!busy || unavailable || item.status === 'forbidden'}
-        onClick={() => { setOperatorId(item.operator_id); clearFeedback() }}>
+        onClick={() => edit({ operatorId: item.operator_id })}>
         <span className="u-network-radio" aria-hidden="true"/>
         <span className="u-network-option-copy"><b title={item.name}>{item.name}</b>
           <span>{item.operator_id}{item.access_technology ? ` · ${item.access_technology.toUpperCase()}` : ''}</span>
         </span>
         <span className="u-network-availability">{t(item.status === 'current' ? 'Current'
-          : item.status === 'forbidden' ? 'Forbidden' : 'Detected')}</span>
+          : item.status === 'forbidden' ? 'Forbidden' : item.status === 'saved' ? 'Saved selection' : 'Detected')}</span>
       </button>)}
       {!options.length && <p className="u-network-empty">{t(busy === 'scan'
         ? 'Scanning nearby networks…' : scanned ? 'No cellular networks were returned by the modem.' : 'Scan to discover nearby operators.')}</p>}
     </div>}
-    <div className={`u-cellular-network-feedback${failed ? ' is-error' : ''}`} role="status">
+    <div className={`u-cellular-network-feedback${failed ? ' is-error' : partial ? ' is-warning' : ''}`} role="status">
       <span aria-hidden="true">{failed ? '!' : 'i'}</span>
-      <p title={blocked || feedback || ''}>{blocked || feedback || t(mode === 'automatic'
+      <p title={feedback || blocked || ''}>{feedback || blocked || t(mode === 'automatic'
         ? 'The SIM chooses an available operator automatically.'
         : 'A detected network may not accept this SIM. Access depends on your plan and roaming agreements.')}</p>
     </div>
@@ -530,9 +532,6 @@ function HardwarePanel({ device, refreshDevices, refresh, showToast }) {
         placeholder={t('Optional 15-digit equipment IMEI')} />
       <button className="btn btn-primary" disabled={!!saving} onClick={saveImei}>{t('Save')}</button>
     </div>}
-    <div className="u-hardware-action u-hardware-detection">
-      <DeviceRescanControl key={device.id} device={device} refresh={refresh} showToast={showToast}/>
-    </div>
     <div className="u-hardware-action u-hardware-danger">
       <div className="u-hardware-action-copy"><h4>{t('Remove device record')}</h4>
         <p>{t('Only disconnected devices can be removed; SIM and line configurations are preserved.')}</p>
@@ -548,7 +547,7 @@ function Discovering({ t }) {
     <p>{t('The gateway is reading the connected readers and modems. This takes a few seconds after a restart.')}</p></div>
 }
 
-function DeviceRescanControl({ device = null, refresh, showToast }) {
+function DeviceRescanControl({ device = null, refresh, showToast, compact = false }) {
   const { t } = useI18n()
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState('')
@@ -593,8 +592,8 @@ function DeviceRescanControl({ device = null, refresh, showToast }) {
     } finally { setBusy(false) }
   }
   const defaultHint = t(device ? 'Re-read this device’s connection and SIM state.' : 'Connected devices are discovered automatically.')
-  return <div className={`u-device-rescan${device ? ' is-device' : ''}`}>
-    {device ? <h4>{t('Device detection')}</h4> : <h2>{t('Communication devices')}</h2>}
+  return <div className={`u-device-rescan${device ? ' is-device' : ''}${compact ? ' is-compact' : ''}`}>
+    {!compact && (device ? <h4>{t('Device detection')}</h4> : <h2>{t('Communication devices')}</h2>)}
     <button className="btn btn-ghost u-device-rescan-button" disabled={busy || device?.present === false} onClick={rescan}
       aria-label={t(device ? 'Re-detect this device' : 'Run full device detection')}>
       <svg className={busy ? 'is-spinning' : ''} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></svg>
@@ -633,19 +632,22 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
   </div>
 }
 
-export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe }) {
-  const { t, language } = useI18n(); const [tab, setTab] = useState('status')
+export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab = 'status', setDeviceTab }) {
+  const { t, language } = useI18n(); const tab = deviceTab; const setTab = setDeviceTab
   const [showDisconnected, setShowDisconnected] = useState(false)
   const { visibleDevices, disconnectedCount, activeDeviceId: active, device: d } = useMemo(
     () => deviceSelection(devices, selectedDeviceId, showDisconnected),
     [devices, selectedDeviceId, showDisconnected],
   )
-  useEffect(() => { if (active !== selectedDeviceId) setSelectedDeviceId(active) }, [active, selectedDeviceId, setSelectedDeviceId])
+  useEffect(() => {
+    if (discovering || loadErrors?.devices) return
+    if (active !== selectedDeviceId) setSelectedDeviceId(active)
+  }, [active, selectedDeviceId, setSelectedDeviceId, discovering, loadErrors?.devices])
   const historyToggle = disconnectedCount > 0 && <label className="u-device-history-toggle">
     <input type="checkbox" checked={showDisconnected} onChange={event => setShowDisconnected(event.target.checked)} />
     {t('Show disconnected devices')} ({disconnectedCount})
   </label>
-  useEffect(() => { if (d && !supportsCellular(d) && tab === 'cellular') setTab('status') }, [d, tab])
+  useEffect(() => { if (!discovering && d && !supportsCellular(d) && tab === 'cellular') setTab('status') }, [d, tab, discovering])
   const emptyContent = loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p>
     : discovering ? <Discovering t={t} />
     : !d ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> : null
@@ -656,7 +658,10 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
     {historyToggle && <div className="u-device-sidebar-footer">{historyToggle}</div>}
     </aside>
     <section className="u-page">{emptyContent}{d && <div className="u-page u-device-body" hidden={!!emptyContent}>
-      <div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
+      <div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div>
+      <div className="u-device-toolbar"><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
+        <DeviceRescanControl key={d.id} compact device={d} refresh={refresh} showToast={showToast}/>
+      </div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>

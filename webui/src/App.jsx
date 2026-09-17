@@ -108,7 +108,21 @@ export default function App() {
   const [selected, setSelected] = useState(null); const [toast, setToast] = useState(null)
   const [callSelected, setCallSelected] = useState(null)
   const [globalCallLineId, setGlobalCallLineId] = useState(null)
-  const [selectedDeviceId, setSelectedDeviceId] = useState(null)
+  const [selectedDeviceId, setSelectedDeviceId] = useState(() => {
+    try { return sessionStorage.getItem('mdd-device-selection') || null } catch { return null }
+  })
+  const [deviceTab, setDeviceTab] = useState(() => {
+    try {
+      const value = sessionStorage.getItem('mdd-device-tab')
+      return ['status', 'sim', 'cellular', 'vowifi', 'hardware'].includes(value) ? value : 'status'
+    } catch { return 'status' }
+  })
+  useEffect(() => {
+    try {
+      if (selectedDeviceId) sessionStorage.setItem('mdd-device-selection', selectedDeviceId)
+      sessionStorage.setItem('mdd-device-tab', deviceTab)
+    } catch { /* Navigation remains usable when browser storage is disabled. */ }
+  }, [selectedDeviceId, deviceTab])
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'auto')
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
   const [authState, setAuthState] = useState(null)
@@ -230,7 +244,7 @@ export default function App() {
   const sel=instances.find(i=>String(i.id)===String(selected))
   const callSel=instances.find(i=>String(i.id)===String(callSelected))
   const presentDeviceCount=physicallyPresentDevices(devices).length
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,setSystemMeta}
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>,
     messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,

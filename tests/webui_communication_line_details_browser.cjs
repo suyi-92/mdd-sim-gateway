@@ -38,7 +38,10 @@ const devices = [
 ]
 
 const writes = []
-let pendingScanResponse = null
+let operation = null
+let networks = []
+let operationNumber = 0
+let applying = false
 let registrationFailure = false
 const json = (response, value, status = 200) => {
   response.writeHead(status, { 'Content-Type': 'application/json' })
@@ -62,14 +65,19 @@ const server = http.createServer((request, response) => {
     if (/\/messages\/reimport-cellular$/.test(url.pathname)) {
       return json(response, { ok: true, imported: 2, retained: 2 })
     }
+    if (/\/cellular\/network-operation$/.test(url.pathname)) {
+      return json(response, { context: 'fixture-context', networks, operation })
+    }
     if (/\/cellular\/networks\/scan$/.test(url.pathname)) {
-      pendingScanResponse = response
-      return
+      operation = { id: `scan-${++operationNumber}`, action: 'scan', state: 'running', selection: {} }
+      return json(response, { context: 'fixture-context', networks, operation })
     }
     if (/\/cellular\/network$/.test(url.pathname)) {
-      if (registrationFailure) return json(response, { detail: { code: 'network_timeout',
-        message: 'Cellular network registration failed.', recovery: { state: 'restored' } } }, 503)
-      return json(response, { ok: true, mode: 'manual', operator_id: '46000', registration: { operator_id: '46000', state: 'roaming' } })
+      operation = { id: `apply-${++operationNumber}`, action: 'apply', state: applying ? 'running' : registrationFailure ? 'failed' : 'success',
+        selection: { mode: 'manual', operator_id: '46000' },
+        ...(registrationFailure ? { error: { code: 'network_timeout', recovery: { state: 'restored' } } }
+          : { result: { ok: true, mode: 'manual', operator_id: '46000', registration: { operator_id: '46000', state: 'roaming' } } }) }
+      return json(response, { context: 'fixture-context', networks, operation })
     }
     return json(response, values[url.pathname] || {})
   }
@@ -213,8 +221,9 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.setViewportSize({ width, height: 900 })
       const controls = page.locator('.u-cellular-network-controls')
       const modeBox = await controls.getByRole('group').boundingBox()
-      const applyBox = await controls.getByRole('button', { name: '应用网络' }).boundingBox()
-      assert.ok(applyBox.x - (modeBox.x + modeBox.width) < 24, `automatic action disconnected from mode at ${width}`)
+      const scanBox = await controls.getByRole('button', { name: '扫描网络' }).boundingBox()
+      assert.equal(await controls.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+      assert.ok(scanBox.x - (modeBox.x + modeBox.width) < 24, `automatic action disconnected from mode at ${width}`)
       await page.locator('.u-cellular-network').screenshot({ path: path.join(output, `automatic-panel-${width}.png`), animations: 'disabled' })
     }
     page.once('dialog', dialog => dialog.accept())
@@ -223,19 +232,38 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.getByText('正在扫描附近网络，模块可能需要几分钟才能完成。', { exact: true }).waitFor()
     assert.equal(await page.getByRole('button', { name: '正在扫描…' }).isEnabled(), false)
     assert.equal(await page.getByRole('button', { name: '应用网络' }).isEnabled(), false)
-    assert.ok(pendingScanResponse)
-    json(pendingScanResponse, { networks: [
+    assert.equal(operation.state, 'running')
+    networks = [
       { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
       { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
       { operator_id: '00101', name: 'Forbidden Fixture', access_technology: 'lte', status: 'forbidden' },
-    ] })
-    pendingScanResponse = null
+    ]
+    operation = { ...operation, state: 'success', result: { networks } }
     await page.getByText('发现 3 个蜂窝网络。', { exact: true }).waitFor()
     assert.equal(await page.getByRole('radio', { name: /Forbidden Fixture/ }).isEnabled(), false)
     await page.getByRole('radio', { name: /China Mobile/ }).click()
+    applying = true
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '应用网络' }).click()
-    await page.getByText('已确认连接到 46000。', { exact: true }).waitFor()
+    await page.getByText('正在等待模块确认驻网，失败后将恢复之前的选择…', { exact: true }).waitFor()
+    await page.locator('.u-tabs').getByRole('button', { name: '硬件', exact: true }).click()
+    await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    assert.equal(await page.getByRole('button', { name: '正在应用…' }).isEnabled(), false)
+    assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /概览/ }).click()
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /设备/ }).click()
+    await page.getByRole('radio', { name: /China Mobile/ }).waitFor()
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).getAttribute('aria-checked'), 'true')
+    assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+    await page.reload()
+    await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    await page.getByRole('button', { name: '正在应用…' }).waitFor()
+    assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).getAttribute('aria-checked'), 'true')
+    applying = false
+    operation = { ...operation, state: 'success' }
+    await page.getByText('已确认连接到 China Mobile (46000)。', { exact: true }).waitFor()
     for (const width of [2560, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
@@ -263,6 +291,15 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await feedback.getByText('由 SIM 自动选择可接入的运营商。', { exact: true }).waitFor()
     assert.equal(await page.locator('.u-cellular-network-feedback.is-error').count(), 0,
       'changing selection must clear the previous attempt’s error')
+    assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+    await page.getByRole('button', { name: '手动', exact: true }).click()
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '扫描网络' }).click()
+    await page.getByRole('button', { name: '正在扫描…' }).waitFor()
+    operation = { ...operation, state: 'partial', error: { code: 'scan_recovery', recovery: { state: 'pending' } } }
+    await page.locator('.u-cellular-network-feedback.is-warning').getByText(/发现 3 个蜂窝网络/).waitFor()
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).count(), 1)
+    assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), true)
 
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [
@@ -270,6 +307,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       ['POST', '/api/devices/modem-2/cellular/networks/scan'],
       ['PUT', '/api/devices/modem-2/cellular/network'],
       ['PUT', '/api/devices/modem-2/cellular/network'],
+      ['POST', '/api/devices/modem-2/cellular/networks/scan'],
     ])
     console.log('PASS: line details, retained-SMS confirmation, cellular network selection, registered-without-bearer status, and wide/narrow layouts; fixture API only')
   } finally {

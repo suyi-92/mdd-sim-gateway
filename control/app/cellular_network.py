@@ -35,6 +35,12 @@ class CellularNetworkError(RuntimeError):
     pass
 
 
+class CellularScanError(CellularNetworkError):
+    def __init__(self, networks: list[dict], recovery: dict):
+        super().__init__("Restoring cellular registration failed. Re-apply the saved network selection.")
+        self.detail = {"code": "scan_recovery", "networks": networks, "recovery": recovery}
+
+
 class CellularRegistrationError(CellularNetworkError):
     """Closed, identity-free status for registration and its recovery transaction."""
 
@@ -182,7 +188,7 @@ def _scan_at(modem_path: str, runner, timeout: float) -> list[dict]:
     return parse_cops_output(_at_command(modem_path, "AT+COPS=?", runner, timeout))
 
 
-def _scan_quectel(modem_path: str, runner, timeout: float, sleeper) -> list[dict]:
+def _scan_quectel(modem_path: str, runner, timeout: float, sleeper, previous=None) -> list[dict]:
     # COPS scans can be rejected while this firmware remains registered, even with
     # no data bearer. Temporarily deregister only when the exact selection can be
     # restored. A non-numeric manual selection is never guessed from its name.
@@ -190,32 +196,58 @@ def _scan_quectel(modem_path: str, runner, timeout: float, sleeper) -> list[dict
     automatic = re.fullmatch(r'\+COPS:\s*0(?:\s*,[^\r\n]*)?', selection)
     manual = re.fullmatch(r'\+COPS:\s*([14])\s*,\s*2\s*,\s*"([0-9]{5,6})"'
                           r'(?:\s*,\s*[0-9]{1,2})?', selection)
+    # A failed manual registration may report only "+COPS: 1". The API can
+    # supply the saved, previously confirmed selection of this exact SIM line.
+    # Never infer a numeric operator from a display name or an unrelated card.
+    if (not manual and re.fullmatch(r'\+COPS:\s*1', selection)
+            and (previous or {}).get("mode") == "manual"
+            and re.fullmatch(r"[0-9]{5,6}", str((previous or {}).get("operator_id") or ""))):
+        manual = re.fullmatch(r'\+COPS:\s*([14]),2,"([0-9]{5,6})"',
+                              f'+COPS: 1,2,"{previous["operator_id"]}"')
     restore = "AT+COPS=0" if automatic else (
         f'AT+COPS={manual[1]},2,"{manual[2]}"' if manual else "")
     if not restore:
         return _scan_at(modem_path, runner, timeout)
+    networks = None
+    scan_error = None
     try:
         _at_command(modem_path, "AT+COPS=2", runner, 60)
         sleeper(3)
-        return _scan_at(modem_path, runner, timeout)
-    finally:
-        # Even a failed/timed-out deregistration may already have changed the RF
-        # state. Never return a successful scan while registration restoration failed.
+        networks = _scan_at(modem_path, runner, timeout)
+    except CellularNetworkError as exc:
+        scan_error = exc
+    # Recovery is separate from the scan result; never discard real networks.
+    selected = {"mode": "automatic" if automatic else "manual",
+                "operator_id": "" if automatic else manual[2]}
+    if not manual or manual[1] == "1":
+        error = _request_registration(modem_path, selected, runner, REGISTER_TIMEOUT_SECONDS, use_at=True)
+        snapshot = _wait_registration(modem_path, selected, runner, sleeper, 21 if not error else 1)
+        applied = _selection_is_applied(modem_path, selected, runner)
+        recovery = {"state": ("restored" if applied and _is_registered(snapshot, selected)
+                              else "pending" if applied else "failed"),
+                    **selected, "registration": snapshot}
+    else:
+        # COPS mode 4 is manual-with-automatic-fallback; preserve it exactly.
         try:
             _at_command(modem_path, restore, runner, REGISTER_TIMEOUT_SECONDS)
-        except CellularNetworkError as exc:
-            raise CellularNetworkError(
-                "Restoring cellular registration failed. Re-apply the saved network selection.") from exc
+            recovery = {"state": "restored", **selected}
+        except CellularNetworkError:
+            recovery = {"state": "failed", **selected}
+    if networks is not None and recovery["state"] != "restored":
+        raise CellularScanError(networks, recovery)
+    if scan_error:
+        raise scan_error
+    return networks
 
 
 def scan(modem_path: str, runner=subprocess.run,
-         timeout: float = SCAN_TIMEOUT_SECONDS, sleeper=time.sleep) -> list[dict]:
+         timeout: float = SCAN_TIMEOUT_SECONDS, sleeper=time.sleep, previous=None) -> list[dict]:
     if not MODEM_PATH_RE.fullmatch(str(modem_path or "")):
         raise CellularNetworkError("The cellular modem path is invalid.")
     # Quectel QMI firmware can report a successful but empty NAS scan while its
     # AT scan returns real networks. Prefer the verified AT path for these modems.
     if _prefer_at_scan(modem_path, runner):
-        return _scan_quectel(modem_path, runner, timeout, sleeper)
+        return _scan_quectel(modem_path, runner, timeout, sleeper, previous)
     try:
         result = runner(
             ["mmcli", "-m", modem_path, "--3gpp-scan", f"--timeout={int(timeout)}"],

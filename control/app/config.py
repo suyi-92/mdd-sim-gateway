@@ -833,6 +833,8 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
         # Never carry one card's manual PLMN onto a replacement card inserted in that line.
         inst["cellular_network_mode"] = "automatic"
         inst["cellular_operator_id"] = ""
+        inst["cellular_operator_name"] = ""
+        inst["cellular_operator_technology"] = ""
     merged = {**existing, **inst}
     if clear_modem_readers:
         # Internal, identity-proven migration to a native reader. Remove keys atomically;

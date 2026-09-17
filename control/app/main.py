@@ -33,7 +33,7 @@ from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd,
-               live_translation, cellular_network)
+               live_translation, cellular_network, cellular_operations)
 from .version import VERSION
 from . import stability
 from . import ims_recovery
@@ -745,6 +745,7 @@ class Hub:
 
 hub = Hub()
 capability_lock = asyncio.Lock()
+network_operations = cellular_operations.NetworkOperations()
 PCSC_MAINTENANCE_WINDOW_SECONDS = 45
 CARD_PROBE_TIMEOUT_SECONDS = 8
 
@@ -4926,6 +4927,8 @@ async def _unified_devices() -> list[dict]:
             "cellular_network": {
                 "mode": str((inst or {}).get("cellular_network_mode") or "automatic"),
                 "operator_id": str((inst or {}).get("cellular_operator_id") or ""),
+                "operator_name": str((inst or {}).get("cellular_operator_name") or ""),
+                "access_technology": str((inst or {}).get("cellular_operator_technology") or ""),
             },
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
                        "ims": ((line_status or {}).get("presentation") or {}).get("label")
@@ -4982,7 +4985,7 @@ async def api_devices():
 @app.post("/api/devices/rescan")
 async def api_devices_rescan():
     """Request one root-owned, all-backend hardware rediscovery."""
-    if capability_lock.locked():
+    if capability_lock.locked() or network_operations.busy():
         raise HTTPException(409, "wait for the current device operation before rediscovery")
     try:
         async with capability_lock:
@@ -4997,7 +5000,7 @@ async def api_devices_rescan():
 
 @app.post("/api/devices/{device_id}/rescan")
 async def api_device_rescan(device_id: str):
-    if capability_lock.locked():
+    if capability_lock.locked() or network_operations.busy():
         raise HTTPException(409, "wait for the current device operation before rediscovery")
     device = next((item for item in await _unified_devices()
                    if str(item.get("id")) == str(device_id)), None)
@@ -5185,20 +5188,69 @@ def _cellular_network_target(device_id: str) -> tuple[dict, dict, str]:
     return observed, inst, modem_path
 
 
-@app.post("/api/devices/{device_id}/cellular/networks/scan")
-async def api_device_cellular_network_scan(device_id: str):
+def _cellular_operation_key(device_id, inst, observed):
+    return (str(device_id), str(inst.get("id") or ""),
+            str((observed.get("cellular") or {}).get("sim_iccid") or ""))
+
+
+@app.get("/api/devices/{device_id}/cellular/network-operation")
+async def api_device_cellular_network_operation(device_id: str):
+    observed = (device_state.status().get("devices") or {}).get(device_id) or {}
+    if not observed.get("present"):
+        raise HTTPException(404, "no such connected cellular modem")
+    iccid = str((observed.get("cellular") or {}).get("sim_iccid") or "")
+    if not iccid:
+        active = network_operations.active
+        if active and active[0] == device_id:
+            return network_operations.view(active)
+        raise HTTPException(503, "cellular operation context is temporarily unavailable")
+    inst = _match_instance_by_iccid(iccid) or {}
+    return network_operations.view(_cellular_operation_key(device_id, inst, observed))
+
+
+def _start_cellular_operation(device_id, action, selection, worker):
+    if capability_lock.locked():
+        raise HTTPException(409, "A cellular network operation is already running.")
+    observed, inst, _modem_path = _cellular_network_target(device_id)
+    key = _cellular_operation_key(device_id, inst, observed)
+
+    async def guarded_worker():
+        fresh, line, _ = _cellular_network_target(device_id)
+        if _cellular_operation_key(device_id, line, fresh) != key:
+            raise HTTPException(409, {"code": "device_changed"})
+        return await worker()
+
+    try:
+        return network_operations.start(key, action, selection, guarded_worker)
+    except cellular_operations.OperationBusy as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+async def _scan_cellular_network(device_id: str):
     """Scan only the selected modem through MM, including its managed AT command path."""
     async with capability_lock:
         _observed, _inst, modem_path = _cellular_network_target(device_id)
         try:
-            networks = await asyncio.to_thread(cellular_network.scan, modem_path)
+            networks = await asyncio.to_thread(cellular_network.scan, modem_path,
+                previous={"mode": _inst.get("cellular_network_mode") or "automatic",
+                          "operator_id": _inst.get("cellular_operator_id") or ""})
+        except cellular_network.CellularScanError as exc:
+            raise HTTPException(503, exc.detail) from exc
         except cellular_network.CellularNetworkError as exc:
             raise HTTPException(503, str(exc)) from exc
     return {"device_id": device_id, "networks": networks}
 
 
-@app.put("/api/devices/{device_id}/cellular/network")
-async def api_device_cellular_network_select(device_id: str, body: dict):
+@app.post("/api/devices/{device_id}/cellular/networks/scan")
+async def api_device_cellular_network_scan(device_id: str, background: bool = False):
+    if background:
+        return _start_cellular_operation(device_id, "scan", {}, lambda: _scan_cellular_network(device_id))
+    if network_operations.busy():
+        raise HTTPException(409, "A cellular network operation is already running.")
+    return await _scan_cellular_network(device_id)
+
+
+def _validate_cellular_selection(body):
     """Request automatic registration or one exact scanned MCC/MNC on this modem."""
     body = body or {}
     mode = str(body.get("mode") or "").lower()
@@ -5209,6 +5261,11 @@ async def api_device_cellular_network_select(device_id: str, body: dict):
         raise HTTPException(400, "mode must be automatic or manual")
     if mode == "manual" and not cellular_network.OPERATOR_ID_RE.fullmatch(operator_id):
         raise HTTPException(400, "manual mode requires a 5-6 digit operator MCC/MNC")
+    return mode, operator_id
+
+
+async def _select_cellular_network(device_id: str, body: dict):
+    mode, operator_id = _validate_cellular_selection(body)
     async with capability_lock:
         _observed, inst, modem_path = _cellular_network_target(device_id)
         try:
@@ -5221,14 +5278,37 @@ async def api_device_cellular_network_select(device_id: str, body: dict):
             raise HTTPException(503, exc.detail) from exc
         except cellular_network.CellularNetworkError as exc:
             raise HTTPException(503, str(exc)) from exc
-        await asyncio.to_thread(cfg.upsert_instance, {
+        fresh = (device_state.status().get("devices") or {}).get(device_id) or {}
+        if (not fresh.get("present") or str((fresh.get("cellular") or {}).get("sim_iccid") or "")
+                != str((_observed.get("cellular") or {}).get("sim_iccid") or "")):
+            raise HTTPException(409, {"code": "device_changed"})
+        saved = {
             "id": str(inst["id"]),
             "cellular_network_mode": selection["mode"],
             "cellular_operator_id": selection["operator_id"],
-        })
+        }
+        networks = network_operations.view(_cellular_operation_key(device_id, inst, _observed))["networks"]
+        chosen = next((item for item in networks if item["operator_id"] == selection["operator_id"]), None)
+        if chosen:
+            saved.update(cellular_operator_name=chosen["name"],
+                         cellular_operator_technology=chosen["access_technology"])
+        elif mode == "automatic" and "cellular_operator_name" in inst:
+            saved.update(cellular_operator_name="", cellular_operator_technology="")
+        await asyncio.to_thread(cfg.upsert_instance, saved)
     await hub.broadcast({"type": "cellular", "device": device_id,
                          "network_selection": selection})
     return {"ok": True, "device_id": device_id, **selection}
+
+
+@app.put("/api/devices/{device_id}/cellular/network")
+async def api_device_cellular_network_select(device_id: str, body: dict, background: bool = False):
+    mode, operator_id = _validate_cellular_selection(body)
+    if background:
+        return _start_cellular_operation(device_id, "apply", {"mode": mode, "operator_id": operator_id},
+                                         lambda: _select_cellular_network(device_id, body))
+    if network_operations.busy():
+        raise HTTPException(409, "A cellular network operation is already running.")
+    return await _select_cellular_network(device_id, body)
 
 
 @app.post("/api/devices/{device_id}/diagnostics")

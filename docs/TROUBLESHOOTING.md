@@ -263,6 +263,11 @@ Quectel、同时具备 QMI 与 AT 端口的模块，经同一 ModemManager 对�
 空列表或扫描成功。Quectel 的扫描需要无线资源空闲，参见
 [厂商说明](https://forums.quectel.com/t/at-cops-return-cme-error-operation-not-allowed/26353/2)。
 
+`1.9.4-vmware.16` 起，选网与扫描的进度、最后结果和扫描到的网络由 Control 后台任务保存。
+切换标签页、导航或刷新页面只重新读取任务，不会重复执行扫描。Control 重启会结束这代任务
+记录，界面会重新核对状态；换 SIM 时不沿用旧卡的扫描结果。扫描已成功而驻网恢复仍在搜网
+或失败时，保留网络列表并单独提示恢复结果，不把扫描结果一并丢弃。
+
 扫描到 PLMN 不代表该 SIM 获准接入它。选网出现 `Network timeout` 时，ModemManager
 的内部注册检查可能已到 60 秒，而模块仍在搜网；单纯加大 `mmcli --timeout` 不会修改该检查。
 `1.9.4-vmware.15` 保留同一次注册请求，再有界等待最多约 2 分钟，确认已注册且手动模式的

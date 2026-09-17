@@ -227,8 +227,8 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("registeredCellular\n      || (c.reason", UNIFIED)
 
     def test_cellular_network_selection_is_scanned_confirmed_and_responsive(self):
-        self.assertIn("api.scanCellularNetworks(device.id)", UNIFIED)
-        self.assertIn("api.selectCellularNetwork(device.id", UNIFIED)
+        self.assertIn("cellularNetworkState.start(device.id, 'scan')", UNIFIED)
+        self.assertIn("cellularNetworkState.start(device.id, 'apply'", UNIFIED)
         self.assertIn("Scanning cellular networks temporarily interrupts", UNIFIED)
         self.assertIn("A detected network may not accept this SIM", UNIFIED)
         self.assertIn("device.sim?.present === false", UNIFIED)
