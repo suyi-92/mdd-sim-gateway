@@ -275,7 +275,7 @@ install_packages() {
   apt-get update -qq
   docker_safe_apt_install preserve \
     ca-certificates curl wget git jq openssl coreutils util-linux iproute2 usbutils \
-    modemmanager network-manager mobile-broadband-provider-info dbus pcscd pcsc-tools libccid \
+    modemmanager libqmi-utils network-manager mobile-broadband-provider-info dbus pcscd pcsc-tools libccid \
     python3 python3-dev python3-venv python3-pip build-essential pkg-config swig \
     libpcsclite-dev libcurl4-openssl-dev libssl-dev libffi-dev \
     autoconf automake libtool help2man flex meson ninja-build patch perl \

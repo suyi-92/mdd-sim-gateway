@@ -83,10 +83,14 @@ class ProfileModemRefreshTests(unittest.TestCase):
                 "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest()})
             with patch.object(app, "modem_snapshot", return_value={
                     "sim_iccid": "old-card", "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
-                    patch.object(host, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                    patch.object(host, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout="modem.generic.device: /sys/devices/fixture\n"
+                        "modem.generic.primary-port: cdc-wdm9\nmodem.generic.primary-sim-slot: 1")) as run:
                 app.process_bridge_restart_requests()
-            run.assert_called_once_with(["mmcli", "--timeout=25", "-m",
-                                         "/org/freedesktop/ModemManager1/Modem/9", "--reset"])
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["mmcli", "-m", "/org/freedesktop/ModemManager1/Modem/9", "--output-keyvalue"],
+                ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", "/dev/cdc-wdm9", "--uim-sim-power-off=1"],
+                ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", "/dev/cdc-wdm9", "--uim-sim-power-on=1"]])
             other.terminate.assert_not_called()
             app.finish_bridge_restart_requests(set())
             self.assertEqual(app._bridge_restarts["fixture"]["state"], "stopped")
@@ -111,9 +115,13 @@ class ProfileModemRefreshTests(unittest.TestCase):
                     "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest()})
                 with patch.object(app, "modem_snapshot", return_value={
                         "sim_iccid": current, "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
-                        patch.object(host, "run", return_value=SimpleNamespace(returncode=code)) as run:
+                        patch.object(host, "run", side_effect=[
+                            SimpleNamespace(returncode=0, stdout="modem.generic.device: /sys/devices/fixture\n"
+                                            "modem.generic.primary-port: cdc-wdm9\nmodem.generic.primary-sim-slot: 1"),
+                            SimpleNamespace(returncode=code), SimpleNamespace(returncode=code)]) as run:
                     app.process_bridge_restart_requests()
                 if current == "new-card":
                     run.assert_not_called()
                 else:
                     self.assertEqual(app._bridge_restarts["fixture"]["state"], "failed")
+                    self.assertIn("--uim-sim-power-on=1", run.call_args.args[0])

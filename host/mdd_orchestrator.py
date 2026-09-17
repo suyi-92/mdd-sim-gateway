@@ -998,12 +998,28 @@ class Orchestrator:
                 obj = str(snapshot.get("mm_object") or "")
                 if (actual and hashlib.sha256(actual.encode()).hexdigest() != expected_iccid_sha256
                         and re.fullmatch(r"/org/freedesktop/ModemManager1/Modem/[0-9]+", obj)):
-                    # Record before issuing Reset, so a manager restart never repeats it.
+                    detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
+                    port = self._kv(detail.stdout or "", "modem.generic.primary-port")
+                    slot = self._kv(detail.stdout or "", "modem.generic.primary-sim-slot")
+                    if (detail.returncode or not re.fullmatch(r"cdc-wdm[0-9]+", port)
+                            or not re.fullmatch(r"[1-8]", slot)):
+                        self._bridge_restart_status(request, "failed",
+                                                    error="cellular SIM refresh has no confirmed QMI device and SIM slot")
+                        continue
+                    # Cycle only the active SIM slot. DMS/Modem.Reset can leave DJI
+                    # compatibility firmware stuck offline and must not be used here.
+                    # Record before the power cycle so a manager restart cannot repeat it.
                     request = self._bridge_restart_status(request, "resetting", modem_reset=True)
                     self.cellular_states.pop(device_id, None)
                     self.radio_states.pop(device_id, None)
-                    result = run(["mmcli", "--timeout=25", "-m", obj, "--reset"])
-                    if result.returncode:
+                    qmi = ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", f"/dev/{port}"]
+                    try:
+                        off = run([*qmi, f"--uim-sim-power-off={slot}"])
+                    finally:
+                        # Always restore power, even after an uncertain off reply. UIM's
+                        # removal/insertion indications make MM rebuild its own SIM object.
+                        result = run([*qmi, f"--uim-sim-power-on={slot}"])
+                    if off.returncode or result.returncode:
                         self._bridge_restart_status(request, "failed",
                                                     error="cellular SIM refresh failed")
                     else:
