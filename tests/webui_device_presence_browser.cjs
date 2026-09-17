@@ -20,6 +20,7 @@ const reader = { id: 'reader-fixture', name: 'SCR Prime CCID Reader (fixture) 00
   sim: { present: false }, capabilities: { vowifi: { desired: false, actual: 'off' } } }
 let devices = [modem, reader]
 let rescanOperationId = ''
+let discovering = false
 const mutations = []
 const json = (response, value) => {
   response.writeHead(200, { 'Content-Type': 'application/json' })
@@ -31,6 +32,7 @@ const server = http.createServer((request, response) => {
     if (request.method !== 'GET') mutations.push([request.method, url.pathname])
     if (request.method === 'POST' && url.pathname === '/api/devices/rescan') {
       rescanOperationId = '0123456789abcdef'
+      discovering = true
       return json(response, { ok: true, state: 'requested', operation_id: rescanOperationId })
     }
     if (request.method === 'POST' && /^\/api\/devices\/[^/]+\/rescan$/.test(url.pathname)) {
@@ -40,7 +42,7 @@ const server = http.createServer((request, response) => {
     }
     if (request.method === 'GET' && url.pathname === '/api/devices/rescan/progress') {
       return json(response, rescanOperationId
-        ? { state: 'success', operation_id: rescanOperationId, modems_detected: 1 }
+        ? { state: discovering ? 'running' : 'success', operation_id: rescanOperationId, modems_detected: 1 }
         : { state: 'idle' })
     }
     const hardware = url.pathname.match(/^\/api\/devices\/([^/]+)\/hardware$/)
@@ -61,7 +63,7 @@ const server = http.createServer((request, response) => {
     }
     const values = {
       '/api/auth/status': { configured: true, authenticated: true, csrf: 'fixture-only' },
-      '/api/devices': { devices, discovering: false },
+      '/api/devices': { devices, discovering },
       '/api/instances': { instances: [] },
       '/api/cards': { cards: [] },
       '/api/system/status': { version: 'fixture', repository_url: 'https://example.invalid/repo' },
@@ -98,14 +100,38 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const history = page.getByLabel(/显示已断开的设备/)
     await heading('DJI/Quectel EC25').waitFor()
     assert.equal(await options.count(), 2)
+    assert.equal(await page.locator('.u-device-page-heading button').count(), 0)
+    const fullDetection = page.locator('.u-device-sidebar-footer').getByRole('button', { name: '重新完整检测', exact: true })
+    const sidebarBefore = await page.locator('.u-device-sidebar').boundingBox()
     page.once('dialog', dialog => dialog.accept())
-    await page.getByRole('button', { name: '重新完整检测', exact: true }).click()
+    await fullDetection.click()
+    await page.clock.fastForward(11000)
+    await page.locator('.u-empty-spinner').waitFor()
+    assert.equal(await page.locator('.u-device-sidebar-footer button').isEnabled(), false,
+      'the running full detection must survive the discovery loading state')
+    discovering = false
     await page.clock.fastForward(1200)
     await page.getByText('完整设备检测已完成，发现 1 个蜂窝模块和 0 个读卡器。', { exact: true }).waitFor()
+    const sidebarAfter = await page.locator('.u-device-sidebar').boundingBox()
+    assert.equal(sidebarAfter.height, sidebarBefore.height, 'discovery feedback must keep its reserved height')
+    await page.getByRole('button', { name: '硬件', exact: true }).click()
+    const deviceDetection = page.locator('.u-hardware-detection').getByRole('button', { name: '重新检测此设备', exact: true })
+    const detectionBefore = await deviceDetection.boundingBox()
     page.once('dialog', dialog => dialog.accept())
-    await page.getByRole('button', { name: '重新检测此设备', exact: true }).click()
+    await deviceDetection.click()
     await page.clock.fastForward(1200)
     await page.getByText('设备检测已完成，请查看下方刷新的硬件和 SIM 状态。', { exact: true }).waitFor()
+    assert.deepEqual(await deviceDetection.boundingBox(), detectionBefore, 'per-device feedback must not move the button')
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
+        `detection controls overflow at ${width}px`)
+      assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false,
+        `device content is clipped at ${width}px`)
+      await page.screenshot({ path: path.join(output, `detection-controls-${width}.png`), fullPage: true, animations: 'disabled' })
+      await page.locator('.u-hardware-detection').screenshot({
+        path: path.join(output, `device-detection-row-${width}.png`), animations: 'disabled' })
+    }
     await page.screenshot({ path: path.join(output, 'connected.png'), fullPage: true, animations: 'disabled' })
     await page.getByRole('button', { name: '蜂窝数据（4G）', exact: true }).click()
     await page.getByText('请先重新检测此设备以恢复 ModemManager，再扫描蜂窝网络。', { exact: true }).waitFor()
@@ -127,6 +153,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await history.check()
     await page.getByRole('button', { name: /DJI\/Quectel EC25/ }).click()
     await page.getByRole('button', { name: '硬件', exact: true }).click()
+    assert.equal(await page.getByRole('button', { name: '重新检测此设备', exact: true }).isEnabled(), false)
     const deviceNameInput = page.locator('.u-hardware-name input')
     assert.equal(await deviceNameInput.getAttribute('placeholder'), 'DJI/Quectel EC25')
     assert.equal(await deviceNameInput.isEnabled(), true)
@@ -154,6 +181,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.clock.fastForward(11000)
     await heading('未发现通信设备').waitFor()
     assert.equal(await options.count(), 0)
+    assert.equal(await page.getByRole('button', { name: '重新完整检测', exact: true }).isEnabled(), true)
     await page.screenshot({ path: path.join(output, 'all-unplugged.png'), fullPage: true, animations: 'disabled' })
 
     devices = [modem, { ...reader, present: false }]

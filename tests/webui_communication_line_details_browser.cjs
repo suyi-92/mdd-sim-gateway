@@ -38,6 +38,7 @@ const devices = [
 ]
 
 const writes = []
+let pendingScanResponse = null
 const json = (response, value, status = 200) => {
   response.writeHead(status, { 'Content-Type': 'application/json' })
   response.end(JSON.stringify(value))
@@ -61,10 +62,8 @@ const server = http.createServer((request, response) => {
       return json(response, { ok: true, imported: 2, retained: 2 })
     }
     if (/\/cellular\/networks\/scan$/.test(url.pathname)) {
-      return json(response, { networks: [
-        { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
-        { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
-      ] })
+      pendingScanResponse = response
+      return
     }
     if (/\/cellular\/network$/.test(url.pathname)) {
       return json(response, { ok: true, mode: 'manual', operator_id: '46000' })
@@ -209,6 +208,15 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '扫描网络' }).click()
+    await page.getByText('正在扫描附近网络，模块可能需要几分钟才能完成。', { exact: true }).waitFor()
+    assert.equal(await page.getByRole('button', { name: '正在扫描…' }).isEnabled(), false)
+    assert.equal(await page.getByRole('button', { name: '应用网络' }).isEnabled(), false)
+    assert.ok(pendingScanResponse)
+    json(pendingScanResponse, { networks: [
+      { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
+      { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
+    ] })
+    pendingScanResponse = null
     await page.getByText('发现 2 个蜂窝网络。', { exact: true }).waitFor()
     await page.getByLabel('选择方式').selectOption('manual')
     await page.getByLabel('可用网络').selectOption('46000')
@@ -219,6 +227,8 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `cellular network selection overflow at ${width}px`)
+      assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false,
+        `cellular network selection is clipped at ${width}px`)
       await page.screenshot({ path: path.join(output, `cellular-network-${width}.png`), fullPage: true, animations: 'disabled' })
       await page.locator('.u-cellular-network').screenshot({
         path: path.join(output, `cellular-network-panel-${width}.png`), animations: 'disabled' })

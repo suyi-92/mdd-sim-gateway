@@ -250,6 +250,19 @@ ExecStartPost 失败，检查 `busctl` 与 D-Bus 服务名。
 注册到蜂窝网络而不使用移动数据，应关闭飞行模式并关闭蜂窝数据；模块射频保持开启，但受管
 数据 profile 会持久设为 `autoconnect=no`，重启或重新插拔模块后也不得抢先自动建立数据连接。
 
+蜂窝网络扫描若显示 `couldn't scan networks ... 'unknown error'`，不一定是模块缺失。
+`mmcli` 会把成功但空的扫描列表也显示成这个错误。`1.9.4-vmware.14` 起，对实时识别为
+Quectel、同时具备 QMI 与 AT 端口的模块，经同一 ModemManager 对象执行 `AT+COPS=?`，
+不直接占用串口。确认能准确恢复当前自动/数字手动选网方式后，临时退网以释放无线资源；
+成功、失败或超时都执行原选网方式恢复，恢复失败会明确提示重新应用选网。无法准确恢复的
+模式只执行扫描，不猜测运营商。扫描步骤最长约 5 分钟，退网与恢复另有有界等待；只有实际
+返回的 PLMN 才进入列表，禁止网络仍不可选。
+其他模块保留标准扫描，仅在上述精确的空列表错误后尝试一次 AT 扫描；超时、SIM、权限和
+忙状态错误不会触发重叠扫描。仍需先关闭飞行模式和数据连接、插入可读 SIM。
+模块真实返回 `Operation not allowed` 时会明确提示等待蜂窝活动结束后重试，不把它伪装成
+空列表或扫描成功。Quectel 的扫描需要无线资源空闲，参见
+[厂商说明](https://forums.quectel.com/t/at-cops-return-cme-error-operation-not-allowed/26353/2)。
+
 ```bash
 mmcli -m <n>
 mmcli -m <n> --simple-status

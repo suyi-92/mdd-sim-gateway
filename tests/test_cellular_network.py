@@ -1,3 +1,6 @@
+import asyncio
+import json
+import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -9,6 +12,23 @@ MODEM = "/org/freedesktop/ModemManager1/Modem/7"
 
 
 class CellularNetworkCommandTests(unittest.TestCase):
+    @staticmethod
+    def reply(stdout="", stderr="", returncode=0):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def metadata(self, plugin="quectel", ports=None):
+        return self.reply(json.dumps({"modem": {"generic": {
+            "plugin": plugin, "ports": ports if ports is not None else [
+                "cdc-wdm7 (qmi)", "ttyUSB7 (at)", "wwan7 (net)"],
+        }}}))
+
+    def cops_reply(self, value):
+        return self.reply(json.dumps({"type": "s", "data": [value]}))
+
+    def transaction(self, scan_reply, selection="+COPS: 0", restore_reply=None):
+        return [self.metadata(), self.cops_reply(selection), self.cops_reply(""),
+                scan_reply, restore_reply if restore_reply is not None else self.cops_reply("")]
+
     def test_scan_parser_merges_technologies_and_orders_current_first(self):
         output = """  ---------------------
   3GPP scan | networks: 46001 - CHN-UNICOM (lte, current)
@@ -39,6 +59,139 @@ class CellularNetworkCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["LC_ALL"], "C")
         self.assertFalse(kwargs["check"])
 
+    def test_quectel_qmi_uses_same_mm_object_with_full_at_timeout(self):
+        runner = Mock(side_effect=self.transaction(self.cops_reply(
+            '+COPS: (1,"Fixture Mobile","Fixture","00101",7),'
+            '(2,"Fixture Home","Home","00102",7),,(0-4),(0-2)')))
+        sleeper = Mock()
+        result = cellular_network.scan(MODEM, runner=runner, sleeper=sleeper)
+        self.assertEqual([n["operator_id"] for n in result], ["00102", "00101"])
+        args, kwargs = runner.call_args_list[3]
+        self.assertEqual(args[0], [
+            "busctl", "--system", "--json=short", "--timeout=330", "call",
+            "org.freedesktop.ModemManager1", MODEM,
+            "org.freedesktop.ModemManager1.Modem", "Command", "su", "AT+COPS=?", "315"])
+        self.assertEqual(kwargs["timeout"], 345)
+        self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
+                         ["AT+COPS?", "AT+COPS=2", "AT+COPS=?", "AT+COPS=0"])
+        sleeper.assert_called_once_with(3)
+        self.assertEqual(result[0]["status"], "current")
+        self.assertEqual(result[0]["access_technology"], "lte")
+
+    def test_other_backends_and_quectel_without_at_keep_standard_scan(self):
+        for metadata in [self.metadata(plugin="generic"), self.metadata(
+                ports=["cdc-wdm7 (qmi)", "wwan7 (net)"]), self.metadata(
+                    ports=["ttyUSB7 (at)"])]:
+            with self.subTest(metadata=metadata):
+                runner = Mock(side_effect=[metadata, self.reply(
+                    "3GPP scan | networks: 00101 - Fixture Mobile (lte, available)")])
+                self.assertEqual(cellular_network.scan(MODEM, runner=runner)[0]["operator_id"], "00101")
+                self.assertIn("--3gpp-scan", runner.call_args.args[0])
+
+    def test_completed_empty_mmcli_scan_gets_one_at_fallback(self):
+        runner = Mock(side_effect=[self.metadata(plugin="generic"),
+            self.reply(stderr=cellular_network.EMPTY_MMCLI_SCAN + "\n", returncode=1),
+            self.cops_reply('+COPS: (1,"Fixture","F","00101",7),,(0-4),(0-2)')])
+        self.assertEqual(cellular_network.scan(MODEM, runner=runner)[0]["operator_id"], "00101")
+        self.assertEqual(len(runner.call_args_list), 3)
+        self.assertIn(MODEM, runner.call_args.args[0])
+
+    def test_real_mm_failures_and_timeouts_never_launch_another_scan(self):
+        for failure in [self.reply(stderr="Timeout was reached", returncode=1),
+                        self.reply(stderr="Unauthorized", returncode=1),
+                        self.reply(stderr="SIM not inserted", returncode=1),
+                        self.reply(stderr="Operation in progress", returncode=1),
+                        subprocess.TimeoutExpired("mmcli", 315)]:
+            with self.subTest(failure=failure):
+                runner = Mock(side_effect=[self.metadata(plugin="generic"), failure])
+                with self.assertRaises(cellular_network.CellularNetworkError):
+                    cellular_network.scan(MODEM, runner=runner)
+                self.assertEqual(len(runner.call_args_list), 2)
+
+    def test_cops_merges_rats_preserves_mnc_and_forbidden_status(self):
+        result = cellular_network.parse_cops_output(
+            '+COPS: (1,"Fixture (West), Mobile","F","00101",0),'
+            '(2,"Fixture LTE","F","00101",7),'
+            '(3,"","Forbidden","001001",2),(0,"","","00102"),,(0-4),(0-2)')
+        self.assertEqual(result, [
+            {"operator_id": "00101", "name": "Fixture (West), Mobile",
+             "access_technology": "gsm/lte", "status": "current"},
+            {"operator_id": "00102", "name": "00102", "access_technology": "", "status": "unknown"},
+            {"operator_id": "001001", "name": "Forbidden", "access_technology": "umts", "status": "forbidden"},
+        ])
+
+    def test_empty_at_list_is_empty_but_malformed_reply_is_an_error(self):
+        for value in ["+COPS:", "+COPS: ,,(0-4),(0-2)"]:
+            runner = Mock(side_effect=self.transaction(self.cops_reply(value)))
+            self.assertEqual(cellular_network.scan(MODEM, runner=runner, sleeper=Mock()), [])
+        for value in ["OK", "ERROR", '+COPS: (1,"Bad","B","001",7)',
+                      '+COPS: (1,"Good","G","00101",7),(broken)',
+                      '+COPS: (1,"Bad","B","00101;reboot",7)']:
+            with self.subTest(value=value), self.assertRaises(cellular_network.CellularNetworkError):
+                cellular_network.parse_cops_output(value)
+        for reply in [self.reply("not json"), self.reply('{"type":"s","data":[]}'),
+                      self.reply('{"type":"u","data":[3]}'),
+                      self.reply(stderr="AT command rejected", returncode=1),
+                      subprocess.TimeoutExpired("busctl", 345)]:
+            runner = Mock(side_effect=self.transaction(reply))
+            with self.subTest(reply=reply), self.assertRaises(cellular_network.CellularNetworkError):
+                cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+            self.assertEqual(runner.call_args.args[0][-2], "AT+COPS=0")
+
+    def test_invalid_path_never_reaches_mm_or_at(self):
+        runner = Mock()
+        with self.assertRaises(cellular_network.CellularNetworkError):
+            cellular_network.scan(MODEM + ";reboot", runner=runner)
+        runner.assert_not_called()
+
+    def test_modem_rejection_is_actionable_and_does_not_become_an_empty_success(self):
+        runner = Mock(side_effect=self.transaction(
+            self.reply(stderr="Call failed: Operation not allowed\n", returncode=1)))
+        with self.assertRaisesRegex(cellular_network.CellularNetworkError, "The modem rejected the scan"):
+            cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+        self.assertEqual(len(runner.call_args_list), 5)
+        self.assertEqual(runner.call_args.args[0][-2], "AT+COPS=0")
+
+    def test_manual_selection_is_restored_exactly_after_success_or_failure(self):
+        for mode in [1, 4]:
+            for result in [self.cops_reply("+COPS: ,,(0-4),(0-2)"),
+                           subprocess.TimeoutExpired("busctl", 345)]:
+                runner = Mock(side_effect=self.transaction(
+                    result, selection=f'+COPS: {mode},2,"001001",7'))
+                with self.subTest(mode=mode, result=result):
+                    if isinstance(result, Exception):
+                        with self.assertRaises(cellular_network.CellularNetworkError):
+                            cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+                    else:
+                        self.assertEqual(cellular_network.scan(MODEM, runner=runner, sleeper=Mock()), [])
+                    self.assertEqual(runner.call_args.args[0][-2], f'AT+COPS={mode},2,"001001"')
+
+    def test_failed_deregistration_still_restores_without_starting_scan(self):
+        for failure in [self.reply(stderr="rejected", returncode=1),
+                        subprocess.TimeoutExpired("busctl", 90)]:
+            runner = Mock(side_effect=[self.metadata(), self.cops_reply("+COPS: 0"),
+                                       failure, self.cops_reply("")])
+            with self.subTest(failure=failure), self.assertRaises(cellular_network.CellularNetworkError):
+                cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+            self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
+                             ["AT+COPS?", "AT+COPS=2", "AT+COPS=0"])
+
+    def test_restore_failure_cannot_be_reported_as_scan_success(self):
+        runner = Mock(side_effect=self.transaction(
+            self.cops_reply('+COPS: (1,"Fixture","F","00101",7)'),
+            restore_reply=self.reply(stderr="restore failed", returncode=1)))
+        with self.assertRaisesRegex(cellular_network.CellularNetworkError, "Restoring cellular registration failed"):
+            cellular_network.scan(MODEM, runner=runner, sleeper=Mock())
+
+    def test_unrestorable_selection_and_deregistered_mode_are_never_changed(self):
+        for selection in ['+COPS: 1,0,"Fixture Mobile",7', "+COPS: 2", "+COPS: 1",
+                          '+COPS: 1,2,"00101;reboot",7', "unknown"]:
+            runner = Mock(side_effect=[self.metadata(), self.cops_reply(selection),
+                                       self.cops_reply("+COPS: ,,(0-4),(0-2)")])
+            self.assertEqual(cellular_network.scan(MODEM, runner=runner, sleeper=Mock()), [])
+            self.assertEqual([call.args[0][-2] for call in runner.call_args_list[1:]],
+                             ["AT+COPS?", "AT+COPS=?"])
+
     def test_registration_accepts_only_automatic_or_exact_plmn(self):
         calls = []
 
@@ -61,6 +214,25 @@ class CellularNetworkCommandTests(unittest.TestCase):
 
 
 class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hardware_rediscovery_cannot_interrupt_a_network_transaction(self):
+        with patch.object(main, "capability_lock", asyncio.Lock()), \
+                patch.object(main.operations, "request_device_rescan") as rescan:
+            async with main.capability_lock:
+                for call in [lambda: main.api_devices_rescan(), lambda: main.api_device_rescan("modem-a")]:
+                    with self.assertRaises(main.HTTPException) as raised:
+                        await call()
+                    self.assertEqual(raised.exception.status_code, 409)
+            rescan.assert_not_called()
+
+    async def test_scan_waits_for_an_existing_hardware_rediscovery(self):
+        for state in ["requested", "running"]:
+            with patch.object(main.operations, "device_rescan_status", return_value={"state": state}), \
+                    patch.object(main.cellular_network, "scan") as scan:
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.api_device_cellular_network_scan("modem-a")
+                self.assertEqual(raised.exception.status_code, 409)
+                scan.assert_not_called()
+
     def observed(self, **cellular):
         return {"devices": {"modem-a": {
             "present": True, "mm_object": MODEM,
@@ -100,6 +272,23 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
             "id": "3", "cellular_network_mode": "manual",
             "cellular_operator_id": "46000"})
         broadcast.assert_awaited_once()
+
+    async def test_scan_guards_fail_before_any_modem_command(self):
+        for observed in [self.observed(sim_present=False), self.observed(data_active=True),
+                         self.observed(available=False)]:
+            with patch.object(main.device_state, "status", return_value=observed), \
+                    patch.object(main.cellular_network, "scan") as scan:
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.api_device_cellular_network_scan("modem-a")
+                self.assertEqual(raised.exception.status_code, 409)
+                scan.assert_not_called()
+        observed = self.observed()
+        observed["devices"]["modem-a"]["desired"] = {"flight_mode": True}
+        with patch.object(main.device_state, "status", return_value=observed), \
+                patch.object(main.cellular_network, "scan") as scan:
+            with self.assertRaises(main.HTTPException):
+                await main.api_device_cellular_network_scan("modem-a")
+            scan.assert_not_called()
 
     async def test_missing_sim_and_active_bearer_fail_before_mmcli(self):
         register = Mock()

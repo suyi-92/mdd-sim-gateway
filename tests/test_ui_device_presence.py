@@ -39,7 +39,8 @@ class DevicePresenceTests(unittest.TestCase):
         self.assertIn("visibleDevices.map", page)
         self.assertNotIn("{devices.map", page)
         self.assertIn("if (active !== selectedDeviceId) setSelectedDeviceId(active)", page)
-        self.assertIn("if (!d) return", page)
+        self.assertIn("!d ? <Empty", page)
+        self.assertIn('{d && <div className="u-page u-device-body"', page)
         self.assertIn("No communication devices found", page)
 
     def test_user_facing_device_surfaces_share_the_naming_helper(self):

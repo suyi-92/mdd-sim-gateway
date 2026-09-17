@@ -324,7 +324,7 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   const scan = async () => {
     if (unavailable || busy) return
     if (!window.confirm(t('Scanning cellular networks temporarily interrupts registration and may take several minutes. Continue?'))) return
-    setBusy('scan'); setFeedback(''); setFailed(false)
+    setBusy('scan'); setFeedback(t('Scanning nearby networks. The modem may take several minutes.')); setFailed(false)
     try {
       const result = await api.scanCellularNetworks(device.id)
       const found = result.networks || []
@@ -335,7 +335,7 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
         ? t('Found {count} cellular networks.', { count: found.length })
         : t('No cellular networks were returned by the modem.'))
     } catch (error) {
-      setFailed(true); setFeedback(`${t('Network scan failed')}: ${error.message}`)
+      setFailed(true); setFeedback(`${t('Network scan failed')}: ${t(error.message)}`)
     } finally { setBusy('') }
   }
   const apply = async () => {
@@ -434,7 +434,7 @@ function DeviceIdentityLine({ device, showToast }) {
 }
 
 
-function HardwarePanel({ device, refreshDevices, showToast }) {
+function HardwarePanel({ device, refreshDevices, refresh, showToast }) {
   const { t } = useI18n()
   const [imei, setImei] = useState(device.imei || '')
   const [name, setName] = useState(device.display_name || '')
@@ -505,6 +505,12 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
         placeholder={t('Optional 15-digit equipment IMEI')} />
       <button className="btn btn-primary" disabled={!!saving} onClick={saveImei}>{t('Save')}</button>
     </div>}
+    <div className="u-hardware-action u-hardware-detection">
+      <div className="u-hardware-action-copy"><h4>{t('Device detection')}</h4>
+        <p>{t('Re-detect this device if its connection or SIM state has stopped updating.')}</p>
+      </div>
+      <DeviceRescanControl key={device.id} device={device} refresh={refresh} showToast={showToast}/>
+    </div>
     <div className="u-hardware-action u-hardware-danger">
       <div className="u-hardware-action-copy"><h4>{t('Remove device record')}</h4>
         <p>{t('Only disconnected devices can be removed; SIM and line configurations are preserved.')}</p>
@@ -531,7 +537,8 @@ function DeviceRescanControl({ device = null, refresh, showToast }) {
       ? t('Re-detect this device? Its reader, SIM bridge and cellular registration may disconnect briefly.')
       : t('Restart hardware discovery? PC/SC readers, modem bridges and cellular registration may disconnect briefly.')
     if (!window.confirm(question)) return
-    setBusy(true); setFailed(false); setFeedback(t('Restarting all hardware discovery backends…'))
+    setBusy(true); setFailed(false); setFeedback(t(device
+      ? 'Re-detecting this device…' : 'Restarting all hardware discovery backends…'))
     try {
       const requested = device ? await api.rescanDevice(device.id) : await api.rescanDevices()
       const operationId = requested.operation_id
@@ -564,7 +571,8 @@ function DeviceRescanControl({ device = null, refresh, showToast }) {
     } finally { setBusy(false) }
   }
   return <div className={`u-device-rescan${device ? ' is-device' : ''}`}>
-    <button className="btn btn-primary u-device-rescan-button" disabled={busy} onClick={rescan}>
+    <button className="btn btn-ghost u-device-rescan-button" disabled={busy || device?.present === false} onClick={rescan}>
+      <svg className={busy ? 'is-spinning' : ''} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></svg>
       {busy ? `${t('Detecting')}…` : t(device ? 'Re-detect this device' : 'Run full device detection')}
     </button>
     <div className={`u-device-rescan-feedback${failed ? ' is-error' : ''}`} role="status">
@@ -612,18 +620,18 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
     <input type="checkbox" checked={showDisconnected} onChange={event => setShowDisconnected(event.target.checked)} />
     {t('Show disconnected devices')} ({disconnectedCount})
   </label>
-  const discoveryHeader = <div className="u-device-discovery-heading">
-    <div><h2>{t('Communication devices')}</h2>
-      <p>{t('Rebuild USB modem, ModemManager, PC/SC reader and SIM bridge detection from the host.')}</p></div>
-    <DeviceRescanControl refresh={refresh} showToast={showToast}/>
-  </div>
   useEffect(() => { if (d && !supportsCellular(d) && tab === 'cellular') setTab('status') }, [d, tab])
-  if (loadErrors?.devices && !devices.length) return <>{discoveryHeader}<p className="u-error">{t('Loading failed')}</p></>
-  if (discovering) return <>{discoveryHeader}<Discovering t={t} /></>
-  if (!d) return <>{discoveryHeader}{historyToggle}<Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /></>
+  const emptyContent = loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p>
+    : discovering ? <Discovering t={t} />
+    : !d ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> : null
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('Cellular data (4G)')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
-  return <>{discoveryHeader}{historyToggle}<div className="u-split"><aside className="card u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i,t)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</aside>
-    <section className="u-page"><div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div><DeviceRescanControl device={d} refresh={refresh} showToast={showToast}/></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
+  return <div className="u-split"><aside className="card u-device-sidebar">
+    <h2>{t('Communication devices')}</h2>
+    <div className="u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i,t)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</div>
+    <div className="u-device-sidebar-footer">{historyToggle}<DeviceRescanControl refresh={refresh} showToast={showToast}/></div>
+    </aside>
+    <section className="u-page">{emptyContent}{d && <div className="u-page u-device-body" hidden={!!emptyContent}>
+      <div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>
@@ -639,11 +647,11 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
           <div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div>
           <div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div>
         </div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on cellular data to let the per-device ModemManager backend establish a data bearer.')} />}
-        <CellularNetworkControl device={d} refreshDevices={refreshDevices} showToast={showToast}/>
+        <CellularNetworkControl key={d.id} device={d} refreshDevices={refreshDevices} showToast={showToast}/>
       </div>}
       {tab==='vowifi' && <div className="card u-panel"><h3>VoWiFi</h3><CountryExitControl device={d} refresh={refresh} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><VowifiHistory instanceId={d.instance_id} subscribe={subscribe}/><div className="u-details cols"><div className="u-detail"><span>ePDG / IKE</span><b>{typeof d.vowifi?.epdg === 'object' ? (d.vowifi.epdg.ike_reason || (d.vowifi.epdg.pcscf ? t('Tunnel connected') : t('Waiting'))) : (d.vowifi?.epdg || d.status?.state || t('Not connected'))}</b></div><div className="u-detail"><span>IMS / SIP</span><b>{d.vowifi?.ims || d.status?.label || t('Not connected')}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t)} /></b></div><div className="u-detail"><span>{t('Rekey')}</span><b>{d.vowifi?.rekey_minutes ?? 30} {t('minutes')}</b></div><div className="u-detail"><span>{t('IKE rekey')}</span><b>{d.vowifi?.ike_rekey_minutes ?? 150} {t('minutes')}</b></div></div>{!!d.egress?.pinned_node && d.egress.pinned_node !== d.egress.node && !!exitChangeReason(d.egress, t, language) && <p className="u-note u-proxy-node-text"><ProxyNodeName text={exitChangeReason(d.egress, t, language)} /></p>}<p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
-      {tab==='hardware' && <HardwarePanel device={d} refreshDevices={refreshDevices} showToast={showToast}/>}
-    </section></div></>
+      {tab==='hardware' && <HardwarePanel key={d.id} device={d} refreshDevices={refreshDevices} refresh={refresh} showToast={showToast}/>}
+    </div>}</section></div>
 }
 
 function CountryExitControl({ device, refresh, showToast }) {

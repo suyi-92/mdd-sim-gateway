@@ -4982,8 +4982,11 @@ async def api_devices():
 @app.post("/api/devices/rescan")
 async def api_devices_rescan():
     """Request one root-owned, all-backend hardware rediscovery."""
+    if capability_lock.locked():
+        raise HTTPException(409, "wait for the current device operation before rediscovery")
     try:
-        result = await asyncio.to_thread(operations.request_device_rescan)
+        async with capability_lock:
+            result = await asyncio.to_thread(operations.request_device_rescan)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(409, str(exc)) from exc
     except OSError as exc:
@@ -4994,14 +4997,17 @@ async def api_devices_rescan():
 
 @app.post("/api/devices/{device_id}/rescan")
 async def api_device_rescan(device_id: str):
+    if capability_lock.locked():
+        raise HTTPException(409, "wait for the current device operation before rediscovery")
     device = next((item for item in await _unified_devices()
                    if str(item.get("id")) == str(device_id)), None)
     if not device:
         raise HTTPException(404, "no such known communication device")
     device_type = "reader" if device.get("device_type") == "reader" else "modem"
     try:
-        result = await asyncio.to_thread(
-            operations.request_device_rescan, str(device_id), device_type)
+        async with capability_lock:
+            result = await asyncio.to_thread(
+                operations.request_device_rescan, str(device_id), device_type)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
@@ -5155,6 +5161,8 @@ async def api_device_cellular(device_id: str):
 
 def _cellular_network_target(device_id: str) -> tuple[dict, dict, str]:
     """Resolve one live modem to its current MM object and configured SIM line."""
+    if operations.device_rescan_status().get("state") in {"requested", "running"}:
+        raise HTTPException(409, "wait for device rediscovery before selecting a cellular network")
     observed = (device_state.status().get("devices") or {}).get(str(device_id))
     if not observed or not observed.get("present"):
         raise HTTPException(404, "no such connected cellular modem")
@@ -5179,7 +5187,7 @@ def _cellular_network_target(device_id: str) -> tuple[dict, dict, str]:
 
 @app.post("/api/devices/{device_id}/cellular/networks/scan")
 async def api_device_cellular_network_scan(device_id: str):
-    """Scan the selected modem only; never guess or expose a network not reported by MM."""
+    """Scan only the selected modem through MM, including its managed AT command path."""
     async with capability_lock:
         _observed, _inst, modem_path = _cellular_network_target(device_id)
         try:
