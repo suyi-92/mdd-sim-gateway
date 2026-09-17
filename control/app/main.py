@@ -20,6 +20,8 @@ import os
 import random
 import re
 import time
+import threading
+from functools import wraps
 from . import phone_identity
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -187,7 +189,8 @@ def _carrier_description(inst: dict | None, card_info: dict | None,
 def _client_card_info(value: dict) -> dict:
     """Card monitor view for authenticated clients, without carrier matching material."""
     return {key: item for key, item in value.items()
-            if key not in {"carrier_identity", "spn", "gid1", "gid2"}}
+            if key not in {"carrier_identity", "spn", "gid1", "gid2",
+                           "esim_verified_bridge", "esim_verified_maintenance"}}
 
 
 def _client_cards(values: list[dict] | None = None) -> list[dict]:
@@ -1052,6 +1055,26 @@ def _bridge_card_evidence(identity: dict) -> bool:
         return False
 
 
+def _pcsc_maintenance_epoch() -> float:
+    try:
+        return os.path.getmtime(os.path.join(cfg.DATA_DIR, "orchestrator", "pcsc-maintenance"))
+    except OSError:
+        return 0.0
+
+
+def _esim_verified_reader_current(name: str, info: dict, maintenance_epoch: float) -> bool:
+    """Reuse only this switch's verified read on the same live bridge and maintenance event."""
+    proof = info.get("esim_verified_bridge")
+    if (not proof or not info.get("present") or not info.get("iccid")
+            or info.get("esim_verified_maintenance") != maintenance_epoch):
+        return False
+    identity = _modem_identity_for_reader(name) or {}
+    return bool(_bridge_card_evidence(identity)
+                and identity.get("iccid") == info.get("iccid")
+                and proof == identity.get("bridge_generation")
+                and info.get("verified_at", 0) >= maintenance_epoch)
+
+
 def _live_vpcd_iccid(name: str) -> str:
     """Return the current bridge-published ICCID for a connected VPCD reader.
 
@@ -1462,17 +1485,15 @@ async def card_monitor():
             # stanzas.  Treat that explicit maintenance window as enumeration churn, not as a
             # physical unplug, so healthy engine containers are not stopped.
             maintenance = False
-            marker = os.path.join(cfg.DATA_DIR, "orchestrator", "pcsc-maintenance")
-            try:
-                # Rebuilding sing-box, ModemManager ownership and all virtual readers can take
-                # more than 15 seconds on a Pi. Keep this comfortably above the observed full
-                # orchestrator restart time so planned churn cannot be mistaken for an unplug.
-                maintenance = (time.time() - os.path.getmtime(marker)
+            maintenance_epoch = _pcsc_maintenance_epoch()
+            maintenance = bool(maintenance_epoch and time.time() - maintenance_epoch
                                < PCSC_MAINTENANCE_WINDOW_SECONDS)
-            except OSError:
-                pass
             if maintenance and not force_rescan:
                 maintenance_readers.update(hub.cards)
+                for name, entry in hub.cards.items():
+                    if (not hub.lpa_busy.get(name)
+                            and not (current.get(name) or {}).get("present")):
+                        entry.pop("esim_verified_bridge", None)
                 # A same-name VPCD reader can already be back with a new bridge-published SIM
                 # while the broader remove/add stream is intentionally suppressed.  Ready
                 # metadata is safe to reconcile now and prevents the UI from borrowing the old
@@ -1571,9 +1592,11 @@ async def card_monitor():
                 if st["present"] and (name in maintenance_readers
                                       or _identity_retry_due(entry)):
                     maintenance_readers.discard(name)
-                    await _on_card_insert(name, st["index"], verify=True)
-                    changed = True
-                    continue
+                    if (entry.get("identity_state") != "confirmed"
+                            or not _esim_verified_reader_current(name, entry, maintenance_epoch)):
+                        await _on_card_insert(name, st["index"], verify=True)
+                        changed = True
+                        continue
                 if st["present"] and await _reconcile_vpcd_card_identity(name, st["index"]):
                     changed = True
             # The first completed scan is always announced, even when it found nothing:
@@ -3799,6 +3822,8 @@ async def _esim_refresh_modem_readers(
             active = siblings[:_modem_active_slot_capacity(hardware_id, len(siblings))]
             primary_name = name if name in active else active[0]
             primary_idx = readers.index(primary_name)
+            before = _modem_identity_for_reader(primary_name) or {}
+            maintenance_epoch = _pcsc_maintenance_epoch()
             card_data = await asyncio.to_thread(sim.read_card, primary_idx)
             actual = str(card_data.iccid or "")
             if actual != str(iccid):
@@ -3818,11 +3843,21 @@ async def _esim_refresh_modem_readers(
                         "allocated SIM slot does not match the target profile")
             refreshed = []
             primary = None
+            after = _modem_identity_for_reader(primary_name) or {}
+            reusable = (_bridge_card_evidence(before) and _bridge_card_evidence(after)
+                        and after.get("iccid") == iccid and after.get("bridge_generation")
+                        and all(before.get(key) == after.get(key)
+                                for key in ("bridge_generation", "bridge_pid", "bridge_start"))
+                        and maintenance_epoch == _pcsc_maintenance_epoch())
             for sibling in active:
                 idx = readers.index(sibling)
                 info = await _esim_refresh_card(
                     sibling, idx, card_data=card_data, auto_start=False, broadcast=False,
                     expect_iccid=iccid)
+                if reusable:
+                    info.update(bridge_generation=after["bridge_generation"],
+                                esim_verified_bridge=after["bridge_generation"],
+                                esim_verified_maintenance=maintenance_epoch)
                 refreshed.append(sibling)
                 if sibling == name or primary is None:
                     primary = info
@@ -3835,7 +3870,8 @@ async def _esim_refresh_modem_readers(
     raise HTTPException(503, f"eSIM profile did not become active on every VPCD slot: {last_error}")
 
 
-async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) -> dict:
+async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
+                                     *, after_bridge=None) -> dict:
     """Rebuild the modem bridge, publish the new line, and return before Engine startup.
 
     Country egress can need longer than one startup attempt to resolve and route a new ePDG.
@@ -3845,6 +3881,8 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     started_at = time.monotonic()
     bridge = await _esim_restart_modem_bridge(hardware_id, iccid)
     bridge_ready_at = time.monotonic()
+    notification_status = await after_bridge() if after_bridge else None
+    notifications_done_at = time.monotonic()
     info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
     refreshed_at = time.monotonic()
     target = _match_instance_by_iccid(iccid)
@@ -3865,12 +3903,13 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     network_operations.reset((str(hardware_id), str(target["id"]), str(iccid)))
     egress.publish()
     log.info(
-        "eSIM profile recovery complete bridge_ms=%d card_refresh_ms=%d",
+        "eSIM profile recovery complete bridge_ms=%d notification_ms=%d card_refresh_ms=%d",
         round((bridge_ready_at - started_at) * 1000),
-        round((refreshed_at - bridge_ready_at) * 1000),
+        round((notifications_done_at - bridge_ready_at) * 1000),
+        round((refreshed_at - notifications_done_at) * 1000),
     )
     return {"card": info, "readers": readers, "instance_id": str(target["id"]),
-            "bridge": bridge, "start_allowed": enabled,
+            "bridge": bridge, "start_allowed": enabled, "notification_status": notification_status,
             "pin_preflight_proof": {
                 "iccid": str(iccid), "pin_enabled": info.get("pin_enabled"),
                 "observed_at": refreshed_at,
@@ -4051,6 +4090,11 @@ async def _esim_run(
     """Serialize an LPA call: engine gate + per-reader lock + lpa_busy + optional refresh."""
     await asyncio.to_thread(_esim_guard_engine, name)
     async with hub.reader_lock(name):
+        # No proof from an earlier operation may suppress a later identity check.
+        hardware_id = device_state.vpcd_modem_hardware_id(name)
+        names = _esim_modem_reader_names(name, hardware_id) if hardware_id else [name]
+        for reader in names:
+            (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
         hub.lpa_busy[name] = True
         try:
             result = await coro
@@ -8087,6 +8131,16 @@ _ESIM_CACHE_PATH = os.path.join(cfg.DATA_DIR, "esim-chip-cache.json")
 
 def _esim_cache_load() -> dict:
     doc = _read_json_file(_ESIM_CACHE_PATH)
+    if isinstance(doc, dict):
+        for entry in doc.values():
+            for se in entry.get("ses") or []:
+                for profile in se.get("profiles") or []:
+                    status = profile.get("notification_status") or {}
+                    if (status.get("state") in {"pending", "processing"}
+                            and time.time() - float(status.get("updated_at") or 0) > 180):
+                        # A restarted Control cannot leave an old attempt spinning forever.
+                        profile["notification_status"] = {
+                            **status, "state": "failed", "reason_code": "notification_timeout"}
     return doc if isinstance(doc, dict) else {}
 
 
@@ -8098,6 +8152,18 @@ def _esim_cache_write(data: dict):
     os.replace(tmp, _ESIM_CACHE_PATH)
 
 
+_esim_cache_lock = threading.RLock()
+
+
+def _esim_cache_transaction(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with _esim_cache_lock:
+            return function(*args, **kwargs)
+    return locked
+
+
+@_esim_cache_transaction
 def _esim_cache_store(ses: list, imei: str):
     eid = next((str(se.get("eid")) for se in ses if se.get("eid")), "")
     # Only a fully successful read may overwrite the cache — a partial/failed load would
@@ -8105,6 +8171,16 @@ def _esim_cache_store(ses: list, imei: str):
     if not eid or any(se.get("error") for se in ses):
         return
     data = _esim_cache_load()
+    # A live profile-list read has no delivery status. Retain the independently
+    # confirmed outcome for the same eUICC/SE/profile, including in this response.
+    previous = {(str(se.get("id") or ""), p.get("iccid")): p.get("notification_status")
+                for se in (data.get(eid) or {}).get("ses") or []
+                for p in se.get("profiles") or []}
+    for se in ses:
+        for profile in se.get("profiles") or []:
+            status = previous.get((str(se.get("id") or ""), profile.get("iccid")))
+            if status:
+                profile["notification_status"] = status
     # Profiles/chip metadata remain useful while a line owns the reader, but the pending
     # notification list is transient: automatic delivery can remove it moments after this
     # snapshot. Persisting it made an already-sent installation result reappear after every
@@ -8124,8 +8200,10 @@ def _esim_cache_for_iccid(iccid: str) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
+@_esim_cache_transaction
 def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
-                               nickname: str | None = None, remove: bool = False):
+                               nickname: str | None = None, remove: bool = False,
+                               notification_status: dict | None = None):
     """Mirror a successful enable/disable/delete/nickname onto the cached view."""
     data = _esim_cache_load()
     changed = False
@@ -8147,6 +8225,8 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
                     hit["profileState"] = state
                 if nickname is not None:
                     hit["profileNickname"] = nickname
+                if notification_status is not None:
+                    hit["notification_status"] = notification_status
             changed = True
             entry_changed = True
         if entry_changed:
@@ -8155,6 +8235,7 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
         _esim_cache_write(data)
 
 
+@_esim_cache_transaction
 def _esim_cache_remove_notifications(
     iccid: str,
     se_id: str | None,
@@ -8186,6 +8267,8 @@ def _esim_cache_remove_notifications(
             current = se.get("notifications") or []
             if seq is None:
                 remaining = []
+                for profile in se.get("profiles") or []:
+                    profile.pop("notification_status", None)
             else:
                 remaining = [
                     item for item in current
@@ -8234,6 +8317,30 @@ def _esim_notifications_processed_callback(
         await _esim_notifications_changed(reader, cache_iccid, se_id, generation=generation)
 
     return processed
+
+
+def _esim_notification_status_callback(reader: str, iccid: str):
+    async def report(status: dict):
+        # Publish only a closed summary, never lpac errors or notification endpoints.
+        state = str(status.get("state") or "")
+        if state not in {"pending", "processing", "processed", "failed", "disabled"}:
+            return
+        reason = str(status.get("reason_code") or "")
+        if reason not in {"reader_busy", "notification_failed", "notification_timeout",
+                          "reader_unavailable"}:
+            reason = ""
+        value = {"state": state, "reason_code": reason,
+                 "attempts": min(3, max(0, int(status.get("attempts") or 0))),
+                 "updated_at": time.time()}
+        try:
+            await asyncio.to_thread(_esim_cache_update_profile, iccid, notification_status=value)
+        except OSError as exc:
+            log.warning("could not persist eSIM notification status error=%s", type(exc).__name__)
+        # This belongs to the profile, not the old card-monitor generation at enable time.
+        await hub.broadcast({"type": "esim_notification_status", "reader": reader,
+                             "iccid": iccid, "notification_status": value})
+        return value
+    return report
 
 
 @app.get("/api/esim/chip/cached")
@@ -8349,6 +8456,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 await _esim_run(
                     name, idx, lpa.profile_enable(
                         name, iccid, aid=se.get("aid"),
+                        on_notification_status=_esim_notification_status_callback(name, iccid),
                         on_notifications_processed=_esim_notifications_processed_callback(
                             name, iccid, se.get("id"))),
                     refresh=True, refresh_expect_iccid=iccid)
@@ -8369,8 +8477,11 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
         previous = await _esim_prepare_profile_switch(hardware_id)
         busy_readers = _esim_modem_reader_names(name, hardware_id)
         for reader in busy_readers:
+            (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
             hub.lpa_busy[reader] = True
         lpa_succeeded = False
+        notification_status = None
+        report_notification = _esim_notification_status_callback(name, iccid)
         try:
             await _esim_profile_event(name, iccid, "switching")
             if _esim_vowifi_requested(hardware_id):
@@ -8380,17 +8491,35 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 body.get("aid"), require=True)
             await _esim_run(
                 name, idx, lpa.profile_enable(
-                    name, iccid, aid=se.get("aid"),
-                    on_notifications_processed=_esim_notifications_processed_callback(
-                        name, iccid, se.get("id"))),
+                    name, iccid, aid=se.get("aid"), process_notifications=False),
                 keep_busy=True)
             lpa_succeeded = True
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
+            notification_status = await report_notification({"state": "pending"})
             await _esim_profile_event(
                 name, iccid, "enabled", profile_state="enabled")
+
+            async def process_after_bridge():
+                nonlocal notification_status
+                await _esim_profile_event(name, iccid, "notifying", profile_state="enabled")
+
+                async def status_changed(status):
+                    nonlocal notification_status
+                    notification_status = await report_notification(status)
+
+                await _esim_run(name, idx, lpa.maybe_process_notifications(
+                    name, aid=se.get("aid"), on_status=status_changed,
+                    on_processed=_esim_notifications_processed_callback(name, iccid, se.get("id"))),
+                    keep_busy=True)
+                return notification_status
+
             try:
-                recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
+                recovery = await _esim_recover_profile_switch(
+                    name, hardware_id, iccid, after_bridge=process_after_bridge)
             except Exception as exc:  # noqa
+                if (notification_status or {}).get("state") in {"pending", "processing"}:
+                    notification_status = await report_notification({
+                        "state": "failed", "reason_code": "reader_unavailable"})
                 # The eUICC already switched — reporting plain failure here made the UI
                 # keep the old profile marked active while the card ran the new one, the
                 # exact "switched but nothing happened" report in issue #26. Lines stay
@@ -8411,6 +8540,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                     reason_code=_recovery_failure_code(exc))
                 return {"ok": True, "iccid": iccid, "se_id": se["id"],
                         "card": hub.cards.get(name),
+                        "notification_status": notification_status,
                         "recovery_error": str(detail) or "line recovery failed"}
             start_allowed = recovery.get("start_allowed", True)
             asyncio.create_task(_esim_restore_cellular_selection(hardware_id, iccid))
@@ -8421,6 +8551,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             else:
                 await _esim_profile_event(name, iccid, "line_disabled", profile_state="enabled")
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
+                    "notification_status": notification_status,
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],
                         "readers": recovery["readers"],
@@ -8433,8 +8564,18 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 await _esim_profile_event(name, iccid, "switch_failed")
             raise
         finally:
+            confirmed = False
             for reader in set(busy_readers) | set(_esim_modem_reader_names(name, hardware_id)):
                 hub.lpa_busy.pop(reader, None)
+                info = hub.cards.get(reader) or {}
+                if _esim_verified_reader_current(reader, info, _pcsc_maintenance_epoch()):
+                    # The monitor may have marked a verified slot pending while lpac owned
+                    # the reader. Restore only proof produced by this completed switch.
+                    info.update(identity_state="confirmed", identity_reason="",
+                                identity_attempts=0, identity_retry_at=0)
+                    confirmed = True
+            if confirmed:
+                await hub.broadcast({"type": "cards", "cards": _client_cards()})
 
 
 @app.post("/api/esim/profiles/{iccid}/disable")

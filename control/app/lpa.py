@@ -38,6 +38,8 @@ class LpaError(Exception):
 
     def user_message(self) -> str:
         """User-facing text; maps raw lpac function names to plain language."""
+        if _reader_busy_error(self):
+            return "The eSIM reader is temporarily busy. Wait for the current card operation, then retry."
         msg = (self.message or "").strip().lower()
         detail = self.detail
         detail_s = ""
@@ -64,6 +66,11 @@ class LpaError(Exception):
 class LpaResult:
     data: Any = None
     progress: list[dict] = field(default_factory=list)
+
+
+def _reader_busy_error(error: LpaError) -> bool:
+    detail = f"{error.message} {error.detail}".lower()
+    return any(value in detail for value in ("8010000b", "scard_e_sharing_violation", "sharing violation"))
 
 
 # Active download process per reader name — used by cancel_download().
@@ -335,11 +342,15 @@ async def profile_enable(
     *,
     aid: str | None = None,
     on_notifications_processed: NotificationProcessedCb | None = None,
+    process_notifications: bool = True,
+    on_notification_status: ProgressCb | None = None,
 ) -> Any:
     r = await run_lpac(
         "profile", "enable", iccid, reader_name=reader_name, aid=aid, timeout=90)
-    await maybe_process_notifications(
-        reader_name, aid=aid, on_processed=on_notifications_processed)
+    if process_notifications:
+        await maybe_process_notifications(
+            reader_name, aid=aid, on_processed=on_notifications_processed,
+            on_status=on_notification_status)
     return r.data
 
 
@@ -455,6 +466,7 @@ async def notification_process(
     all_notifications: bool = False,
     autoremove: bool = True,
     aid: str | None = None,
+    timeout: float = 180,
 ) -> Any:
     args = ["notification", "process"]
     if all_notifications:
@@ -463,7 +475,7 @@ async def notification_process(
         args.append("-r")
     if seq is not None and not all_notifications:
         args.append(str(seq))
-    r = await run_lpac(*args, reader_name=reader_name, aid=aid, timeout=180)
+    r = await run_lpac(*args, reader_name=reader_name, aid=aid, timeout=timeout)
     return r.data
 
 
@@ -488,19 +500,47 @@ async def maybe_process_notifications(
     *,
     aid: str | None = None,
     on_processed: NotificationProcessedCb | None = None,
+    on_status: ProgressCb | None = None,
 ) -> bool:
-    """Best-effort SGP.22 notification delivery after profile mutations."""
+    """Bounded best-effort delivery; only transient PC/SC sharing conflicts retry."""
+    async def report(state, attempts, reason_code=""):
+        if on_status:
+            try:
+                result = on_status({"state": state, "attempts": attempts, "reason_code": reason_code})
+                if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
+                    await result
+            except Exception as error:  # noqa - feedback cannot turn an enabled profile into a failure
+                log.warning("notification status callback failed error=%s", type(error).__name__)
+
     if not auto_process_notifications():
+        await report("disabled", 0)
         return False
-    try:
-        await notification_process(
-            reader_name, all_notifications=True, autoremove=True, aid=aid)
-    except LpaError as e:
-        log.warning("auto notification process failed reader=%s: %s (%s)",
-                    reader_name, e.message, e.detail)
-        return False
-    except Exception as e:  # noqa
-        log.warning("auto notification process error reader=%s: %r", reader_name, e)
+    deadline = asyncio.get_running_loop().time() + 45
+    attempts = 0
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(.75)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            await report("failed", attempts, "notification_timeout")
+            return False
+        attempts = attempt + 1
+        await report("processing", attempts)
+        try:
+            await notification_process(reader_name, all_notifications=True, autoremove=True,
+                                       aid=aid, timeout=remaining)
+            break
+        except LpaError as error:
+            busy = _reader_busy_error(error)
+            if busy and attempts < 3:
+                continue
+            code = ("reader_busy" if busy else "notification_timeout"
+                    if error.message == "lpac timed out" else "notification_failed")
+        except Exception:  # noqa - do not publish arbitrary endpoint/card details
+            code = "notification_failed"
+        log.warning("auto notification process failed reader=%s code=%s attempts=%d",
+                    reader_name, code, attempts)
+        await report("failed", attempts, code)
         return False
     if on_processed:
         try:
@@ -510,6 +550,7 @@ async def maybe_process_notifications(
         except Exception as e:  # noqa - delivery succeeded; cache/UI refresh is best effort
             log.warning("notification post-process hook failed reader=%s error=%s",
                         reader_name, type(e).__name__)
+    await report("processed", attempts)
     return True
 
 

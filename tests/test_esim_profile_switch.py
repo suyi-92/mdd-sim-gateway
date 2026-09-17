@@ -579,6 +579,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["iccid"], "profile-target")
         self.assertEqual(result["recovery_error"], "bridge failed")
+        self.assertEqual(result["notification_status"]["state"], "failed")
+        self.assertEqual(result["notification_status"]["reason_code"], "reader_unavailable")
         restore.assert_not_awaited()
         self.assertNotIn("reader", main.hub.lpa_busy)
 

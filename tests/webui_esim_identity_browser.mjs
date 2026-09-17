@@ -40,8 +40,8 @@ try {
  const page = await browser.newPage()
  const errors=[]; page.on('pageerror', e=>errors.push(e.message))
  await page.addInitScript(()=>localStorage.setItem('mdd-language','en'))
- let current='card-a', pending, cacheReads=0
- const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[{iccid:card,profileNickname:card,profileState:'enabled'}]}]})
+ let current='card-a', pending, cacheReads=0, notificationStatus=null
+ const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[{iccid:card,profileNickname:card,profileState:'enabled',notification_status:notificationStatus}]}]})
  await page.route('**/api/**', async route => {
    const url=new URL(route.request().url())
    if(url.pathname==='/api/esim/status') return route.fulfill({json:{available:true}})
@@ -70,9 +70,24 @@ try {
  await page.getByText('Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.',{exact:true}).waitFor()
  for(const width of [1440,900,390]) {
    await page.setViewportSize({width,height:900})
+   const action = page.getByRole('button',{name:'Rename',exact:true})
+   const before = await action.boundingBox()
+   await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'failed',reason_code:'reader_busy'}}))
+   await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).waitFor()
+   assert.deepEqual(await action.boundingBox(),before,'notification feedback must not move profile actions')
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
    await page.screenshot({path:path.join(output,`identity-${width}.png`),fullPage:true})
+   await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'processed'}}))
+   await page.getByText('card-b',{exact:true}).last().waitFor()
  }
+ // Persisted delivery failure survives a page reload and a new card-monitor generation.
+ notificationStatus={state:'failed',reason_code:'reader_busy'}
+ await page.reload()
+ await page.evaluate(()=>window.changeCard('card-b',4))
+ await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).waitFor()
+ await page.evaluate(()=>window.deliver({type:'esim_notifications',reader:'fixture-reader',se_id:'one'}))
+ assert.equal(await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).count(),0)
+ notificationStatus=null
  // Late failed response after card replacement must not clear new results or show an error.
  await page.getByRole('button',{name:'Load',exact:true}).click()
  while(!pending) await new Promise(r=>setTimeout(r,10))

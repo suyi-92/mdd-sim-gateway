@@ -31,6 +31,24 @@ function isNonEuiccError(msg) {
   return /euicc_init|does not appear to be an eUICC|not an eUICC|ordinary USIM/i.test(s)
 }
 
+function notificationFeedback(status, t) {
+  if (['pending', 'processing'].includes(status?.state)) {
+    return t('Processing the eSIM notification…')
+  }
+  if (status?.state === 'failed') {
+    return status.reason_code === 'reader_busy'
+      ? t('The reader was busy. eSIM notification pending; click Load, then Process all to retry.')
+      : t('eSIM notification pending; click Load, then Process all to retry.')
+  }
+  return ''
+}
+
+function withNotificationStatus(list, iccid, status) {
+  return list.map((se) => ({ ...se, profiles: (se.profiles || []).map((profile) => (
+    profile.iccid === iccid ? { ...profile, notification_status: status } : profile
+  )) }))
+}
+
 /** An empty reader fails euicc_init exactly like an ordinary USIM does, so without this the
  * UI accuses a perfectly good eSIM of not being one — the modem's virtual reader is empty
  * whenever its SIM bridge is down. Check this first: lpac reports both symptoms at once. */
@@ -508,7 +526,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     [ses],
   )
   const hasEuicc = ses.some((se) => se.eid || se.chip || (se.profiles || []).length)
-  const switchActive = ['switching', 'recovering', 'starting', 'retrying'].includes(profileSwitch?.phase)
+  const switchActive = ['switching', 'recovering', 'notifying', 'starting', 'retrying'].includes(profileSwitch?.phase)
 
   useEffect(() => {
     if (switchActive && lineRunning && selectedCard?.iccid === profileSwitch?.iccid) {
@@ -636,6 +654,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (res?.card?.identity_state === 'confirmed' && res.card.iccid === p.iccid) {
         setSes((list) => withEnabledProfile(list, p.iccid))
       }
+      if (res?.notification_status) {
+        setSes((list) => withNotificationStatus(list, p.iccid, res.notification_status))
+      }
       if (res?.recovery_error) {
         // The eUICC switched but the line did not come back on its own — say exactly
         // that, so the user starts the line instead of retrying an already-done switch.
@@ -723,6 +744,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     return subscribe((msg) => {
       if (owner !== session.current || !owner.mounted) return
       if (msg.generation != null && msg.generation !== selectedCard?.generation) return
+      if (msg.type === 'esim_notification_status') {
+        if (msg.reader !== reader) return
+        setSes((list) => withNotificationStatus(list, msg.iccid, msg.notification_status))
+        return
+      }
       if (msg.type === 'esim_notifications') {
         if (reader && msg.reader && msg.reader !== reader) return
         setSes((list) => list.map((se) => {
@@ -731,9 +757,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
           const notifications = msg.seq == null
             ? []
             : current.filter((item) => `${item.seqNumber ?? item.seq ?? ''}` !== `${msg.seq}`)
-          return notifications.length === current.length
-            ? se
-            : { ...se, notifications }
+          return { ...se, notifications, profiles: (se.profiles || []).map((profile) => (
+            msg.seq == null ? { ...profile, notification_status: null } : profile
+          )) }
         }))
         return
       }
@@ -746,6 +772,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
           setProfileSwitch({ iccid: msg.iccid, phase: 'switching' })
         } else if (msg.event === 'enabled') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'recovering' })
+        } else if (msg.event === 'notifying') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'notifying' })
         } else if (msg.event === 'recovery_retry') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'retrying' })
         } else if (msg.event === 'line_started') {
@@ -1074,6 +1102,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
             ? t('Enabling the eSIM profile…')
             : profileSwitch?.phase === 'recovering'
               ? t('Profile enabled; rebuilding the modem SIM bridge…')
+              : profileSwitch?.phase === 'notifying'
+                ? t('SIM bridge ready; processing the eSIM notification…')
               : profileSwitch?.phase === 'starting'
                 ? t('SIM bridge ready; starting the VoWiFi line…')
                 : profileSwitch?.phase === 'retrying'
@@ -1122,6 +1152,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                         const title = profileDisplayName(p, t('Profile'))
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
+                        const notification = notificationFeedback(p.notification_status, t)
+                        const feedback = renameFeedback?.message || notification
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
                             border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
@@ -1140,13 +1172,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                 <StatePill state={['pending', 'failed'].includes(selectedCard?.identity_state) ? 'unknown' : p.profileState}
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
-                              <div role={renameFeedback ? 'status' : undefined} title={renameFeedback?.message} style={{
-                                marginTop: 4, fontSize: 12, color: 'var(--text-mute)',
+                              <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
+                                marginTop: 4, fontSize: 12, color: !renameFeedback && notification && p.notification_status?.state === 'failed' ? 'var(--warning, #b45309)' : 'var(--text-mute)',
                                 height: 18, lineHeight: '18px',
-                                fontFamily: 'ui-monospace, monospace', overflow: 'hidden',
+                                fontFamily: feedback ? 'inherit' : 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                               }}>
-                                {renameFeedback?.message || p.iccid}
+                                {feedback || p.iccid}
                               </div>
                             </div>
                             <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
