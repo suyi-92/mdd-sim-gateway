@@ -3876,6 +3876,28 @@ def _esim_vowifi_requested(hardware_id: str) -> bool:
     return bool(wanted.get("vowifi_enabled", True))
 
 
+async def _esim_restore_cellular_selection(device_id: str, iccid: str) -> None:
+    """Reapply the new SIM's policy, never inherit the previous SIM's manual PLMN.
+
+    Use the regular tracked network operation so progress/failure survives navigation.
+    A later user action, active data bearer, flight mode or another profile wins.
+    """
+    if capability_lock.locked() or network_operations.busy():
+        return
+    try:
+        _observed, inst, _path = _cellular_network_target(device_id)
+        if str(inst.get("iccid") or "") != str(iccid):
+            return
+        await api_device_cellular_network_select(device_id, {
+            "mode": inst.get("cellular_network_mode") or "automatic",
+            "operator_id": inst.get("cellular_operator_id") or "",
+        }, background=True)
+    except HTTPException:
+        # No available radio is normal on a VoWiFi-only device. Profile recovery is
+        # independent of roaming registration, which has its own operation feedback.
+        return
+
+
 async def _esim_profile_event(
     reader: str,
     iccid: str,
@@ -8365,6 +8387,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                         "card": hub.cards.get(name),
                         "recovery_error": str(detail) or "line recovery failed"}
             start_allowed = recovery.get("start_allowed", True)
+            asyncio.create_task(_esim_restore_cellular_selection(hardware_id, iccid))
             if start_allowed:
                 asyncio.create_task(_esim_start_profile_line(
                     name, switch_key, iccid, str(recovery["instance_id"]),

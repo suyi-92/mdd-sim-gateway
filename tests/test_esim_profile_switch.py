@@ -616,7 +616,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["recovery_pending"])
-        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(len(scheduled), 2)
         self.assertEqual(
             [call.args[2] for call in events.await_args_list],
             ["switching", "enabled"])

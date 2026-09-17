@@ -12,6 +12,21 @@ from host import mdd_orchestrator as host
 
 
 class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_sim_selection_is_tracked_and_later_profile_is_not_overwritten(self):
+        for current, mode in (("new-card", "automatic"), ("new-card", "manual"), ("later-card", "automatic")):
+            with self.subTest(current=current, mode=mode), \
+                    patch.object(main.network_operations, "busy", return_value=False), \
+                    patch.object(main, "_cellular_network_target", return_value=({}, {
+                        "iccid": current, "cellular_network_mode": mode,
+                        "cellular_operator_id": "00101" if mode == "manual" else ""}, "modem")), \
+                    patch.object(main, "api_device_cellular_network_select", new=AsyncMock()) as select:
+                await main._esim_restore_cellular_selection("modem-a", "new-card")
+            if current == "new-card":
+                select.assert_awaited_once_with("modem-a", {"mode": mode,
+                    "operator_id": "00101" if mode == "manual" else ""}, background=True)
+            else:
+                select.assert_not_awaited()
+
     async def test_verified_new_profile_outranks_old_mm_and_monitor_snapshots(self):
         identity = {**verified_bridge(), "hardware_id": "modem-a", "iccid": "new-card"}
         observed = {"shared": {"modemmanager_active": True}, "devices": {"modem-a": {
