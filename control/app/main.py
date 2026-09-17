@@ -4792,9 +4792,14 @@ async def _unified_devices() -> list[dict]:
                     cell_actual = "starting"
                 else:
                     cell_actual, cell_reason = "error", "Cellular radio is not enabled"
+                visited = carrier_id.visited_network(host_cell.get("operator_code"), host_cell.get("operator"))
                 cellular_view = {
-                    "registration": registration, "operator": host_cell.get("operator") or "",
-                    "operator_code": host_cell.get("operator_code") or "",
+                    "registration": registration, "operator": visited["name"],
+                    "operator_zh": visited["name_zh"],
+                    "operator_reported": visited["reported_name"],
+                    "operator_name_conflict": visited["name_conflict"],
+                    "observed_at": observed_doc.get("updated_at") or 0,
+                    "operator_code": visited["operator_id"],
                     "access_technology": host_cell.get("access_technology") or "",
                     "packet_service": host_cell.get("packet_service") or "",
                     "signal": host_cell.get("signal"), "apn": host_cell.get("apn") or "",
@@ -4927,7 +4932,10 @@ async def _unified_devices() -> list[dict]:
             "cellular_network": {
                 "mode": str((inst or {}).get("cellular_network_mode") or "automatic"),
                 "operator_id": str((inst or {}).get("cellular_operator_id") or ""),
-                "operator_name": str((inst or {}).get("cellular_operator_name") or ""),
+                "operator_name": carrier_id.visited_network(
+                    (inst or {}).get("cellular_operator_id"), (inst or {}).get("cellular_operator_name"))["name"],
+                "operator_name_zh": carrier_id.visited_network(
+                    (inst or {}).get("cellular_operator_id"), (inst or {}).get("cellular_operator_name"))["name_zh"],
                 "access_technology": str((inst or {}).get("cellular_operator_technology") or ""),
             },
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
@@ -5235,10 +5243,15 @@ async def _scan_cellular_network(device_id: str):
                 previous={"mode": _inst.get("cellular_network_mode") or "automatic",
                           "operator_id": _inst.get("cellular_operator_id") or ""})
         except cellular_network.CellularScanError as exc:
-            raise HTTPException(503, exc.detail) from exc
+            raise HTTPException(503, {**exc.detail, "networks": _display_cellular_networks(exc.detail["networks"])}) from exc
         except cellular_network.CellularNetworkError as exc:
             raise HTTPException(503, str(exc)) from exc
-    return {"device_id": device_id, "networks": networks}
+    return {"device_id": device_id, "networks": _display_cellular_networks(networks)}
+
+
+def _display_cellular_networks(networks):
+    return [{**item, **carrier_id.visited_network(item.get("operator_id"), item.get("name"))}
+            for item in networks]
 
 
 @app.post("/api/devices/{device_id}/cellular/networks/scan")

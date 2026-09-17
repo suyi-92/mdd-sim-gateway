@@ -463,7 +463,10 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_match_instance_by_iccid", return_value=line), \
                 patch.object(main.cellular_network, "scan", return_value=networks) as scan:
             result = await main.api_device_cellular_network_scan("modem-a")
-        self.assertEqual(result, {"device_id": "modem-a", "networks": networks})
+        self.assertEqual(result["device_id"], "modem-a")
+        self.assertEqual(result["networks"][0]["name"], "China Mobile")
+        self.assertEqual(result["networks"][0]["name_zh"], "中国移动")
+        self.assertEqual(result["networks"][0]["access_technology"], "lte")
         scan.assert_called_once_with(MODEM, previous={"mode": "automatic", "operator_id": ""})
 
     async def test_manual_selection_persists_only_after_registration(self):

@@ -5,6 +5,35 @@ from control.app import carrier_id
 
 
 class CarrierIdTests(unittest.TestCase):
+    def test_visited_network_uses_exact_plmn_over_stale_reported_name(self):
+        value = carrier_id.visited_network("46000", "CHN-UNICOM")
+        self.assertEqual(value["name"], "China Mobile")
+        self.assertEqual(value["name_zh"], "中国移动")
+        self.assertEqual(value["reported_name"], "CHN-UNICOM")
+        self.assertTrue(value["name_conflict"])
+
+    def test_visited_bilingual_labels_match_plain_aosp_network_records(self):
+        carriers, _, _ = carrier_id._database()
+        for code, english, chinese, raw in [
+                ("46000", "China Mobile", "中国移动", "CHINA MOBILE"),
+                ("46001", "China Unicom", "中国联通", "CHN-UNICOM"),
+                ("46011", "China Telecom", "中国电信", "CHN-CT")]:
+            with self.subTest(code=code):
+                self.assertTrue(any(c.get("carrier_name") == english and any(
+                    set(a) == {"mccmnc_tuple"} and code in a["mccmnc_tuple"]
+                    for a in c["attributes"]) for c in carriers))
+                value = carrier_id.visited_network(code, raw)
+                self.assertEqual((value["name"], value["name_zh"]), (english, chinese))
+                self.assertFalse(value["name_conflict"])
+
+    def test_visited_labels_do_not_guess_unknown_codes_or_sim_brands(self):
+        for code in ["46099", "460000", "23433", "", "46000;bad"]:
+            value = carrier_id.visited_network(code, "CMLink")
+            self.assertEqual(value["name"], "CMLink")
+            self.assertEqual(value["name_zh"], "")
+        self.assertEqual(carrier_id.lookup({"mcc": "234", "mnc": "33",
+                         "carrier_identity": {"spn": "CMLink"}})["name"], "CMLink UK")
+
     def test_exact_three_digit_mnc_wins_over_an_earlier_two_digit_record(self):
         value = carrier_id.lookup({"mcc": "405", "mnc": "045"})
         self.assertEqual(value["name"], "TATA DOCOMO")

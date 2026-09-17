@@ -39,6 +39,31 @@ _LOCAL_SPN_RULES = (
     },
 )
 
+# Visited-network labels, separate from SIM/MVNO identification. These exact
+# PLMNs are present as plain network rules in the vendored AOSP table. Do not
+# broaden by MCC prefix, pad MNCs, or identify a network from a possibly stale name.
+_VISITED_LABELS = {
+    "46000": ("China Mobile", "中国移动", {"chinamobile", "cmcc", "chncmcc", "中国移动"}),
+    "46001": ("China Unicom", "中国联通", {"chinaunicom", "chnunicom", "unicom", "中国联通"}),
+    "46011": ("China Telecom", "中国电信", {"chinatelecom", "chnct", "ct", "中国电信"}),
+}
+
+
+def visited_network(plmn: str, reported_name: str = "") -> dict:
+    """Normalize a visited PLMN for display without changing registration/SIM identity."""
+    code = str(plmn or "").strip()
+    if not re.fullmatch(r"[0-9]{5,6}", code):
+        code = ""
+    reported = " ".join(str(reported_name or "").split())[:100]
+    if reported.casefold() in {"--", "unknown", "none", "n/a"}:
+        reported = ""
+    known = _VISITED_LABELS.get(code)
+    name, zh = (known[0], known[1]) if known else (reported or code, "")
+    folded = re.sub(r"[\s_-]+", "", reported).casefold()
+    reported_owner = next((value[0] for value in _VISITED_LABELS.values() if folded in value[2]), "")
+    return {"operator_id": code, "name": name, "name_zh": zh,
+            "reported_name": reported, "name_conflict": bool(known and reported_owner and reported_owner != name)}
+
 
 def _value(text: str) -> str | int:
     text = text.strip()

@@ -1,11 +1,73 @@
-export function cellularRegistrationDetail(device, t = value => value) {
+export function networkName(network = {}, language = 'zh') {
+  return (language === 'zh' && network.name_zh) || network.name || network.operator_id || ''
+}
+
+export function networkLabel(network = {}, language = 'zh') {
+  const name = networkName(network, language)
+  return network.operator_id && name !== network.operator_id ? `${name} (${network.operator_id})` : name
+}
+
+export function currentCellularNetwork(device = {}) {
+  const cellular = device.cellular || {}
+  return { operator_id: cellular.operator_code || '', name: cellular.operator || '',
+    name_zh: cellular.operator_zh || '', observed_at: Number(cellular.observed_at) || 0,
+    connected: device.present !== false && device.sim?.present !== false
+      && ['home', 'roaming', 'registered'].includes(cellular.registration)
+      && /^[0-9]{5,6}$/.test(cellular.operator_code || '') }
+}
+
+export function networkAvailability(network, current) {
+  if (current.connected && network.operator_id === current.operator_id) return 'current'
+  return network.status === 'current' ? 'available' : network.status
+}
+
+// Operation results are historical. Only a newer host observation can establish
+// the current connection or resolve a scan's former registration-recovery warning.
+export function cellularOperationOutcome(operation, current, networks, language, t) {
+  if (!operation) return null
+  const fresh = !operation.finished_at || current.observed_at >= operation.finished_at
+  if (operation.action === 'apply' && operation.state === 'success') {
+    const code = operation.result?.registration?.operator_id || operation.selection?.operator_id
+    const target = networks.find(item => item.operator_id === code)
+      || (current.operator_id === code ? current : { operator_id: code })
+    const network = networkLabel(target, language) || t('Automatic network selection')
+    if (!fresh) return { tone: 'info', text: t('Last selection completed: {network}. Updating current registration…', { network }) }
+    if (current.connected && current.operator_id === code) {
+      return { tone: 'info', text: t('Currently registered on {network}.', { network: networkLabel(current, language) }) }
+    }
+    return { tone: 'warning', text: t(current.connected
+      ? 'Last selection: {network}. Current network: {current}.'
+      : 'Last selection completed: {network}. Currently not registered on a cellular network.',
+    { network, current: networkLabel(current, language) }) }
+  }
+  if (operation.action === 'scan' && operation.state === 'partial') {
+    const recovery = operation.error?.recovery || {}
+    if (!fresh) return { tone: 'info', text: t('Scan complete: {count} networks. Updating current registration…',
+      { count: networks.length }) }
+    const matches = recovery.mode === 'automatic'
+      || (recovery.mode === 'manual' && recovery.operator_id === current.operator_id)
+    if (fresh && current.connected && matches) return { tone: 'info', text: t(
+      'Scan complete: {count} networks. Registration has now recovered on {network}.',
+      { count: networks.length, network: networkLabel(current, language) }) }
+    const prefix = t('Scan complete: {count} networks.', { count: networks.length })
+    const detail = fresh && current.connected ? t('The original selection was not restored. Current network: {network}.',
+      { network: networkLabel(current, language) })
+      : t(recovery.state === 'pending' ? 'Restoring cellular registration is still in progress.'
+        : 'The modem could not restore registration after scanning. Choose Automatic, then Apply network to reconnect.')
+    return { tone: 'warning', text: `${prefix} ${detail}` }
+  }
+  return null
+}
+
+export function cellularRegistrationDetail(device, t = value => value, language = 'zh') {
   const cellular = device?.cellular || {}
   const registration = String(cellular.registration || '').toLowerCase()
   if (!['home', 'roaming', 'registered'].includes(registration)) return ''
   const pieces = [registration === 'roaming' ? t('Roaming registered') : t('Home network registered')]
   const technology = String(cellular.access_technology || '').toUpperCase()
   if (technology) pieces.push(technology)
-  if (cellular.operator) pieces.push(cellular.operator)
+  const operator = networkName({ name: cellular.operator, name_zh: cellular.operator_zh }, language)
+  if (operator) pieces.push(operator)
   if (cellular.signal != null) pieces.push(t('Signal {signal}%', { signal: cellular.signal }))
   pieces.push(cellular.data_active ? t('Data bearer connected') : t('No data bearer'))
   return pieces.join(' · ')

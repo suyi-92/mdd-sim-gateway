@@ -28,8 +28,8 @@ const devices = [
   { id: 'modem-2', instance_id: '2', device_type: 'modem', present: true,
     name: 'Travel modem', sim: { present: true, number: '+1555**7654#',
       carrier: { name: 'Fixture Wireless', home_network: 'Fixture Host', plmn: '310-280' } },
-    cellular: { registration: 'roaming', access_technology: 'lte', operator: 'Visited Fixture',
-      operator_code: '46001', signal: 78, packet_service: 'attached', data_active: false },
+    cellular: { registration: 'roaming', access_technology: 'lte', operator: 'China Unicom', operator_zh: '中国联通',
+      operator_code: '46001', observed_at: 100, signal: 78, packet_service: 'attached', data_active: false },
     cellular_network: { mode: 'automatic', operator_id: '' },
     egress: { country: 'us', detected_country: 'us', node: '', mode: 'direct', ready: true },
     capabilities: { cellular: { desired: false, actual: 'off',
@@ -207,7 +207,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.goto(origin + '/#/devices')
     await page.getByText('Travel modem', { exact: true }).click()
     const registered = page.getByText(
-      '漫游已注册 · LTE · Visited Fixture · 信号 78% · 无数据承载', { exact: true })
+      '漫游已注册 · LTE · 中国联通 · 信号 78% · 无数据承载', { exact: true })
     await registered.waitFor()
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
@@ -234,13 +234,15 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await page.getByRole('button', { name: '应用网络' }).isEnabled(), false)
     assert.equal(operation.state, 'running')
     networks = [
-      { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
-      { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
-      { operator_id: '00101', name: 'Forbidden Fixture', access_technology: 'lte', status: 'forbidden' },
+      { operator_id: '46001', name: 'China Unicom', name_zh: '中国联通', access_technology: 'lte', status: 'current' },
+      { operator_id: '46000', name: 'China Mobile', name_zh: '中国移动', access_technology: 'lte', status: 'available' },
+      { operator_id: '46011', name: 'China Telecom', name_zh: '中国电信', access_technology: 'lte', status: 'forbidden' },
     ]
     operation = { ...operation, state: 'success', result: { networks } }
     await page.getByText('发现 3 个蜂窝网络。', { exact: true }).waitFor()
-    assert.equal(await page.getByRole('radio', { name: /Forbidden Fixture/ }).isEnabled(), false)
+    assert.equal(await page.getByRole('radio', { name: /中国电信/ }).isEnabled(), false)
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).locator('b').innerText(), '中国移动')
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).locator('small').innerText(), 'China Mobile')
     await page.getByRole('radio', { name: /China Mobile/ }).click()
     applying = true
     page.once('dialog', dialog => dialog.accept())
@@ -263,7 +265,17 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).getAttribute('aria-checked'), 'true')
     applying = false
     operation = { ...operation, state: 'success' }
-    await page.getByText('已确认连接到 China Mobile (46000)。', { exact: true }).waitFor()
+    // Model the Control normalization of the modem's stale name/new PLMN pair.
+    devices[1].cellular = { ...devices[1].cellular, operator: 'China Mobile', operator_zh: '中国移动',
+      operator_code: '46000', operator_reported: 'CHN-UNICOM', operator_name_conflict: true, observed_at: 200 }
+    devices[1].cellular_network = { mode: 'manual', operator_id: '46000',
+      operator_name: 'China Mobile', operator_name_zh: '中国移动', access_technology: 'lte' }
+    await page.getByText('当前已驻网：中国移动 (46000)。', { exact: true }).waitFor()
+    assert.equal(await page.locator('.u-cellular-operator-detail strong').innerText(), '中国移动 (46000)')
+    assert.equal(await page.locator('.u-cellular-operator-detail small').innerText(), 'China Mobile')
+    assert.equal((await page.locator('.u-cellular-operator-detail').innerText()).includes('CHN-UNICOM'), false)
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).locator('.u-network-availability').innerText(), '当前')
+    assert.equal(await page.getByRole('radio', { name: /China Unicom/ }).locator('.u-network-availability').innerText(), '已检测')
     for (const width of [2560, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
@@ -296,10 +308,19 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '扫描网络' }).click()
     await page.getByRole('button', { name: '正在扫描…' }).waitFor()
-    operation = { ...operation, state: 'partial', error: { code: 'scan_recovery', recovery: { state: 'pending' } } }
-    await page.locator('.u-cellular-network-feedback.is-warning').getByText(/发现 3 个蜂窝网络/).waitFor()
+    devices[1].cellular = { ...devices[1].cellular, registration: 'searching', observed_at: 300 }
+    operation = { ...operation, state: 'partial', finished_at: 250,
+      error: { code: 'scan_recovery', recovery: { state: 'failed', mode: 'manual', operator_id: '46000' } } }
+    await page.locator('.u-cellular-network-feedback.is-warning').getByText(/扫描后未能恢复驻网/).waitFor()
+    await page.locator('.u-cellular-current').getByText('未连接', { exact: true }).waitFor()
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).count(), 1)
     assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), true)
+    await page.locator('.u-cellular-network').screenshot({ path: path.join(output, 'scan-recovery-failed.png'), animations: 'disabled' })
+    devices[1].cellular = { ...devices[1].cellular, registration: 'roaming', observed_at: 400 }
+    await page.reload()
+    await page.getByText('扫描完成，发现 3 个运营商网络。当前已恢复驻网：中国移动 (46000)。', { exact: true }).waitFor()
+    assert.equal(await page.locator('.u-cellular-network-feedback.is-warning').count(), 0)
+    await page.locator('.u-cellular-network').screenshot({ path: path.join(output, 'scan-recovered.png'), animations: 'disabled' })
 
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [
