@@ -1087,7 +1087,7 @@ class IdleBackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 9)
+            self.assertEqual(len(app._input_mtimes()), 10)
 
     def test_a_backup_request_wakes_the_idle_orchestrator(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1115,7 +1115,7 @@ class HotplugResponsivenessTests(unittest.TestCase):
             self.assertNotEqual(two_devices, three_devices,
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 9)
+            self.assertEqual(len(app._input_mtimes()), 10)
 
 
 class PastedNodeFidelityTests(unittest.TestCase):

@@ -241,6 +241,16 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("host_cell.get(\"sim_present\") is True", CONTROL_MAIN)
         self.assertIn("sim_present = host_cell.get(\"sim_present\") is True", CONTROL_MAIN)
 
+    def test_full_device_detection_is_visible_in_empty_state_and_has_fixed_feedback(self):
+        self.assertIn("api.rescanDevices()", UNIFIED)
+        self.assertIn("api.deviceRescanProgress()", UNIFIED)
+        self.assertIn("Restart hardware discovery?", UNIFIED)
+        self.assertIn("<>{discoveryHeader}<Discovering", UNIFIED)
+        self.assertIn("<>{discoveryHeader}{historyToggle}<Empty", UNIFIED)
+        feedback = css_rule(".u-device-rescan-feedback")
+        self.assertIn("min-height:20px", feedback)
+        self.assertIn("@media(max-width:760px)", CSS)
+
     def test_retained_sms_reimport_has_confirmation_and_fixed_feedback(self):
         self.assertIn("api.reimportCellularMessages(forId)", MESSAGES)
         self.assertIn("window.confirm(tr('Re-import SMS still retained", MESSAGES)

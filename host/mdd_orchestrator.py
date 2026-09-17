@@ -65,6 +65,7 @@ MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
 BACKUP_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
+DEVICE_RESCAN_OPERATION_ID = re.compile(r"[0-9a-f]{16}\Z")
 SERVICE_RESTART_SETTLE_SECONDS = {"services": 300, "host": 1800}
 DEVICE_STATE_VERSION = 3
 DEFAULT_DEVICE_CAPABILITIES = {
@@ -783,6 +784,8 @@ class Orchestrator:
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
         self.exit_test_request_dir = self.root / "exit-test-requests"
         self.backup_operation_request_path = self.root / "backup-operation-request.json"
+        self.device_rescan_request_path = self.root / "device-rescan-request.json"
+        self.device_rescan_status_path = self.root / "device-rescan-status.json"
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -1033,6 +1036,96 @@ class Orchestrator:
     @staticmethod
     def service_active(name: str) -> bool:
         return run(["systemctl", "is-active", "--quiet", name]).returncode == 0
+
+    def process_device_rescan_request(self) -> dict | None:
+        """Rebuild every host discovery backend without resetting a physical USB device."""
+        request = read_json(self.device_rescan_request_path)
+        if not request:
+            return None
+        try:
+            self.device_rescan_request_path.unlink()
+        except OSError:
+            pass
+
+        operation_id = str(request.get("operation_id") or "")
+        requested_at = request.get("requested_at")
+        safe_request = {"operation_id": operation_id,
+                        "requested_at": requested_at if isinstance(requested_at, int) else 0}
+
+        def publish(state: str, **fields):
+            atomic_json(self.device_rescan_status_path, {
+                **safe_request, "state": state, "updated_at": int(time.time()), **fields,
+            })
+
+        if (set(request) != {"operation_id", "requested_at"}
+                or not DEVICE_RESCAN_OPERATION_ID.fullmatch(operation_id)
+                or not isinstance(requested_at, int)):
+            publish("failed", error_code="rescan.error.invalid_request")
+            return None
+        if self.dry_run:
+            publish("failed", error_code="rescan.error.dry_run")
+            return None
+
+        publish("running")
+        self.log("full hardware rediscovery requested")
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "pcsc-maintenance").write_text(
+            str(int(time.time())), encoding="ascii")
+        self.stop_bridges()
+        # A rediscovery must never republish identity or registration sampled from the
+        # previous physical card generation while the fresh probes are still running.
+        self.cellular_states.clear()
+        self.radio_states.clear()
+        self._degraded.clear()
+        self._claim_evidence = {}
+        self._unclaimed_since.clear()
+        self._bridge_failures.clear()
+        self._bridge_started.clear()
+        self._bridge_commands.clear()
+        self.modem_profiles_swept = False
+        self.applied_cellular_backend = None
+        self._last_conclusion = ""
+
+        failures = []
+
+        def required(args: list[str], label: str):
+            result = run(args)
+            if result.returncode:
+                detail = " ".join((result.stderr or result.stdout or "").split())[:240]
+                failures.append(f"{label}: {detail or 'command failed'}")
+
+        required(["udevadm", "control", "--reload-rules"], "udev reload")
+        for subsystem in ("tty", "usbmisc", "net"):
+            required(["udevadm", "trigger", "--action=add",
+                      f"--subsystem-match={subsystem}"], f"udev {subsystem}")
+        required(["udevadm", "settle"], "udev settle")
+        required(["systemctl", "restart", "pcscd.service"], "pcscd restart")
+        if not self._serial_mode:
+            required(["systemctl", "restart", "ModemManager.service"],
+                     "ModemManager restart")
+            required(["mmcli", "--scan-modems"], "ModemManager scan")
+        if failures:
+            publish("failed", error_code="rescan.error.failed",
+                    error="; ".join(failures)[:600])
+            return None
+        return request
+
+    def finish_device_rescan(self, request: dict | None, discovered: list[dict],
+                             assignments: dict, *, error: str = ""):
+        if not request:
+            return
+        state = "failed" if error else "success"
+        value = {
+            **request, "state": state, "updated_at": int(time.time()),
+            "modems_detected": len(discovered),
+            "pcsc_active": self.service_active("pcscd.service"),
+            "modemmanager_active": self.service_active("ModemManager.service"),
+        }
+        if error:
+            value.update(error_code="rescan.error.failed", error=str(error)[:600])
+        atomic_json(self.device_rescan_status_path, value)
+        self.log(f"full hardware rediscovery {state}: "
+                 f"modems={len(discovered)} assignments={len(assignments)}")
 
     def process_service_restart_request(self):
         """Restart the gateway's own services, or the host, when the control plane asks.
@@ -3641,6 +3734,10 @@ class Orchestrator:
                     desired["hardware"] = (conf.get("settings") or {}).get("hardware") or {}
                 except Exception:
                     pass
+            hardware_config = desired.get("hardware") or {}
+            self._serial_mode = str(hardware_config.get("modem_backend")
+                                    or "auto") == "serial"
+            device_rescan = self.process_device_rescan_request()
             discovered = self.usb_modems(desired.get("hardware") or {})
             self.migrate_device_ids(discovered)
             desired_devices, _migrated = self.desired_devices(discovered)
@@ -3648,9 +3745,6 @@ class Orchestrator:
             active_desired = {device_id: state for device_id, state in desired_devices.items()
                               if device_id in present_ids}
             plan = self.capability_plan(active_desired)
-            hardware_config = desired.get("hardware") or {}
-            self._serial_mode = str(hardware_config.get("modem_backend")
-                                    or "auto") == "serial"
             cellular_required = self.cellular_backend_needed(plan, present_ids,
                                                              hardware_config)
             # Standing ModemManager down after a refusal must not reset the modems: it never
@@ -3691,6 +3785,8 @@ class Orchestrator:
                     self.publish_device_status(desired_devices, assignments, error=error,
                                                disruption=disruption,
                                                affected_devices=affected)
+                    self.finish_device_rescan(
+                        device_rescan, discovered, assignments, error=error)
                     time.sleep(self.interval)
                     continue
 
@@ -3715,6 +3811,7 @@ class Orchestrator:
             self.publish_device_status(desired_devices, assignments)
             self.publish_host_diagnostics(discovered, assignments, mm_active,
                                           cellular_required, vowifi_required)
+            self.finish_device_rescan(device_rescan, discovered, assignments)
             # Compare what this cycle concluded, not what it observed: timestamps and counters
             # differ every time and would defeat the comparison.
             fingerprint = json.dumps([sorted(present_ids), active_desired, cellular_required,
@@ -3729,7 +3826,8 @@ class Orchestrator:
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
                      self.bridge_restart_request_dir, self.exit_test_request_dir,
-                     self.backup_operation_request_path):
+                     self.backup_operation_request_path,
+                     self.device_rescan_request_path):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:

@@ -1527,6 +1527,64 @@ modem.3gpp.registration-state : unknown
             self.assertEqual(status["state"], "failed")
             self.assertEqual(status["error_code"], "restart.error.launch")
 
+    def test_full_device_rescan_rebuilds_every_backend_and_clears_stale_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            app.cellular_states["modem-a"] = {"registration": "roaming"}
+            app.radio_states["modem-a"] = True
+            app._degraded["modem-a"] = "old failure"
+            app._bridge_failures["modem-a"] = {"count": 2}
+            app._claim_evidence = {"old": True}
+            app._serial_mode = False
+            request = {"operation_id": "0123456789abcdef", "requested_at": 1000}
+            mdd_orchestrator.atomic_json(app.device_rescan_request_path, request)
+            calls = []
+            result = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run",
+                       side_effect=lambda args, **kwargs: calls.append(args) or result), \
+                    patch.object(app, "stop_bridges") as stop_bridges, \
+                    patch.object(app, "service_active", return_value=True):
+                active = app.process_device_rescan_request()
+                app.finish_device_rescan(
+                    active, [{"id": "modem-a"}], {"modem-a": {"name": "Fixture"}})
+
+            self.assertEqual(active, request)
+            stop_bridges.assert_called_once_with()
+            self.assertFalse(app.device_rescan_request_path.exists())
+            self.assertEqual(app.cellular_states, {})
+            self.assertEqual(app.radio_states, {})
+            self.assertEqual(app._degraded, {})
+            self.assertEqual(app._bridge_failures, {})
+            self.assertEqual(app._claim_evidence, {})
+            self.assertIn(["systemctl", "restart", "pcscd.service"], calls)
+            self.assertIn(["systemctl", "restart", "ModemManager.service"], calls)
+            self.assertIn(["mmcli", "--scan-modems"], calls)
+            self.assertTrue((app.root / "pcsc-maintenance").is_file())
+            status = mdd_orchestrator.read_json(app.device_rescan_status_path)
+            self.assertEqual(status["state"], "success")
+            self.assertEqual(status["modems_detected"], 1)
+
+    def test_full_device_rescan_in_serial_mode_never_starts_modemmanager(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            app._serial_mode = True
+            mdd_orchestrator.atomic_json(app.device_rescan_request_path, {
+                "operation_id": "0123456789abcdef", "requested_at": 1000,
+            })
+            calls = []
+            result = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("host.mdd_orchestrator.run",
+                       side_effect=lambda args, **kwargs: calls.append(args) or result), \
+                    patch.object(app, "stop_bridges"):
+                self.assertIsNotNone(app.process_device_rescan_request())
+            self.assertNotIn(["systemctl", "restart", "ModemManager.service"], calls)
+            self.assertNotIn(["mmcli", "--scan-modems"], calls)
+
     def test_only_a_recent_service_restart_is_settled_as_success(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

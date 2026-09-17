@@ -19,11 +19,25 @@ const reader = { id: 'reader-fixture', name: 'SCR Prime CCID Reader (fixture) 00
   default_name: '3T Electronics SCR Prime reader', device_type: 'reader', present: true,
   sim: { present: false }, capabilities: { vowifi: { desired: false, actual: 'off' } } }
 let devices = [modem, reader]
+let rescanRequested = false
 const mutations = []
+const json = (response, value) => {
+  response.writeHead(200, { 'Content-Type': 'application/json' })
+  response.end(JSON.stringify(value))
+}
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost')
   if (url.pathname.startsWith('/api/')) {
     if (request.method !== 'GET') mutations.push([request.method, url.pathname])
+    if (request.method === 'POST' && url.pathname === '/api/devices/rescan') {
+      rescanRequested = true
+      return json(response, { ok: true, state: 'requested', operation_id: '0123456789abcdef' })
+    }
+    if (request.method === 'GET' && url.pathname === '/api/devices/rescan/progress') {
+      return json(response, rescanRequested
+        ? { state: 'success', operation_id: '0123456789abcdef', modems_detected: 1 }
+        : { state: 'idle' })
+    }
     const hardware = url.pathname.match(/^\/api\/devices\/([^/]+)\/hardware$/)
     if (request.method === 'PUT' && hardware) {
       let body = ''
@@ -65,7 +79,10 @@ server.on('upgrade', (_request, socket) => socket.destroy())
   let browser
   try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-    browser = await chromium.launch({ headless: true })
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: process.env.MDD_BROWSER_EXECUTABLE || undefined,
+    })
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
@@ -76,6 +93,10 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const history = page.getByLabel(/显示已断开的设备/)
     await heading('DJI/Quectel EC25').waitFor()
     assert.equal(await options.count(), 2)
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '重新完整检测', exact: true }).click()
+    await page.clock.fastForward(1200)
+    await page.getByText('完整设备检测已完成，发现 1 个蜂窝模块和 0 个读卡器。', { exact: true }).waitFor()
     await page.screenshot({ path: path.join(output, 'connected.png'), fullPage: true, animations: 'disabled' })
     await page.getByRole('button', { name: '蜂窝数据（4G）', exact: true }).click()
 
@@ -99,7 +120,9 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const deviceNameInput = page.locator('.u-hardware-name input')
     assert.equal(await deviceNameInput.getAttribute('placeholder'), 'DJI/Quectel EC25')
     assert.equal(await deviceNameInput.isEnabled(), true)
-    assert.deepEqual(mutations, [], 'navigation and history views must not write configuration')
+    assert.deepEqual(mutations, [
+      ['POST', '/api/devices/rescan'],
+    ], 'navigation and history views must not write configuration')
     await deviceNameInput.fill('Main modem')
     await page.locator('.u-hardware-name button').click()
     await heading('Main modem').waitFor()
@@ -129,6 +152,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(devices[0].capabilities.flight.desired, true)
     assert.equal(devices[0].capabilities.vowifi.desired, true)
     assert.deepEqual(mutations, [
+      ['POST', '/api/devices/rescan'],
       ['PUT', '/api/devices/modem-fixture/hardware'],
       ['PUT', '/api/devices/modem-fixture/hardware'],
     ], 'only the explicit custom-name save and restore may mutate configuration')

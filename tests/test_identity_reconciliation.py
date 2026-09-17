@@ -231,6 +231,39 @@ class MaintenanceReconciliationTests(unittest.IsolatedAsyncioTestCase):
             read.assert_called_once_with(0)
             self.assertEqual(cards[name]['iccid'], 'replacement')
 
+    async def test_completed_full_rescan_bypasses_maintenance_cache_and_reprobes_card(self):
+        import asyncio
+        name = 'fixture-reader'
+        announced = asyncio.Event()
+        cards = {name: {'name': name, 'index': 0, 'present': True,
+                        'iccid': 'old-card', 'identity_state': 'confirmed'}}
+
+        async def broadcast(_message):
+            announced.set()
+
+        inserted = AsyncMock()
+        with patch.object(main.hub, 'cards', cards), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'device_rescan_applied', 'previous'), \
+                patch.object(main.hub, 'broadcast', new=AsyncMock(side_effect=broadcast)), \
+                patch.object(main.operations, 'device_rescan_status', return_value={
+                    'state': 'success', 'operation_id': '0123456789abcdef'}), \
+                patch.object(main.card, 'reader_states', return_value=[{
+                    'name': name, 'index': 0, 'present': True}]), \
+                patch.object(main.card, 'wait_for_change', return_value=None), \
+                patch.object(main.os.path, 'getmtime', return_value=main.time.time()), \
+                patch.object(main, '_on_card_insert', new=inserted):
+            monitor = asyncio.create_task(main.card_monitor())
+            try:
+                await asyncio.wait_for(announced.wait(), timeout=2)
+            finally:
+                monitor.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await monitor
+
+        inserted.assert_awaited_once_with(name, 0, verify=True)
+        self.assertTrue(main.hub.scanned)
+
     async def test_esim_refresh_updates_saved_subscription_not_only_memory(self):
         from control.app.sim import CardInfo
         old = {'id': 'line', 'iccid': 'fixture', 'imsi': 'old', 'mcc': '262', 'mnc': '01'}

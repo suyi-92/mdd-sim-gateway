@@ -25,7 +25,7 @@ class InitialLoadingUiTests(unittest.TestCase):
 
     def test_device_pages_wait_for_the_first_hardware_scan(self):
         self.assertIn("const pending = discovering", DEVICES)
-        self.assertIn("if (discovering) return <Discovering t={t} />", DEVICES)
+        self.assertIn("if (discovering) return <>{discoveryHeader}<Discovering t={t} /></>", DEVICES)
 
     def test_global_line_views_wait_for_the_first_snapshot(self):
         self.assertIn("const [initialLoading, setInitialLoading] = useState(true)", APP)

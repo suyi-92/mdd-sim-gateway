@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from control.app import config, operations
 
@@ -677,6 +677,90 @@ class ServiceRestartTests(unittest.TestCase):
 
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
+
+
+class DeviceRescanOperationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(config, "DATA_DIR", self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.root = Path(self.tmp.name, "orchestrator")
+
+    def test_request_is_private_bounded_and_idempotent_while_running(self):
+        with patch.object(operations.secrets, "token_hex", return_value="0123456789abcdef"):
+            first = operations.request_device_rescan()
+            second = operations.request_device_rescan()
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["operation_id"], "0123456789abcdef")
+        self.assertEqual(second["operation_id"], first["operation_id"])
+        request_path = self.root / "device-rescan-request.json"
+        status_path = self.root / "device-rescan-status.json"
+        self.assertEqual(request_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(status_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(operations.device_rescan_status()["state"], "requested")
+
+    def test_unconsumed_request_becomes_a_visible_failure(self):
+        self.root.mkdir(parents=True)
+        request = {"operation_id": "0123456789abcdef",
+                   "requested_at": int(time.time()) - 300}
+        (self.root / "device-rescan-request.json").write_text(json.dumps(request))
+        status = operations.device_rescan_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "rescan.error.not_picked_up")
+
+    def test_status_does_not_publish_untrusted_error_detail(self):
+        self.root.mkdir(parents=True)
+        (self.root / "device-rescan-status.json").write_text(json.dumps({
+            "state": "failed", "operation_id": "0123456789abcdef",
+            "error_code": "rescan.error.failed", "error": "private device detail",
+            "updated_at": int(time.time()),
+        }))
+        status = operations.device_rescan_status()
+        self.assertNotIn("error", status)
+        self.assertEqual(status["error_code"], "rescan.error.failed")
+
+
+@unittest.skipIf(main is None, "control-plane dependencies are unavailable")
+class DeviceRescanApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_is_forwarded_and_broadcast(self):
+        result = {"ok": True, "operation_id": "0123456789abcdef",
+                  "state": "requested"}
+        with patch.object(main.operations, "request_device_rescan",
+                          return_value=result) as request, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            response = await main.api_devices_rescan()
+        self.assertEqual(response, result)
+        request.assert_called_once_with()
+        broadcast.assert_awaited_once()
+
+    async def test_devices_reports_discovering_while_host_rescan_runs(self):
+        with patch.object(main.operations, "device_rescan_status",
+                          return_value={"state": "running"}), \
+                patch.object(main, "_unified_devices", new=AsyncMock(
+                    return_value=[])), \
+                patch.object(main.device_state, "status", return_value={}):
+            response = await main.api_devices()
+        self.assertTrue(response["discovering"])
+
+    async def test_progress_waits_for_control_pcsc_reconciliation(self):
+        status = {"state": "success", "operation_id": "0123456789abcdef",
+                  "modems_detected": 1}
+        with patch.object(main.operations, "device_rescan_status", return_value=status), \
+                patch.object(main.hub, "device_rescan_applied", "previous"):
+            pending = main.api_devices_rescan_progress()
+        self.assertEqual(pending["state"], "running")
+        self.assertEqual(pending["phase"], "pcsc")
+
+        with patch.object(main.operations, "device_rescan_status", return_value=status), \
+                patch.object(main.hub, "device_rescan_applied", "0123456789abcdef"), \
+                patch.object(main.hub, "cards_list", return_value=[{"name": "reader"}]), \
+                patch.object(main.device_state, "native_reader_devices",
+                             return_value={"reader-a": {}}):
+            completed = main.api_devices_rescan_progress()
+        self.assertEqual(completed["state"], "success")
+        self.assertEqual(completed["readers_detected"], 1)
 
 
 if __name__ == "__main__":

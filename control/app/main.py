@@ -623,6 +623,7 @@ class Hub:
         self.hotplug_pending: dict[str, dict] = {}
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
         self.esim_line_recoveries: set[str] = set()  # one post-switch starter per line
+        self.device_rescan_applied = ""  # newest completed host rediscovery reconciled here
         # When each line last became healthy, so a failure can be attributed. A line that
         # carried IMS for a long time and then broke is not evidence against its exit node.
         self.ok_since: dict[str, float] = {}
@@ -1417,6 +1418,14 @@ async def card_monitor():
     maintenance_readers = set()
     while True:
         try:
+            rescan_status = operations.device_rescan_status()
+            rescan_id = str(rescan_status.get("operation_id") or "")
+            force_rescan = bool(rescan_id
+                                and rescan_status.get("state") == "success"
+                                and rescan_id != hub.device_rescan_applied)
+            if force_rescan:
+                hub.scanned = False
+                maintenance_readers.clear()
             states = await asyncio.to_thread(card.reader_states)
             if states is None:
                 # Transient PC/SC error (pcscd restarting?) — NOT "all readers gone".
@@ -1440,7 +1449,7 @@ async def card_monitor():
                                < PCSC_MAINTENANCE_WINDOW_SECONDS)
             except OSError:
                 pass
-            if maintenance:
+            if maintenance and not force_rescan:
                 maintenance_readers.update(hub.cards)
                 # A same-name VPCD reader can already be back with a new bridge-published SIM
                 # while the broader remove/add stream is intentionally suppressed.  Ready
@@ -1521,6 +1530,16 @@ async def card_monitor():
                         await _on_card_remove(entry)
                     changed = True
                     continue
+                if force_rescan:
+                    if st["present"]:
+                        await _on_card_insert(name, st["index"], verify=True)
+                    else:
+                        hub.cards[name] = {
+                            **st, "iccid": None, "matched": None, "imsi": None,
+                            "pin_enabled": None, "pin_tries": None,
+                        }
+                    changed = True
+                    continue
                 if st["present"] and (name in maintenance_readers
                                       or _identity_retry_due(entry)):
                     maintenance_readers.discard(name)
@@ -1531,11 +1550,15 @@ async def card_monitor():
                     changed = True
             # The first completed scan is always announced, even when it found nothing:
             # it is what turns the UI's "detecting devices" state into a real answer.
-            if changed or first:
+            if changed or first or force_rescan:
                 await hub.broadcast({"type": "cards", "cards": _client_cards()})
             # Only a completed scan counts: a failed first scan must retry as "first"
             # (readers seen later may belong to already-running engines).
             hub.scanned = True
+            if force_rescan:
+                # Mark completion only after a real PC/SC snapshot was reconciled. A transient
+                # pcscd outage or probe exception must retry this same requested generation.
+                hub.device_rescan_applied = rescan_id
             first = False
         except Exception as e:  # noqa
             log.debug("card monitor error: %r", e)
@@ -4686,6 +4709,8 @@ async def _unified_devices() -> list[dict]:
         device_present = (bool(native_card is not None) if is_native_reader
                           else bool(observed.get("present", False)))
         host_cell = observed.get("cellular") or {}
+        host_cell_current = bool(shared.get("modemmanager_active")
+                                 and host_cell.get("available"))
         inst = (_match_instance_by_iccid(native_card.get("iccid"))
                 if native_card and native_card.get("present") and native_card.get("iccid")
                 else _instance_for_device(device_id, identity, cards, observed)
@@ -4730,7 +4755,7 @@ async def _unified_devices() -> list[dict]:
             cell_reason = "This gateway is configured for VoWiFi only (ModemManager disabled)"
         cellular_view = None
         if is_cellular_target:
-            if host_cell.get("available"):
+            if host_cell_current:
                 registration = str(host_cell.get("registration") or "unknown").lower()
                 radio_on = bool(actual_state.get("cellular_radio_enabled",
                                                  host_cell.get("radio_enabled",
@@ -4776,6 +4801,7 @@ async def _unified_devices() -> list[dict]:
         # every virtual reader slot is empty or VoWiFi is disabled.
         live_modem_iccid = (str(host_cell.get("sim_iccid") or "")
                             if device_present and not is_native_reader
+                            and host_cell_current
                             and host_cell.get("sim_present") is True else "")
         if live_modem_iccid and not card_info:
             card_info = {
@@ -4806,7 +4832,7 @@ async def _unified_devices() -> list[dict]:
                             device_state.logical_channel_view(identity, bridge_active))
         if is_native_reader:
             sim_present = bool(card_info.get("present"))
-        elif host_cell.get("available"):
+        elif host_cell_current:
             # ModemManager's current SIM object/failure reason outranks a VPCD card cache.
             # A hot removal recreates the MM object and can leave the old bridge identity
             # visible briefly; presenting that as an inserted card is materially wrong.
@@ -4815,12 +4841,17 @@ async def _unified_devices() -> list[dict]:
             # During an MM object-generation change there is no current card proof. The old
             # bridge cache must not fill that gap with the SIM removed from the prior object.
             sim_present = False
+        elif (actual_state.get("vowifi_backend") == "direct-serial"
+              and not bridge_active):
+            # A stopped/crashing direct bridge has not proven that the old VPCD card is
+            # still inserted. Fail closed until a fresh bridge publishes current identity.
+            sim_present = False
         else:
             sim_present = bool(card_info.get("present"))
         if not device_present:
             cell_actual, cell_reason = "off", "Device not connected"
             flight_actual, flight_available = "off", False
-        elif not is_native_reader and host_cell.get("available") and not sim_present:
+        elif not is_native_reader and host_cell_current and not sim_present:
             cell_actual, cell_reason = "off", "No SIM inserted"
             flight_actual = "on" if flight_desired else "off"
             flight_available = not serial_only
@@ -4922,8 +4953,37 @@ async def api_devices():
     # Sessions are memory-only, so a sign-in usually follows a control-plane restart — right
     # when the card monitor is still completing its first scan and smart-card readers are not
     # in the list yet. `discovering` lets the UI say so instead of reporting a confident zero.
-    return {"devices": await _unified_devices(), "discovering": not hub.scanned,
+    rescan = operations.device_rescan_status()
+    discovering = not hub.scanned or rescan.get("state") in {"requested", "running"}
+    return {"devices": await _unified_devices(), "discovering": discovering,
             "shared": device_state.status().get("shared") or {}}
+
+
+@app.post("/api/devices/rescan")
+async def api_devices_rescan():
+    """Request one root-owned, all-backend hardware rediscovery."""
+    try:
+        result = await asyncio.to_thread(operations.request_device_rescan)
+    except OSError as exc:
+        raise HTTPException(503, "could not publish the device rediscovery request") from exc
+    await hub.broadcast({"type": "device", "event": "rediscovery_requested"})
+    return result
+
+
+@app.get("/api/devices/rescan/progress")
+def api_devices_rescan_progress():
+    status = operations.device_rescan_status()
+    operation_id = str(status.get("operation_id") or "")
+    if (status.get("state") == "success" and operation_id
+            and hub.device_rescan_applied != operation_id):
+        # The host backends are ready, but the Control cache has not yet reconciled its first
+        # authoritative PC/SC snapshot. Keep the browser waiting rather than announcing a
+        # complete scan that still contains the previous reader generation.
+        return {**status, "state": "running", "phase": "pcsc"}
+    if status.get("state") == "success":
+        status["readers_detected"] = len(
+            device_state.native_reader_devices(hub.cards_list()))
+    return status
 
 
 @app.put("/api/devices/{device_id}/hardware")

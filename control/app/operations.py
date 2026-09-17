@@ -291,11 +291,18 @@ _RESTART_PICKUP_SECONDS = 60
 # A full service restart normally tears the API down within seconds. If the detached systemd
 # job never does so, keep the browser from waiting forever on a stale ``running`` document.
 _RESTART_RUNNING_SECONDS = 120
+_DEVICE_RESCAN_PICKUP_SECONDS = 60
+_DEVICE_RESCAN_RUNNING_SECONDS = 120
 
 
 def _service_restart_paths() -> tuple[Path, Path]:
     root = Path(cfg.DATA_DIR) / "orchestrator"
     return root / "service-restart-request.json", root / "service-restart-status.json"
+
+
+def _device_rescan_paths() -> tuple[Path, Path]:
+    root = Path(cfg.DATA_DIR) / "orchestrator"
+    return root / "device-rescan-request.json", root / "device-rescan-status.json"
 
 
 def _write_private_json(path: Path, value: dict):
@@ -358,6 +365,52 @@ def service_restart_status() -> dict:
                       updated_at=int(time.time()))
         _write_private_json(status_path, status)
     return status
+
+
+def request_device_rescan() -> dict:
+    """Ask the root orchestrator to rebuild every hardware discovery backend."""
+    request_path, status_path = _device_rescan_paths()
+    current = device_rescan_status()
+    if current.get("state") in {"requested", "running"}:
+        return {"ok": True, **current}
+    now = int(time.time())
+    operation_id = secrets.token_hex(8)
+    request = {"operation_id": operation_id, "requested_at": now}
+    _write_private_json(status_path, {**request, "state": "requested", "updated_at": now})
+    _write_private_json(request_path, request)
+    return {"ok": True, **request, "state": "requested", "updated_at": now}
+
+
+def device_rescan_status() -> dict:
+    """Return bounded progress for the all-device rediscovery operation."""
+    request_path, status_path = _device_rescan_paths()
+    status = _read_json(status_path)
+    status.setdefault("state", "idle")
+    request = _read_json(request_path)
+    try:
+        requested_at = int(request.get("requested_at") or 0)
+    except (TypeError, ValueError):
+        requested_at = 0
+    now = time.time()
+    if requested_at:
+        status.update(requested=True,
+                      operation_id=str(request.get("operation_id") or
+                                       status.get("operation_id") or ""))
+        if now - requested_at > _DEVICE_RESCAN_PICKUP_SECONDS:
+            status.update(state="failed", error_code="rescan.error.not_picked_up",
+                          updated_at=int(now))
+            _write_private_json(status_path, status)
+    elif (status.get("state") == "running"
+          and isinstance(status.get("updated_at"), (int, float))
+          and now - float(status["updated_at"]) > _DEVICE_RESCAN_RUNNING_SECONDS):
+        status.update(state="failed", error_code="rescan.error.failed",
+                      updated_at=int(now))
+        _write_private_json(status_path, status)
+    # Never expose arbitrary fields written into the shared runtime directory.
+    return {key: status[key] for key in (
+        "state", "operation_id", "requested_at", "updated_at", "requested",
+        "error_code", "modems_detected", "pcsc_active", "modemmanager_active")
+            if key in status}
 
 
 _BACKUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz\Z")
