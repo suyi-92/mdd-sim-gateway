@@ -35,6 +35,15 @@ class CellularNetworkError(RuntimeError):
     pass
 
 
+class CellularRegistrationError(CellularNetworkError):
+    """Closed, identity-free status for registration and its recovery transaction."""
+
+    def __init__(self, code: str, recovery: dict | None = None):
+        super().__init__("Cellular network registration failed.")
+        self.detail = {"code": code, "message": str(self),
+                       "recovery": recovery or {"state": "unchanged"}}
+
+
 def _error(result, fallback: str) -> str:
     detail = " ".join(str(getattr(result, "stderr", "") or "").split())
     return detail[:300] if detail else fallback
@@ -227,31 +236,144 @@ def scan(modem_path: str, runner=subprocess.run,
     return parse_scan_output(result.stdout)
 
 
-def register(modem_path: str, *, mode: str, operator_id: str = "",
-             runner=subprocess.run, timeout: float = REGISTER_TIMEOUT_SECONDS) -> dict:
-    if not MODEM_PATH_RE.fullmatch(str(modem_path or "")):
-        raise CellularNetworkError("The cellular modem path is invalid.")
+def _selection(mode: str, operator_id: str) -> dict:
     mode = str(mode or "").lower()
     operator_id = str(operator_id or "").strip()
     if mode == "automatic":
-        args = ["mmcli", "-m", modem_path, "--3gpp-register-home",
-                f"--timeout={int(timeout)}"]
-        operator_id = ""
-    elif mode == "manual" and OPERATOR_ID_RE.fullmatch(operator_id):
-        args = ["mmcli", "-m", modem_path,
-                f"--3gpp-register-in-operator={operator_id}",
-                f"--timeout={int(timeout)}"]
-    else:
-        raise CellularNetworkError(
-            "Use automatic mode or provide a 5-6 digit operator MCC/MNC.")
+        return {"mode": mode, "operator_id": ""}
+    if mode == "manual" and re.fullmatch(r"[0-9]{5,6}", operator_id):
+        return {"mode": mode, "operator_id": operator_id}
+    raise CellularNetworkError("Use automatic mode or provide a 5-6 digit operator MCC/MNC.")
+
+
+def _registration_error(detail: str) -> str:
+    detail = detail.lower()
+    if any(word in detail for word in ("networknotallowed", "network not allowed", "registration denied")):
+        return "denied"
+    if "no network service" in detail or "nonetwork" in detail:
+        return "no_service"
+    if "timeout" in detail or "timed out" in detail:
+        return "network_timeout"
+    if any(word in detail for word in ("couldn't find modem", "not available", "serviceunknown")):
+        return "unavailable"
+    return "failed"
+
+
+def _request_registration(modem_path: str, selection: dict, runner, timeout: float,
+                          *, use_at: bool = False) -> str:
+    keep_registration = (use_at and selection["mode"] == "automatic"
+                         and _is_registered(_registration_snapshot(modem_path, runner), selection))
+    action = ("--3gpp-register-home" if selection["mode"] == "automatic"
+              else f"--3gpp-register-in-operator={selection['operator_id']}")
     try:
-        result = runner(args, capture_output=True, text=True,
-                        timeout=timeout + 15, check=False,
+        result = runner(["mmcli", "-m", modem_path, action, f"--timeout={int(timeout)}"],
+                        capture_output=True, text=True, timeout=timeout + 15, check=False,
                         env={**os.environ, "LC_ALL": "C"})
-    except subprocess.TimeoutExpired as exc:
-        raise CellularNetworkError("Cellular network registration timed out.") from exc
-    except OSError as exc:
-        raise CellularNetworkError("ModemManager is unavailable.") from exc
-    if result.returncode:
-        raise CellularNetworkError(_error(result, "Cellular network registration failed."))
-    return {"mode": mode, "operator_id": operator_id}
+    except subprocess.TimeoutExpired:
+        error = "network_timeout"
+    except OSError:
+        return "unavailable"
+    else:
+        error = _registration_error(_error(result, "failed")) if result.returncode else ""
+    if use_at and error in {"", "network_timeout"}:
+        # Synchronize MM's selection intent FIRST. Applying it after COPS can
+        # overwrite the freshly selected AT mode using a stale QMI registration.
+        # MM remains the only tty owner; no port, band or APN configuration changes.
+        command = ("AT+COPS=0" if selection["mode"] == "automatic"
+                   else f'AT+COPS=1,2,"{selection["operator_id"]}"')
+        try:
+            if not keep_registration:
+                _at_command(modem_path, "AT+COPS=2", runner, 60)
+            _at_command(modem_path, command, runner, max(timeout, 180))
+        except CellularNetworkError as exc:
+            return _registration_error(str(exc))
+        return ""
+    return error
+
+
+def _registration_snapshot(modem_path: str, runner) -> dict:
+    try:
+        result = runner(["mmcli", "-m", modem_path, "--output-json"],
+                        capture_output=True, text=True, timeout=10, check=False,
+                        env={**os.environ, "LC_ALL": "C"})
+        if result.returncode:
+            return {"state": "unavailable", "operator_id": ""}
+        cell = json.loads(result.stdout)["modem"]["3gpp"]
+        state = str(cell.get("registration-state") or "unknown")
+        code = str(cell.get("operator-code") or "")
+        return {"state": state if state in {"home", "roaming", "searching", "denied", "idle"} else "unknown",
+                "operator_id": code if re.fullmatch(r"[0-9]{5,6}", code) else ""}
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
+        return {"state": "unavailable", "operator_id": ""}
+
+
+def _is_registered(snapshot: dict, selection: dict) -> bool:
+    return (snapshot["state"] in {"home", "roaming"} and bool(snapshot["operator_id"])
+            and (selection["mode"] == "automatic"
+                 or snapshot["operator_id"] == selection["operator_id"]))
+
+
+def _wait_registration(modem_path: str, selection: dict, runner, sleeper, attempts: int) -> dict:
+    snapshot = {}
+    confirmed = 0
+    for attempt in range(attempts):
+        snapshot = _registration_snapshot(modem_path, runner)
+        confirmed = confirmed + 1 if _is_registered(snapshot, selection) else 0
+        if confirmed >= min(3, attempts) or snapshot["state"] in {"denied", "unavailable"}:
+            break
+        if attempt + 1 < attempts:
+            sleeper(3)
+    if _is_registered(snapshot, selection) and confirmed < min(3, attempts):
+        return {**snapshot, "state": "registering"}
+    return snapshot
+
+
+def _selection_is_applied(modem_path: str, selection: dict, runner) -> bool:
+    """A registration timeout can still restore selection; prove that separately."""
+    if not _prefer_at_scan(modem_path, runner):
+        return False
+    try:
+        value = _at_command(modem_path, "AT+COPS?", runner, 10).strip()
+    except CellularNetworkError:
+        return False
+    if selection["mode"] == "automatic":
+        return bool(re.fullmatch(r'\+COPS:\s*0(?:\s*,[^\r\n]*)?', value))
+    match = re.fullmatch(r'\+COPS:\s*1\s*,\s*2\s*,\s*"([0-9]{5,6})"'
+                         r'(?:\s*,\s*[0-9]{1,2})?', value)
+    return bool(match and match[1] == selection["operator_id"])
+
+
+def register(modem_path: str, *, mode: str, operator_id: str = "", previous: dict | None = None,
+             runner=subprocess.run, timeout: float = REGISTER_TIMEOUT_SECONDS,
+             sleeper=time.sleep, settle_attempts: int = 41) -> dict:
+    """Confirm the requested PLMN, restoring saved selection after a failed attempt.
+
+    MM's Register method has its own 60-second registration check even when the
+    CLI timeout is longer. Its NetworkTimeout does not cancel modem selection;
+    allow late registration before recovery, without starting a competing command.
+    """
+    if not MODEM_PATH_RE.fullmatch(str(modem_path or "")):
+        raise CellularNetworkError("The cellular modem path is invalid.")
+    selected = _selection(mode, operator_id)
+    previous = previous or {"mode": "automatic", "operator_id": ""}
+    restore = _selection(previous.get("mode", "automatic"), previous.get("operator_id", ""))
+    use_at = _prefer_at_scan(modem_path, runner)
+    error = _request_registration(modem_path, selected, runner, timeout, use_at=use_at)
+    snapshot = _wait_registration(modem_path, selected, runner, sleeper,
+                                  settle_attempts if error in {"", "network_timeout"} else 1)
+    if (error in {"", "network_timeout"} and _is_registered(snapshot, selected)
+            and (not use_at or _selection_is_applied(modem_path, selected, runner))):
+        return {**selected, "registration": snapshot}
+    if snapshot["state"] == "denied":
+        error = "denied"
+    error = error or "not_registered"
+    recovery_error = _request_registration(modem_path, restore, runner, timeout, use_at=use_at)
+    recovered = _wait_registration(modem_path, restore, runner, sleeper,
+                                   settle_attempts if recovery_error in {"", "network_timeout"} else 1)
+    restored_selection = (_selection_is_applied(modem_path, restore, runner) if use_at
+                          else not recovery_error or (recovery_error == "network_timeout"
+                               and _selection_is_applied(modem_path, restore, runner)))
+    recovery_state = ("restored" if restored_selection and recovery_error in {"", "network_timeout"} and _is_registered(recovered, restore)
+                      else "pending" if restored_selection and recovered["state"] in {"searching", "idle", "registering"}
+                      else "failed")
+    raise CellularRegistrationError(error, {"state": recovery_state, **restore, "registration": recovered})

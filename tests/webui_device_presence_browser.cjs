@@ -101,13 +101,13 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await heading('DJI/Quectel EC25').waitFor()
     assert.equal(await options.count(), 2)
     assert.equal(await page.locator('.u-device-page-heading button').count(), 0)
-    const fullDetection = page.locator('.u-device-sidebar-footer').getByRole('button', { name: '重新完整检测', exact: true })
+    const fullDetection = page.locator('.u-device-sidebar>.u-device-rescan').getByRole('button', { name: '重新完整检测', exact: true })
     const sidebarBefore = await page.locator('.u-device-sidebar').boundingBox()
     page.once('dialog', dialog => dialog.accept())
     await fullDetection.click()
     await page.clock.fastForward(11000)
     await page.locator('.u-empty-spinner').waitFor()
-    assert.equal(await page.locator('.u-device-sidebar-footer button').isEnabled(), false,
+    assert.equal(await page.locator('.u-device-sidebar>.u-device-rescan button').isEnabled(), false,
       'the running full detection must survive the discovery loading state')
     discovering = false
     await page.clock.fastForward(1200)
@@ -117,12 +117,15 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.getByRole('button', { name: '硬件', exact: true }).click()
     const deviceDetection = page.locator('.u-hardware-detection').getByRole('button', { name: '重新检测此设备', exact: true })
     const detectionBefore = await deviceDetection.boundingBox()
+    assert.ok(detectionBefore.width <= 130, 'single-device action must stay compact')
+    assert.equal(await page.locator('.u-device-sidebar-footer button').count(), 0)
+    assert.ok((await fullDetection.boundingBox()).width <= 130, 'global detection must stay compact')
     page.once('dialog', dialog => dialog.accept())
     await deviceDetection.click()
     await page.clock.fastForward(1200)
     await page.getByText('设备检测已完成，请查看下方刷新的硬件和 SIM 状态。', { exact: true }).waitFor()
     assert.deepEqual(await deviceDetection.boundingBox(), detectionBefore, 'per-device feedback must not move the button')
-    for (const width of [1440, 900, 390]) {
+    for (const width of [2560, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `detection controls overflow at ${width}px`)

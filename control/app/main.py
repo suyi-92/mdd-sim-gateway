@@ -5214,7 +5214,11 @@ async def api_device_cellular_network_select(device_id: str, body: dict):
         try:
             selection = await asyncio.to_thread(
                 cellular_network.register, modem_path,
-                mode=mode, operator_id=operator_id)
+                mode=mode, operator_id=operator_id,
+                previous={"mode": inst.get("cellular_network_mode") or "automatic",
+                          "operator_id": inst.get("cellular_operator_id") or ""})
+        except cellular_network.CellularRegistrationError as exc:
+            raise HTTPException(503, exc.detail) from exc
         except cellular_network.CellularNetworkError as exc:
             raise HTTPException(503, str(exc)) from exc
         await asyncio.to_thread(cfg.upsert_instance, {

@@ -230,12 +230,12 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("api.scanCellularNetworks(device.id)", UNIFIED)
         self.assertIn("api.selectCellularNetwork(device.id", UNIFIED)
         self.assertIn("Scanning cellular networks temporarily interrupts", UNIFIED)
-        self.assertIn("Manual selection chooses a visited operator", UNIFIED)
+        self.assertIn("A detected network may not accept this SIM", UNIFIED)
         self.assertIn("device.sim?.present === false", UNIFIED)
         feedback = css_rule(".u-cellular-network-feedback")
         self.assertIn("min-height:20px", feedback)
         controls = css_rule(".u-cellular-network-controls")
-        self.assertIn("minmax(240px,1fr)", controls)
+        self.assertIn("display:flex", controls)
 
     def test_modemmanager_sim_presence_overrides_stale_bridge_card(self):
         self.assertIn("host_cell.get(\"sim_present\") is True", CONTROL_MAIN)

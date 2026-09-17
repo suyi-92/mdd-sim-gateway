@@ -39,6 +39,7 @@ const devices = [
 
 const writes = []
 let pendingScanResponse = null
+let registrationFailure = false
 const json = (response, value, status = 200) => {
   response.writeHead(status, { 'Content-Type': 'application/json' })
   response.end(JSON.stringify(value))
@@ -66,7 +67,9 @@ const server = http.createServer((request, response) => {
       return
     }
     if (/\/cellular\/network$/.test(url.pathname)) {
-      return json(response, { ok: true, mode: 'manual', operator_id: '46000' })
+      if (registrationFailure) return json(response, { detail: { code: 'network_timeout',
+        message: 'Cellular network registration failed.', recovery: { state: 'restored' } } }, 503)
+      return json(response, { ok: true, mode: 'manual', operator_id: '46000', registration: { operator_id: '46000', state: 'roaming' } })
     }
     return json(response, values[url.pathname] || {})
   }
@@ -206,7 +209,16 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     }
 
     await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    for (const width of [2560, 1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      const controls = page.locator('.u-cellular-network-controls')
+      const modeBox = await controls.getByRole('group').boundingBox()
+      const applyBox = await controls.getByRole('button', { name: '应用网络' }).boundingBox()
+      assert.ok(applyBox.x - (modeBox.x + modeBox.width) < 24, `automatic action disconnected from mode at ${width}`)
+      await page.locator('.u-cellular-network').screenshot({ path: path.join(output, `automatic-panel-${width}.png`), animations: 'disabled' })
+    }
     page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '手动', exact: true }).click()
     await page.getByRole('button', { name: '扫描网络' }).click()
     await page.getByText('正在扫描附近网络，模块可能需要几分钟才能完成。', { exact: true }).waitFor()
     assert.equal(await page.getByRole('button', { name: '正在扫描…' }).isEnabled(), false)
@@ -215,15 +227,16 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     json(pendingScanResponse, { networks: [
       { operator_id: '46001', name: 'Visited Fixture', access_technology: 'lte', status: 'current' },
       { operator_id: '46000', name: 'China Mobile', access_technology: 'lte', status: 'available' },
+      { operator_id: '00101', name: 'Forbidden Fixture', access_technology: 'lte', status: 'forbidden' },
     ] })
     pendingScanResponse = null
-    await page.getByText('发现 2 个蜂窝网络。', { exact: true }).waitFor()
-    await page.getByLabel('选择方式').selectOption('manual')
-    await page.getByLabel('可用网络').selectOption('46000')
+    await page.getByText('发现 3 个蜂窝网络。', { exact: true }).waitFor()
+    assert.equal(await page.getByRole('radio', { name: /Forbidden Fixture/ }).isEnabled(), false)
+    await page.getByRole('radio', { name: /China Mobile/ }).click()
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '应用网络' }).click()
-    await page.getByText('已应用蜂窝网络选择：China Mobile (46000)。', { exact: true }).waitFor()
-    for (const width of [1440, 900, 390]) {
+    await page.getByText('已确认连接到 46000。', { exact: true }).waitFor()
+    for (const width of [2560, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
         `cellular network selection overflow at ${width}px`)
@@ -234,10 +247,28 @@ server.on('upgrade', (_request, socket) => socket.destroy())
         path: path.join(output, `cellular-network-panel-${width}.png`), animations: 'disabled' })
     }
 
+    registrationFailure = true
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '应用网络' }).click()
+    const feedback = page.locator('.u-cellular-network-feedback')
+    await feedback.getByText(/所选网络未能完成注册/).waitFor()
+    assert.ok((await feedback.innerText()).includes('已恢复之前的选网并确认驻网。'))
+    assert.equal((await feedback.innerText()).includes('GDBus'), false)
+    for (const width of [2560, 1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false)
+      await page.locator('.u-cellular-network').screenshot({ path: path.join(output, `registration-error-${width}.png`), animations: 'disabled' })
+    }
+    await page.getByRole('button', { name: '自动', exact: true }).click()
+    await feedback.getByText('由 SIM 自动选择可接入的运营商。', { exact: true }).waitFor()
+    assert.equal(await page.locator('.u-cellular-network-feedback.is-error').count(), 0,
+      'changing selection must clear the previous attempt’s error')
+
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [
       ['POST', '/api/instances/2/messages/reimport-cellular'],
       ['POST', '/api/devices/modem-2/cellular/networks/scan'],
+      ['PUT', '/api/devices/modem-2/cellular/network'],
       ['PUT', '/api/devices/modem-2/cellular/network'],
     ])
     console.log('PASS: line details, retained-SMS confirmation, cellular network selection, registered-without-bearer status, and wide/narrow layouts; fixture API only')

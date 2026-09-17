@@ -196,21 +196,205 @@ class CellularNetworkCommandTests(unittest.TestCase):
         calls = []
 
         def runner(args, **kwargs):
+            if "--output-json" in args and not calls:
+                calls.append((args, kwargs))
+                return self.reply("{}")
             calls.append((args, kwargs))
+            if "--output-json" in args:
+                return self.reply(json.dumps({"modem": {"3gpp": {
+                    "registration-state": "roaming", "operator-code": "46000"}}}))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         self.assertEqual(cellular_network.register(
-            MODEM, mode="automatic", runner=runner, timeout=20),
-            {"mode": "automatic", "operator_id": ""})
+            MODEM, mode="automatic", runner=runner, timeout=20, sleeper=Mock()),
+            {"mode": "automatic", "operator_id": "",
+             "registration": {"state": "roaming", "operator_id": "46000"}})
         self.assertEqual(cellular_network.register(
-            MODEM, mode="manual", operator_id="46000", runner=runner, timeout=20),
-            {"mode": "manual", "operator_id": "46000"})
-        self.assertIn("--3gpp-register-home", calls[0][0])
-        self.assertIn("--3gpp-register-in-operator=46000", calls[1][0])
+            MODEM, mode="manual", operator_id="46000", runner=runner, timeout=20, sleeper=Mock()),
+            {"mode": "manual", "operator_id": "46000",
+             "registration": {"state": "roaming", "operator_id": "46000"}})
+        self.assertTrue(any("--3gpp-register-home" in args for args, _ in calls))
+        self.assertTrue(any("--3gpp-register-in-operator=46000" in args for args, _ in calls))
         with self.assertRaises(cellular_network.CellularNetworkError):
             cellular_network.register(
                 MODEM, mode="manual", operator_id="46000; reboot", runner=runner)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 10)
+
+    def test_selection_recovery_proof_requires_exact_mode_and_numeric_plmn(self):
+        for selection, reply, expected in [
+                ({"mode": "automatic", "operator_id": ""}, "+COPS: 0", True),
+                ({"mode": "automatic", "operator_id": ""}, "+COPS: 1", False),
+                ({"mode": "manual", "operator_id": "00101"}, '+COPS: 1,2,"00101",7', True),
+                ({"mode": "manual", "operator_id": "00101"}, '+COPS: 1,2,"00102",7', False),
+                ({"mode": "manual", "operator_id": "00101"}, '+COPS: 1,0,"Fixture",7', False)]:
+            runner = Mock(side_effect=[self.metadata(), self.cops_reply(reply)])
+            self.assertEqual(cellular_network._selection_is_applied(MODEM, selection, runner), expected)
+
+
+class CellularRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        backend = patch.object(cellular_network, "_prefer_at_scan", return_value=False)
+        self.backend = backend.start()
+        self.addCleanup(backend.stop)
+        patcher = patch.object(cellular_network, "_selection_is_applied", return_value=False)
+        self.selection_applied = patcher.start()
+        self.addCleanup(patcher.stop)
+    @staticmethod
+    def reply(value="", error=""):
+        return SimpleNamespace(returncode=int(bool(error)), stdout=value, stderr=error)
+
+    def state(self, state="roaming", operator="00101"):
+        return self.reply(json.dumps({"modem": {"3gpp": {
+            "registration-state": state, "operator-code": operator}}}))
+
+    def test_late_registration_after_mm_timeout_is_confirmed_without_retry(self):
+        runner = Mock(side_effect=[self.reply(error="Network timeout"),
+            self.state("searching", ""), self.state("roaming", "00102"),
+            self.state("roaming", "00102"), self.state("roaming", "00102")])
+        sleep = Mock()
+        result = cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                           runner=runner, sleeper=sleep, settle_attempts=4)
+        self.assertEqual(result["registration"], {"state": "roaming", "operator_id": "00102"})
+        self.assertEqual(sum("--output-json" not in c.args[0] for c in runner.call_args_list), 1)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_wrong_plmn_is_not_success_even_when_command_and_state_say_registered(self):
+        runner = Mock(side_effect=[self.reply(), self.state(operator="00101"),
+            self.reply(), self.state(operator="00101")])
+        with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+            cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                      runner=runner, sleeper=Mock(), settle_attempts=1)
+        self.assertEqual(caught.exception.detail["code"], "not_registered")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "restored")
+        self.assertIn("--3gpp-register-home", runner.call_args_list[2].args[0])
+
+    def test_manual_failure_restores_saved_manual_selection(self):
+        runner = Mock(side_effect=[self.reply(error="Network not allowed"), self.state("denied", ""),
+            self.reply(), self.state(operator="001001")])
+        with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+            cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                previous={"mode": "manual", "operator_id": "001001"}, runner=runner,
+                sleeper=Mock(), settle_attempts=1)
+        self.assertEqual(caught.exception.detail["code"], "denied")
+        self.assertIn("--3gpp-register-in-operator=001001", runner.call_args_list[2].args[0])
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "restored")
+
+    def test_recovery_distinguishes_searching_and_failure_without_raw_errors(self):
+        for recovery_reply, state, expected in [
+                (self.reply(), self.state("searching", ""), "pending"),
+                (self.reply(error="secret transport error"), self.state("unknown", ""), "failed")]:
+            runner = Mock(side_effect=[self.reply(error="Network timeout private-data"),
+                self.state("searching", ""), recovery_reply, state])
+            with self.subTest(expected=expected), self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+                cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                          runner=runner, sleeper=Mock(), settle_attempts=1)
+            self.assertEqual(caught.exception.detail["recovery"]["state"], expected)
+            self.assertNotIn("private-data", json.dumps(caught.exception.detail))
+            self.assertNotIn("secret", json.dumps(caught.exception.detail))
+
+    def test_invalid_saved_selection_cannot_reach_hardware(self):
+        runner = Mock()
+        with self.assertRaises(cellular_network.CellularNetworkError):
+            cellular_network.register(MODEM, mode="manual", operator_id="00101",
+                previous={"mode": "manual", "operator_id": "00102;reboot"}, runner=runner)
+        runner.assert_not_called()
+
+    def test_transport_timeout_restores_and_unreadable_status_is_not_success(self):
+        runner = Mock(side_effect=[subprocess.TimeoutExpired("mmcli", 135),
+            self.reply("not json"), self.reply(), self.state()])
+        with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+            cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                      runner=runner, sleeper=Mock(), settle_attempts=1)
+        self.assertEqual(caught.exception.detail["code"], "network_timeout")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "restored")
+
+    def test_recovery_timeout_with_proven_automatic_mode_is_pending_not_registered(self):
+        self.selection_applied.return_value = True
+        runner = Mock(side_effect=[self.reply(error="Network timeout"), self.state("searching", ""),
+            self.reply(error="Network timeout"), self.state("idle", "")])
+        with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+            cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                      runner=runner, sleeper=Mock(), settle_attempts=1)
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "pending")
+        self.selection_applied.assert_called_once_with(MODEM, {"mode": "automatic", "operator_id": ""}, runner)
+
+    def test_quectel_registration_synchronizes_mm_before_managed_at(self):
+        self.backend.return_value = True
+        self.selection_applied.return_value = True
+        order = []
+        def run(args, **kwargs):
+            if "--output-json" in args:
+                return self.state(operator="00102")
+            order.append("mm-register")
+            return self.reply()
+        runner = Mock(side_effect=run)
+        def at(*args):
+            order.append(args[1])
+            return ""
+        with patch.object(cellular_network, "_at_command", side_effect=at) as command:
+            result = cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                              runner=runner, sleeper=Mock(), settle_attempts=1)
+        self.assertEqual([c.args[1] for c in command.call_args_list], ["AT+COPS=2", 'AT+COPS=1,2,"00102"'])
+        self.assertTrue(all(c.args[0] == MODEM for c in command.call_args_list))
+        self.assertIn("--3gpp-register-in-operator=00102", runner.call_args_list[0].args[0])
+        self.assertEqual(result["registration"]["operator_id"], "00102")
+        self.assertEqual(order, ["mm-register", "AT+COPS=2", 'AT+COPS=1,2,"00102"'])
+
+    def test_registration_permission_error_never_touches_at(self):
+        runner = Mock(return_value=self.reply(error="Unauthorized"))
+        with patch.object(cellular_network, "_at_command") as command:
+            self.assertEqual(cellular_network._request_registration(MODEM,
+                {"mode": "automatic", "operator_id": ""}, runner, 120, use_at=True), "failed")
+        command.assert_not_called()
+
+    def test_quectel_rejection_restores_saved_selection_via_at_and_mm(self):
+        self.backend.return_value = True
+        self.selection_applied.return_value = True
+        runner = Mock(side_effect=[self.reply(), self.state("searching", ""), self.state("searching", ""), self.reply(), self.state()])
+        with patch.object(cellular_network, "_at_command", side_effect=["",
+                cellular_network.CellularNetworkError("Call failed: No network service"), "", ""]) as command:
+            with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+                cellular_network.register(MODEM, mode="manual", operator_id="00102",
+                                          runner=runner, sleeper=Mock(), settle_attempts=1)
+        self.assertEqual([c.args[1] for c in command.call_args_list],
+                         ["AT+COPS=2", 'AT+COPS=1,2,"00102"', "AT+COPS=2", "AT+COPS=0"])
+        self.assertEqual(caught.exception.detail["code"], "no_service")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "restored")
+        self.assertIn("--3gpp-register-home", runner.call_args_list[3].args[0])
+
+    def test_automatic_selection_preserves_a_working_quectel_registration(self):
+        self.backend.return_value = True
+        self.selection_applied.return_value = True
+        runner = Mock(side_effect=[self.state(), self.reply(), self.state()])
+        with patch.object(cellular_network, "_at_command", return_value="") as command:
+            cellular_network.register(MODEM, mode="automatic", runner=runner,
+                                      sleeper=Mock(), settle_attempts=1)
+        self.assertEqual([c.args[1] for c in command.call_args_list], ["AT+COPS=0"])
+
+    def test_transient_old_registration_is_not_confirmed(self):
+        runner = Mock(side_effect=[self.reply(), self.state(), self.state("searching", ""),
+            self.state("idle", ""), self.reply(), self.state(), self.state(), self.state()])
+        with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+            cellular_network.register(MODEM, mode="automatic", runner=runner,
+                                      sleeper=Mock(), settle_attempts=3)
+        self.assertEqual(caught.exception.detail["code"], "not_registered")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "restored")
+
+    def test_one_registered_sample_at_deadline_does_not_bypass_stability_check(self):
+        runner = Mock(side_effect=[self.state("searching", ""), self.state("searching", ""), self.state()])
+        result = cellular_network._wait_registration(MODEM, {"mode": "automatic", "operator_id": ""},
+                                                     runner, Mock(), 3)
+        self.assertEqual(result["state"], "registering")
+
+    def test_quectel_cannot_report_automatic_success_while_hardware_remains_manual(self):
+        self.backend.return_value = True
+        runner = Mock(side_effect=[self.state(), self.reply(), self.state(), self.state(), self.reply(), self.state()])
+        with patch.object(cellular_network, "_at_command", return_value=""):
+            with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+                cellular_network.register(MODEM, mode="automatic", runner=runner,
+                                          sleeper=Mock(), settle_attempts=1)
+        self.assertEqual(caught.exception.detail["code"], "not_registered")
+        self.assertEqual(caught.exception.detail["recovery"]["state"], "failed")
 
 
 class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
@@ -267,11 +451,24 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
                 "modem-a", {"mode": "manual", "operator_id": "46000"})
         self.assertTrue(result["ok"])
         register.assert_called_once_with(
-            MODEM, mode="manual", operator_id="46000")
+            MODEM, mode="manual", operator_id="46000",
+            previous={"mode": "automatic", "operator_id": ""})
         save.assert_called_once_with({
             "id": "3", "cellular_network_mode": "manual",
             "cellular_operator_id": "46000"})
         broadcast.assert_awaited_once()
+
+    async def test_failed_registration_never_saves_the_requested_network(self):
+        failure = cellular_network.CellularRegistrationError("network_timeout", {"state": "restored"})
+        with patch.object(main.device_state, "status", return_value=self.observed()), \
+                patch.object(main, "_match_instance_by_iccid", return_value={"id": "3"}), \
+                patch.object(main.cellular_network, "register", side_effect=failure), \
+                patch.object(main.cfg, "upsert_instance") as save:
+            with self.assertRaises(main.HTTPException) as caught:
+                await main.api_device_cellular_network_select("modem-a", {"mode": "manual", "operator_id": "00102"})
+            self.assertEqual(caught.exception.status_code, 503)
+            self.assertEqual(caught.exception.detail, failure.detail)
+            save.assert_not_called()
 
     async def test_scan_guards_fail_before_any_modem_command(self):
         for observed in [self.observed(sim_present=False), self.observed(data_active=True),

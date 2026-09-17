@@ -306,10 +306,12 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   const [busy, setBusy] = useState('')
   const [feedback, setFeedback] = useState('')
   const [failed, setFailed] = useState(false)
+  const [scanned, setScanned] = useState(false)
+  const clearFeedback = () => { setFeedback(''); setFailed(false) }
   useEffect(() => {
     setMode(saved.mode === 'manual' ? 'manual' : 'automatic')
     setOperatorId(saved.operator_id || '')
-    setNetworks([]); setFeedback(''); setFailed(false); setBusy('')
+    setNetworks([]); setScanned(false); clearFeedback(); setBusy('')
   }, [device.id])
   const simMissing = device.sim?.present === false
   const dataActive = !!device.cellular?.data_active
@@ -328,7 +330,7 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
     try {
       const result = await api.scanCellularNetworks(device.id)
       const found = result.networks || []
-      setNetworks(found)
+      setNetworks(found); setScanned(true)
       const current = found.find(item => item.status === 'current')
       if (mode === 'manual' && !operatorId && current) setOperatorId(current.operator_id)
       setFeedback(found.length
@@ -344,56 +346,79 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
     const label = mode === 'automatic' ? t('Automatic network selection')
       : `${selected?.name || operatorId} (${operatorId})`
     if (!window.confirm(t('Register this modem using {network}? Cellular service will briefly disconnect.', { network: label }))) return
-    setBusy('apply'); setFeedback(''); setFailed(false)
+    setBusy('apply'); setFeedback(t('Waiting for the modem to confirm registration…')); setFailed(false)
     try {
-      await api.selectCellularNetwork(device.id, {
+      const result = await api.selectCellularNetwork(device.id, {
         mode, operator_id: mode === 'manual' ? operatorId : '',
       })
-      setFeedback(t('Cellular network selection applied: {network}.', { network: label }))
+      setFeedback(t('Connected to {network}.', { network: result.registration?.operator_id || label }))
       showToast?.(t('Cellular network selection applied'))
-      await refreshDevices?.()
     } catch (error) {
-      setFailed(true); setFeedback(`${t('Network selection failed')}: ${error.message}`)
-    } finally { setBusy('') }
+      const detail = error.data?.detail || {}
+      const messages = {
+        network_timeout: 'The selected network did not accept registration in time. Try another network or automatic selection.',
+        denied: 'Registration was rejected. This SIM may not have roaming access to that network.',
+        no_service: 'The selected network is not providing service to this SIM. Try another network or automatic selection.',
+        not_registered: 'The modem has not registered on the selected network.',
+        unavailable: 'The modem is unavailable. Re-detect this device and try again.',
+      }
+      const recovery = detail.recovery?.state
+      const recovered = recovery === 'restored' ? t('Previous network selection restored.')
+        : recovery === 'pending' ? t('Previous selection restored; searching for service.')
+        : recovery === 'failed' ? t('Recovery failed. Apply automatic selection to reconnect.') : ''
+      setFailed(true); setFeedback(`${t(messages[detail.code] || 'Network selection failed. Try automatic selection or re-detect this device.')} ${recovered}`.trim())
+    } finally {
+      setBusy('')
+      try { await refreshDevices?.() } catch { /* The confirmed operation result remains visible. */ }
+    }
   }
   const blocked = backendMissing ? t('Re-detect this device to restore ModemManager before scanning networks.')
     : simMissing ? t('Insert a readable SIM before selecting a network.')
     : dataActive ? t('Turn off cellular data before selecting a network.')
     : flightMode ? t('Turn off flight mode before selecting a network.') : ''
   return <div className="u-cellular-network">
-    <h3>{t('Cellular network selection')}</h3>
+    <div className="u-cellular-network-heading"><h3>{t('Cellular network selection')}</h3>
+      <span className="u-cellular-current">{t('Current network')}: {device.cellular?.operator || t('Not connected')}{device.cellular?.operator_code ? ` · ${device.cellular.operator_code}` : ''}</span>
+    </div>
     <div className="u-cellular-network-controls">
-      <label className="u-inline-field"><span>{t('Selection mode')}</span>
-        <select value={mode} disabled={!!busy || unavailable}
-          onChange={event => setMode(event.target.value)}>
-          <option value="automatic">{t('Automatic')}</option>
-          <option value="manual">{t('Manual')}</option>
-        </select>
-      </label>
-      {mode === 'manual' && <label className="u-inline-field u-cellular-network-list"><span>{t('Available network')}</span>
-        <select value={operatorId} disabled={!!busy || unavailable}
-          onChange={event => setOperatorId(event.target.value)}>
-          <option value="">{t('Scan to select a network')}</option>
-          {options.map(item => <option key={item.operator_id} value={item.operator_id}
-            disabled={item.status === 'forbidden'}>
-            {item.name} ({item.operator_id}){item.access_technology ? ` · ${item.access_technology.toUpperCase()}` : ''}{item.status === 'forbidden' ? ` · ${t('Forbidden')}` : ''}
-          </option>)}
-        </select>
-      </label>}
+      <div className="u-network-mode" role="group" aria-label={t('Selection mode')}>
+        {['automatic', 'manual'].map(value => <button key={value} type="button"
+          aria-pressed={mode === value} disabled={!!busy || unavailable}
+          onClick={() => { setMode(value); clearFeedback() }}>
+          {t(value === 'automatic' ? 'Automatic' : 'Manual')}
+        </button>)}
+      </div>
       <div className="u-cellular-network-actions">
-        <button className="btn btn-ghost" disabled={!!busy || unavailable} onClick={scan}>
+        {mode === 'manual' && <button className="btn btn-ghost" disabled={!!busy || unavailable} onClick={scan}>
           {busy === 'scan' ? `${t('Scanning')}…` : t('Scan networks')}
-        </button>
+        </button>}
         <button className="btn btn-primary"
-          disabled={!!busy || unavailable || (mode === 'manual' && !operatorId)} onClick={apply}>
+          disabled={!!busy || unavailable || (mode === 'manual' && (!operatorId || options.find(item => item.operator_id === operatorId)?.status === 'forbidden'))} onClick={apply}>
           {busy === 'apply' ? `${t('Applying')}…` : t('Apply network')}
         </button>
       </div>
     </div>
+    {mode === 'manual' && <div className="u-cellular-network-list" role="radiogroup" aria-label={t('Available network')}>
+      {options.map(item => <button type="button" key={item.operator_id} role="radio"
+        aria-checked={operatorId === item.operator_id} className="u-network-option"
+        disabled={!!busy || unavailable || item.status === 'forbidden'}
+        onClick={() => { setOperatorId(item.operator_id); clearFeedback() }}>
+        <span className="u-network-radio" aria-hidden="true"/>
+        <span className="u-network-option-copy"><b title={item.name}>{item.name}</b>
+          <span>{item.operator_id}{item.access_technology ? ` · ${item.access_technology.toUpperCase()}` : ''}</span>
+        </span>
+        <span className="u-network-availability">{t(item.status === 'current' ? 'Current'
+          : item.status === 'forbidden' ? 'Forbidden' : 'Detected')}</span>
+      </button>)}
+      {!options.length && <p className="u-network-empty">{t(busy === 'scan'
+        ? 'Scanning nearby networks…' : scanned ? 'No cellular networks were returned by the modem.' : 'Scan to discover nearby operators.')}</p>}
+    </div>}
     <div className={`u-cellular-network-feedback${failed ? ' is-error' : ''}`} role="status">
-      {blocked || feedback || '\u00a0'}
+      <span aria-hidden="true">{failed ? '!' : 'i'}</span>
+      <p title={blocked || feedback || ''}>{blocked || feedback || t(mode === 'automatic'
+        ? 'The SIM chooses an available operator automatically.'
+        : 'A detected network may not accept this SIM. Access depends on your plan and roaming agreements.')}</p>
     </div>
-    <p className="u-note">{t('Manual selection chooses a visited operator (PLMN), not an individual physical cell tower.')}</p>
   </div>
 }
 
@@ -506,9 +531,6 @@ function HardwarePanel({ device, refreshDevices, refresh, showToast }) {
       <button className="btn btn-primary" disabled={!!saving} onClick={saveImei}>{t('Save')}</button>
     </div>}
     <div className="u-hardware-action u-hardware-detection">
-      <div className="u-hardware-action-copy"><h4>{t('Device detection')}</h4>
-        <p>{t('Re-detect this device if its connection or SIM state has stopped updating.')}</p>
-      </div>
       <DeviceRescanControl key={device.id} device={device} refresh={refresh} showToast={showToast}/>
     </div>
     <div className="u-hardware-action u-hardware-danger">
@@ -570,13 +592,16 @@ function DeviceRescanControl({ device = null, refresh, showToast }) {
       setFeedback(`${t(device ? 'Device detection failed' : 'Full device detection failed')}: ${error.message}`)
     } finally { setBusy(false) }
   }
+  const defaultHint = t(device ? 'Re-read this device’s connection and SIM state.' : 'Connected devices are discovered automatically.')
   return <div className={`u-device-rescan${device ? ' is-device' : ''}`}>
-    <button className="btn btn-ghost u-device-rescan-button" disabled={busy || device?.present === false} onClick={rescan}>
+    {device ? <h4>{t('Device detection')}</h4> : <h2>{t('Communication devices')}</h2>}
+    <button className="btn btn-ghost u-device-rescan-button" disabled={busy || device?.present === false} onClick={rescan}
+      aria-label={t(device ? 'Re-detect this device' : 'Run full device detection')}>
       <svg className={busy ? 'is-spinning' : ''} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></svg>
-      {busy ? `${t('Detecting')}…` : t(device ? 'Re-detect this device' : 'Run full device detection')}
+      {busy ? `${t('Detecting')}…` : t(device ? 'Re-detect' : 'Detect all')}
     </button>
-    <div className={`u-device-rescan-feedback${failed ? ' is-error' : ''}`} role="status">
-      {feedback || '\u00a0'}
+    <div className={`u-device-rescan-feedback${failed ? ' is-error' : ''}`} role="status" title={feedback || defaultHint}>
+      {feedback || defaultHint}
     </div>
   </div>
 }
@@ -626,9 +651,9 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
     : !d ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> : null
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('Cellular data (4G)')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
   return <div className="u-split"><aside className="card u-device-sidebar">
-    <h2>{t('Communication devices')}</h2>
+    <DeviceRescanControl refresh={refresh} showToast={showToast}/>
     <div className="u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i,t)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</div>
-    <div className="u-device-sidebar-footer">{historyToggle}<DeviceRescanControl refresh={refresh} showToast={showToast}/></div>
+    {historyToggle && <div className="u-device-sidebar-footer">{historyToggle}</div>}
     </aside>
     <section className="u-page">{emptyContent}{d && <div className="u-page u-device-body" hidden={!!emptyContent}>
       <div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
