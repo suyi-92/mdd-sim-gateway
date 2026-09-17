@@ -989,6 +989,25 @@ class Orchestrator:
                     proc.wait()
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
+            # LPA changes the card behind MM's cached SIM object. Reinitialise only
+            # this physical modem when that object still identifies the old profile.
+            assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(device_id) or {}
+            if assignment.get("tty") and not self._serial_mode and not self.dry_run:
+                snapshot = self.modem_snapshot({"id": device_id, "tty": assignment["tty"]})
+                actual = str(snapshot.get("sim_iccid") or "")
+                obj = str(snapshot.get("mm_object") or "")
+                if (actual and hashlib.sha256(actual.encode()).hexdigest() != expected_iccid_sha256
+                        and re.fullmatch(r"/org/freedesktop/ModemManager1/Modem/[0-9]+", obj)):
+                    # Record before issuing Reset, so a manager restart never repeats it.
+                    request = self._bridge_restart_status(request, "resetting", modem_reset=True)
+                    self.cellular_states.pop(device_id, None)
+                    self.radio_states.pop(device_id, None)
+                    result = run(["mmcli", "--timeout=25", "-m", obj, "--reset"])
+                    if result.returncode:
+                        self._bridge_restart_status(request, "failed",
+                                                    error="cellular SIM refresh failed")
+                    else:
+                        self._bridge_restart_status(request, "stopped")
 
     def finish_bridge_restart_requests(self, present_ids: set[str]):
         """Advance stopped requests only when the replacement bridge is authoritative."""
@@ -999,13 +1018,17 @@ class Orchestrator:
                 self._bridge_restarts.pop(request_id, None)
                 continue
             device_id = str(request.get("device_id") or "")
+            elapsed = now - float(request.get("started_at") or now)
+            limit = 100 if request.get("modem_reset") else 45
+            if elapsed > limit:
+                self._bridge_restart_status(
+                    request, "failed", error="timed out rebuilding the VPCD bridge and SIM identity")
+                continue
             if device_id not in present_ids:
+                if request.get("modem_reset"):
+                    continue  # Reset can temporarily remove the target USB device.
                 self._bridge_restart_status(
                     request, "failed", error="modem disappeared during bridge rebuild")
-                continue
-            if now - float(request.get("started_at") or now) > 45:
-                self._bridge_restart_status(
-                    request, "failed", error="timed out rebuilding the VPCD bridge")
                 continue
             proc = self.bridges.get(device_id)
             if not proc or proc.poll() is not None:
@@ -1028,6 +1051,11 @@ class Orchestrator:
             actual = str(identity.get("iccid") or "")
             if expected and hashlib.sha256(actual.encode()).hexdigest() != expected:
                 continue
+            if request.get("modem_reset"):
+                cellular = self.cellular_states.get(device_id) or {}
+                current = str(cellular.get("sim_iccid") or "")
+                if not current or hashlib.sha256(current.encode()).hexdigest() != expected:
+                    continue
             self._bridge_restart_status(
                 request, "channels_ready", bridge_pid=int(proc.pid),
                 channel_allocated=int(identity.get("channel_allocated") or 0))
@@ -3785,6 +3813,11 @@ class Orchestrator:
             plan = self.capability_plan(active_desired)
             cellular_required = self.cellular_backend_needed(plan, present_ids,
                                                              hardware_config)
+            # A scoped SIM refresh may temporarily remove the only USB modem. Do not
+            # turn that expected gap into a global MM/bridge backend transition.
+            cellular_required = cellular_required or any(
+                request.get("modem_reset") and request.get("state") not in {"channels_ready", "failed"}
+                for request in self._bridge_restarts.values())
             # Standing ModemManager down after a refusal must not reset the modems: it never
             # owned them (no objects), and the reset would re-enumerate USB, retire the very
             # refusal verdicts that justified the stand-down, and restart the whole cycle.

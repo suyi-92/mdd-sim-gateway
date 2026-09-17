@@ -12,6 +12,7 @@ import json
 import importlib.util
 import ipaddress
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -532,11 +533,13 @@ def line_country(inst: dict) -> str:
 def epdg_for(inst: dict) -> str:
     if inst.get("epdg"):
         return str(inst["epdg"]).strip()
-    mcc = str(inst.get("mcc") or "").zfill(3)
-    mnc = str(inst.get("mnc") or "").zfill(3)
-    if not mcc.strip("0") or not mnc.strip("0"):
+    mcc = str(inst.get("mcc") or "").strip()
+    mnc = str(inst.get("mnc") or "").strip()
+    # MNC 00/000 is valid (for example 454-00); missing and all-zero are not synonyms.
+    if (not re.fullmatch(r"[0-9]{3}", mcc) or mcc == "000"
+            or not re.fullmatch(r"[0-9]{2,3}", mnc)):
         return ""
-    return f"epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"
+    return f"epdg.epc.mnc{mnc.zfill(3)}.mcc{mcc}.pub.3gppnetwork.org"
 
 
 def country_exit_revision(proxy: dict, country: str) -> str:

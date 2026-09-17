@@ -55,6 +55,16 @@ class CountryEgressTests(unittest.TestCase):
         self.assertEqual(egress.epdg_for({"mcc": "310", "mnc": "260"}),
                          "epdg.epc.mnc260.mcc310.pub.3gppnetwork.org")
 
+    def test_zero_mnc_is_a_valid_network_not_a_missing_identity(self):
+        for mnc in ("00", "000"):
+            with self.subTest(mnc=mnc):
+                self.assertEqual(egress.epdg_for({"mcc": "454", "mnc": mnc}),
+                                 "epdg.epc.mnc000.mcc454.pub.3gppnetwork.org")
+        for mcc, mnc in (("454", ""), ("", "00"), ("000", "00"),
+                         ("454", "invalid"), ("454", "0000")):
+            with self.subTest(mcc=mcc, mnc=mnc):
+                self.assertEqual(egress.epdg_for({"mcc": mcc, "mnc": mnc}), "")
+
     def test_manual_proxy_url(self):
         outbound = parse_proxy_url("socks5://alice:secret@127.0.0.1:1080", "exit-gb")
         self.assertEqual(outbound["type"], "socks")

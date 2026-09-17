@@ -3,6 +3,10 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'VoWiFi is off': 'VoWiFi 已关闭',
+  'Wait for the current cellular or eSIM operation to finish.': '请等待当前蜂窝网络或 eSIM 操作完成。',
+  'Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.': '配置文件已启用；此设备的 VoWiFi 已关闭，需要时可前往“设备”页面开启。',
+  'Refreshing cellular SIM identity after profile switch': '正在刷新切换后的蜂窝 SIM 身份',
   'Card read timed out; waiting for the reader session to finish': '读卡超时，正在等待该读卡会话释放',
   'Unconfirmed': '未确认',
   'Card identity not confirmed': '当前卡身份尚未确认',

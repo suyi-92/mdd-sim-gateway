@@ -322,6 +322,28 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await page.locator('.u-cellular-network-feedback.is-warning').count(), 0)
     await page.locator('.u-cellular-network').screenshot({ path: path.join(output, 'scan-recovered.png'), animations: 'disabled' })
 
+    // eSIM REFRESH may publish devices before the cards websocket catches up. The
+    // old card must disappear, and selection follows the same physical modem.
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page.goto(origin + '/#/messages')
+    await page.locator('.u-line-selector:visible select').selectOption('2')
+    cards[1].hardware_id = 'modem-2'
+    instances.push({ id: '3', name: 'New eSIM profile', mcc: '454', mnc: '00', enabled: false,
+      status: { state: 'STOPPED', label: 'Stopped' } })
+    devices[1] = { ...devices[1], instance_id: '3', cellular: null,
+      capabilities: { ...devices[1].capabilities, vowifi: { desired: false, actual: 'off' } },
+      egress: { country: 'hk', detected_country: 'hk', mode: 'manual', ready: false },
+      sim: { present: true, carrier: { name: 'Fixture HK', plmn: '454-00' } } }
+    await page.waitForFunction(() => [...document.querySelectorAll('.u-line-selector select')]
+      .some(select => select.offsetParent && select.value === '3'))
+    assert.deepEqual(await page.locator('.u-line-selector:visible select option').evaluateAll(
+      options => options.map(option => option.value)), ['1', '3'])
+    assert.ok((await page.locator('.u-line-selector:visible select option:checked').innerText()).includes('VoWiFi 已关闭'))
+    for (const width of [1440, 900, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false)
+      await page.locator('.u-line-selector:visible').screenshot({ path: path.join(output, `esim-switch-${width}.png`), animations: 'disabled' })
+    }
     assert.deepEqual(errors, [])
     assert.deepEqual(writes, [
       ['POST', '/api/instances/2/messages/reimport-cellular'],

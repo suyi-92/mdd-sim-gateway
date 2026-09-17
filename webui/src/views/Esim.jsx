@@ -642,6 +642,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         setErr(t('Switched to {name}, but its line could not start automatically: {error}', { name: title, error: res.recovery_error }))
         setProfileSwitch({ iccid: p.iccid, phase: 'error' })
         showToast?.(t('Profile switched — check the line for {name}', { name: title }))
+      } else if (res?.recovery_skipped === 'vowifi_disabled') {
+        setProfileSwitch({ iccid: p.iccid, phase: 'disabled' })
       } else if (res?.recovery_pending) {
         setProfileSwitch((current) => (
           current?.iccid === p.iccid && ['retrying', 'started', 'error'].includes(current.phase)
@@ -748,6 +750,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
           setProfileSwitch({ iccid: msg.iccid, phase: 'retrying' })
         } else if (msg.event === 'line_started') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'started' })
+          refresh?.()
+        } else if (msg.event === 'line_disabled') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'disabled' })
           refresh?.()
         } else if (msg.event === 'recovery_error') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'error' })
@@ -1075,9 +1080,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                   ? t('Profile enabled; waiting for the country exit, then retrying automatically…')
                   : profileSwitch?.phase === 'started'
                     ? t('Profile switched; the VoWiFi line has started.')
-                    : profileSwitch?.phase === 'error'
-                      ? t('Profile switching needs attention; see the message above.')
-                      : '\u00a0'}
+                    : profileSwitch?.phase === 'disabled'
+                      ? t('Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.')
+                      : profileSwitch?.phase === 'error'
+                        ? t('Profile switching needs attention; see the message above.')
+                        : '\u00a0'}
         </div>
         {!profiles.length ? (
           <div style={{ color: 'var(--text-mute)', fontSize: 13 }}>

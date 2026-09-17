@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useRef } from 'react'
 import CopyableText from '../CopyableText.jsx'
 import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
@@ -14,11 +14,16 @@ import { communicationLineDetails } from '../simLineDetails.js'
 // Config and it reappears when the reader returns).
 export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false, showToast }) {
   const { t, language } = useI18n()
+  const selectedHardware = useRef('')
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
   // PC/SC bridge has no card. Treat either source as live so 4G-only calls/SMS history
   // remains selectable.
-  const readerFor = (i) => cards.find((c) => c.present &&
-    (String(c.matched) === String(i.id) || (c.iccid && c.iccid === i.iccid)))
+  const readerFor = (i) => cards.find((c) => {
+    if (!c.present) return false
+    const owner = devices.find(d => d.id === c.hardware_id)
+    if (owner && (!owner.present || String(owner.instance_id || '') !== String(i.id))) return false
+    return String(c.matched) === String(i.id) || (c.iccid && c.iccid === i.iccid)
+  })
   const deviceFor = (i) => devices.find((d) => d.present &&
     String(d.instance_id || '') === String(i.id))
   const sourceFor = (i) => readerFor(i) || deviceFor(i)
@@ -32,7 +37,12 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   // App, where a global default could leak an unrelated line into a device's SIM tab.
   const id = selected?.id
   useEffect(() => {
-    if (!id || !live.some((i) => i.id === id)) setSelected(live[0]?.id || null)
+    if (!id || !live.some((i) => i.id === id)) {
+      const replacement = live.find(i => deviceFor(i)?.id === selectedHardware.current)
+      setSelected(replacement?.id || live[0]?.id || null)
+    } else {
+      selectedHardware.current = deviceFor(selected)?.id || readerFor(selected)?.hardware_id || ''
+    }
   }, [id, live.map((i) => i.id).join(',')])  // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!live.length) return null
@@ -52,7 +62,11 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
           const c = sourceFor(i)
           const physical = deviceFor(i) || c
           const tail = numberTail(i)
-          const statusLabel = i.status?.presentation?.label || i.status?.label
+          const statusLabel = i.status?.state === 'STOPPED' && physical.device_type === 'modem'
+            && physical.capabilities?.vowifi?.desired === false
+            ? ['home', 'roaming', 'registered'].includes(physical.cellular?.registration)
+              ? 'Cellular network registered' : 'VoWiFi is off'
+            : i.status?.presentation?.label || i.status?.label
           const st = statusLabel ? ` — ${t(statusLabel)}` : ''
           return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}

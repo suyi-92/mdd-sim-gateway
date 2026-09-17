@@ -45,7 +45,7 @@ STATUS_OK_GRACE_SECONDS = 20
 STATUS_POLL_FAST_SECONDS = 4.0
 STATUS_POLL_HEALTHY_SECONDS = 15.0
 ESIM_BRIDGE_RESTART_TIMEOUT = float(
-    os.environ.get("MDD_ESIM_BRIDGE_RESTART_TIMEOUT", "50"))
+    os.environ.get("MDD_ESIM_BRIDGE_RESTART_TIMEOUT", "110"))
 ESIM_CARD_REFRESH_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_CARD_REFRESH_ATTEMPTS", "12"))
 ESIM_CARD_REFRESH_INTERVAL = float(
@@ -1801,8 +1801,13 @@ async def sync_modem_msisdns():
     modem value from being assigned to whichever line happens to use the device.
     """
     observed = device_state.status().get("devices") or {}
-    for device in observed.values():
+    identities = _device_identities()
+    for device_id, device in observed.items():
         cellular = (device or {}).get("cellular") or {}
+        identity = identities.get(device_id) or {}
+        if (_device_bridge_identity_current(identity, device)
+                and identity["iccid"] != cellular.get("sim_iccid")):
+            continue
         msisdn = str(cellular.get("msisdn") or "").strip()
         sim_iccid = str(cellular.get("sim_iccid") or "").strip()
         if not msisdn or not sim_iccid:
@@ -3844,8 +3849,9 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
         raise HTTPException(
             409, f"the active eSIM profile still needs line configuration: {missing}")
     target = await asyncio.to_thread(_refresh_instance_reader_binding, target)
+    enabled = _esim_vowifi_requested(hardware_id)
     target = await asyncio.to_thread(
-        cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
+        cfg.upsert_instance, {"id": str(target["id"]), "enabled": enabled})
     egress.publish()
     log.info(
         "eSIM profile recovery complete bridge_ms=%d card_refresh_ms=%d",
@@ -3853,7 +3859,7 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
         round((refreshed_at - bridge_ready_at) * 1000),
     )
     return {"card": info, "readers": readers, "instance_id": str(target["id"]),
-            "bridge": bridge,
+            "bridge": bridge, "start_allowed": enabled,
             "pin_preflight_proof": {
                 "iccid": str(iccid), "pin_enabled": info.get("pin_enabled"),
                 "observed_at": refreshed_at,
@@ -3862,6 +3868,12 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
                             for reader in readers],
             } if info.get("present") and str(info.get("iccid") or "") == str(iccid) else None,
             }
+
+
+def _esim_vowifi_requested(hardware_id: str) -> bool:
+    desired = device_state.desired()
+    wanted = (desired.get("devices") or {}).get(hardware_id) or desired.get("defaults") or {}
+    return bool(wanted.get("vowifi_enabled", True))
 
 
 async def _esim_profile_event(
@@ -3926,6 +3938,9 @@ async def _esim_start_profile_line(
             # profile while lpac/bridge recovery owns the card; retry sleeps remain unlocked.
             async with hub.esim_switch_lock(switch_key):
                 inst = cfg.get_instance(iid)
+                if not switch_key.startswith("reader:") and not _esim_vowifi_requested(switch_key):
+                    await _esim_profile_event(reader, iccid, "line_disabled", profile_state="enabled")
+                    return
                 current = any(
                     card_info.get("present")
                     and str(card_info.get("iccid") or "") == str(iccid)
@@ -4508,9 +4523,10 @@ def _instance_for_device(device_id: str, identity: dict, cards: list[dict],
     Their last ICCID must never make an offline modem appear permanently attached to
     the last SIM it happened to contain.
     """
-    # ModemManager owns the physical modem while 4G is active and remains the
-    # authoritative source for the inserted SIM.  In that state the optional
-    # PC/SC VoWiFi bridge can legitimately expose no card at all.
+    # An eUICC REFRESH can leave MM's SIM object cached on the previous profile.
+    # A live bridge's direct-card proof outranks that cache, but never a confirmed removal.
+    if _device_bridge_identity_current(identity, observed):
+        return _match_instance_by_iccid(str(identity["iccid"]))
     live_iccid = str((((observed or {}).get("cellular") or {}).get("sim_iccid")) or "")
     if live_iccid:
         return _match_instance_by_iccid(live_iccid)
@@ -4519,6 +4535,15 @@ def _instance_for_device(device_id: str, identity: dict, cards: list[dict],
     if card_info and card_info.get("iccid"):
         return _match_instance_by_iccid(card_info["iccid"])
     return None
+
+
+def _device_bridge_identity_current(identity: dict, observed: dict | None) -> bool:
+    observed = observed or {}
+    cellular = observed.get("cellular") or {}
+    return bool(observed.get("present")
+                and (observed.get("actual") or {}).get("vowifi_bridge_active")
+                and cellular.get("failed_reason") != "sim-missing"
+                and _bridge_card_evidence(identity))
 
 
 def _device_for_card(card_info: dict, cards: list[dict] | None = None) -> tuple[str, str]:
@@ -4730,6 +4755,12 @@ async def _unified_devices() -> list[dict]:
         host_cell = observed.get("cellular") or {}
         host_cell_current = bool(shared.get("modemmanager_active")
                                  and host_cell.get("available"))
+        bridge_current = _device_bridge_identity_current(identity, observed)
+        identity_pending = bool(bridge_current and host_cell.get("sim_iccid")
+                                and host_cell["sim_iccid"] != identity["iccid"])
+        if identity_pending:
+            # Do not attach the old profile's number/registration to the new SIM.
+            host_cell_current = False
         inst = (_match_instance_by_iccid(native_card.get("iccid"))
                 if native_card and native_card.get("present") and native_card.get("iccid")
                 else _instance_for_device(device_id, identity, cards, observed)
@@ -4819,7 +4850,8 @@ async def _unified_devices() -> list[dict]:
                     cell_actual = "starting"
         card_info = native_card or next((item for item in cards
                                          if item.get("hardware_id") == device_id
-                                         and item.get("present")), {})
+                                         and item.get("present")
+                                         and (not bridge_current or item.get("iccid") == identity["iccid"])), {})
         # Keep physical SIM state independent from the optional VoWiFi PC/SC
         # bridge.  A connected cellular modem can have a readable SIM even when
         # every virtual reader slot is empty or VoWiFi is disabled.
@@ -4827,9 +4859,10 @@ async def _unified_devices() -> list[dict]:
                             if device_present and not is_native_reader
                             and host_cell_current
                             and host_cell.get("sim_present") is True else "")
-        if live_modem_iccid and not card_info:
+        current_iccid = str(identity["iccid"]) if bridge_current else live_modem_iccid
+        if current_iccid and not card_info:
             card_info = {
-                "present": True, "iccid": live_modem_iccid,
+                "present": True, "iccid": current_iccid,
                 "hardware_id": device_id, "hardware_kind": "modem",
                 "mcc": (inst or {}).get("mcc", ""),
                 "mnc": (inst or {}).get("mnc", ""),
@@ -4856,6 +4889,8 @@ async def _unified_devices() -> list[dict]:
                             device_state.logical_channel_view(identity, bridge_active))
         if is_native_reader:
             sim_present = bool(card_info.get("present"))
+        elif bridge_current:
+            sim_present = True
         elif host_cell_current:
             # ModemManager's current SIM object/failure reason outranks a VPCD card cache.
             # A hot removal recreates the MM object and can leave the old bridge identity
@@ -4875,6 +4910,9 @@ async def _unified_devices() -> list[dict]:
         if not device_present:
             cell_actual, cell_reason = "off", "Device not connected"
             flight_actual, flight_available = "off", False
+        elif identity_pending:
+            cell_actual, cell_reason = "starting", "Refreshing cellular SIM identity after profile switch"
+            flight_actual, flight_available = ("on" if flight_desired else "off"), not serial_only
         elif not is_native_reader and host_cell_current and not sim_present:
             cell_actual, cell_reason = "off", "No SIM inserted"
             flight_actual = "on" if flight_desired else "off"
@@ -5178,6 +5216,10 @@ def _cellular_network_target(device_id: str) -> tuple[dict, dict, str]:
     if not observed or not observed.get("present"):
         raise HTTPException(404, "no such connected cellular modem")
     cellular = observed.get("cellular") or {}
+    identity = _device_identities().get(device_id) or {}
+    if (_device_bridge_identity_current(identity, observed)
+            and identity["iccid"] != cellular.get("sim_iccid")):
+        raise HTTPException(409, {"code": "device_changed"})
     if not cellular.get("available"):
         raise HTTPException(409, "ModemManager has no usable object for this modem")
     if cellular.get("sim_present") is not True:
@@ -5206,14 +5248,16 @@ async def api_device_cellular_network_operation(device_id: str):
     observed = (device_state.status().get("devices") or {}).get(device_id) or {}
     if not observed.get("present"):
         raise HTTPException(404, "no such connected cellular modem")
-    iccid = str((observed.get("cellular") or {}).get("sim_iccid") or "")
+    identity = _device_identities().get(device_id) or {}
+    iccid = (str(identity["iccid"]) if _device_bridge_identity_current(identity, observed)
+             else str((observed.get("cellular") or {}).get("sim_iccid") or ""))
     if not iccid:
         active = network_operations.active
         if active and active[0] == device_id:
             return network_operations.view(active)
         raise HTTPException(503, "cellular operation context is temporarily unavailable")
     inst = _match_instance_by_iccid(iccid) or {}
-    return network_operations.view(_cellular_operation_key(device_id, inst, observed))
+    return network_operations.view((str(device_id), str(inst.get("id") or ""), iccid))
 
 
 def _start_cellular_operation(device_id, action, selection, worker):
@@ -8231,6 +8275,13 @@ async def api_esim_profiles(reader_index: int = 0, reader: str | None = None):
 
 @app.post("/api/esim/profiles/{iccid}/enable")
 async def api_esim_enable(iccid: str, body: dict | None = None):
+    if capability_lock.locked():
+        raise HTTPException(409, "Wait for the current cellular or eSIM operation to finish.")
+    async with capability_lock:
+        return await _enable_esim_profile(iccid, body)
+
+
+async def _enable_esim_profile(iccid: str, body: dict | None = None):
     body = body or {}
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
@@ -8274,7 +8325,8 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
         lpa_succeeded = False
         try:
             await _esim_profile_event(name, iccid, "switching")
-            await asyncio.to_thread(_esim_prewarm_target_egress, iccid)
+            if _esim_vowifi_requested(hardware_id):
+                await asyncio.to_thread(_esim_prewarm_target_egress, iccid)
             se = await asyncio.to_thread(
                 _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
                 body.get("aid"), require=True)
@@ -8312,15 +8364,20 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 return {"ok": True, "iccid": iccid, "se_id": se["id"],
                         "card": hub.cards.get(name),
                         "recovery_error": str(detail) or "line recovery failed"}
-            asyncio.create_task(_esim_start_profile_line(
-                name, switch_key, iccid, str(recovery["instance_id"]),
-                pin_preflight_proof=recovery.get("pin_preflight_proof")))
+            start_allowed = recovery.get("start_allowed", True)
+            if start_allowed:
+                asyncio.create_task(_esim_start_profile_line(
+                    name, switch_key, iccid, str(recovery["instance_id"]),
+                    pin_preflight_proof=recovery.get("pin_preflight_proof")))
+            else:
+                await _esim_profile_event(name, iccid, "line_disabled", profile_state="enabled")
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],
                         "readers": recovery["readers"],
                         "bridge_state": recovery["bridge"].get("state"),
-                    }, "recovery_pending": True}
+                    }, "recovery_pending": start_allowed,
+                    "recovery_skipped": "" if start_allowed else "vowifi_disabled"}
         except Exception:
             if not lpa_succeeded:
                 await _esim_restore_profile_switch(previous)
