@@ -19,7 +19,7 @@ const reader = { id: 'reader-fixture', name: 'SCR Prime CCID Reader (fixture) 00
   default_name: '3T Electronics SCR Prime reader', device_type: 'reader', present: true,
   sim: { present: false }, capabilities: { vowifi: { desired: false, actual: 'off' } } }
 let devices = [modem, reader]
-let rescanRequested = false
+let rescanOperationId = ''
 const mutations = []
 const json = (response, value) => {
   response.writeHead(200, { 'Content-Type': 'application/json' })
@@ -30,12 +30,17 @@ const server = http.createServer((request, response) => {
   if (url.pathname.startsWith('/api/')) {
     if (request.method !== 'GET') mutations.push([request.method, url.pathname])
     if (request.method === 'POST' && url.pathname === '/api/devices/rescan') {
-      rescanRequested = true
-      return json(response, { ok: true, state: 'requested', operation_id: '0123456789abcdef' })
+      rescanOperationId = '0123456789abcdef'
+      return json(response, { ok: true, state: 'requested', operation_id: rescanOperationId })
+    }
+    if (request.method === 'POST' && /^\/api\/devices\/[^/]+\/rescan$/.test(url.pathname)) {
+      rescanOperationId = 'fedcba9876543210'
+      return json(response, { ok: true, state: 'requested', operation_id: rescanOperationId,
+        scope: 'device' })
     }
     if (request.method === 'GET' && url.pathname === '/api/devices/rescan/progress') {
-      return json(response, rescanRequested
-        ? { state: 'success', operation_id: '0123456789abcdef', modems_detected: 1 }
+      return json(response, rescanOperationId
+        ? { state: 'success', operation_id: rescanOperationId, modems_detected: 1 }
         : { state: 'idle' })
     }
     const hardware = url.pathname.match(/^\/api\/devices\/([^/]+)\/hardware$/)
@@ -97,8 +102,13 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.getByRole('button', { name: '重新完整检测', exact: true }).click()
     await page.clock.fastForward(1200)
     await page.getByText('完整设备检测已完成，发现 1 个蜂窝模块和 0 个读卡器。', { exact: true }).waitFor()
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('button', { name: '重新检测此设备', exact: true }).click()
+    await page.clock.fastForward(1200)
+    await page.getByText('设备检测已完成，请查看下方刷新的硬件和 SIM 状态。', { exact: true }).waitFor()
     await page.screenshot({ path: path.join(output, 'connected.png'), fullPage: true, animations: 'disabled' })
     await page.getByRole('button', { name: '蜂窝数据（4G）', exact: true }).click()
+    await page.getByText('请先重新检测此设备以恢复 ModemManager，再扫描蜂窝网络。', { exact: true }).waitFor()
 
     devices = [{ ...modem, present: false }, reader]
     await page.clock.fastForward(11000)
@@ -122,6 +132,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await deviceNameInput.isEnabled(), true)
     assert.deepEqual(mutations, [
       ['POST', '/api/devices/rescan'],
+      ['POST', '/api/devices/modem-fixture/rescan'],
     ], 'navigation and history views must not write configuration')
     await deviceNameInput.fill('Main modem')
     await page.locator('.u-hardware-name button').click()
@@ -153,6 +164,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(devices[0].capabilities.vowifi.desired, true)
     assert.deepEqual(mutations, [
       ['POST', '/api/devices/rescan'],
+      ['POST', '/api/devices/modem-fixture/rescan'],
       ['PUT', '/api/devices/modem-fixture/hardware'],
       ['PUT', '/api/devices/modem-fixture/hardware'],
     ], 'only the explicit custom-name save and restore may mutate configuration')

@@ -695,6 +695,7 @@ class DeviceRescanOperationTests(unittest.TestCase):
         self.assertTrue(first["ok"])
         self.assertEqual(first["operation_id"], "0123456789abcdef")
         self.assertEqual(second["operation_id"], first["operation_id"])
+        self.assertEqual(first["scope"], "all")
         request_path = self.root / "device-rescan-request.json"
         status_path = self.root / "device-rescan-status.json"
         self.assertEqual(request_path.stat().st_mode & 0o777, 0o600)
@@ -709,6 +710,19 @@ class DeviceRescanOperationTests(unittest.TestCase):
         status = operations.device_rescan_status()
         self.assertEqual(status["state"], "failed")
         self.assertEqual(status["error_code"], "rescan.error.not_picked_up")
+
+    def test_scoped_request_validates_target_and_rejects_parallel_other_device(self):
+        with self.assertRaises(ValueError):
+            operations.request_device_rescan("bad/device", "modem")
+        with patch.object(operations.secrets, "token_hex", return_value="0123456789abcdef"):
+            first = operations.request_device_rescan("modem-a", "modem")
+        self.assertEqual(first["scope"], "device")
+        self.assertEqual(first["device_id"], "modem-a")
+        self.assertEqual(first["device_type"], "modem")
+        same = operations.request_device_rescan("modem-a", "modem")
+        self.assertEqual(same["operation_id"], first["operation_id"])
+        with self.assertRaises(RuntimeError):
+            operations.request_device_rescan("reader-a", "reader")
 
     def test_status_does_not_publish_untrusted_error_detail(self):
         self.root.mkdir(parents=True)
@@ -744,8 +758,29 @@ class DeviceRescanApiTests(unittest.IsolatedAsyncioTestCase):
             response = await main.api_devices()
         self.assertTrue(response["discovering"])
 
+        with patch.object(main.operations, "device_rescan_status", return_value={
+                    "state": "running", "scope": "device"}), \
+                patch.object(main, "_unified_devices", new=AsyncMock(return_value=[])), \
+                patch.object(main.device_state, "status", return_value={}), \
+                patch.object(main.hub, "scanned", True):
+            scoped = await main.api_devices()
+        self.assertFalse(scoped["discovering"])
+
+    async def test_one_device_request_is_scoped_from_live_device_type(self):
+        device = {"id": "reader-a", "device_type": "reader"}
+        result = {"ok": True, "operation_id": "0123456789abcdef",
+                  "state": "requested", "scope": "device"}
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(main.operations, "request_device_rescan",
+                             return_value=result) as request, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            response = await main.api_device_rescan("reader-a")
+        self.assertEqual(response, result)
+        request.assert_called_once_with("reader-a", "reader")
+        broadcast.assert_awaited_once()
+
     async def test_progress_waits_for_control_pcsc_reconciliation(self):
-        status = {"state": "success", "operation_id": "0123456789abcdef",
+        status = {"state": "success", "operation_id": "0123456789abcdef", "scope": "all",
                   "modems_detected": 1}
         with patch.object(main.operations, "device_rescan_status", return_value=status), \
                 patch.object(main.hub, "device_rescan_applied", "previous"):
@@ -761,6 +796,30 @@ class DeviceRescanApiTests(unittest.IsolatedAsyncioTestCase):
             completed = main.api_devices_rescan_progress()
         self.assertEqual(completed["state"], "success")
         self.assertEqual(completed["readers_detected"], 1)
+
+        scoped = {"state": "success", "operation_id": "fedcba9876543210",
+                  "scope": "device", "device_id": "modem-a", "device_type": "modem",
+                  "modems_detected": 1}
+        with patch.object(main.operations, "device_rescan_status", return_value=scoped), \
+                patch.object(main.hub, "device_rescan_applied", "previous"):
+            device_pending = main.api_devices_rescan_progress()
+        self.assertEqual(device_pending["state"], "running")
+        with patch.object(main.operations, "device_rescan_status", return_value=scoped), \
+                patch.object(main.hub, "device_rescan_applied", "fedcba9876543210"):
+            device_completed = main.api_devices_rescan_progress()
+        self.assertEqual(device_completed["state"], "success")
+        self.assertNotIn("readers_detected", device_completed)
+
+        missing_reader = {"state": "success", "operation_id": "a" * 16,
+                          "scope": "device", "device_id": "reader-a",
+                          "device_type": "reader"}
+        with patch.object(main.operations, "device_rescan_status",
+                          return_value=missing_reader), \
+                patch.object(main.hub, "device_rescan_applied", "a" * 16), \
+                patch.object(main.hub, "cards_list", return_value=[]):
+            missing = main.api_devices_rescan_progress()
+        self.assertEqual(missing["state"], "failed")
+        self.assertEqual(missing["error_code"], "rescan.error.device_not_present")
 
 
 if __name__ == "__main__":

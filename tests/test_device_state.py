@@ -1538,7 +1538,8 @@ modem.3gpp.registration-state : unknown
             app._bridge_failures["modem-a"] = {"count": 2}
             app._claim_evidence = {"old": True}
             app._serial_mode = False
-            request = {"operation_id": "0123456789abcdef", "requested_at": 1000}
+            request = {"operation_id": "0123456789abcdef", "requested_at": 1000,
+                       "scope": "all", "device_id": "", "device_type": ""}
             mdd_orchestrator.atomic_json(app.device_rescan_request_path, request)
             calls = []
             result = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1575,6 +1576,7 @@ modem.3gpp.registration-state : unknown
             app._serial_mode = True
             mdd_orchestrator.atomic_json(app.device_rescan_request_path, {
                 "operation_id": "0123456789abcdef", "requested_at": 1000,
+                "scope": "all", "device_id": "", "device_type": "",
             })
             calls = []
             result = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1584,6 +1586,39 @@ modem.3gpp.registration-state : unknown
                 self.assertIsNotNone(app.process_device_rescan_request())
             self.assertNotIn(["systemctl", "restart", "ModemManager.service"], calls)
             self.assertNotIn(["mmcli", "--scan-modems"], calls)
+
+    def test_one_modem_rescan_keeps_other_bridges_and_pcscd_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            app._serial_mode = False
+            app.cellular_states = {"modem-a": {"registration": "roaming"},
+                                   "modem-b": {"registration": "home"}}
+            app._degraded = {"modem-a": "failed", "modem-b": "healthy"}
+            mdd_orchestrator.atomic_json(app.hw_state_path, {"assignments": {
+                "modem-a": {"tty": "/dev/ttyUSB2"},
+                "modem-b": {"tty": "/dev/ttyUSB6"},
+            }})
+            request = {"operation_id": "0123456789abcdef", "requested_at": 1000,
+                       "scope": "device", "device_id": "modem-a",
+                       "device_type": "modem"}
+            mdd_orchestrator.atomic_json(app.device_rescan_request_path, request)
+            calls = []
+            result = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("host.mdd_orchestrator.run",
+                       side_effect=lambda args, **kwargs: calls.append(args) or result), \
+                    patch.object(app, "stop_bridge") as stop_bridge:
+                active = app.process_device_rescan_request()
+            self.assertEqual(active, request)
+            stop_bridge.assert_called_once_with("modem-a")
+            self.assertNotIn("modem-a", app.cellular_states)
+            self.assertEqual(app.cellular_states["modem-b"]["registration"], "home")
+            self.assertNotIn("modem-a", app._degraded)
+            self.assertEqual(app._degraded["modem-b"], "healthy")
+            self.assertIn(["systemctl", "start", "ModemManager.service"], calls)
+            self.assertNotIn(["systemctl", "restart", "ModemManager.service"], calls)
+            self.assertNotIn(["systemctl", "restart", "pcscd.service"], calls)
 
     def test_only_a_recent_service_restart_is_settled_as_success(self):
         with tempfile.TemporaryDirectory() as temp:

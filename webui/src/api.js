@@ -128,6 +128,7 @@ export const api = {
   // App.jsx then derives read-only device cards from /api/instances + /api/cards.
   devices: () => poll('devices', '/api/devices'),
   rescanDevices: () => j('POST', '/api/devices/rescan', {}),
+  rescanDevice: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/rescan`, {}),
   deviceRescanProgress: () => j('GET', '/api/devices/rescan/progress'),
   patchDeviceCapabilities: (id, patch) => j('PATCH', `/api/devices/${encodeURIComponent(id)}/capabilities`, patch),
   deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),

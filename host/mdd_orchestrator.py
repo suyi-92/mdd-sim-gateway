@@ -1038,7 +1038,7 @@ class Orchestrator:
         return run(["systemctl", "is-active", "--quiet", name]).returncode == 0
 
     def process_device_rescan_request(self) -> dict | None:
-        """Rebuild every host discovery backend without resetting a physical USB device."""
+        """Rebuild all discovery backends, or only the backend owning one device."""
         request = read_json(self.device_rescan_request_path)
         if not request:
             return None
@@ -1049,17 +1049,28 @@ class Orchestrator:
 
         operation_id = str(request.get("operation_id") or "")
         requested_at = request.get("requested_at")
+        scope = str(request.get("scope") or "")
+        device_id = str(request.get("device_id") or "")
+        device_type = str(request.get("device_type") or "")
         safe_request = {"operation_id": operation_id,
-                        "requested_at": requested_at if isinstance(requested_at, int) else 0}
+                        "requested_at": requested_at if isinstance(requested_at, int) else 0,
+                        "scope": scope, "device_id": device_id,
+                        "device_type": device_type}
 
         def publish(state: str, **fields):
             atomic_json(self.device_rescan_status_path, {
                 **safe_request, "state": state, "updated_at": int(time.time()), **fields,
             })
 
-        if (set(request) != {"operation_id", "requested_at"}
+        if (set(request) != {"operation_id", "requested_at", "scope",
+                            "device_id", "device_type"}
                 or not DEVICE_RESCAN_OPERATION_ID.fullmatch(operation_id)
-                or not isinstance(requested_at, int)):
+                or not isinstance(requested_at, int)
+                or scope not in {"all", "device"}
+                or (scope == "all" and (device_id or device_type))
+                or (scope == "device" and (
+                    not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", device_id)
+                    or device_type not in {"modem", "reader"}))):
             publish("failed", error_code="rescan.error.invalid_request")
             return None
         if self.dry_run:
@@ -1067,23 +1078,38 @@ class Orchestrator:
             return None
 
         publish("running")
-        self.log("full hardware rediscovery requested")
+        self.log("full hardware rediscovery requested" if scope == "all" else
+                 f"device hardware rediscovery requested: {device_id}")
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "pcsc-maintenance").write_text(
             str(int(time.time())), encoding="ascii")
-        self.stop_bridges()
+        assignments = read_json(self.hw_state_path).get("assignments") or {}
+        if scope == "device" and device_type == "modem" and device_id not in assignments:
+            publish("failed", error_code="rescan.error.device_not_present")
+            return None
+        if scope == "all":
+            self.stop_bridges()
+        elif device_type == "modem":
+            self.stop_bridge(device_id)
         # A rediscovery must never republish identity or registration sampled from the
         # previous physical card generation while the fresh probes are still running.
-        self.cellular_states.clear()
-        self.radio_states.clear()
-        self._degraded.clear()
-        self._claim_evidence = {}
-        self._unclaimed_since.clear()
-        self._bridge_failures.clear()
-        self._bridge_started.clear()
-        self._bridge_commands.clear()
-        self.modem_profiles_swept = False
-        self.applied_cellular_backend = None
+        maps = (self.cellular_states, self.radio_states, self._degraded,
+                self._bridge_failures, self._bridge_started, self._bridge_commands)
+        if scope == "all":
+            for value in maps:
+                value.clear()
+            self._claim_evidence = {}
+            self._unclaimed_since.clear()
+            self.modem_profiles_swept = False
+        elif device_type == "modem":
+            for value in maps:
+                value.pop(device_id, None)
+            target_tty = str((assignments.get(device_id) or {}).get("tty") or "")
+            if target_tty:
+                self._unclaimed_since.pop(target_tty, None)
+            self._claim_evidence = {}
+        if scope == "all" or device_type == "modem":
+            self.applied_cellular_backend = None
         self._last_conclusion = ""
 
         failures = []
@@ -1099,10 +1125,12 @@ class Orchestrator:
             required(["udevadm", "trigger", "--action=add",
                       f"--subsystem-match={subsystem}"], f"udev {subsystem}")
         required(["udevadm", "settle"], "udev settle")
-        required(["systemctl", "restart", "pcscd.service"], "pcscd restart")
-        if not self._serial_mode:
-            required(["systemctl", "restart", "ModemManager.service"],
-                     "ModemManager restart")
+        if scope == "all" or device_type == "reader":
+            required(["systemctl", "restart", "pcscd.service"], "pcscd restart")
+        if not self._serial_mode and (scope == "all" or device_type == "modem"):
+            action = "restart" if scope == "all" else "start"
+            required(["systemctl", action, "ModemManager.service"],
+                     f"ModemManager {action}")
             required(["mmcli", "--scan-modems"], "ModemManager scan")
         if failures:
             publish("failed", error_code="rescan.error.failed",
@@ -1115,17 +1143,22 @@ class Orchestrator:
         if not request:
             return
         state = "failed" if error else "success"
+        scope = str(request.get("scope") or "all")
+        device_id = str(request.get("device_id") or "")
         value = {
             **request, "state": state, "updated_at": int(time.time()),
-            "modems_detected": len(discovered),
+            "modems_detected": (int(any(str(item.get("id")) == device_id
+                                        for item in discovered))
+                                 if scope == "device" and device_id else len(discovered)),
             "pcsc_active": self.service_active("pcscd.service"),
             "modemmanager_active": self.service_active("ModemManager.service"),
         }
         if error:
             value.update(error_code="rescan.error.failed", error=str(error)[:600])
         atomic_json(self.device_rescan_status_path, value)
-        self.log(f"full hardware rediscovery {state}: "
-                 f"modems={len(discovered)} assignments={len(assignments)}")
+        self.log((f"full hardware rediscovery {state}: modems={len(discovered)} "
+                  f"assignments={len(assignments)}") if scope == "all" else
+                 f"device hardware rediscovery {state}: {device_id}")
 
     def process_service_restart_request(self):
         """Restart the gateway's own services, or the host, when the control plane asks.
@@ -1361,16 +1394,21 @@ class Orchestrator:
 
     def stop_bridges(self):
         """Release the exclusive AT port before ModemManager starts."""
-        for hwid, proc in list(self.bridges.items()):
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-            self.bridges.pop(hwid, None)
-            self.bridge_ports.pop(hwid, None)
+        for hwid in list(self.bridges):
+            self.stop_bridge(hwid)
+
+    def stop_bridge(self, device_id: str):
+        """Release one modem AT bridge without disrupting any other device."""
+        proc = self.bridges.get(device_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        self.bridges.pop(device_id, None)
+        self.bridge_ports.pop(device_id, None)
 
     def reset_modems_after_cellular(self):
         """Reset EC25-class modems after ModemManager releases QMI/UIM ownership."""

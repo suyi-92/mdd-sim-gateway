@@ -264,6 +264,44 @@ class MaintenanceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         inserted.assert_awaited_once_with(name, 0, verify=True)
         self.assertTrue(main.hub.scanned)
 
+    async def test_scoped_modem_rescan_never_reprobes_another_reader(self):
+        import asyncio
+        target = 'VoWiFi Modem modem-a 00 00'
+        other = 'fixture-native-reader'
+        announced = asyncio.Event()
+
+        async def broadcast(_message):
+            announced.set()
+
+        inserted = AsyncMock()
+        cards = {
+            target: {'name': target, 'index': 0, 'present': True, 'iccid': 'old-a'},
+            other: {'name': other, 'index': 1, 'present': True, 'iccid': 'old-b',
+                    'hardware_kind': 'reader', 'reader_port': '1-2'},
+        }
+        with patch.object(main.hub, 'cards', cards), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'device_rescan_applied', 'previous'), \
+                patch.object(main.hub, 'broadcast', new=AsyncMock(side_effect=broadcast)), \
+                patch.object(main.operations, 'device_rescan_status', return_value={
+                    'state': 'success', 'operation_id': '0123456789abcdef',
+                    'scope': 'device', 'device_id': 'modem-a', 'device_type': 'modem'}), \
+                patch.object(main.card, 'reader_states', return_value=[
+                    {'name': target, 'index': 0, 'present': True},
+                    {'name': other, 'index': 1, 'present': True},
+                ]), patch.object(main.card, 'wait_for_change', return_value=None), \
+                patch.object(main.os.path, 'getmtime', return_value=main.time.time()), \
+                patch.object(main, '_on_card_insert', new=inserted):
+            monitor = asyncio.create_task(main.card_monitor())
+            try:
+                await asyncio.wait_for(announced.wait(), timeout=2)
+            finally:
+                monitor.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await monitor
+
+        inserted.assert_awaited_once_with(target, 0, verify=True)
+
     async def test_esim_refresh_updates_saved_subscription_not_only_memory(self):
         from control.app.sim import CardInfo
         old = {'id': 'line', 'iccid': 'fixture', 'imsi': 'old', 'mcc': '262', 'mnc': '01'}

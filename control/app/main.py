@@ -1420,9 +1420,21 @@ async def card_monitor():
         try:
             rescan_status = operations.device_rescan_status()
             rescan_id = str(rescan_status.get("operation_id") or "")
+            rescan_scope = str(rescan_status.get("scope") or "all")
+            rescan_device_id = str(rescan_status.get("device_id") or "")
+            rescan_device_type = str(rescan_status.get("device_type") or "")
             force_rescan = bool(rescan_id
                                 and rescan_status.get("state") == "success"
                                 and rescan_id != hub.device_rescan_applied)
+
+            def rescan_target(name: str, state: dict | None = None) -> bool:
+                if not force_rescan or rescan_scope == "all":
+                    return force_rescan
+                if rescan_device_type == "modem":
+                    return device_state.vpcd_modem_hardware_id(name) == rescan_device_id
+                candidate = {**(hub.cards.get(name) or {}), **(state or {}), "name": name}
+                return rescan_device_id in device_state.native_reader_devices([candidate])
+
             if force_rescan:
                 hub.scanned = False
                 maintenance_readers.clear()
@@ -1466,7 +1478,9 @@ async def card_monitor():
                 continue
 
             # reader unplugged -> drop its row + stop any engine bound to it
-            for name in [n for n in hub.cards if n not in current]:
+            for name in [n for n in hub.cards if n not in current
+                         and (not force_rescan or rescan_scope == "all"
+                              or rescan_target(n))]:
                 entry = hub.cards.pop(name)
                 stopped = await _on_card_remove(entry, reader_unplugged=True)
                 if not stopped:
@@ -1479,6 +1493,10 @@ async def card_monitor():
 
             for name, st in current.items():
                 entry = hub.cards.get(name)
+                targeted = rescan_target(name, st)
+                if force_rescan and rescan_scope == "device" and not targeted:
+                    # A scoped operation must not probe, stop or relabel another reader.
+                    continue
                 # LPA holds the reader exclusively and enable/disable triggers REFRESH
                 # (looks like remove+insert). Keep last-known state; skip insert/remove.
                 if hub.lpa_busy.get(name):
@@ -1530,7 +1548,7 @@ async def card_monitor():
                         await _on_card_remove(entry)
                     changed = True
                     continue
-                if force_rescan:
+                if targeted:
                     if st["present"]:
                         await _on_card_insert(name, st["index"], verify=True)
                     else:
@@ -4954,7 +4972,9 @@ async def api_devices():
     # when the card monitor is still completing its first scan and smart-card readers are not
     # in the list yet. `discovering` lets the UI say so instead of reporting a confident zero.
     rescan = operations.device_rescan_status()
-    discovering = not hub.scanned or rescan.get("state") in {"requested", "running"}
+    discovering = (not hub.scanned or (
+        rescan.get("scope") in {None, "all"}
+        and rescan.get("state") in {"requested", "running"}))
     return {"devices": await _unified_devices(), "discovering": discovering,
             "shared": device_state.status().get("shared") or {}}
 
@@ -4964,9 +4984,32 @@ async def api_devices_rescan():
     """Request one root-owned, all-backend hardware rediscovery."""
     try:
         result = await asyncio.to_thread(operations.request_device_rescan)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(503, "could not publish the device rediscovery request") from exc
     await hub.broadcast({"type": "device", "event": "rediscovery_requested"})
+    return result
+
+
+@app.post("/api/devices/{device_id}/rescan")
+async def api_device_rescan(device_id: str):
+    device = next((item for item in await _unified_devices()
+                   if str(item.get("id")) == str(device_id)), None)
+    if not device:
+        raise HTTPException(404, "no such known communication device")
+    device_type = "reader" if device.get("device_type") == "reader" else "modem"
+    try:
+        result = await asyncio.to_thread(
+            operations.request_device_rescan, str(device_id), device_type)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503, "could not publish the device rediscovery request") from exc
+    await hub.broadcast({"type": "device", "device": str(device_id),
+                         "event": "rediscovery_requested"})
     return result
 
 
@@ -4980,7 +5023,16 @@ def api_devices_rescan_progress():
         # authoritative PC/SC snapshot. Keep the browser waiting rather than announcing a
         # complete scan that still contains the previous reader generation.
         return {**status, "state": "running", "phase": "pcsc"}
-    if status.get("state") == "success":
+    if status.get("state") == "success" and status.get("scope") == "device":
+        target = str(status.get("device_id") or "")
+        if status.get("device_type") == "modem":
+            present = int(status.get("modems_detected") or 0) > 0
+        else:
+            present = target in device_state.native_reader_devices(hub.cards_list())
+        if not present:
+            return {**status, "state": "failed",
+                    "error_code": "rescan.error.device_not_present"}
+    if status.get("state") == "success" and status.get("scope") in {None, "all"}:
         status["readers_detected"] = len(
             device_state.native_reader_devices(hub.cards_list()))
     return status

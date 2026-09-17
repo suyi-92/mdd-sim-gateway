@@ -293,6 +293,7 @@ _RESTART_PICKUP_SECONDS = 60
 _RESTART_RUNNING_SECONDS = 120
 _DEVICE_RESCAN_PICKUP_SECONDS = 60
 _DEVICE_RESCAN_RUNNING_SECONDS = 120
+_DEVICE_ID = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
 
 
 def _service_restart_paths() -> tuple[Path, Path]:
@@ -367,15 +368,27 @@ def service_restart_status() -> dict:
     return status
 
 
-def request_device_rescan() -> dict:
+def request_device_rescan(device_id: str = "", device_type: str = "") -> dict:
     """Ask the root orchestrator to rebuild every hardware discovery backend."""
+    device_id = str(device_id or "")
+    device_type = str(device_type or "")
+    if bool(device_id) != bool(device_type):
+        raise ValueError("device id and type must be provided together")
+    if device_id and (not _DEVICE_ID.fullmatch(device_id)
+                      or device_type not in {"modem", "reader"}):
+        raise ValueError("invalid device rediscovery target")
+    scope = "device" if device_id else "all"
     request_path, status_path = _device_rescan_paths()
     current = device_rescan_status()
     if current.get("state") in {"requested", "running"}:
-        return {"ok": True, **current}
+        if (current.get("scope") == scope
+                and str(current.get("device_id") or "") == device_id):
+            return {"ok": True, **current}
+        raise RuntimeError("another hardware rediscovery is already running")
     now = int(time.time())
     operation_id = secrets.token_hex(8)
-    request = {"operation_id": operation_id, "requested_at": now}
+    request = {"operation_id": operation_id, "requested_at": now,
+               "scope": scope, "device_id": device_id, "device_type": device_type}
     _write_private_json(status_path, {**request, "state": "requested", "updated_at": now})
     _write_private_json(request_path, request)
     return {"ok": True, **request, "state": "requested", "updated_at": now}
@@ -409,7 +422,8 @@ def device_rescan_status() -> dict:
     # Never expose arbitrary fields written into the shared runtime directory.
     return {key: status[key] for key in (
         "state", "operation_id", "requested_at", "updated_at", "requested",
-        "error_code", "modems_detected", "pcsc_active", "modemmanager_active")
+        "error_code", "scope", "device_id", "device_type", "modems_detected",
+        "pcsc_active", "modemmanager_active")
             if key in status}
 
 

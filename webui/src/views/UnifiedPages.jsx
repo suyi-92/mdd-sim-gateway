@@ -314,7 +314,8 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   const simMissing = device.sim?.present === false
   const dataActive = !!device.cellular?.data_active
   const flightMode = capability(device, 'flight').desired
-  const unavailable = simMissing || dataActive || flightMode || !device.cellular
+  const backendMissing = !device.cellular
+  const unavailable = simMissing || dataActive || flightMode || backendMissing
   const options = [...networks]
   if (operatorId && !options.some(item => item.operator_id === operatorId)) {
     options.unshift({ operator_id: operatorId, name: operatorId,
@@ -355,7 +356,8 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
       setFailed(true); setFeedback(`${t('Network selection failed')}: ${error.message}`)
     } finally { setBusy('') }
   }
-  const blocked = simMissing ? t('Insert a readable SIM before selecting a network.')
+  const blocked = backendMissing ? t('Re-detect this device to restore ModemManager before scanning networks.')
+    : simMissing ? t('Insert a readable SIM before selecting a network.')
     : dataActive ? t('Turn off cellular data before selecting a network.')
     : flightMode ? t('Turn off flight mode before selecting a network.') : ''
   return <div className="u-cellular-network">
@@ -518,17 +520,20 @@ function Discovering({ t }) {
     <p>{t('The gateway is reading the connected readers and modems. This takes a few seconds after a restart.')}</p></div>
 }
 
-function DeviceRescanControl({ refresh, showToast }) {
+function DeviceRescanControl({ device = null, refresh, showToast }) {
   const { t } = useI18n()
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState('')
   const [failed, setFailed] = useState(false)
   const rescan = async () => {
     if (busy) return
-    if (!window.confirm(t('Restart hardware discovery? PC/SC readers, modem bridges and cellular registration may disconnect briefly.'))) return
+    const question = device
+      ? t('Re-detect this device? Its reader, SIM bridge and cellular registration may disconnect briefly.')
+      : t('Restart hardware discovery? PC/SC readers, modem bridges and cellular registration may disconnect briefly.')
+    if (!window.confirm(question)) return
     setBusy(true); setFailed(false); setFeedback(t('Restarting all hardware discovery backends…'))
     try {
-      const requested = await api.rescanDevices()
+      const requested = device ? await api.rescanDevice(device.id) : await api.rescanDevices()
       const operationId = requested.operation_id
       let completed = null
       for (let attempt = 0; attempt < 135; attempt += 1) {
@@ -543,19 +548,24 @@ function DeviceRescanControl({ refresh, showToast }) {
       if (completed.state !== 'success') {
         throw new Error(t(completed.error_code || 'Full device detection failed'))
       }
-      const modems = Number(completed.modems_detected || 0)
-      const readers = Number(completed.readers_detected || 0)
-      setFeedback(t('Full device detection completed. {modems} cellular modem(s) and {readers} card reader(s) found.', { modems, readers }))
-      showToast?.(t('Full device detection completed'))
+      if (device) {
+        setFeedback(t('Device detection completed. Review the refreshed hardware and SIM state below.'))
+        showToast?.(t('Device detection completed'))
+      } else {
+        const modems = Number(completed.modems_detected || 0)
+        const readers = Number(completed.readers_detected || 0)
+        setFeedback(t('Full device detection completed. {modems} cellular modem(s) and {readers} card reader(s) found.', { modems, readers }))
+        showToast?.(t('Full device detection completed'))
+      }
       await refresh?.()
     } catch (error) {
       setFailed(true)
-      setFeedback(`${t('Full device detection failed')}: ${error.message}`)
+      setFeedback(`${t(device ? 'Device detection failed' : 'Full device detection failed')}: ${error.message}`)
     } finally { setBusy(false) }
   }
-  return <div className="u-device-rescan">
+  return <div className={`u-device-rescan${device ? ' is-device' : ''}`}>
     <button className="btn btn-primary u-device-rescan-button" disabled={busy} onClick={rescan}>
-      {busy ? `${t('Detecting')}…` : t('Run full device detection')}
+      {busy ? `${t('Detecting')}…` : t(device ? 'Re-detect this device' : 'Run full device detection')}
     </button>
     <div className={`u-device-rescan-feedback${failed ? ' is-error' : ''}`} role="status">
       {feedback || '\u00a0'}
@@ -613,7 +623,7 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
   if (!d) return <>{discoveryHeader}{historyToggle}<Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /></>
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('Cellular data (4G)')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
   return <>{discoveryHeader}{historyToggle}<div className="u-split"><aside className="card u-device-list">{visibleDevices.map((x,i)=>{const badge=deviceStatusBadge(x);return <button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i,t)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={badge.state}>{badge.label ? t(badge.label) : null}</Badge></span></button>})}</aside>
-    <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
+    <section className="u-page"><div className="u-page-heading u-device-page-heading"><div><h2>{deviceTitle(d, visibleDevices.indexOf(d), t)}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div><DeviceRescanControl device={d} refresh={refresh} showToast={showToast}/></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>

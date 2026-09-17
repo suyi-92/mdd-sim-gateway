@@ -243,8 +243,11 @@ class PageRhythmTests(unittest.TestCase):
 
     def test_full_device_detection_is_visible_in_empty_state_and_has_fixed_feedback(self):
         self.assertIn("api.rescanDevices()", UNIFIED)
+        self.assertIn("api.rescanDevice(device.id)", UNIFIED)
         self.assertIn("api.deviceRescanProgress()", UNIFIED)
         self.assertIn("Restart hardware discovery?", UNIFIED)
+        self.assertIn("Re-detect this device", UNIFIED)
+        self.assertIn("Re-detect this device to restore ModemManager", UNIFIED)
         self.assertIn("<>{discoveryHeader}<Discovering", UNIFIED)
         self.assertIn("<>{discoveryHeader}{historyToggle}<Empty", UNIFIED)
         feedback = css_rule(".u-device-rescan-feedback")
