@@ -12,7 +12,7 @@ import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
 import { BackupImport, BackupRecord } from './BackupTransfer.jsx'
 import { cellularRegistrationDetail, currentCellularNetwork, networkName, networkLabel,
-  cellularOperationOutcome, networkAvailability } from '../cellularPresentation.js'
+  cellularOperationOutcome, cellularOperationProgress, networkAvailability } from '../cellularPresentation.js'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
 const CAPABILITY_ON_DETAILS = {
@@ -347,14 +347,15 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   let feedback = ''
   if (report) {
     if (outcome) feedback = outcome.text
-    else if (busy) feedback = t(busy === 'scan' ? 'Scanning nearby networks. The modem may take several minutes.'
-      : 'Waiting for the modem to confirm registration…')
+    else if (busy) feedback = busy === 'scan' ? t('Scanning nearby networks. The modem may take several minutes.')
+      : cellularOperationProgress(operation, t)
     else if (operation.state === 'success') {
       feedback = t(networks.length ? 'Found {count} cellular networks.'
         : 'No cellular networks were returned by the modem.', { count: networks.length })
     } else {
       const detail = operation.error || {}
       const messages = {
+        operation_timeout: 'Network selection reached its total time limit. Current registration is unconfirmed.',
         network_timeout: 'The selected network did not accept registration in time. Try another network or automatic selection.',
         denied: 'Registration was rejected. This SIM may not have roaming access to that network.',
         no_service: 'The selected network is not providing service to this SIM. Try another network or automatic selection.',
@@ -448,6 +449,7 @@ function CellularOperator({ network, connected, updating = false }) {
 
 function simName(d, t) {
   if (d.present === false) return t('Device not connected')
+  if (d.sim?.present !== false && d.sim?.carrier?.brand_source === 'esim_profile') return d.sim.carrier.name
   return d.sim?.present === false ? t('No SIM inserted') : (d.sim?.name || d.carrier || d.operator || 'SIM')
 }
 function carrierLabel(d, t) {
@@ -469,8 +471,10 @@ function stablePathName(d, t) {
 function deviceSimLine(d, t, language) {
   const name = simName(d, t)
   if (d.present === false || d.sim?.present === false) return name
-  const country = d.egress?.detected_country || d.egress?.country
-  return country ? `${name} · ${countryName(country, language)}` : name
+  const numberCountry = d.sim?.number_country
+  const home = d.sim?.home_country || d.egress?.detected_country || d.egress?.country
+  return numberCountry ? `${name} · ${t('Number region')}: ${countryName(numberCountry, language)}`
+    : home ? `${name} · ${t('SIM home network')}: ${countryName(home, language)}` : name
 }
 function DeviceIdentityLine({ device, showToast }) {
   const { t } = useI18n()

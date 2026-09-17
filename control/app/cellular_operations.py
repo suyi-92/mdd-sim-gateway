@@ -5,7 +5,9 @@ import asyncio
 import copy
 import secrets
 import time
+import math
 from collections import OrderedDict
+from .cellular_network import REGISTER_TOTAL_TIMEOUT_SECONDS
 
 
 class OperationBusy(RuntimeError):
@@ -17,6 +19,7 @@ class NetworkOperations:
         self.limit = limit
         self.records = OrderedDict()
         self.active = None
+        self.active_deadline = None
         self.tasks = set()
 
     def busy(self):
@@ -34,8 +37,30 @@ class NetworkOperations:
         return self.records[key]
 
     def view(self, key):
-        return {**copy.deepcopy(self._record(key)),
-                "blocked": self.busy() and self.active != key}
+        result = {**copy.deepcopy(self._record(key)),
+                  "blocked": self.busy() and self.active != key}
+        operation = result.get("operation")
+        if operation and operation.get("deadline_at") and operation["state"] == "running":
+            operation["remaining_seconds"] = max(0, math.ceil((self.active_deadline or time.monotonic()) - time.monotonic()))
+        return result
+
+    def reset(self, key):
+        if self.busy():
+            raise OperationBusy("A cellular network operation is already running.")
+        self.records.pop(key, None)
+        self._record(key)["selection_reset"] = True
+        return self.view(key)
+
+    def progress(self, key, operation_id, phase):
+        operation = self._record(key).get("operation")
+        if (self.active == key and operation and operation["id"] == operation_id
+                and phase in {"registering", "confirming", "restoring"}):
+            operation["phase"] = phase
+
+    def deadline(self, key, operation_id):
+        operation = self._record(key).get("operation")
+        return (self.active_deadline if self.active == key and operation
+                and operation["id"] == operation_id else None)
 
     def start(self, key, action, selection, worker):
         # No await between admission and ownership. A second tab cannot enqueue a
@@ -43,10 +68,15 @@ class NetworkOperations:
         if self.busy():
             raise OperationBusy("A cellular network operation is already running.")
         record = self._record(key)
+        record.pop("selection_reset", None)
         operation = {"id": secrets.token_hex(12), "action": action, "state": "running",
-                     "selection": copy.deepcopy(selection), "started_at": int(time.time())}
+                     "selection": copy.deepcopy(selection), "started_at": int(time.time()),
+                     "phase": "queued"}
+        if action == "apply":
+            operation["deadline_at"] = operation["started_at"] + REGISTER_TOTAL_TIMEOUT_SECONDS
         record["operation"] = operation
         self.active = key
+        self.active_deadline = time.monotonic() + REGISTER_TOTAL_TIMEOUT_SECONDS if action == "apply" else None
 
         async def run():
             try:
@@ -71,6 +101,7 @@ class NetworkOperations:
             finally:
                 operation["finished_at"] = int(time.time())
                 self.active = None
+                self.active_deadline = None
 
         task = asyncio.create_task(run())
         self.tasks.add(task)

@@ -3,7 +3,7 @@ import json
 import subprocess
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from control.app import cellular_network, main
 
@@ -346,7 +346,8 @@ class CellularRegistrationTests(unittest.TestCase):
             cellular_network.register(MODEM, mode="manual", operator_id="00102",
                                       runner=runner, sleeper=Mock(), settle_attempts=1)
         self.assertEqual(caught.exception.detail["recovery"]["state"], "pending")
-        self.selection_applied.assert_called_once_with(MODEM, {"mode": "automatic", "operator_id": ""}, runner)
+        self.selection_applied.assert_called_once_with(MODEM, {"mode": "automatic", "operator_id": ""}, ANY)
+        self.assertIs(self.selection_applied.call_args.args[2].runner, runner)
 
     def test_quectel_registration_synchronizes_mm_before_managed_at(self):
         self.backend.return_value = True
@@ -484,7 +485,7 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
                 "modem-a", {"mode": "manual", "operator_id": "46000"})
         self.assertTrue(result["ok"])
         register.assert_called_once_with(
-            MODEM, mode="manual", operator_id="46000",
+            MODEM, mode="manual", operator_id="46000", progress=ANY, deadline=ANY,
             previous={"mode": "automatic", "operator_id": ""})
         save.assert_called_once_with({
             "id": "3", "cellular_network_mode": "manual",

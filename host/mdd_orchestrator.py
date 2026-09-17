@@ -1791,7 +1791,7 @@ class Orchestrator:
         return digits if digits.startswith("89") and 18 <= len(digits) <= 20 else ""
 
     @staticmethod
-    def normalize_msisdn(value: str, home_mcc: str = "") -> str:
+    def normalize_msisdn(value: str, home_mcc: str = "", number_type: int | None = None) -> str:
         """Return a conservative E.164-like number from ModemManager OwnNumbers.
 
         Modems commonly add spaces, dashes or parentheses.  Reject placeholders and
@@ -1807,11 +1807,40 @@ class Orchestrator:
         digits = number.lstrip("+")
         if not 5 <= len(digits) <= 20:
             return ""
+        if number_type == 145 and re.fullmatch(r"[1-9][0-9]{4,14}", digits):
+            return "+" + digits
         prefix = MCC_CALLING_PREFIXES.get(str(home_mcc or "").strip())
         if (not number.startswith("+") and prefix and digits.startswith(prefix)
                 and 10 <= len(digits) <= 15):
             number = "+" + digits
         return number
+
+    def modem_number(self, obj: str, iccid: str, raw: str, home_mcc: str) -> str:
+        number = self.normalize_msisdn(raw, home_mcc)
+        if not number or number.startswith("+") or not iccid:
+            return number
+        # Read CNUM only for an ambiguous bare number, once per SIM/MM generation.
+        # Type 145 proves international format even if number region differs from MCC.
+        cache = getattr(self, "_modem_number_cache", None)
+        if cache is None:
+            self._modem_number_cache = cache = {}
+        key = (obj, iccid, number)
+        cached = cache.get(key)
+        if cached and time.monotonic() < cached[0]:
+            return self.normalize_msisdn(raw, home_mcc, cached[1])
+        result = run(["timeout", "8s", "mmcli", "--timeout=5", "-m", obj, "--command=AT+CNUM"])
+        types = set()
+        if result.returncode == 0:
+            for reported, kind in re.findall(
+                    r'\+CNUM:\s*(?:"[^"\r\n]*")?\s*,\s*"([+0-9 ()-]+)"\s*,\s*([0-9]+)',
+                    result.stdout or ""):
+                if re.sub(r"\D", "", reported) == re.sub(r"\D", "", number):
+                    types.add(int(kind))
+        number_type = next(iter(types)) if len(types) == 1 else None
+        if len(cache) >= 64:
+            cache.clear()
+        cache[key] = (time.monotonic() + (3600 if number_type is not None else 60), number_type)
+        return self.normalize_msisdn(raw, home_mcc, number_type)
 
     @staticmethod
     def cellular_profile_name(device_id: str) -> str:
@@ -1860,7 +1889,7 @@ class Orchestrator:
         if not sim_present:
             registration = "unknown"
         msisdn = (next((number for raw in own_numbers
-                        if (number := self.normalize_msisdn(raw, sim_mcc))), "")
+                        if (number := self.modem_number(obj, sim_iccid, raw, sim_mcc))), "")
                   if sim_present else "")
         # Many USB modems keep their hardware power-state at "on" after
         # ModemManager --disable.  The generic state is the authoritative RF state.

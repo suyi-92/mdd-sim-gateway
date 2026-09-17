@@ -59,6 +59,18 @@ export function cellularOperationOutcome(operation, current, networks, language,
   return null
 }
 
+export function cellularOperationProgress(operation, t) {
+  const stages = {
+    queued: 'Preparing network selection…',
+    registering: 'Requesting network registration…',
+    confirming: 'Confirming cellular registration…',
+    restoring: 'Registration was not confirmed; restoring the previous selection…',
+  }
+  const phase = t(stages[operation.phase] || 'Waiting for the modem to confirm registration…')
+  return Number.isFinite(operation.remaining_seconds)
+    ? `${phase} ${t('At most {seconds}s remaining.', { seconds: operation.remaining_seconds })}` : phase
+}
+
 export function cellularRegistrationDetail(device, t = value => value, language = 'zh') {
   const cellular = device?.cellular || {}
   const registration = String(cellular.registration || '').toLowerCase()

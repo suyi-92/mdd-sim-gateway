@@ -30,7 +30,11 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   const live = instances.filter((i) => sourceFor(i))
   // Keep the selector text exactly as it was in 1.9.4-vmware.2. The richer, full
   // identity belongs to the adjacent details and must not widen or unmask this control.
-  const lineName = (i) => i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
+  const lineName = (i) => {
+    const carrier = deviceFor(i)?.sim?.carrier
+    return (carrier?.brand_source === 'esim_profile' && carrier.name)
+      || i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
+  }
   const numberTail = (i) => String(i.msisdn || '').replace(/\D/g, '').slice(-4)
 
   // Calls/Messages own their useful default: choose the first live line here instead of in
@@ -51,7 +55,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   const details = showDetails ? communicationLineDetails(current, currentDevice, t, language) : null
   const detailFields = details ? [
     ['Carrier', details.carrier], ['Line name', details.line], ['Number', details.number, true],
-    ['Country', details.country], ['Network route', details.networkRoute],
+    ['Number region', details.country], ['SIM home network', details.homeNetwork], ['Network route', details.networkRoute],
   ] : []
   return (
     <div className="card u-line-selector">

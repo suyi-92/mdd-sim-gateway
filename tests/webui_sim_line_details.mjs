@@ -8,7 +8,7 @@ const tr = (key, values = {}) => key.replace(/\{(\w+)\}/g, (_, name) => values[n
 test('communication details distinguish carrier, configured line, network and route', () => {
   const line = { id: '1', name: 'Desk line', mcc: '234', mnc: '33', msisdn: '+447700900357' }
   const device = {
-    sim: { number: '+447700900357', carrier: {
+    sim: { number: '+447700900357', number_country: 'gb', home_country: 'gb', carrier: {
       name: 'Fixture Mobile', home_network: 'EE', current_network: 'Visited Network', plmn: '234-33',
     } },
     egress: { country: 'gb', node: 'GB Fixture Node', mode: 'manual', ready: true },
@@ -19,9 +19,23 @@ test('communication details distinguish carrier, configured line, network and ro
     line: 'Desk line',
     number: '+447700900357',
     country: 'United Kingdom (GB)',
+    homeNetwork: 'United Kingdom (GB) · 234-33',
     network: 'Visited Network · EE',
     networkRoute: 'GB Fixture Node',
   })
+})
+
+test('Saily US phone region remains separate from its Hong Kong SIM and route', () => {
+  const details = communicationLineDetails({ msisdn: '+12025550123' }, {
+    sim: { number_country: 'us', home_country: 'hk',
+      carrier: { name: 'Saily', brand_source: 'esim_profile', plmn: '454-00' } },
+    egress: { country: 'hk', node: 'HK Fixture', mode: 'manual', ready: true },
+  }, tr, 'en')
+  assert.equal(details.carrier, 'Saily')
+  assert.equal(details.country, 'United States (US)')
+  assert.match(details.homeNetwork, /\(HK\) · 454-00$/)
+  assert.equal(details.homeNetwork.includes('United States'), false)
+  assert.equal(details.networkRoute, 'HK Fixture')
 })
 
 test('direct and unavailable routes are explicit and retain the full number', () => {

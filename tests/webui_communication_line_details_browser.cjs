@@ -120,7 +120,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       const details = page.locator('.u-line-selector-meta:visible')
       await details.getByText('Fixture Mobile (234-33)', { exact: true }).waitFor()
       const text = await details.innerText()
-      for (const expected of ['运营商', '线路名称', '号码', '国家', '网络线路',
+      for (const expected of ['运营商', '线路名称', '号码', '号码地区', 'SIM 归属网', '网络线路',
         'Desk line', '+447700900357', '英国 (GB)', 'GB Fixture Node']) {
         assert.ok(text.includes(expected), `${view} missing ${expected}`)
       }
@@ -160,7 +160,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       const box = node.getBoundingClientRect()
       return { left: box.left, right: box.right }
     }))
-    assert.equal(detailBoxes.length, 5)
+    assert.equal(detailBoxes.length, 6)
     assert.ok(detailBoxes.at(-1).right - detailBoxes[0].left < 1000,
       'wide details should stay compact instead of distributing across all empty space')
     for (let index = 1; index < detailBoxes.length; index += 1) {
@@ -263,6 +263,15 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.getByRole('button', { name: '正在应用…' }).waitFor()
     assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).getAttribute('aria-checked'), 'true')
+    operation = { ...operation, phase: 'confirming', remaining_seconds: 60 }
+    await page.getByText('正在确认驻网状态… 最多还需 60 秒。', { exact: true }).waitFor()
+    const waitingButton = await page.getByRole('button', { name: '正在应用…' }).boundingBox()
+    operation = { ...operation, phase: 'restoring', remaining_seconds: 30 }
+    await page.getByText('驻网未确认，正在恢复原选网方式… 最多还需 30 秒。', { exact: true }).waitFor()
+    const restoringButton = await page.getByRole('button', { name: '正在应用…' }).boundingBox()
+    assert.equal(restoringButton.x, waitingButton.x)
+    assert.equal(restoringButton.y, waitingButton.y)
+    await page.locator('.u-cellular-network').screenshot({ path: path.join(output, 'restoring-stage.png'), animations: 'disabled' })
     applying = false
     operation = { ...operation, state: 'success' }
     // Model the Control normalization of the modem's stale name/new PLMN pair.
@@ -328,17 +337,24 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.goto(origin + '/#/messages')
     await page.locator('.u-line-selector:visible select').selectOption('2')
     cards[1].hardware_id = 'modem-2'
-    instances.push({ id: '3', name: 'New eSIM profile', mcc: '454', mnc: '00', enabled: false,
+    instances.push({ id: '3', name: 'New eSIM profile', mcc: '454', mnc: '00', enabled: false, msisdn: '+12025550123',
       status: { state: 'STOPPED', label: 'Stopped' } })
     devices[1] = { ...devices[1], instance_id: '3', cellular: null,
       capabilities: { ...devices[1].capabilities, vowifi: { desired: false, actual: 'off' } },
       egress: { country: 'hk', detected_country: 'hk', mode: 'manual', ready: false },
-      sim: { present: true, carrier: { name: 'Fixture HK', plmn: '454-00' } } }
+      sim: { present: true, number: '+12025550123', number_country: 'us', home_country: 'hk',
+        carrier: { name: 'Saily', brand_source: 'esim_profile', plmn: '454-00' } } }
     await page.waitForFunction(() => [...document.querySelectorAll('.u-line-selector select')]
       .some(select => select.offsetParent && select.value === '3'))
     assert.deepEqual(await page.locator('.u-line-selector:visible select option').evaluateAll(
       options => options.map(option => option.value)), ['1', '3'])
     assert.ok((await page.locator('.u-line-selector:visible select option:checked').innerText()).includes('VoWiFi 已关闭'))
+    const sailyDetails = page.locator('.u-line-selector-meta:visible')
+    await sailyDetails.getByText('Saily', { exact: true }).waitFor()
+    await sailyDetails.getByText('美国 (US)', { exact: true }).waitFor()
+    await sailyDetails.getByText('香港 (HK) · 454-00', { exact: true }).waitFor()
+    await sailyDetails.getByRole('button', { name: '复制号码' }).click()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+12025550123')
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false)

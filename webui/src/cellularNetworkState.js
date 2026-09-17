@@ -20,14 +20,18 @@ export function createCellularNetworkState(client = api, timers = globalThis) {
     const changed = record.value.context && record.value.context !== status.context
     const operation = status.operation || null
     const patch = { ...status, operation, loading: false, readError: false }
-    if (changed) Object.assign(patch, initial(record.saved), status, { loading: false })
+    if (changed) Object.assign(patch, initial(status.saved_selection || record.saved), status, { loading: false })
+    if (!record.value.context && status.saved_selection && !operation) {
+      patch.mode = status.saved_selection.mode
+      patch.operatorId = status.saved_selection.operator_id || ''
+    }
     if (operation?.action === 'scan' && !record.value.context) patch.mode = 'manual'
     if (operation?.action === 'apply' && operation.id !== record.value.operation?.id) {
       patch.mode = operation.selection.mode
       patch.operatorId = operation.selection.operator_id || ''
       patch.dismissed = ''
     }
-    if (changed && busy(record.value) && !operation) {
+    if (changed && busy(record.value) && !operation && !status.selection_reset) {
       patch.operation = { id: `interrupted-${++sequence}`, action: record.value.operation.action,
         state: 'failed', error: { code: 'interrupted' } }
     }

@@ -8,6 +8,19 @@ const timers = { setTimeout: () => 1, clearTimeout() {} }
 const running = action => ({ context: 'fixture-context', networks: [network],
   operation: { id: 'fixture-op', action, state: 'running', selection: { mode: 'manual', operator_id: '00101' } } })
 
+test('eSIM reset selects automatic even before the device poll refreshes saved settings', async () => {
+  let status = running('apply')
+  const store = createCellularNetworkState({ cellularNetworkOperation: async () => status }, timers)
+  store.ensure({ ...device, cellular_network: { mode: 'manual', operator_id: '00101' } })
+  await store.refresh(device.id)
+  status = { context: 'reset-context', networks: [], operation: null, selection_reset: true,
+    saved_selection: { mode: 'automatic', operator_id: '' } }
+  await store.refresh(device.id)
+  assert.equal(store.get(device.id).mode, 'automatic')
+  assert.equal(store.get(device.id).operatorId, '')
+  assert.equal(store.get(device.id).operation, null)
+})
+
 test('draft, scan names and running application survive page unsubscription', async () => {
   let status = { context: 'fixture-context', networks: [network], operation: null }
   const client = { cellularNetworkOperation: async () => status,

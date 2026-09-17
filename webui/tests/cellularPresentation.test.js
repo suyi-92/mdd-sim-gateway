@@ -1,9 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { cellularRegistrationDetail, networkName, networkLabel, currentCellularNetwork,
-  cellularOperationOutcome, networkAvailability } from '../src/cellularPresentation.js'
+  cellularOperationOutcome, cellularOperationProgress, networkAvailability } from '../src/cellularPresentation.js'
 
 const t = (value, args = {}) => value.replace('{signal}', String(args.signal ?? ''))
+
+test('network feedback distinguishes restoring from initial registration and shows remaining budget', () => {
+  const translate = (value, args = {}) => value.replace('{seconds}', args.seconds)
+  const feedback = cellularOperationProgress({ phase: 'restoring', remaining_seconds: 21 }, translate)
+  assert.match(feedback, /restoring the previous selection/)
+  assert.match(feedback, /21s remaining/)
+})
 
 test('registered roaming is distinct from a disconnected data bearer', () => {
   const detail = cellularRegistrationDetail({ cellular: {

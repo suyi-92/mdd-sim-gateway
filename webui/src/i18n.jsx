@@ -3,6 +3,14 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Number region': '号码地区',
+  'SIM home network': 'SIM 归属网',
+  'Preparing network selection…': '正在准备选网…',
+  'Requesting network registration…': '正在请求注册网络…',
+  'Confirming cellular registration…': '正在确认驻网状态…',
+  'Registration was not confirmed; restoring the previous selection…': '驻网未确认，正在恢复原选网方式…',
+  'At most {seconds}s remaining.': '最多还需 {seconds} 秒。',
+  'Network selection reached its total time limit. Current registration is unconfirmed.': '选网已达到总超时，尚未确认成功驻网。',
   'VoWiFi is off': 'VoWiFi 已关闭',
   'Wait for the current cellular or eSIM operation to finish.': '请等待当前蜂窝网络或 eSIM 操作完成。',
   'Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.': '配置文件已启用；此设备的 VoWiFi 已关闭，需要时可前往“设备”页面开启。',

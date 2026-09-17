@@ -12,6 +12,29 @@ NETWORK = {"operator_id": "00101", "name": "Fixture Mobile",
 
 
 class NetworkOperationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_has_a_budget_and_esim_reset_rejects_live_jobs(self):
+        state = cellular_operations.NetworkOperations()
+        finish = asyncio.Event()
+        async def worker():
+            await finish.wait()
+            return {}
+        first = state.start(KEY, "apply", {"mode": "manual", "operator_id": "00101"}, worker)
+        operation_id = first["operation"]["id"]
+        state.progress(KEY, operation_id, "restoring")
+        view = state.view(KEY)
+        self.assertEqual(view["operation"]["phase"], "restoring")
+        self.assertLessEqual(view["operation"]["remaining_seconds"], 180)
+        with self.assertRaises(cellular_operations.OperationBusy):
+            state.reset(KEY)
+        finish.set()
+        await asyncio.gather(*state.tasks)
+        fresh = state.reset(KEY)
+        self.assertNotEqual(fresh["context"], first["context"])
+        self.assertTrue(fresh["selection_reset"])
+        self.assertIsNone(fresh["operation"])
+        state.progress(KEY, operation_id, "registering")
+        self.assertIsNone(state.view(KEY)["operation"])
+
     async def test_job_outlives_request_and_keeps_names_for_later_readers(self):
         state = cellular_operations.NetworkOperations()
         done = asyncio.Event()

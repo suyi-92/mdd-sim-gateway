@@ -34,13 +34,15 @@ export function communicationLineDetails(line = {}, device = {}, t = value => va
     || [line.mcc, line.mnc].map(clean).filter(Boolean).join('-')
   const configuredCarrier = typeof line.carrier === 'string' ? clean(line.carrier) : ''
   const carrierName = clean(carrier.name) || configuredCarrier || t('Unknown carrier')
-  const carrierLabel = plmn && !carrierName.includes(plmn)
+  const carrierLabel = carrier.brand_source === 'esim_profile' ? carrierName : plmn && !carrierName.includes(plmn)
     ? `${carrierName} (${plmn})`
     : carrierName
   const networkNames = distinct([carrier.current_network, carrier.home_network])
   const network = networkNames.join(' · ') || plmn || t('Unknown network')
   const route = device?.egress || line.egress || {}
   const countryCode = clean(route.detected_country || route.country || line.proxy_country_effective)
+  const numberCountry = clean(device?.sim?.number_country)
+  const homeCountry = clean(device?.sim?.home_country || countryCode)
   let networkRoute = clean(route.node)
   if (!networkRoute && ['direct', 'disabled', 'legacy'].includes(clean(route.mode).toLowerCase())) {
     networkRoute = route.mode === 'direct' ? t('Explicit direct connection') : t('Host network')
@@ -51,7 +53,8 @@ export function communicationLineDetails(line = {}, device = {}, t = value => va
     carrier: carrierLabel,
     line: lineDisplayName(line, t),
     number: lineNumber(line.msisdn || device?.sim?.number, t),
-    country: countryDisplayName(countryCode, language, t),
+    country: countryDisplayName(numberCountry, language, t),
+    homeNetwork: [countryDisplayName(homeCountry, language, t), plmn].filter(Boolean).join(' · '),
     network,
     networkRoute: networkRoute || t('Not connected'),
   }

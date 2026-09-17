@@ -113,6 +113,8 @@ git remote -v
 - 普通 PC/SC reader 可以没有 IMEI；缺少 SMSC 只能禁用主动 VoWiFi 短信，不能阻止通话。
 - 端口分配同时探测真实 TCP 与 UDP 占用；Engine 启动失败必须清理 Docker `Created` 残留。
 - eSIM profile 首次启用时继续等待陈旧 `disabled` 出口状态刷新。
+- 切换 eSIM 后蜂窝访问网络选择默认恢复自动，清除原手动 PLMN 与旧候选草稿；号码地区、
+  eSIM 品牌和 SIM 技术归属网分别呈现，不以号码地区改写真实 MCC/MNC 或国家出口配置。
 - Fake-IP 环境下，ePDG 必须在选定国家出口内解析并固定真实地址；浏览器 SDP 必须过滤
   Fake-IP ICE candidate。
 - CMLink UK 的 `10086` 保持原样，不改写为 `+4410086`；它是带音频的 home-local 语音短号，

@@ -12,7 +12,7 @@ from host import mdd_orchestrator as host
 
 
 class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
-    async def test_new_sim_selection_is_tracked_and_later_profile_is_not_overwritten(self):
+    async def test_switch_always_selects_automatic_and_later_profile_is_not_overwritten(self):
         for current, mode in (("new-card", "automatic"), ("new-card", "manual"), ("later-card", "automatic")):
             with self.subTest(current=current, mode=mode), \
                     patch.object(main.network_operations, "busy", return_value=False), \
@@ -22,8 +22,8 @@ class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(main, "api_device_cellular_network_select", new=AsyncMock()) as select:
                 await main._esim_restore_cellular_selection("modem-a", "new-card")
             if current == "new-card":
-                select.assert_awaited_once_with("modem-a", {"mode": mode,
-                    "operator_id": "00101" if mode == "manual" else ""}, background=True)
+                select.assert_awaited_once_with("modem-a", {"mode": "automatic",
+                    "operator_id": ""}, background=True)
             else:
                 select.assert_not_awaited()
 
@@ -73,6 +73,8 @@ class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
             result = await main._esim_recover_profile_switch("reader", "modem-a", "new-card")
         self.assertFalse(result["start_allowed"])
         self.assertFalse(saved.call_args.args[0]["enabled"])
+        self.assertEqual(saved.call_args.args[0]["cellular_network_mode"], "automatic")
+        self.assertEqual(saved.call_args.args[0]["cellular_operator_id"], "")
 
     async def test_later_device_off_cancels_background_start(self):
         with patch.object(main, "_esim_vowifi_requested", return_value=False), \

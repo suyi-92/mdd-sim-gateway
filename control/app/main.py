@@ -20,6 +20,7 @@ import os
 import random
 import re
 import time
+from . import phone_identity
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -172,6 +173,14 @@ def _carrier_description(inst: dict | None, card_info: dict | None,
     current = str((cellular or {}).get("operator") or "").strip()
     if current.casefold() in {"--", "unknown", "none", "n/a"}:
         current = ""
+    cached = _esim_cache_for_iccid(str(identity.get("iccid") or "")) or {}
+    providers = {str(profile.get("serviceProviderName") or "").strip()
+                 for se in cached.get("ses") or [] for profile in se.get("profiles") or []
+                 if profile.get("iccid") == identity.get("iccid")}
+    providers = {name for name in providers if name and len(name) <= 80
+                 and any(c.isalpha() for c in name) and not any(ord(c) < 32 for c in name)}
+    if len(providers) == 1:
+        resolved = {**resolved, "name": providers.pop(), "brand_source": "esim_profile"}
     return {**resolved, "current_network": current}
 
 
@@ -3851,7 +3860,9 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) 
     target = await asyncio.to_thread(_refresh_instance_reader_binding, target)
     enabled = _esim_vowifi_requested(hardware_id)
     target = await asyncio.to_thread(
-        cfg.upsert_instance, {"id": str(target["id"]), "enabled": enabled})
+        cfg.upsert_instance, {"id": str(target["id"]), "enabled": enabled,
+                              **_esim_automatic_selection()})
+    network_operations.reset((str(hardware_id), str(target["id"]), str(iccid)))
     egress.publish()
     log.info(
         "eSIM profile recovery complete bridge_ms=%d card_refresh_ms=%d",
@@ -3876,8 +3887,13 @@ def _esim_vowifi_requested(hardware_id: str) -> bool:
     return bool(wanted.get("vowifi_enabled", True))
 
 
+def _esim_automatic_selection() -> dict:
+    return {"cellular_network_mode": "automatic", "cellular_operator_id": "",
+            "cellular_operator_name": "", "cellular_operator_technology": ""}
+
+
 async def _esim_restore_cellular_selection(device_id: str, iccid: str) -> None:
-    """Reapply the new SIM's policy, never inherit the previous SIM's manual PLMN.
+    """An enabled eSIM always starts with automatic visited-network selection.
 
     Use the regular tracked network operation so progress/failure survives navigation.
     A later user action, active data bearer, flight mode or another profile wins.
@@ -3889,8 +3905,7 @@ async def _esim_restore_cellular_selection(device_id: str, iccid: str) -> None:
         if str(inst.get("iccid") or "") != str(iccid):
             return
         await api_device_cellular_network_select(device_id, {
-            "mode": inst.get("cellular_network_mode") or "automatic",
-            "operator_id": inst.get("cellular_operator_id") or "",
+            "mode": "automatic", "operator_id": "",
         }, background=True)
     except HTTPException:
         # No available radio is normal on a VoWiFi-only device. Profile recovery is
@@ -4986,6 +5001,8 @@ async def _unified_devices() -> list[dict]:
             "sim": {"name": (((inst or {}).get("name")
                              or (cellular_view or {}).get("operator") or "SIM") if inst else ""),
                     "number": (inst or {}).get("msisdn") or "",
+                    "number_country": phone_identity.number_country((inst or {}).get("msisdn") or ""),
+                    "home_country": egress.country_for_mcc((inst or card_info).get("mcc")),
                     "present": sim_present,
                     "carrier": carrier},
             "cellular": cellular_view,
@@ -5279,7 +5296,9 @@ async def api_device_cellular_network_operation(device_id: str):
             return network_operations.view(active)
         raise HTTPException(503, "cellular operation context is temporarily unavailable")
     inst = _match_instance_by_iccid(iccid) or {}
-    return network_operations.view((str(device_id), str(inst.get("id") or ""), iccid))
+    return {**network_operations.view((str(device_id), str(inst.get("id") or ""), iccid)),
+            "saved_selection": {"mode": inst.get("cellular_network_mode") or "automatic",
+                                "operator_id": inst.get("cellular_operator_id") or ""}}
 
 
 def _start_cellular_operation(device_id, action, selection, worker):
@@ -5347,10 +5366,16 @@ async def _select_cellular_network(device_id: str, body: dict):
     mode, operator_id = _validate_cellular_selection(body)
     async with capability_lock:
         _observed, inst, modem_path = _cellular_network_target(device_id)
+        key = _cellular_operation_key(device_id, inst, _observed)
+        operation = network_operations.view(key).get("operation") or {}
+        loop = asyncio.get_running_loop()
+        def progress(phase):
+            loop.call_soon_threadsafe(network_operations.progress, key, operation.get("id"), phase)
         try:
             selection = await asyncio.to_thread(
                 cellular_network.register, modem_path,
-                mode=mode, operator_id=operator_id,
+                mode=mode, operator_id=operator_id, progress=progress,
+                deadline=network_operations.deadline(key, operation.get("id")),
                 previous={"mode": inst.get("cellular_network_mode") or "automatic",
                           "operator_id": inst.get("cellular_operator_id") or ""})
         except cellular_network.CellularRegistrationError as exc:
@@ -8297,7 +8322,7 @@ async def api_esim_profiles(reader_index: int = 0, reader: str | None = None):
 
 @app.post("/api/esim/profiles/{iccid}/enable")
 async def api_esim_enable(iccid: str, body: dict | None = None):
-    if capability_lock.locked():
+    if capability_lock.locked() or network_operations.busy():
         raise HTTPException(409, "Wait for the current cellular or eSIM operation to finish.")
     async with capability_lock:
         return await _enable_esim_profile(iccid, body)
@@ -8333,7 +8358,8 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 raise
             target = _match_instance_by_iccid(iccid)
             if target and str(target["id"]) not in hub.manual_stops:
-                await asyncio.to_thread(cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
+                await asyncio.to_thread(cfg.upsert_instance, {"id": str(target["id"]), "enabled": True,
+                                                            **_esim_automatic_selection()})
             await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
             await _esim_profile_event(
                 name, iccid, "enabled", profile_state="enabled")

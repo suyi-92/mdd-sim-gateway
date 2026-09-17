@@ -15,6 +15,8 @@ NETWORK_LINE_RE = re.compile(
     r"(?P<code>\d{5,6})\s+-\s*(?P<name>.*?)\s+\((?P<detail>[^()]*)\)\s*$")
 SCAN_TIMEOUT_SECONDS = 315
 REGISTER_TIMEOUT_SECONDS = 120
+REGISTER_TOTAL_TIMEOUT_SECONDS = 180
+REGISTER_RECOVERY_SECONDS = 45
 NETWORK_STATUSES = {"available", "current", "forbidden", "unknown"}
 MM_SERVICE = "org.freedesktop.ModemManager1"
 EMPTY_MMCLI_SCAN = "error: couldn't scan networks in the modem: 'unknown error'"
@@ -33,6 +35,33 @@ COPS_TECHNOLOGIES = {
 
 class CellularNetworkError(RuntimeError):
     pass
+
+
+class _DeadlineRunner:
+    """Bound the real command and its D-Bus/AT timeout, not just an asyncio waiter.
+
+    Cancelling to_thread would leave a radio writer alive after its lock was released.
+    The synchronous worker instead keeps ownership until each bounded process exits.
+    """
+    def __init__(self, runner, deadline, clock):
+        self.runner, self.deadline, self.clock = runner, deadline, clock
+
+    def remaining(self):
+        return max(0.0, self.deadline - self.clock())
+
+    def __call__(self, args, **kwargs):
+        remaining = self.remaining()
+        if remaining < 2:
+            raise subprocess.TimeoutExpired(args, remaining)
+        args = list(args)
+        limit = max(1, int(remaining) - 1)
+        for index, arg in enumerate(args):
+            if arg.startswith("--timeout="):
+                args[index] = f"--timeout={min(int(arg.split('=', 1)[1]), limit)}"
+        if args[0] == "busctl" and "Command" in args and args[-1].isdigit():
+            args[-1] = str(min(int(args[-1]), max(1, limit - 1)))
+        kwargs["timeout"] = min(float(kwargs.get("timeout", remaining)), remaining)
+        return self.runner(args, **kwargs)
 
 
 class CellularScanError(CellularNetworkError):
@@ -349,12 +378,16 @@ def _wait_registration(modem_path: str, selection: dict, runner, sleeper, attemp
     snapshot = {}
     confirmed = 0
     for attempt in range(attempts):
+        if isinstance(runner, _DeadlineRunner) and runner.remaining() < 2:
+            break
         snapshot = _registration_snapshot(modem_path, runner)
         confirmed = confirmed + 1 if _is_registered(snapshot, selection) else 0
         if confirmed >= min(3, attempts) or snapshot["state"] in {"denied", "unavailable"}:
             break
         if attempt + 1 < attempts:
-            sleeper(3)
+            sleeper(min(3, runner.remaining()) if isinstance(runner, _DeadlineRunner) else 3)
+    if not snapshot:
+        return {"state": "unknown", "operator_id": ""}
     if _is_registered(snapshot, selection) and confirmed < min(3, attempts):
         return {**snapshot, "state": "registering"}
     return snapshot
@@ -377,7 +410,9 @@ def _selection_is_applied(modem_path: str, selection: dict, runner) -> bool:
 
 def register(modem_path: str, *, mode: str, operator_id: str = "", previous: dict | None = None,
              runner=subprocess.run, timeout: float = REGISTER_TIMEOUT_SECONDS,
-             sleeper=time.sleep, settle_attempts: int = 41) -> dict:
+             sleeper=time.sleep, settle_attempts: int = 41, progress=None,
+             clock=time.monotonic, total_timeout: float = REGISTER_TOTAL_TIMEOUT_SECONDS,
+             deadline: float | None = None) -> dict:
     """Confirm the requested PLMN, restoring saved selection after a failed attempt.
 
     MM's Register method has its own 60-second registration check even when the
@@ -389,22 +424,38 @@ def register(modem_path: str, *, mode: str, operator_id: str = "", previous: dic
     selected = _selection(mode, operator_id)
     previous = previous or {"mode": "automatic", "operator_id": ""}
     restore = _selection(previous.get("mode", "automatic"), previous.get("operator_id", ""))
-    use_at = _prefer_at_scan(modem_path, runner)
-    error = _request_registration(modem_path, selected, runner, timeout, use_at=use_at)
-    snapshot = _wait_registration(modem_path, selected, runner, sleeper,
+    now = clock()
+    deadline = min(now + max(0.0, total_timeout), deadline) if deadline is not None else now + max(0.0, total_timeout)
+    if deadline - now < 2:
+        raise CellularRegistrationError("operation_timeout")
+    recovery_reserve = min(REGISTER_RECOVERY_SECONDS, (deadline - now) / 3)
+    apply_runner = _DeadlineRunner(runner, deadline - recovery_reserve, clock)
+    recovery_runner = _DeadlineRunner(runner, deadline, clock)
+    if progress:
+        progress("registering")
+    use_at = _prefer_at_scan(modem_path, apply_runner)
+    error = _request_registration(modem_path, selected, apply_runner, timeout, use_at=use_at)
+    if progress:
+        progress("confirming")
+    snapshot = _wait_registration(modem_path, selected, apply_runner, sleeper,
                                   settle_attempts if error in {"", "network_timeout"} else 1)
     if (error in {"", "network_timeout"} and _is_registered(snapshot, selected)
-            and (not use_at or _selection_is_applied(modem_path, selected, runner))):
+            and (not use_at or _selection_is_applied(modem_path, selected, apply_runner))):
         return {**selected, "registration": snapshot}
     if snapshot["state"] == "denied":
         error = "denied"
     error = error or "not_registered"
-    recovery_error = _request_registration(modem_path, restore, runner, timeout, use_at=use_at)
-    recovered = _wait_registration(modem_path, restore, runner, sleeper,
+    if apply_runner.remaining() < 2:
+        error = "operation_timeout"
+    if progress:
+        progress("restoring")
+    recovery_error = _request_registration(modem_path, restore, recovery_runner,
+                                            min(timeout, 15), use_at=use_at)
+    recovered = _wait_registration(modem_path, restore, recovery_runner, sleeper,
                                    settle_attempts if recovery_error in {"", "network_timeout"} else 1)
-    restored_selection = (_selection_is_applied(modem_path, restore, runner) if use_at
+    restored_selection = (_selection_is_applied(modem_path, restore, recovery_runner) if use_at
                           else not recovery_error or (recovery_error == "network_timeout"
-                               and _selection_is_applied(modem_path, restore, runner)))
+                               and _selection_is_applied(modem_path, restore, recovery_runner)))
     recovery_state = ("restored" if restored_selection and recovery_error in {"", "network_timeout"} and _is_registered(recovered, restore)
                       else "pending" if restored_selection and recovered["state"] in {"searching", "idle", "registering"}
                       else "failed")
