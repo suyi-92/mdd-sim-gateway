@@ -367,6 +367,7 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   const current = updating ? { ...observed, connected: false } : observed
   const availability = item => networkAvailability(item || {}, current)
   const outcome = report ? cellularOperationOutcome(operation, current, options, language, t) : null
+  const currentFailure = failed && !outcome?.resolved
   const recoveryText = value => value?.state === 'restored' ? t('Previous network selection restored.')
     : value?.state === 'pending' ? t('Previous selection restored; searching for service.')
     : value?.state === 'failed' ? t('Recovery failed. Apply automatic selection to reconnect.') : ''
@@ -456,8 +457,8 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
       {!options.length && <p className="u-network-empty">{t(busy === 'scan'
         ? 'Scanning nearby networks…' : scanned ? 'No cellular networks were returned by the modem.' : 'Scan to discover nearby operators.')}</p>}
     </div>}
-    <div className={`u-cellular-network-feedback${failed ? ' is-error' : (outcome?.tone === 'warning' || (partial && !outcome)) ? ' is-warning' : ''}`} role="status">
-      <span aria-hidden="true">{failed ? '!' : 'i'}</span>
+    <div className={`u-cellular-network-feedback${currentFailure ? ' is-error' : (outcome?.tone === 'warning' || (partial && !outcome)) ? ' is-warning' : ''}`} role="status">
+      <span aria-hidden="true">{currentFailure ? '!' : 'i'}</span>
       <p title={feedback || blocked || ''}>{feedback || blocked || t(mode === 'automatic'
         ? 'The SIM chooses an available operator automatically.'
         : 'A detected network may not accept this SIM. Access depends on your plan and roaming agreements.')}</p>

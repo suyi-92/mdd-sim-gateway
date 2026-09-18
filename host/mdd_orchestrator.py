@@ -2292,11 +2292,13 @@ class Orchestrator:
         obj = self.modemmanager_modem_for_tty(modem.get("tty") or "")
         if not obj:
             return {"available": False, "registration": "unknown", "data_active": False,
-                    "sim_present": False, "sim_iccid": "", "msisdn": ""}
+                    "sim_present": False, "sim_iccid": "", "msisdn": "",
+                    "observed_at": time.time()}
         detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
         if detail.returncode:
             return {"available": False, "registration": "unknown", "data_active": False,
-                    "sim_present": False, "sim_iccid": "", "msisdn": ""}
+                    "sim_present": False, "sim_iccid": "", "msisdn": "",
+                    "observed_at": time.time()}
         text = detail.stdout or ""
         power = self._kv(text, "modem.generic.power-state").lower()
         state = self._kv(text, "modem.generic.state").lower()
@@ -2403,6 +2405,9 @@ class Orchestrator:
             modem, obj, sim_iccid, registration) if sim_present else {}
         if rejection:
             snapshot["network_reject"] = rejection
+        # This belongs to the actual ModemManager sample, not a later publication that may
+        # simply repeat cached state during a backend transition.
+        snapshot["observed_at"] = time.time()
         return snapshot
 
     @staticmethod
@@ -2876,6 +2881,7 @@ class Orchestrator:
                         "available": False, "registration": "unknown",
                         "data_active": False, "sim_present": False,
                         "sim_iccid": "", "msisdn": "",
+                        "observed_at": time.time(),
                     }
                     continue
                 snapshot = self.modem_snapshot(modem)

@@ -616,7 +616,8 @@ modem.3gpp.packet-service-state : attached
                               return_value="/org/freedesktop/ModemManager1/Modem/1"), patch(
                                   "host.mdd_orchestrator.run",
                                   return_value=SimpleNamespace(
-                                      returncode=0, stdout=detail, stderr="")):
+                                      returncode=0, stdout=detail, stderr="")), patch(
+                                  "host.mdd_orchestrator.time.time", return_value=1234.5):
                 value = app.modem_snapshot({"id": "modem-a", "tty": "/dev/ttyUSB2"})
         self.assertTrue(value["available"])
         self.assertFalse(value["sim_present"])
@@ -627,6 +628,7 @@ modem.3gpp.packet-service-state : attached
         self.assertEqual(value["operator_code"], "")
         self.assertEqual(value["access_technology"], "")
         self.assertEqual(value["packet_service"], "")
+        self.assertEqual(value["observed_at"], 1234.5)
 
     def test_sim_missing_replaces_previous_snapshot_without_radio_retry(self):
         with tempfile.TemporaryDirectory() as temp:

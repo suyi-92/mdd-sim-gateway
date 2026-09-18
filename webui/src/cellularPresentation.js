@@ -26,6 +26,26 @@ export function networkAvailability(network, current) {
 export function cellularOperationOutcome(operation, current, networks, language, t) {
   if (!operation) return null
   const fresh = !operation.finished_at || current.observed_at >= operation.finished_at
+  const lateRegistration = operation.action === 'apply' && operation.state === 'failed'
+    && ['operation_timeout', 'network_timeout'].includes(operation.error?.code)
+    && Number(operation.finished_at || 0) > 0
+    && current.observed_at > operation.finished_at && current.connected
+  if (lateRegistration) {
+    const requestedCode = operation.selection?.operator_id || ''
+    const requested = networks.find(item => item.operator_id === requestedCode)
+      || { operator_id: requestedCode }
+    const requestedLabel = networkLabel(requested, language) || t('Automatic network selection')
+    const currentLabel = networkLabel(current, language)
+    const matches = operation.selection?.mode === 'automatic'
+      || (operation.selection?.mode === 'manual' && requestedCode === current.operator_id)
+    return matches
+      ? { tone: 'info', resolved: true, text: t(
+        'The network request timed out, but a newer modem sample confirms registration on {network}. The requested selection mode was not confirmed.',
+        { network: currentLabel }) }
+      : { tone: 'warning', resolved: true, text: t(
+        'The network request timed out. Service has recovered on {current}, but the requested network {network} was not confirmed.',
+        { current: currentLabel, network: requestedLabel }) }
+  }
   if (operation.action === 'apply' && operation.state === 'success') {
     const code = operation.result?.registration?.operator_id || operation.selection?.operator_id
     const target = networks.find(item => item.operator_id === code)

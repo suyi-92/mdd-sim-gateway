@@ -92,3 +92,40 @@ test('a last-scan current badge follows the live PLMN after changing networks', 
   assert.equal(networkAvailability({ ...mobile, status: 'available' }, live(mobile)), 'current')
   assert.equal(networkAvailability({ ...mobile, status: 'current' }, { ...live(), connected: false }), 'available')
 })
+
+test('a newer registration supersedes timeout as current truth without rewriting history', () => {
+  const automatic = { action: 'apply', state: 'failed', finished_at: 100,
+    selection: { mode: 'automatic', operator_id: '' },
+    error: { code: 'operation_timeout', recovery: { state: 'failed' } } }
+  const recovered = cellularOperationOutcome(
+    automatic, live(unicom), [mobile, unicom], 'zh', translated)
+  assert.equal(recovered.tone, 'info')
+  assert.equal(recovered.resolved, true)
+  assert.match(recovered.text, /newer modem sample confirms registration on 中国联通 \(46001\)/)
+  assert.match(recovered.text, /selection mode was not confirmed/)
+
+  assert.equal(cellularOperationOutcome(
+    automatic, { ...live(unicom), observed_at: 100 }, [unicom], 'zh', translated), null)
+  assert.equal(cellularOperationOutcome(
+    { ...automatic, finished_at: 0 }, live(unicom), [unicom], 'zh', translated), null)
+  assert.equal(cellularOperationOutcome(
+    automatic, { ...live(unicom), connected: false }, [unicom], 'zh', translated), null)
+})
+
+test('late registration on another PLMN does not confirm a manual target', () => {
+  const manual = { action: 'apply', state: 'failed', finished_at: 100,
+    selection: { mode: 'manual', operator_id: '46000' },
+    error: { code: 'network_timeout' } }
+  const other = cellularOperationOutcome(
+    manual, live(unicom), [mobile, unicom], 'zh', translated)
+  assert.equal(other.tone, 'warning')
+  assert.equal(other.resolved, true)
+  assert.match(other.text, /Service has recovered on 中国联通 \(46001\)/)
+  assert.match(other.text, /requested network 中国移动 \(46000\) was not confirmed/)
+
+  const matching = cellularOperationOutcome(manual, live(mobile), [mobile], 'zh', translated)
+  assert.equal(matching.tone, 'info')
+  assert.match(matching.text, /selection mode was not confirmed/)
+  assert.equal(cellularOperationOutcome(
+    { ...manual, error: { code: 'network_rejected' } }, live(mobile), [mobile], 'zh', translated), null)
+})

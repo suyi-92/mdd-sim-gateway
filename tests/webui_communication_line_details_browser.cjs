@@ -205,8 +205,8 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     }
 
     await page.goto(origin + '/#/devices')
-    await page.getByText('Travel modem', { exact: true }).click()
-    const registered = page.getByText(
+    await page.locator('.u-device-sidebar .u-device-option').filter({ hasText: 'Travel modem' }).click()
+    const registered = page.locator('.u-device-body').getByText(
       '漫游已注册 · LTE · 中国联通 · 信号 78% · 无数据承载', { exact: true })
     await registered.waitFor()
     for (const width of [1440, 900, 390]) {
@@ -308,11 +308,26 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       assert.equal(await page.locator('.u-content').evaluate(element => element.scrollWidth > element.clientWidth), false)
       await page.locator('.u-cellular-network').screenshot({ path: path.join(output, `registration-error-${width}.png`), animations: 'disabled' })
     }
+    // The historical timeout remains in the operation journal, but a strictly newer modem
+    // sample is current truth. Replace the red instruction with a neutral late-recovery fact;
+    // do not claim the requested selection mode was saved.
+    operation = { id: 'apply-late', action: 'apply', state: 'failed', finished_at: 500,
+      selection: { mode: 'automatic', operator_id: '' },
+      error: { code: 'operation_timeout', recovery: { state: 'failed' } } }
+    devices[1].cellular = { ...devices[1].cellular, registration: 'roaming',
+      operator: 'China Unicom', operator_zh: '中国联通', operator_code: '46001', observed_at: 600 }
+    await feedback.getByText(/本次选网请求曾超时，但更新的模块采样已确认当前驻网：中国联通 \(46001\)/).waitFor()
+    assert.equal(await page.locator('.u-cellular-network-feedback.is-error').count(), 0)
+    assert.equal((await feedback.innerText()).includes('恢复失败'), false)
+    assert.equal((await feedback.locator('span').innerText()), 'i')
+    await page.locator('.u-cellular-network').screenshot({ path: path.join(output, 'registration-late-recovery.png'), animations: 'disabled' })
     await page.getByRole('button', { name: '自动', exact: true }).click()
     await feedback.getByText('由 SIM 自动选择可接入的运营商。', { exact: true }).waitFor()
     assert.equal(await page.locator('.u-cellular-network-feedback.is-error').count(), 0,
       'changing selection must clear the previous attempt’s error')
     assert.equal(await page.getByRole('button', { name: '扫描网络' }).isEnabled(), false)
+    devices[1].cellular = { ...devices[1].cellular, operator: 'China Mobile', operator_zh: '中国移动',
+      operator_code: '46000', observed_at: 600 }
     await page.getByRole('button', { name: '手动', exact: true }).click()
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '扫描网络' }).click()
@@ -320,6 +335,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     devices[1].cellular = { ...devices[1].cellular, registration: 'searching', observed_at: 300 }
     operation = { ...operation, state: 'partial', finished_at: 250,
       error: { code: 'scan_recovery', recovery: { state: 'failed', mode: 'manual', operator_id: '46000' } } }
+    await page.reload()
     await page.locator('.u-cellular-network-feedback.is-warning').getByText(/扫描后未能恢复驻网/).waitFor()
     await page.locator('.u-cellular-current').getByText('未连接', { exact: true }).waitFor()
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).count(), 1)
@@ -344,6 +360,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       egress: { country: 'hk', detected_country: 'hk', mode: 'manual', ready: false },
       sim: { present: true, number: '+12025550123', number_country: 'us', home_country: 'hk',
         carrier: { name: 'Saily', brand_source: 'esim_profile', plmn: '454-00' } } }
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
     await page.waitForFunction(() => [...document.querySelectorAll('.u-line-selector select')]
       .some(select => select.offsetParent && select.value === '3'))
     assert.deepEqual(await page.locator('.u-line-selector:visible select option').evaluateAll(

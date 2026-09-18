@@ -5234,7 +5234,7 @@ async def _unified_devices() -> list[dict]:
                     "operator_zh": visited["name_zh"],
                     "operator_reported": visited["reported_name"],
                     "operator_name_conflict": visited["name_conflict"],
-                    "observed_at": observed_doc.get("updated_at") or 0,
+                    "observed_at": float(host_cell.get("observed_at") or 0),
                     "operator_code": visited["operator_id"],
                     "access_technology": host_cell.get("access_technology") or "",
                     "packet_service": host_cell.get("packet_service") or "",

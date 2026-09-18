@@ -482,6 +482,8 @@ const zh = {
   "The original selection was not restored. Current network: {network}.": "原选网目标未恢复，当前网络：{network}。",
   "Restoring cellular registration is still in progress.": "扫描后的驻网恢复仍在进行，请稍候。",
   "The modem could not restore registration after scanning. Choose Automatic, then Apply network to reconnect.": "扫描后未能恢复驻网。可切换到“自动”，再点击“应用网络”重新连接。",
+  "The network request timed out, but a newer modem sample confirms registration on {network}. The requested selection mode was not confirmed.": "本次选网请求曾超时，但更新的模块采样已确认当前驻网：{network}。请求的选网模式并未被确认保存。",
+  "The network request timed out. Service has recovered on {current}, but the requested network {network} was not confirmed.": "本次选网请求曾超时；服务已在 {current} 恢复，但请求的网络 {network} 未获确认。",
 
   "Saved network": "已保存网络",
   "Saved selection": "已保存选择",
