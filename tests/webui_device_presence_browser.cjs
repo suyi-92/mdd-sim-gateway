@@ -20,6 +20,8 @@ const reader = { id: 'reader-fixture', name: 'SCR Prime CCID Reader (fixture) 00
   sim: { present: false }, capabilities: { vowifi: { desired: false, actual: 'off' } } }
 let devices = [modem, reader]
 let rescanOperationId = ''
+let rescanScope = ''
+let rescanDeviceId = ''
 let discovering = false
 const mutations = []
 const json = (response, value) => {
@@ -32,17 +34,21 @@ const server = http.createServer((request, response) => {
     if (request.method !== 'GET') mutations.push([request.method, url.pathname])
     if (request.method === 'POST' && url.pathname === '/api/devices/rescan') {
       rescanOperationId = '0123456789abcdef'
+      rescanScope = 'all'; rescanDeviceId = ''
       discovering = true
       return json(response, { ok: true, state: 'requested', operation_id: rescanOperationId })
     }
     if (request.method === 'POST' && /^\/api\/devices\/[^/]+\/rescan$/.test(url.pathname)) {
       rescanOperationId = 'fedcba9876543210'
+      rescanScope = 'device'; rescanDeviceId = decodeURIComponent(url.pathname.split('/')[3])
       return json(response, { ok: true, state: 'requested', operation_id: rescanOperationId,
         scope: 'device' })
     }
     if (request.method === 'GET' && url.pathname === '/api/devices/rescan/progress') {
       return json(response, rescanOperationId
-        ? { state: discovering ? 'running' : 'success', operation_id: rescanOperationId, modems_detected: 1 }
+        ? { state: discovering ? 'running' : 'success', operation_id: rescanOperationId,
+          scope: rescanScope, device_id: rescanDeviceId, sim_state: 'unknown',
+          registration_state: 'unknown', modems_detected: 1 }
         : { state: 'idle' })
     }
     const hardware = url.pathname.match(/^\/api\/devices\/([^/]+)\/hardware$/)

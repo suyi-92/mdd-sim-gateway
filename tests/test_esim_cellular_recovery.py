@@ -9,6 +9,27 @@ from control.app import esim_recovery, main
 
 
 class RecoveryStoreTests(unittest.TestCase):
+    def test_flight_pause_survives_restart_and_resumes_with_one_bounded_budget(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(esim_recovery.time, 'time', return_value=1000) as clock:
+            path = str(Path(temp) / 'recovery.json')
+            store = esim_recovery.RecoveryStore(path, timeout=90)
+            task = store.schedule('modem-a', 'fixture-card', 'reader', 'generation-a')
+            store.update(task['id'], 'waiting_flight_mode')
+            clock.return_value = 87400
+            restarted = esim_recovery.RecoveryStore(path, timeout=90)
+            paused = restarted.active()
+            self.assertEqual([item['id'] for item in paused], [task['id']])
+            self.assertEqual(paused[0]['deadline_at'], 0)
+            self.assertEqual(paused[0]['hardware_generation'], 'generation-a')
+            resumed = restarted.update(task['id'], 'waiting_baseband')
+            self.assertEqual(resumed['deadline_at'], 87490)
+            clock.return_value = 87480
+            self.assertEqual(restarted.update(task['id'], 'registering')['deadline_at'], 87490)
+            clock.return_value = 87491
+            self.assertEqual(restarted.active(), [])
+            self.assertEqual(restarted.latest('modem-a')['error_code'], 'recovery_timeout')
+
     def test_new_switch_supersedes_old_and_restart_keeps_current_task(self):
         with tempfile.TemporaryDirectory() as temp:
             path = str(Path(temp) / "recovery.json")
@@ -94,6 +115,43 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_bridge_card_evidence", return_value=True):
             await main._advance_esim_cellular_recovery(task)
         self.assertEqual(self.store.update(task["id"])["error_code"], "profile_changed")
+
+    async def test_paused_task_keeps_usb_generation_guard_after_old_deadline(self):
+        with patch.object(esim_recovery.time, 'time', return_value=1000) as clock:
+            task = self.store.schedule(
+                'modem-a', 'fixture-card', 'reader', 'generation-a')
+            self.store.update(task['id'], 'waiting_flight_mode',
+                              local_identity_verified=True)
+            clock.return_value = 87400
+            task = self.store.active()[0]
+            observed = self.observed()
+            observed['devices']['modem-a']['usb_generation'] = 'generation-b'
+            with patch.object(main.device_state, 'status', return_value=observed), \
+                    patch.object(main, '_esim_restore_cellular_selection',
+                                 new=AsyncMock()) as start:
+                await main._advance_esim_cellular_recovery(task)
+            start.assert_not_awaited()
+            self.assertEqual(self.store.latest('modem-a')['error_code'],
+                             'device_generation_changed')
+
+    async def test_paused_task_resumes_with_new_budget_after_radio_is_allowed(self):
+        with patch.object(esim_recovery.time, 'time', return_value=1000) as clock:
+            task = self.store.schedule(
+                'modem-a', 'fixture-card', 'reader', 'generation-a')
+            self.store.update(task['id'], 'waiting_flight_mode',
+                              local_identity_verified=True)
+            clock.return_value = 87400
+            with patch.object(main.device_state, 'status', return_value=self.observed()), \
+                    patch.object(main, '_device_identities', return_value={}), \
+                    patch.object(main.capability_lock, 'locked', return_value=False), \
+                    patch.object(main.network_operations, 'busy', return_value=False), \
+                    patch.object(main, '_esim_restore_cellular_selection', new=AsyncMock(
+                        return_value={'operation': {'state': 'running'}})) as start:
+                await main._advance_esim_cellular_recovery(self.store.active()[0])
+            start.assert_awaited_once_with('modem-a', 'fixture-card')
+            resumed = self.store.latest('modem-a')
+            self.assertEqual(resumed['state'], 'registering')
+            self.assertEqual(resumed['deadline_at'], 87400 + self.store.timeout)
 
 
 if __name__ == "__main__":

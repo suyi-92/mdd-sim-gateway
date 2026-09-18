@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, connectWs, setCsrf } from './api.js'
+import { createRefreshCoordinator } from './refreshCoordinator.js'
 import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Messages from './views/Messages.jsx'
@@ -97,6 +98,7 @@ function legacyDevices(instances, cards) {
 export default function App() {
   const { t } = useI18n()
   const [view, setView] = useState(viewFromHash); const [menuOpen, setMenuOpen] = useState(false)
+  const [visitedViews, setVisitedViews] = useState(() => [viewFromHash()])
   const [instances, setInstances] = useState([]); const [cards, setCards] = useState([]); const [devices, setDevices] = useState([])
   // Sessions live in memory, so signing in normally happens seconds after the control plane
   // restarted — while its first card scan is still running. Until that scan has answered,
@@ -128,9 +130,12 @@ export default function App() {
   const [authState, setAuthState] = useState(null)
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
   const namedHardware = useRef({ devices: [], cards: [] })
-  const refreshInFlight = useRef(false)
+  const refreshCoordinator = useRef(null)
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('theme', theme) }, [theme])
+  useEffect(() => {
+    setVisitedViews(previous => previous.includes(view) ? previous : [...previous, view])
+  }, [view])
   // Keep the address bar on the current page without growing history, and follow the hash
   // when the user edits it or navigates back/forward (replaceState never fires hashchange,
   // so the two effects cannot feed each other).
@@ -159,22 +164,14 @@ export default function App() {
     setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))
   },[])
 
-  const refresh = useCallback(async () => {
-    if (refreshInFlight.current) return
-    refreshInFlight.current = true
-    try {
-      const [instancesResult, cardsResult, devicesResult] = await Promise.allSettled([
-        api.instances(), api.cards(), api.devices(),
-      ])
-      setInitialLoading(false)
-      setLoadErrors({
-        instances: instancesResult.status === 'rejected',
-        cards: cardsResult.status === 'rejected',
-        devices: devicesResult.status === 'rejected' && devicesResult.reason?.status !== 404,
-      })
-      const nextInstances = instancesResult.status === 'fulfilled' ? instancesResult.value.instances || [] : null
-      const nextCards = cardsResult.status === 'fulfilled' ? cardsResult.value.cards || [] : null
-      if (nextInstances) {
+  if (!refreshCoordinator.current) refreshCoordinator.current = createRefreshCoordinator(
+    { instances: () => api.instances(), cards: () => api.cards(), devices: () => api.devices() },
+    (scope, result, results) => {
+      setLoadErrors(previous => ({ ...previous,
+        [scope]: result.status === 'rejected' && !(scope === 'devices' && result.reason?.status === 404),
+      }))
+      if (scope === 'instances' && result.status === 'fulfilled') {
+        const nextInstances = result.value.instances || []
         setInstances(nextInstances)
         // Selection is view context, not a global default. In particular, opening an offline
         // device must never silently put the first unrelated saved SIM into its edit/delete
@@ -182,21 +179,25 @@ export default function App() {
         setSelected(s => s && nextInstances.some(item => String(item.id) === String(s)) ? s : null)
         setCallSelected(s => s && nextInstances.some(item => String(item.id) === String(s)) ? s : null)
       }
-      if (nextCards) setCards(nextCards)
-      if (devicesResult.status === 'fulfilled') {
-        const r=devicesResult.value; const list=Array.isArray(r)?r:(r.devices||[])
+      if (scope === 'cards' && result.status === 'fulfilled') setCards(result.value.cards || [])
+      if (scope === 'devices' && result.status === 'fulfilled') {
+        const r=result.value; const list=Array.isArray(r)?r:(r.devices||[])
         unifiedAvailable.current=true; setDevices(list); setDiscovering(!!r.discovering)
         setLastDeviceUpdate(Date.now())
+      }
       // Compatibility mode is only for an older backend that does not implement the unified
       // endpoint. A transient network failure must not turn every saved line and reader into
       // a temporary "device" until the next poll succeeds.
-      } else if (devicesResult.reason?.status === 404 && nextInstances && nextCards) {
-        unifiedAvailable.current=false; setDevices(legacyDevices(nextInstances,nextCards)); setDiscovering(false)
+      if (results.devices?.status === 'rejected' && results.devices.reason?.status === 404
+          && results.instances?.status === 'fulfilled' && results.cards?.status === 'fulfilled') {
+        unifiedAvailable.current=false
+        setDevices(legacyDevices(results.instances.value.instances || [], results.cards.value.cards || []))
+        setDiscovering(false)
       }
-    } finally {
-      refreshInFlight.current = false
-    }
-  }, [])
+    },
+    () => setInitialLoading(false),
+  )
+  const refresh = useCallback(() => refreshCoordinator.current(), [])
   useEffect(()=>{
     window.addEventListener('mdd-auth-expired',expireAuth)
     return()=>window.removeEventListener('mdd-auth-expired',expireAuth)
@@ -245,12 +246,13 @@ export default function App() {
   const callSel=instances.find(i=>String(i.id)===String(callSelected))
   const presentDeviceCount=physicallyPresentDevices(devices).length
   const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
-  const content={
+  const pages={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>,
-    messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,
+    messages:<Messages {...common}/>, esim:<Esim {...common} pageVisible={view === 'esim'}/>, keepalive:<Keepalive {...common}/>,
     egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
-  }[view]
+  }
+  const mountedViews = visitedViews.includes(view) ? visitedViews : [...visitedViews, view]
   const communicationView = view === 'calls' || view === 'messages'
   const issueUrl = `${(systemMeta.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`
   return <div className="u-shell">
@@ -265,7 +267,15 @@ export default function App() {
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className={`u-live${loadErrors.devices ? " is-stale" : ""}`} role="status" title={lastDeviceUpdate ? t('Last device update: {time}', { time: new Date(lastDeviceUpdate).toLocaleTimeString() }) : undefined}><span className="u-dot" /><span className="u-live-label">{initialLoading?t('Loading…'):loadErrors.devices?t('Device list is out of date; retrying'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</span></div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>{view !== 'calls' && content}</div></main>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className={`u-live${loadErrors.devices ? " is-stale" : ""}`} role="status" title={lastDeviceUpdate ? t('Last device update: {time}', { time: new Date(lastDeviceUpdate).toLocaleTimeString() }) : undefined}><span className="u-dot" /><span className="u-live-label">{initialLoading?t('Loading…'):loadErrors.devices?t('Device list is out of date; retrying'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</span></div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>
+      {mountedViews.filter(page => page !== 'calls').map(page => (
+        <div key={page} className={page === 'messages' ? 'u-persistent-call-page' : undefined}
+          hidden={page !== view} aria-hidden={page !== view}
+          style={{ display: page !== view ? 'none' : page === 'messages' ? undefined : 'contents' }}>
+          {pages[page]}
+        </div>
+      ))}
+    </div></main>
     {toast&&<div className="u-toast" key={toast.id} role="status">{toast.message}</div>}
   </div>
 }

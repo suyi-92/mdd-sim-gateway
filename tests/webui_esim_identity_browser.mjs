@@ -40,11 +40,16 @@ try {
  const page = await browser.newPage()
  const errors=[]; page.on('pageerror', e=>errors.push(e.message))
  await page.addInitScript(()=>localStorage.setItem('mdd-language','en'))
- let current='card-a', pending, cacheReads=0, notificationStatus=null
+ let current='card-a', pending, cacheReads=0, notificationStatus=null, downloadOperation=null
  const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[{iccid:card,profileNickname:card,profileState:'enabled',notification_status:notificationStatus}]}]})
  await page.route('**/api/**', async route => {
    const url=new URL(route.request().url())
    if(url.pathname==='/api/esim/status') return route.fulfill({json:{available:true}})
+   if(url.pathname==='/api/esim/download/operation') return route.fulfill({json:{operation:downloadOperation}})
+   if(url.pathname==='/api/esim/download' && route.request().method()==='POST') {
+     downloadOperation={operation_id:'0123456789abcdef01234567',state:'running',step:'es10b_prepare_download',generation:1,updated_at:100}
+     return route.fulfill({json:{ok:true,started:true,operation_id:downloadOperation.operation_id,operation:downloadOperation}})
+   }
    if(url.pathname==='/api/esim/chip/cached') { cacheReads++; return route.fulfill({json:payload(current)}) }
    if(url.pathname==='/api/esim/chip') { pending=route; return }
    throw new Error('Unexpected API '+url.pathname)
@@ -52,6 +57,14 @@ try {
  const address=server.httpServer.address()
  await page.goto('http://127.0.0.1:'+address.port+'/fixture')
  await page.getByText('card-a',{exact:true}).last().waitFor()
+ // Initial operation status was idle. Starting a new download must start polling; no WS
+ // completion is delivered, so only the persisted GET can finish this card.
+ await page.getByRole('button',{name:'Download eSIM',exact:true}).click()
+ await page.getByText('LPA activation code',{exact:true}).locator('..').locator('textarea').fill('LPA:1$smdp.example.invalid$fixture-match')
+ await page.locator('.u-download-action').click()
+ await page.getByText('Downloading…',{exact:true}).waitFor()
+ downloadOperation={...downloadOperation,state:'success',step:'completed',generation:1,updated_at:101,finished_at:101}
+ await page.getByText('Download complete',{exact:true}).waitFor()
  // An old live response must not replace a same-name replacement card cache.
  await page.getByRole('button',{name:'Load',exact:true}).click()
  await page.waitForFunction(()=>document.querySelector('.u-load-action')?.textContent.includes('Loading'))

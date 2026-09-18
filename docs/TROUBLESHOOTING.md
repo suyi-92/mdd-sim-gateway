@@ -1,5 +1,13 @@
 # VMware 故障排查
 
+`1.9.4-vmware.27` 把“请求已接受”和“硬件/运营商已连接”分开。设备开关应立即显示持久任务阶段
+（保存目标、停止线路、硬件收敛、恢复线路），切页或刷新后继续查询同一任务；`starting` 只表示
+业务连接尚未完成，不再永久锁死关闭开关。若任务显示 `interrupted`，Control 在执行期间发生过
+重启：系统不会重放可能有副作用的动作，应以当前 desired/actual 状态为准后人工重试。设备重检
+在宿主完成后仍需等待 Control 确认新 PC/SC 代次，但现在有硬截止；服务重启带任务 ID 并拒绝
+另一范围覆盖；eSIM 下载可恢复安全阶段与封闭错误码，但不会保存或回显激活码、确认码、ICCID、
+原始 lpac metadata。飞行模式等待不再消耗 eSIM 蜂窝初始化预算。
+
 `1.9.4-vmware.26` 区分 direct-serial 单路径终态与 MM+direct 双路径终态。飞行模式下
 ModemManager 没有运行，direct 返回 PhoneFailure 只能写为 `sim_access_failed_direct`；不得据此
 声称 MM 路径也失败。新版终态会保存已尝试路径；旧版没有这项证据的双路径记录按单路径保守

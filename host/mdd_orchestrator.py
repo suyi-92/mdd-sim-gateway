@@ -391,6 +391,9 @@ MODEM_MAY_PROVIDE_DEFAULT_ROUTE = os.environ.get(
 # an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
 # ModemManager has decided not to manage this hardware, not that it is still working on it.
 MM_CLAIM_GRACE_SECONDS = float(os.environ.get("MDD_MM_CLAIM_GRACE", "180"))
+# Fast sampling helps an explicit radio/data request converge, but a rejected or
+# permanently unavailable network must not keep full reconciles running each second.
+CAPABILITY_POLL_BUDGET_SECONDS = 180.0
 # A bridge that exits is respawned, but blindly and instantly respawning turned one broken
 # serial port into a fifteen-second crash loop that device status reported as a running
 # bridge. Retries double from base to ceiling; a bridge that survives the stable window has
@@ -889,6 +892,7 @@ class Orchestrator:
         self.applied_cellular_backend: bool | None = None
         self.radio_states: dict[str, bool] = {}
         self.cellular_states: dict[str, dict] = {}
+        self._capability_poll: dict[str, tuple[tuple, float]] = {}
         self.data_attempt_at: dict[str, float] = {}
         # Profiles already re-stamped with modem_profile_policy() this process. Correcting a
         # legacy profile is a one-off; without this the data-off path would shell out to nmcli
@@ -1018,6 +1022,16 @@ class Orchestrator:
         previous = self._cellular_recoveries.get(device_id) or {}
         value = {**previous, **fields, "device_id": device_id, "state": state,
                  "updated_at": time.time()}
+        if state == "waiting_flight_mode":
+            value["deadline_at"] = 0.0
+        elif (previous.get("state") == "waiting_flight_mode"
+              and state not in {"ready", "failed", "cancelled"}):
+            value["deadline_at"] = time.time() + ESIM_CELLULAR_RECOVERY_SECONDS
+            # A completed UIM cycle remains completed; only its identity wait resumes.
+            value["identity_deadline_at"] = (
+                time.time() + ESIM_CELLULAR_IDENTITY_WAIT_SECONDS
+                if value.get("power_cycle_completed") else 0.0)
+            value["next_attempt_at"] = 0.0
         self._cellular_recoveries[device_id] = value
         self._persist_cellular_recoveries()
         return value
@@ -1138,6 +1152,24 @@ class Orchestrator:
                     blocked.add(device_id)
                 continue
             modem = current.get(device_id)
+            generation = str((modem or {}).get("usb_generation") or "")
+            expected_generation = str(recovery.get("usb_generation") or "")
+            if modem and expected_generation and generation != expected_generation:
+                self._set_cellular_recovery(
+                    device_id, "cancelled", phase="baseband_initialization",
+                    error_code="device_generation_changed")
+                continue
+            if modem and not expected_generation:
+                recovery = self._set_cellular_recovery(
+                    device_id, state or "pending", usb_generation=generation)
+            if flight_mode:
+                self._set_cellular_recovery(
+                    device_id, "waiting_flight_mode", phase="baseband_initialization")
+                continue
+            blocked.add(device_id)
+            if state == "waiting_flight_mode":
+                recovery = self._set_cellular_recovery(
+                    device_id, "pending", phase="baseband_initialization")
             deadline = float(recovery.get("deadline_at") or 0)
             if deadline and now >= deadline:
                 self._set_cellular_recovery(
@@ -1147,24 +1179,7 @@ class Orchestrator:
             if not modem:
                 self._set_cellular_recovery(
                     device_id, "waiting_device", phase="baseband_initialization")
-                if not flight_mode:
-                    blocked.add(device_id)
                 continue
-            generation = str(modem.get("usb_generation") or "")
-            expected_generation = str(recovery.get("usb_generation") or "")
-            if expected_generation and generation != expected_generation:
-                self._set_cellular_recovery(
-                    device_id, "cancelled", phase="baseband_initialization",
-                    error_code="device_generation_changed")
-                continue
-            if not expected_generation:
-                recovery = self._set_cellular_recovery(
-                    device_id, state or "pending", usb_generation=generation)
-            if flight_mode:
-                self._set_cellular_recovery(
-                    device_id, "waiting_flight_mode", phase="baseband_initialization")
-                continue
-            blocked.add(device_id)
             if not through_modemmanager:
                 self._set_cellular_recovery(
                     device_id, "waiting_modemmanager", phase="baseband_initialization")
@@ -1446,12 +1461,19 @@ class Orchestrator:
             pass
         status_path = self.root / "service-restart-status.json"
         scope = str(request.get("scope") or "")
+        operation_id = str(request.get("operation_id") or "")
+        requested_at = request.get("requested_at")
 
         def publish(state: str, **fields):
             atomic_json(status_path, {"state": state, "scope": scope,
+                                      "operation_id": operation_id,
+                                      "requested_at": requested_at,
+                                      "orchestrator_pid": os.getpid(),
                                       "updated_at": int(time.time()), **fields})
 
-        if scope not in {"control", "services", "host"}:
+        if (scope not in {"control", "services", "host"}
+                or not re.fullmatch(r"[0-9a-f]{16}", operation_id)
+                or not isinstance(requested_at, int)):
             publish("failed", error_code="restart.error.invalid_scope")
             return
         if self.dry_run:
@@ -1464,8 +1486,8 @@ class Orchestrator:
             if result.returncode:
                 publish("failed", error_code="restart.error.failed",
                         error=(result.stderr or result.stdout or "").strip()[:400])
-            else:
-                publish("success")
+            # systemctl returning only proves the process was spawned. Leave the operation
+            # running until settle_service_restart observes both systemd and HTTPS healthy.
             return
         if scope == "host":
             # systemd owns the shutdown from here; this process is torn down with everything
@@ -1552,10 +1574,21 @@ class Orchestrator:
                 age = max(0, now - int(status.get("updated_at") or 0))
             except (TypeError, ValueError):
                 age = SERVICE_RESTART_SETTLE_SECONDS[scope] + 1
-            if age <= SERVICE_RESTART_SETTLE_SECONDS[scope]:
+            https = run(["curl", "-ksS", "--max-time", "3", "-o", "/dev/null",
+                         "-w", "%{http_code}",
+                         "https://127.0.0.1:8443/api/auth/status"])
+            healthy = (self.service_active("mdd-sim-gateway-control.service")
+                       and https.returncode == 0 and str(https.stdout or "").strip() == "200")
+            # A detached full-service/host restart is launched while this old process and
+            # HTTPS are still healthy. Only the replacement orchestrator may certify it;
+            # control-only restart deliberately keeps this process.
+            replacement_process = (scope == "control"
+                                   or int(status.get("orchestrator_pid") or 0) != os.getpid())
+            if (age <= SERVICE_RESTART_SETTLE_SECONDS[scope]
+                    and healthy and replacement_process):
                 atomic_json(status_path, {**status, "state": "success",
                                           "updated_at": now})
-            else:
+            elif age > SERVICE_RESTART_SETTLE_SECONDS[scope]:
                 # An unrelated later restart must not turn a long-dead detached job into a
                 # false success. The API also applies a shorter timeout while Control remains
                 # alive; this covers the case where nobody had the page open to observe it.
@@ -1664,6 +1697,7 @@ class Orchestrator:
                               if bridge_failure and not vowifi_actual else "",
                           ) if part)),
             }
+        self._update_capability_poll(devices)
         atomic_json(self.device_status_path, {
             "version": 2, "updated_at": int(time.time()), "devices": devices,
             "shared": {
@@ -1678,6 +1712,42 @@ class Orchestrator:
                 "isolation": "ModemManager is shared; radio, registration and NetworkManager data profiles are scoped per modem",
             },
         })
+
+    def _update_capability_poll(self, devices: dict) -> None:
+        """Keep ordinary RF/MM discovery/data convergence out of the idle backoff.
+
+        The loop fingerprint intentionally ignores volatile modem snapshots. Track only
+        unfinished radio/data intent here, bounded per USB generation and desired state.
+        This changes observation cadence, never the radio, SIM or network safety gates.
+        """
+        pending = {}
+        now = time.time()
+        for device_id, device in devices.items():
+            actual = device.get("actual") or {}
+            cellular = device.get("cellular") or {}
+            recovery = device.get("cellular_recovery") or {}
+            if (not device.get("present") or self._serial_mode or device.get("error")
+                    or cellular.get("failed_reason")
+                    or cellular.get("network_reject")
+                    or recovery.get("state") in {"failed", "cancelled"}):
+                continue
+            wanted = device.get("desired") or {}
+            radio = not bool(wanted.get("flight_mode"))
+            data = radio and bool(wanted.get("cellular_enabled"))
+            radio_ready = (actual.get("cellular_radio_enabled") == radio
+                           and (not radio or (actual.get("cellular_backend_active")
+                                              and cellular.get("available"))))
+            if (radio_ready
+                    and bool(cellular.get("data_active")) == data):
+                continue
+            key = (str(device.get("usb_generation") or ""), radio, data)
+            previous = self._capability_poll.get(device_id)
+            deadline = (previous[1] if previous and previous[0] == key
+                        else now + CAPABILITY_POLL_BUDGET_SECONDS)
+            # Retain expired windows until the intent changes or converges; otherwise
+            # each new status sample would start another fast-poll budget forever.
+            pending[device_id] = (key, deadline)
+        self._capability_poll = pending
 
     def stop_bridges(self):
         """Release the exclusive AT port before ModemManager starts."""
@@ -4274,6 +4344,10 @@ class Orchestrator:
             cycle_inputs = self._input_mtimes()
             self.process_backup_operation_request()
             self.process_service_restart_request()
+            # ``control`` does not restart this process, while a full restart can return
+            # before HTTPS is ready. Re-check the same operation until the health proof or
+            # its bounded deadline, rather than settling only once at process startup.
+            self.settle_service_restart()
             self.process_bridge_restart_requests()
             self.retire_obsolete_services()
             self.reconcile_timezone()
@@ -4390,7 +4464,8 @@ class Orchestrator:
                      self.data / "config.yaml", self.reselect_path,
                      self.bridge_restart_request_dir, self.exit_test_request_dir,
                      self.backup_operation_request_path,
-                     self.device_rescan_request_path):
+                     self.device_rescan_request_path,
+                     self.root / "service-restart-request.json"):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:
@@ -4428,6 +4503,10 @@ class Orchestrator:
         if any(value.get("state") not in {"ready", "failed", "cancelled",
                                           "waiting_flight_mode"}
                for value in self._cellular_recoveries.values()):
+            seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
+        if read_json(self.root / "service-restart-status.json").get("state") == "running":
+            seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
+        if any(deadline > time.time() for _key, deadline in self._capability_poll.values()):
             seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
         deadline = time.time() + seconds
         poll_interval = min(self.interval, INPUT_WAKE_POLL_SECONDS)

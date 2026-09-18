@@ -62,6 +62,7 @@ const server = http.createServer(async (request, response) => {
       '/api/instances': { instances: [{ id: '7', name: 'Fixture line', iccid: 'profile-active', status: { state: running ? 'OK' : 'STOPPED' } },
         { id: '8', name: 'Unrelated line', status: { state: 'OK' } }] },
       '/api/esim/status': { available: true },
+      '/api/esim/download/operation': { operation: null },
       '/api/esim/chip/cached': { cached: true, ts: 1788825600, ses: [{ id: 'default', aid: 'fixture-aid', eid: 'fixture-euicc', profiles }] },
       '/api/system/status': { version: 'fixture' },
     }

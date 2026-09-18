@@ -80,9 +80,17 @@ class RecoveryStore:
             task = tasks.get(str(task_id))
             if not isinstance(task, dict):
                 return None
+            previous_state = task.get("state")
             task.update(fields)
             if state:
                 task["state"] = state
+            if task.get("state") == "waiting_flight_mode":
+                # RF is deliberately unavailable. Waiting for an operator must survive
+                # an overnight pause/restart without spending the execution budget.
+                task["deadline_at"] = 0.0
+            elif (previous_state == "waiting_flight_mode" and state
+                  and state not in TERMINAL_STATES):
+                task["deadline_at"] = now + self.timeout
             task["updated_at"] = now
             if task.get("state") in TERMINAL_STATES:
                 task["finished_at"] = now
@@ -99,7 +107,8 @@ class RecoveryStore:
             for task in tasks.values():
                 if not isinstance(task, dict) or task.get("state") in TERMINAL_STATES:
                     continue
-                if now >= float(task.get("deadline_at") or 0):
+                if (task.get("state") != "waiting_flight_mode"
+                        and now >= float(task.get("deadline_at") or 0)):
                     task.update(state="failed", phase="expired",
                                 error_code="recovery_timeout", updated_at=now,
                                 finished_at=now)

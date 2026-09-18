@@ -37,7 +37,7 @@ from . import (store, engine, status as status_mod, sim, card, notify_push, lpa,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd,
                live_translation, cellular_network, cellular_operations)
-from . import esim_recovery
+from . import capability_operations, esim_recovery, esim_operations
 from .version import VERSION
 from . import stability
 from . import ims_recovery
@@ -778,15 +778,22 @@ class Hub:
 
 hub = Hub()
 capability_lock = asyncio.Lock()
+capability_operation_store = capability_operations.CapabilityOperations(
+    os.path.join(cfg.DATA_DIR, "device-capability-operations.json"))
+capability_tasks: set[asyncio.Task] = set()
 network_operations = cellular_operations.NetworkOperations()
 esim_recoveries = esim_recovery.RecoveryStore(
     os.path.join(cfg.DATA_DIR, "esim-cellular-recoveries.json"))
+esim_download_operations = esim_operations.DownloadOperations(
+    os.path.join(cfg.DATA_DIR, "esim-download-operations.json"))
+esim_download_tasks: set[asyncio.Task] = set()
 PCSC_MAINTENANCE_WINDOW_SECONDS = 45
 CARD_PROBE_TIMEOUT_SECONDS = 8
 CARD_PROBE_HARD_TIMEOUT_SECONDS = float(
     os.environ.get("MDD_CARD_PROBE_HARD_TIMEOUT", "45"))
 CARD_ICCID_HARD_TIMEOUT_SECONDS = float(
     os.environ.get("MDD_CARD_ICCID_HARD_TIMEOUT", "20"))
+DEVICE_RESCAN_CONTROL_TIMEOUT_SECONDS = max(180.0, CARD_PROBE_HARD_TIMEOUT_SECONDS * 3)
 
 
 def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
@@ -3173,6 +3180,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
 async def lifespan(app: FastAPI):
     hub.event_loop = asyncio.get_running_loop()
     store.init()
+    await asyncio.to_thread(esim_download_operations.interrupt_running)
     # A lowered operator limit may leave more saved or running lines than currently allowed.
     # Keep every saved record, but stop excess engines before background recovery begins.
     for saved_line in cfg.list_instances():
@@ -3219,10 +3227,17 @@ async def lifespan(app: FastAPI):
     host_poller.cancel()
     segment_reaper.cancel()
     esim_recovery_poller.cancel()
+    downloads = list(esim_download_tasks)
+    capability_changes = list(capability_tasks)
+    for task in downloads:
+        task.cancel()
+    for task in capability_changes:
+        task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, esim_recovery_poller,
+                         segment_reaper, esim_recovery_poller, *downloads,
+                         *capability_changes,
                          return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
@@ -5125,6 +5140,8 @@ async def _unified_devices() -> list[dict]:
     shared = observed_doc.get("shared") or {}
 
     settings = cfg.get_settings()
+    capability_snapshots = await asyncio.to_thread(
+        capability_operation_store.latest_all)
     egress_snapshot = egress.status()
     configured_exits = settings.get("proxy", {}).get("exits", {}) or {}
     available_countries = sorted(country for country, value in configured_exits.items()
@@ -5384,6 +5401,7 @@ async def _unified_devices() -> list[dict]:
             "cellular": cellular_view,
             "cellular_recovery": cellular_recovery,
             "esim_recovery": esim_recovery_status,
+            "capability_operation": capability_snapshots.get(device_id) or {},
             "cellular_network": {
                 "mode": str((inst or {}).get("cellular_network_mode") or "automatic"),
                 "operator_id": str((inst or {}).get("cellular_operator_id") or ""),
@@ -5510,6 +5528,14 @@ def api_devices_rescan_progress():
         # The host backends are ready, but the Control cache has not yet reconciled its first
         # authoritative PC/SC snapshot. Keep the browser waiting rather than announcing a
         # complete scan that still contains the previous reader generation.
+        try:
+            control_age = (max(0.0, time.time() - float(status["updated_at"]))
+                           if status.get("updated_at") else 0.0)
+        except (TypeError, ValueError):
+            control_age = 0.0
+        if control_age > DEVICE_RESCAN_CONTROL_TIMEOUT_SECONDS:
+            return {**status, "state": "failed",
+                    "error_code": "rescan.error.pcsc_timeout"}
         return {**status, "state": "running", "phase": "pcsc"}
     if status.get("state") == "success" and status.get("scope") == "device":
         target = str(status.get("device_id") or "")
@@ -5912,8 +5938,36 @@ async def _resume_instances(instance_ids: set[str], skip: set[str] | None = None
     return failed
 
 
-@app.patch("/api/devices/{device_id}/capabilities")
-async def api_device_capabilities(device_id: str, body: dict):
+async def _capability_progress(operation_id: str, phase: str) -> None:
+    if operation_id:
+        await asyncio.to_thread(
+            capability_operation_store.update, operation_id,
+            state="running", phase=phase)
+
+
+async def _wait_for_vowifi_bridge(device_id: str, timeout: float = 120) -> dict:
+    """Wait only for this modem's SIM bridge, never unrelated RF/data work."""
+    deadline = time.monotonic() + timeout
+    latest = {}
+    while time.monotonic() < deadline:
+        latest = device_state.status()
+        current = (latest.get("devices") or {}).get(device_id) or {}
+        desired = current.get("desired") or {}
+        actual = current.get("actual") or {}
+        if desired.get("vowifi_enabled") is True \
+                and actual.get("vowifi_bridge_active") is True:
+            return latest
+        # A transient MM refusal is precisely what triggers the bounded direct-serial
+        # fallback; its explanatory error must not abort that recovery before the bridge can
+        # publish ready. Only the generation-bound terminal gate is conclusive here.
+        if (current.get("bridge_recovery") or {}).get("state") == "failed":
+            raise RuntimeError("SIM bridge recovery reached a terminal failure")
+        await asyncio.sleep(.5)
+    raise TimeoutError("VoWiFi SIM bridge transition timed out")
+
+
+async def _apply_device_capabilities(device_id: str, body: dict,
+                                     operation_id: str = ""):
     allowed = {"cellular_enabled", "vowifi_enabled", "flight_mode"}
     if not body or not set(body).issubset(allowed):
         raise HTTPException(400, "provide cellular_enabled, vowifi_enabled and/or flight_mode only")
@@ -5939,11 +5993,15 @@ async def api_device_capabilities(device_id: str, body: dict):
             retry = bool(wanted and not await asyncio.to_thread(engine.is_running, iid))
             if wanted == previous and not retry:
                 return device
+            # Persist intent before any Docker/PCSC work. A disconnected browser can then
+            # recover the accepted target from config and the durable operation record.
+            await _capability_progress(operation_id, "persisting")
+            cfg.upsert_instance({"id": iid, "enabled": wanted})
             if wanted:
-                cfg.upsert_instance({"id": iid, "enabled": True})
+                await _capability_progress(operation_id, "starting")
                 await api_instance_start(iid)
             else:
-                cfg.upsert_instance({"id": iid, "enabled": False})
+                await _capability_progress(operation_id, "stopping")
                 _record_lifecycle(iid, "vowifi_disabled", "user_requested")
                 await _stop_instance(iid, "device_vowifi_disabled")
             refreshed = await _unified_devices()
@@ -5981,10 +6039,20 @@ async def api_device_capabilities(device_id: str, body: dict):
         if vowifi_action and target_iid and not wanted["vowifi_enabled"]:
             _record_lifecycle(target_iid, "vowifi_disabled", "user_requested")
             hub.reset_health(target_iid, "device_vowifi_disabled")
+        # Save the line intent and operation target before waiting on a graceful container
+        # stop, ModemManager, USB re-enumeration or carrier registration. The operation
+        # snapshot acknowledges the click immediately without tearing down a bridge underneath
+        # an Engine that has not released its PC/SC session yet.
+        await _capability_progress(operation_id, "persisting")
+        if target_iid and vowifi_action:
+            target_instance = cfg.upsert_instance({
+                "id": target_iid, "enabled": bool(wanted["vowifi_enabled"])})
         # Data bearer and flight-mode changes are reconciled underneath the existing line.
         # Only a VoWiFi toggle intentionally stops/starts that line.
         affected_instances = [target_instance] if vowifi_action and target_instance else []
         running_ids = []
+        if affected_instances:
+            await _capability_progress(operation_id, "stopping")
         for inst in affected_instances:
             if inst and await asyncio.to_thread(engine.is_running, str(inst["id"])):
                 running_ids.append(str(inst["id"]))
@@ -6001,17 +6069,22 @@ async def api_device_capabilities(device_id: str, body: dict):
                          "reason_code": "stopped", "reason": "Stopped.", "detail": {}})
                     hub.status_sampled_at[str(inst["id"])] = time.monotonic()
 
+        # The Engine has released PC/SC before the host is told to remove a modem bridge.
+        # The durable operation record already acknowledged the target to refreshing pages,
+        # so preserving this hardware ordering does not put HTTP latency back on the user.
         device_state.set_desired(device_id,
                                  cellular_enabled=wanted["cellular_enabled"],
                                  vowifi_enabled=wanted["vowifi_enabled"],
                                  flight_mode=bool(wanted.get("flight_mode")))
-        if target_iid and vowifi_action:
-            target_instance = cfg.upsert_instance({
-                "id": target_iid, "enabled": bool(wanted["vowifi_enabled"])})
         egress.publish()
         skip_resume = {target_iid} if target_iid and not wanted["vowifi_enabled"] else set()
         try:
-            await _wait_for_device_request(device_id, wanted)
+            if cellular_changed or flight_changed:
+                await _capability_progress(operation_id, "reconciling")
+                await _wait_for_device_request(device_id, wanted)
+            elif vowifi_action and wanted["vowifi_enabled"]:
+                await _capability_progress(operation_id, "reconciling")
+                await _wait_for_vowifi_bridge(device_id)
         except TimeoutError as exc:
             await _resume_instances(set(running_ids), skip_resume)
             raise HTTPException(504, str(exc)) from exc
@@ -6022,6 +6095,8 @@ async def api_device_capabilities(device_id: str, body: dict):
         resume_ids = set(running_ids)
         if vowifi_action and wanted["vowifi_enabled"] and target_instance:
             resume_ids.add(str(target_instance["id"]))
+        if resume_ids - skip_resume:
+            await _capability_progress(operation_id, "starting")
         failed = await _resume_instances(resume_ids, skip_resume)
         await hub.broadcast({"type": "capability", "device": device_id, "desired": wanted,
                              "resume_failed": failed})
@@ -6030,6 +6105,98 @@ async def api_device_capabilities(device_id: str, body: dict):
         if failed:
             response["resume_failed"] = failed
         return response
+
+
+def _capability_error_code(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.CancelledError):
+        return "interrupted"
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        code = str(detail.get("code") or "") if isinstance(detail, dict) else ""
+        if code in capability_operations.ERROR_CODES:
+            return code
+        if exc.status_code == 404:
+            return "not_found"
+        if exc.status_code == 504:
+            return "transition_timeout"
+        if exc.status_code == 503:
+            return "device_unavailable"
+        if exc.status_code == 409:
+            return "device_unavailable"
+    if isinstance(exc, TimeoutError):
+        return "transition_timeout"
+    if isinstance(exc, RuntimeError):
+        return "device_unavailable"
+    return "failed"
+
+
+async def _run_capability_operation(operation_id: str, device_id: str, body: dict) -> None:
+    operation = {}
+    try:
+        result = await _apply_device_capabilities(device_id, body, operation_id)
+        failed = bool((result or {}).get("resume_failed"))
+        operation = await asyncio.to_thread(
+            capability_operation_store.update, operation_id,
+            state="failed" if failed else "success",
+            error_code="resume_failed" if failed else "")
+    except asyncio.CancelledError:
+        operation = await asyncio.to_thread(
+            capability_operation_store.update, operation_id,
+            state="interrupted", error_code="interrupted")
+        raise
+    except Exception as exc:  # closed code only; arbitrary runtime text stays server-side
+        log.warning("device capability operation failed device=%s error_type=%s",
+                    device_id, type(exc).__name__)
+        operation = await asyncio.to_thread(
+            capability_operation_store.update, operation_id,
+            state="failed", error_code=_capability_error_code(exc))
+    finally:
+        await hub.broadcast({"type": "capability", "device": device_id,
+                             "operation": operation or {}})
+
+
+@app.get("/api/devices/{device_id}/capability-operation")
+def api_device_capability_operation(device_id: str):
+    return {"operation": capability_operation_store.latest(str(device_id))}
+
+
+@app.patch("/api/devices/{device_id}/capabilities")
+async def api_device_capabilities(device_id: str, body: dict, background: bool = False):
+    # Direct callers retain the synchronous contract. The WebUI opts into the durable
+    # background contract so its HTTP lifetime is never the hardware-operation lifetime.
+    if not background:
+        return await _apply_device_capabilities(device_id, body)
+
+    allowed = {"cellular_enabled", "vowifi_enabled", "flight_mode"}
+    if not body or not set(body).issubset(allowed) \
+            or any(not isinstance(value, bool) for value in body.values()):
+        raise HTTPException(400, "capability values must be boolean")
+    device = next((item for item in await _unified_devices()
+                   if item["id"] == device_id), None)
+    if not device:
+        raise HTTPException(404, "no such physical device")
+    if device.get("device_type") == "reader" \
+            and ({"cellular_enabled", "flight_mode"} & set(body)):
+        raise HTTPException(400, "a smart-card reader has no cellular radio")
+    if network_operations.busy() \
+            or operations.device_rescan_status().get("state") in {"requested", "running"}:
+        raise HTTPException(409, "another device operation is running")
+    existing = capability_operation_store.latest(device_id)
+    if existing.get("state") in capability_operations.ACTIVE_STATES:
+        if existing.get("target") == capability_operations.CapabilityOperations._target(body):
+            return {"accepted": True, "operation": existing}
+        raise HTTPException(409, "another device capability operation is running")
+    if capability_lock.locked():
+        raise HTTPException(409, "another device operation is running")
+    try:
+        operation = capability_operation_store.begin(device_id, body)
+    except (capability_operations.OperationBusy, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    task = asyncio.create_task(
+        _run_capability_operation(operation["operation_id"], device_id, dict(body)))
+    capability_tasks.add(task)
+    task.add_done_callback(capability_tasks.discard)
+    return {"accepted": True, "operation": operation}
 
 
 # ----------------------------- settings -----------------------------
@@ -9142,6 +9309,20 @@ async def _esim_nickname_and_recover(name, idx, hardware_id, iccid, nick, body):
             "reader_ready": True}
 
 
+@app.get("/api/esim/download/operation")
+async def api_esim_download_operation(reader_index: int = 0, reader: str | None = None):
+    name, _idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
+    current_iccid = _current_reader_iccid(name)
+    process_owned = bool(hub.lpa_busy.get(name))
+    operation = await asyncio.to_thread(
+        esim_download_operations.latest, name, current_iccid, not process_owned)
+    if operation and current_iccid:
+        # Generation is process-local. The private card digest proved continuity across a
+        # Control restart; publish the current generation so the browser's live fence agrees.
+        operation["generation"] = (hub.cards.get(name) or {}).get("generation")
+    return {"operation": operation}
+
+
 @app.post("/api/esim/download")
 async def api_esim_download(body: dict):
     """Start a profile download as a background task; progress via WS type=esim_download."""
@@ -9156,18 +9337,34 @@ async def api_esim_download(body: dict):
     imei = _esim_imei_for_reader(name, body.get("imei"))
     notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
     # Claim busy before returning so a second concurrent POST cannot start another job.
+    if hub.lpa_busy.get(name):
+        raise HTTPException(409, "an eSIM operation is already running on this reader")
     hub.lpa_busy[name] = True
     se_id = se["id"]
     aid = se.get("aid")
 
     generation = (hub.cards.get(name) or {}).get("generation")
+    try:
+        operation = await asyncio.to_thread(
+            esim_download_operations.start, name, generation, notification_cache_iccid)
+    except esim_operations.DownloadBusy as exc:
+        hub.lpa_busy.pop(name, None)
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        hub.lpa_busy.pop(name, None)
+        raise HTTPException(503, "could not record the eSIM download request") from exc
+    operation_id = operation["operation_id"]
+
     async def _job():
         try:
             async with hub.reader_lock(name):
                 try:
+                    await asyncio.to_thread(esim_download_operations.update,
+                                            operation_id, "started", step="started")
                     await hub.broadcast({
                         "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "started", "step": "started", "imei": imei,
+                        "operation_id": operation_id,
                     })
 
                     async def on_progress(event):
@@ -9177,7 +9374,10 @@ async def api_esim_download(body: dict):
                         msg = {
                             "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                             "se_id": se_id, "event": "progress", "step": step,
+                            "operation_id": operation_id,
                         }
+                        await asyncio.to_thread(esim_download_operations.update,
+                                                operation_id, "progress", step=step)
                         if isinstance(data, dict):
                             msg["metadata"] = data
                             msg["data"] = data
@@ -9200,33 +9400,52 @@ async def api_esim_download(body: dict):
                             name, notification_cache_iccid, se_id),
                     )
                     await _esim_refresh_card(name, idx)
+                    refreshed_generation = (hub.cards.get(name) or {}).get("generation")
+                    await asyncio.to_thread(esim_download_operations.update,
+                                            operation_id, "completed",
+                                            generation=refreshed_generation)
                     await hub.broadcast({
                         "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "completed", "step": "completed",
                         "result": result, "card": hub.cards.get(name),
+                        "operation_id": operation_id,
                     })
                 except lpa.LpaError as e:
                     # lpac puts the failing function name in message (e.g. es9p_authenticate_client).
+                    await asyncio.to_thread(
+                        esim_download_operations.update, operation_id, "error",
+                        error_code=esim_operations.error_code(e, lpa.classify_lpa_error(e)))
                     err = {
                         "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "error",
                         "step": (e.message or "").strip() or None,
                         "error": e.user_message(),
+                        "operation_id": operation_id,
                     }
                     await hub.broadcast(err)
                 except Exception as e:  # noqa
                     log.exception("esim download failed")
+                    await asyncio.to_thread(esim_download_operations.update,
+                                            operation_id, "error", error_code="unknown_error")
                     await hub.broadcast({
                         "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "error", "error": str(e),
+                        "operation_id": operation_id,
                     })
+        except asyncio.CancelledError:
+            await asyncio.to_thread(esim_download_operations.update,
+                                    operation_id, "error", error_code="interrupted")
+            raise
         finally:
             hub.lpa_busy.pop(name, None)
 
-    asyncio.create_task(_job())
+    task = asyncio.create_task(_job())
+    esim_download_tasks.add(task)
+    task.add_done_callback(esim_download_tasks.discard)
     return {
         "ok": True, "started": True, "reader": name, "reader_index": idx,
         "se_id": se_id, "imei": imei,
+        "operation_id": operation_id, "operation": operation,
     }
 
 
@@ -9235,11 +9454,17 @@ async def api_esim_download_cancel(body: dict | None = None):
     body = body or {}
     name, _idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    cancelled = lpa.cancel_download(name)
+    operation = await asyncio.to_thread(esim_download_operations.latest, name)
+    operation_id = (operation or {}).get("operation_id")
+    cancelled = await lpa.cancel_download(name)
     if cancelled:
+        if operation_id:
+            await asyncio.to_thread(esim_download_operations.update,
+                                    operation_id, "cancelling")
         await hub.broadcast({
             "type": "esim_download", "reader": name,
             "event": "cancelling", "step": "cancelling",
+            "operation_id": operation_id,
         })
     return {"ok": True, "cancelled": cancelled}
 

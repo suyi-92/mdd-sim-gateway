@@ -3,6 +3,7 @@ export { physicallyPresentDevices } from '../devicePresence'
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useCallback, useSyncExternalStore } from 'react'
 import { api } from '../api.js'
 import { cellularNetworkState } from '../cellularNetworkState.js'
+import { capabilityOperationState } from '../capabilityOperationState.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
 import CopyableText from '../CopyableText.jsx'
@@ -224,14 +225,29 @@ function LogicalChannels({ value }) {
 
 export function CapabilitySwitch({ device, kind, onChanged, showToast, compact = false }) {
   const { t, language } = useI18n()
-  const [submitting, setSubmitting] = useState(false)
-  const [pendingTarget, setPendingTarget] = useState(null)
+  capabilityOperationState.ensure(device)
+  const operationState = useSyncExternalStore(
+    useCallback(listener => capabilityOperationState.subscribe(device.id, listener), [device.id]),
+    useCallback(() => capabilityOperationState.get(device.id), [device.id]),
+  )
+  useEffect(() => { capabilityOperationState.observe(device) }, [device, device.capability_operation])
+  const refreshedOperation = useRef('')
+  const operation = operationState?.operation || {}
+  const operationActive = ['accepted', 'running'].includes(operation.state)
   const c = capability(device, kind)
-  const pending = submitting || c.actual === 'starting' || c.actual === 'stopping'
+  const field = kind === 'flight' ? 'flight_mode' : `${kind}_enabled`
+  const operationTargetsThis = Object.prototype.hasOwnProperty.call(operation.target || {}, field)
+  const pending = !!operationState?.submitting || operationActive
   const unavailable = !c.available || c.actual === 'unsupported' || device.compatibilityOnly ||
     device.present === false || (kind === 'cellular' && capability(device, 'flight').desired)
   const title = kind === 'cellular' ? t('Cellular data (4G)') : kind === 'flight' ? t('Flight mode') : t('VoWiFi / WiFi Calling')
   const canRetry = kind === 'vowifi' && c.desired && ['off', 'degraded', 'error'].includes(c.actual) && !unavailable
+  useEffect(() => {
+    if (!operation.operation_id || ['accepted', 'running'].includes(operation.state)
+        || refreshedOperation.current === operation.operation_id) return
+    refreshedOperation.current = operation.operation_id
+    void onChanged?.()
+  }, [operation.operation_id, operation.state, onChanged])
   const change = async (next, retry = false) => {
     const other = capability(device, kind === 'cellular' ? 'vowifi' : 'cellular')
     const impact = retry
@@ -240,11 +256,9 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
       ? t('Changing cellular data rebuilds SIM access. VoWiFi may reconnect for 20–60 seconds. Continue?')
       : t('{action} {name}? The UI will wait for the real device state.', { action: next ? t('Enable') : t('Disable'), name: title })
     if (!window.confirm(impact)) return
-    setPendingTarget(next)
-    setSubmitting(true)
     try {
-      const field = kind === 'flight' ? 'flight_mode' : `${kind}_enabled`
-      await api.patchDeviceCapabilities(device.id, { [field]: next })
+      const accepted = await capabilityOperationState.start(device.id, { [field]: next })
+      if (!accepted) return
       showToast?.(t('Request accepted; waiting for device state'))
       await onChanged?.()
     } catch (e) {
@@ -273,9 +287,10 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
         return
       }
       showToast?.(`${t('Capability change failed')}: ${e.status === 404 ? t('Unified device control is not available on this backend') : e.message}`)
-    } finally { setSubmitting(false); setPendingTarget(null) }
+    }
   }
   const toggle = () => change(!c.desired)
+  const pendingTarget = operationActive && operationTargetsThis ? !!operation.target[field] : null
   const displayedDesired = pendingTarget == null ? c.desired : pendingTarget
   const displayedState = pendingTarget == null ? c.actual : (pendingTarget ? 'starting' : 'stopping')
   // A healthy line is reported by two feeds: the periodic device snapshot and live status
@@ -284,18 +299,28 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   const draft = kind === 'vowifi' && device?.provisioning?.state === 'draft'
   const missing = provisioningMissingText(device, t, language)
   const registeredCellular = kind === 'cellular' ? cellularRegistrationDetail(device, t, language) : ''
+  const operationActualMatches = operationTargetsThis
+    && (!!operation.target[field] ? c.actual === 'on' : c.actual === 'off')
   const stateDetail = c.actual === 'on'
     ? t(CAPABILITY_ON_DETAILS[kind] || 'cap.help.on')
     : c.actual === 'off' && CAPABILITY_OFF_DETAILS[kind]
       ? t(CAPABILITY_OFF_DETAILS[kind])
       : t(`cap.help.${c.actual}`)
-  const detail = draft
+  const operationFeedback = operationState?.readError && operationActive
+    ? t('Capability operation status is unavailable. Retrying…')
+    : operationTargetsThis && operationActive
+      ? t(`capability.phase.${operation.phase || 'queued'}`)
+      : operationTargetsThis && ['failed', 'interrupted'].includes(operation.state) && !operationActualMatches
+        ? t(`capability.error.${operation.error_code || 'failed'}`)
+        : ''
+  const detail = operationFeedback || (draft
     ? t('Complete SIM and hardware setup before enabling VoWiFi. Missing: {items}.', { items: missing || t('SIM or hardware identity') })
     : registeredCellular
       || (c.reason ? t(c.reason) : stateDetail)
+  )
   return <div className={`u-capability ${compact ? 'compact' : ''}`}>
     <div><b>{title}</b><div className="u-cap-detail">{detail}</div></div>
-    <div className="u-cap-actions">{canRetry && <button className="btn btn-ghost" disabled={submitting} onClick={() => change(true, true)}>{t('Restart line')}</button>}<Badge state={displayedState}>{device.present === false ? t('Offline') : null}</Badge><button className={`u-switch ${displayedDesired ? 'on' : ''}`} role="switch" aria-checked={displayedDesired}
+    <div className="u-cap-actions">{canRetry && <button className="btn btn-ghost" disabled={pending} onClick={() => change(true, true)}>{t('Restart line')}</button>}<Badge state={displayedState}>{device.present === false ? t('Offline') : null}</Badge><button className={`u-switch ${displayedDesired ? 'on' : ''}`} role="switch" aria-checked={displayedDesired}
       aria-label={title} disabled={pending || unavailable} onClick={toggle}><span /></button></div>
   </div>
 }
@@ -582,6 +607,63 @@ function DeviceRescanControl({ device = null, refresh, showToast, compact = fals
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState('')
   const [failed, setFailed] = useState(false)
+  const [operationId, setOperationId] = useState('')
+  const completed = useRef('')
+  const matches = useCallback(status => device
+    ? status?.scope === 'device' && String(status.device_id || '') === String(device.id)
+    : !status?.scope || status.scope === 'all', [device])
+  const successText = useCallback(status => {
+    if (device) {
+      const simResult = t({ readable: 'SIM identity confirmed', pin_required: 'SIM PIN required',
+        unreadable: 'SIM present but unreadable', not_present: 'No SIM present' }[status.sim_state]
+        || 'SIM state unknown')
+      return t('Hardware detection completed · {sim} · cellular registration: {registration}', {
+        sim: simResult, registration: status.registration_state || 'unknown',
+      })
+    }
+    return t('Full device detection completed. {modems} cellular modem(s) and {readers} card reader(s) found.', {
+      modems: Number(status.modems_detected || 0), readers: Number(status.readers_detected || 0),
+    })
+  }, [device, t])
+  useEffect(() => {
+    let stopped = false, timer
+    const tick = async () => {
+      try {
+        const status = await api.deviceRescanProgress()
+        if (stopped || !matches(status)) return
+        const active = ['requested', 'running'].includes(status.state)
+        if (!operationId && active && status.operation_id) {
+          setOperationId(status.operation_id)
+          setBusy(true); setFailed(false)
+          setFeedback(t(device ? 'Re-detecting this device…' : 'Restarting all hardware discovery backends…'))
+        } else if (operationId && (!status.operation_id || status.operation_id === operationId)) {
+          if (active) {
+            setBusy(true)
+            setFeedback(t(device ? 'Re-detecting this device…' : 'Restarting all hardware discovery backends…'))
+          } else if (['success', 'failed'].includes(status.state)) {
+            setBusy(false)
+            if (status.state === 'success') {
+              setFailed(false); setFeedback(successText(status))
+              if (completed.current !== operationId) {
+                completed.current = operationId
+                showToast?.(t(device ? 'Device detection completed' : 'Full device detection completed'))
+                void refresh?.()
+              }
+            } else {
+              setFailed(true)
+              setFeedback(`${t(device ? 'Device detection failed' : 'Full device detection failed')}: ${t(status.error_code || 'rescan.error.failed')}`)
+            }
+          }
+        }
+        if (active) timer = setTimeout(tick, 1000)
+      } catch {
+        // A temporary read error must not turn a known running rediscovery into idle.
+        if (!stopped) timer = setTimeout(tick, (busy || operationId) ? 1500 : 3000)
+      }
+    }
+    void tick()
+    return () => { stopped = true; clearTimeout(timer) }
+  }, [busy, device, matches, operationId, refresh, showToast, successText, t])
   const rescan = async () => {
     if (busy) return
     const question = device
@@ -592,40 +674,12 @@ function DeviceRescanControl({ device = null, refresh, showToast, compact = fals
       ? 'Re-detecting this device…' : 'Restarting all hardware discovery backends…'))
     try {
       const requested = device ? await api.rescanDevice(device.id) : await api.rescanDevices()
-      const operationId = requested.operation_id
-      let completed = null
-      for (let attempt = 0; attempt < 135; attempt += 1) {
-        await new Promise(resolve => setTimeout(resolve, 1000))
-        const status = await api.deviceRescanProgress()
-        if (operationId && status.operation_id && status.operation_id !== operationId) continue
-        if (status.state === 'success' || status.state === 'failed') {
-          completed = status; break
-        }
-      }
-      if (!completed) throw new Error(t('Full device detection timed out'))
-      if (completed.state !== 'success') {
-        throw new Error(t(completed.error_code || 'Full device detection failed'))
-      }
-      if (device) {
-        const simResult = t({ readable: 'SIM identity confirmed', pin_required: 'SIM PIN required',
-          unreadable: 'SIM present but unreadable', not_present: 'No SIM present' }[completed.sim_state]
-          || 'SIM state unknown')
-        const registration = completed.registration_state || 'unknown'
-        setFeedback(t('Hardware detection completed · {sim} · cellular registration: {registration}', {
-          sim: simResult, registration,
-        }))
-        showToast?.(t('Device detection completed'))
-      } else {
-        const modems = Number(completed.modems_detected || 0)
-        const readers = Number(completed.readers_detected || 0)
-        setFeedback(t('Full device detection completed. {modems} cellular modem(s) and {readers} card reader(s) found.', { modems, readers }))
-        showToast?.(t('Full device detection completed'))
-      }
-      await refresh?.()
+      setOperationId(requested.operation_id || '')
     } catch (error) {
       setFailed(true)
       setFeedback(`${t(device ? 'Device detection failed' : 'Full device detection failed')}: ${error.message}`)
-    } finally { setBusy(false) }
+      setBusy(false)
+    }
   }
   const defaultHint = t(device ? 'Re-read this device’s connection and SIM state.' : 'Connected devices are discovered automatically.')
   return <div className={`u-device-rescan${device ? ' is-device' : ''}${compact ? ' is-compact' : ''}`}>
@@ -1291,9 +1345,19 @@ export function NotificationsPage({ showToast, instances = [], initialLoading = 
 }
 
 export function SystemPage({ showToast }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [backups,setBackups]=useState(null); const [backupsError,setBackupsError]=useState(false); const [backupOperation,setBackupOperation]=useState(null); const [backupBusy,setBackupBusy]=useState(null)
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState(() => { try { const saved = sessionStorage.getItem('mdd-system-tab'); return ['general','web','voice','security','backup','maintenance'].includes(saved) ? saved : 'general' } catch { return 'general' } }); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [backups,setBackups]=useState(null); const [backupsError,setBackupsError]=useState(false); const [backupOperation,setBackupOperation]=useState(null); const [backupBusy,setBackupBusy]=useState(null)
   const loadStatus = () => api.systemStatus().then(value => { setStatus(value); setStatusError(false) }).catch(() => setStatusError(true)).finally(() => setStatusLoaded(true))
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadStatus() }, [])
+  useEffect(() => { try { sessionStorage.setItem('mdd-system-tab', tab) } catch { /* Optional navigation state. */ } }, [tab])
+  useEffect(() => {
+    let cancelled = false
+    api.restartProgress().then(progress => {
+      if (!cancelled && ['requested', 'running'].includes(progress?.state)) {
+        setRestarting(progress.scope || 'services')
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
   const loadBackups = () => api.backups().then(value => { setBackups(value.backups || []); setBackupOperation(value.operation || { state: 'idle' }); setBackupsError(false) }).catch(() => setBackupsError(true))
   useEffect(() => { if (tab === 'backup') loadBackups() }, [tab])
   useEffect(() => {

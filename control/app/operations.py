@@ -290,7 +290,8 @@ SERVICE_RESTART_SCOPES = ("control", "services", "host")
 _RESTART_PICKUP_SECONDS = 60
 # A full service restart normally tears the API down within seconds. If the detached systemd
 # job never does so, keep the browser from waiting forever on a stale ``running`` document.
-_RESTART_RUNNING_SECONDS = 120
+_RESTART_RUNNING_SECONDS = {"control": 120, "services": 300, "host": 1800}
+_SERVICE_RESTART_LOCK = threading.Lock()
 _DEVICE_RESCAN_PICKUP_SECONDS = 60
 _DEVICE_RESCAN_RUNNING_SECONDS = 120
 _DEVICE_ID = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
@@ -333,12 +334,22 @@ def request_service_restart(scope: str) -> dict:
     if scope not in SERVICE_RESTART_SCOPES:
         return {"ok": False, "error_code": "restart.error.invalid_scope"}
     request_path, status_path = _service_restart_paths()
-    now = int(time.time())
-    # Reset the visible status first so the previous restart's outcome cannot be read as this
-    # one's while the orchestrator is still picking the request up.
-    _write_private_json(status_path, {"state": "requested", "scope": scope, "updated_at": now})
-    _write_private_json(request_path, {"scope": scope, "requested_at": now})
-    return {"ok": True, "scope": scope}
+    with _SERVICE_RESTART_LOCK:
+        current = service_restart_status()
+        if current.get("state") in {"requested", "running"}:
+            if current.get("scope") == scope:
+                return {"ok": True, **current}
+            return {"ok": False, "error_code": "restart.error.busy",
+                    "operation_id": current.get("operation_id", "")}
+        now = int(time.time())
+        operation_id = secrets.token_hex(8)
+        request = {"operation_id": operation_id, "scope": scope, "requested_at": now}
+        # Reset the visible status first so the previous restart's outcome cannot be read as
+        # this one's while the orchestrator is still picking the request up.
+        _write_private_json(status_path, {
+            **request, "state": "requested", "updated_at": now})
+        _write_private_json(request_path, request)
+        return {"ok": True, **request, "state": "requested", "updated_at": now}
 
 
 def service_restart_status() -> dict:
@@ -358,13 +369,15 @@ def service_restart_status() -> dict:
             status["error_code"] = "restart.error.not_picked_up"
     elif (status.get("state") == "running"
           and isinstance(status.get("updated_at"), (int, float))
-          and time.time() - float(status["updated_at"]) > _RESTART_RUNNING_SECONDS):
+          and time.time() - float(status["updated_at"]) >
+          _RESTART_RUNNING_SECONDS.get(str(status.get("scope") or ""), 120)):
         # The request was consumed, but a detached restart job that exits before touching the
         # services cannot be completed by settle_service_restart(). Persist the failure so a
         # later unrelated orchestrator restart cannot misreport this attempt as successful.
         status.update(state="failed", error_code="restart.error.failed",
                       updated_at=int(time.time()))
         _write_private_json(status_path, status)
+    status.pop("orchestrator_pid", None)
     return status
 
 

@@ -628,7 +628,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "upsert_instance", return_value={**line, "enabled": True}) as save, \
                 patch.object(main.device_state, "set_desired") as set_desired, \
                 patch.object(main.egress, "publish"), \
-                patch.object(main, "_wait_for_device_request", new=AsyncMock()), \
+                patch.object(main, "_wait_for_vowifi_bridge", new=AsyncMock()), \
                 patch.object(main, "_resume_instances", new=AsyncMock(return_value={})) as resume, \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             result = await main.api_device_capabilities(
@@ -699,6 +699,77 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
             await main.api_device_capabilities("reader-a", {"vowifi_enabled": True})
 
         self.assertEqual(order, ["save", "start"])
+
+    async def test_vowifi_off_persists_before_stop_and_skips_cellular_wait(self):
+        line = {"id": "3", "name": "Fixture", "enabled": True}
+        device = {"id": "modem-a", "device_type": "modem", "instance_id": "3"}
+        desired = {"devices": {"modem-a": {
+            "cellular_enabled": False, "vowifi_enabled": True, "flight_mode": True}}}
+        observed = {"devices": {"modem-a": {"present": True}}}
+        order = []
+
+        def save_desired(*_args, **_kwargs):
+            order.append("desired")
+
+        def save_line(update):
+            order.append("line")
+            return {**line, **update}
+
+        def stop(_iid):
+            order.append("stop")
+
+        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[]), \
+                patch.object(main, "_instance_for_device", return_value=line), \
+                patch.object(main.engine, "is_running", return_value=True), \
+                patch.object(main.engine, "stop", side_effect=stop), \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(main.cfg, "upsert_instance", side_effect=save_line), \
+                patch.object(main.device_state, "set_desired", side_effect=save_desired), \
+                patch.object(main.egress, "publish"), \
+                patch.object(main, "_wait_for_device_request", new=AsyncMock()) as wait_device, \
+                patch.object(main, "_wait_for_vowifi_bridge", new=AsyncMock()) as wait_bridge, \
+                patch.object(main, "_resume_instances", new=AsyncMock(return_value={})), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main.api_device_capabilities("modem-a", {"vowifi_enabled": False})
+
+        self.assertEqual(order[:3], ["line", "stop", "desired"])
+        wait_device.assert_not_awaited()
+        wait_bridge.assert_not_awaited()
+
+    async def test_background_capability_request_returns_before_worker_finishes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = main.capability_operations.CapabilityOperations(
+                Path(temp) / "capabilities.json")
+            gate = asyncio.Event()
+
+            async def apply(_device_id, _body, _operation_id):
+                await gate.wait()
+                return {"id": "modem-a"}
+
+            device = {"id": "modem-a", "device_type": "modem"}
+            with patch.object(main, "capability_operation_store", store), \
+                    patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                    patch.object(main, "_apply_device_capabilities", new=AsyncMock(side_effect=apply)), \
+                    patch.object(main.hub, "broadcast", new=AsyncMock()):
+                before = set(main.capability_tasks)
+                result = await main.api_device_capabilities(
+                    "modem-a", {"flight_mode": False}, background=True)
+                created = set(main.capability_tasks) - before
+                self.assertEqual(result["operation"]["state"], "accepted")
+                self.assertEqual(len(created), 1)
+                self.assertFalse(next(iter(created)).done())
+                gate.set()
+                await next(iter(created))
+
+            self.assertEqual(store.latest("modem-a")["state"], "success")
+
+    def test_capability_timeout_is_a_closed_actionable_error(self):
+        self.assertEqual(
+            main._capability_error_code(main.HTTPException(504, "private timeout detail")),
+            "transition_timeout")
 
     async def test_manual_stop_clears_pending_automatic_recovery(self):
         main.hub.health["stop-test"] = {

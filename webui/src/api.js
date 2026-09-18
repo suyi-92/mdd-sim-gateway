@@ -130,7 +130,9 @@ export const api = {
   rescanDevices: () => j('POST', '/api/devices/rescan', {}),
   rescanDevice: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/rescan`, {}),
   deviceRescanProgress: () => j('GET', '/api/devices/rescan/progress'),
-  patchDeviceCapabilities: (id, patch) => j('PATCH', `/api/devices/${encodeURIComponent(id)}/capabilities`, patch),
+  patchDeviceCapabilities: (id, patch) => j('PATCH', `/api/devices/${encodeURIComponent(id)}/capabilities?background=true`, patch),
+  deviceCapabilityOperation: (id) => boundedRead(signal => j(
+    'GET', `/api/devices/${encodeURIComponent(id)}/capability-operation`, undefined, signal)),
   deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),
   scanCellularNetworks: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/cellular/networks/scan?background=true`, {}),
   selectCellularNetwork: (id, selection) => j('PUT', `/api/devices/${encodeURIComponent(id)}/cellular/network?background=true`, selection),
@@ -270,6 +272,7 @@ export const api = {
     readerBody(readerOrBody, { nickname }),
   ),
   esimDownload: (body) => j('POST', '/api/esim/download', body),
+  esimDownloadOperation: (readerOrIndex, maybeName) => j('GET', `/api/esim/download/operation?${readerQuery(readerOrIndex, maybeName)}`),
   esimDownloadCancel: (readerOrBody) => j('POST', '/api/esim/download/cancel', readerBody(readerOrBody)),
   esimDiscovery: (body) => j('POST', '/api/esim/discovery', body || {}),
   esimNotifications: (readerOrIndex, maybeName) => j(

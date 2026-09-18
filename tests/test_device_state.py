@@ -1606,6 +1606,7 @@ modem.3gpp.registration-state : unknown
             app = Orchestrator(root / "data", root, dry_run=False)
             app.root.mkdir(parents=True)
             mdd_orchestrator.atomic_json(app.root / "service-restart-request.json", {
+                "operation_id": "0123456789abcdef",
                 "scope": "services", "requested_at": int(time.time()),
             })
             calls = []
@@ -1632,6 +1633,7 @@ modem.3gpp.registration-state : unknown
             app = Orchestrator(root / "data", root, dry_run=False)
             app.root.mkdir(parents=True)
             mdd_orchestrator.atomic_json(app.root / "service-restart-request.json", {
+                "operation_id": "0123456789abcdef",
                 "scope": "services", "requested_at": int(time.time()),
             })
             results = [
@@ -1750,18 +1752,64 @@ modem.3gpp.registration-state : unknown
             mdd_orchestrator.atomic_json(status_path, {
                 "state": "running", "scope": "services", "updated_at": 900,
             })
-            with patch("host.mdd_orchestrator.time.time", return_value=1000):
+            healthy = SimpleNamespace(returncode=0, stdout="200", stderr="")
+            with patch("host.mdd_orchestrator.time.time", return_value=1000), \
+                    patch("host.mdd_orchestrator.run", return_value=healthy), \
+                    patch.object(app, "service_active", return_value=True):
                 app.settle_service_restart()
             self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "success")
 
             mdd_orchestrator.atomic_json(status_path, {
                 "state": "running", "scope": "services", "updated_at": 100,
             })
-            with patch("host.mdd_orchestrator.time.time", return_value=1000):
+            with patch("host.mdd_orchestrator.time.time", return_value=1000), \
+                    patch("host.mdd_orchestrator.run", return_value=healthy), \
+                    patch.object(app, "service_active", return_value=True):
                 app.settle_service_restart()
             failed = mdd_orchestrator.read_json(status_path)
             self.assertEqual(failed["state"], "failed")
             self.assertEqual(failed["error_code"], "restart.error.failed")
+
+    def test_service_restart_stays_running_until_https_is_healthy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            status_path = app.root / "service-restart-status.json"
+            mdd_orchestrator.atomic_json(status_path, {
+                "state": "running", "scope": "services", "updated_at": 990,
+            })
+            refused = SimpleNamespace(returncode=7, stdout="000", stderr="")
+            with patch("host.mdd_orchestrator.time.time", return_value=1000), \
+                    patch("host.mdd_orchestrator.run", return_value=refused), \
+                    patch.object(app, "service_active", return_value=True):
+                app.settle_service_restart()
+
+            self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "running")
+
+    def test_old_orchestrator_cannot_certify_its_own_detached_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            status_path = app.root / "service-restart-status.json"
+            status = {"state": "running", "scope": "services", "updated_at": 990,
+                      "orchestrator_pid": os.getpid()}
+            mdd_orchestrator.atomic_json(status_path, status)
+            healthy = SimpleNamespace(returncode=0, stdout="200", stderr="")
+            with patch("host.mdd_orchestrator.time.time", return_value=1000), \
+                    patch("host.mdd_orchestrator.run", return_value=healthy), \
+                    patch.object(app, "service_active", return_value=True):
+                app.settle_service_restart()
+            self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "running")
+
+            mdd_orchestrator.atomic_json(
+                status_path, {**status, "orchestrator_pid": os.getpid() + 1})
+            with patch("host.mdd_orchestrator.time.time", return_value=1000), \
+                    patch("host.mdd_orchestrator.run", return_value=healthy), \
+                    patch.object(app, "service_active", return_value=True):
+                app.settle_service_restart()
+            self.assertEqual(mdd_orchestrator.read_json(status_path)["state"], "success")
 
 
 if __name__ == "__main__":

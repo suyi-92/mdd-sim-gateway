@@ -640,16 +640,32 @@ class ServiceRestartTests(unittest.TestCase):
             # The status is reset with the request so the previous restart's outcome cannot be
             # read as this one's while the orchestrator is still picking it up.
             status = json.loads((self.root / "service-restart-status.json").read_text())
-            self.assertEqual(status, {"state": "requested", "scope": scope,
+            self.assertEqual(status, {**request, "state": "requested",
                                       "updated_at": request["requested_at"]})
+            self.assertRegex(request["operation_id"], r"^[0-9a-f]{16}$")
             self.assertEqual(
                 (self.root / "service-restart-request.json").stat().st_mode & 0o777, 0o600)
+            (self.root / "service-restart-request.json").unlink()
+            status["state"] = "success"
+            (self.root / "service-restart-status.json").write_text(json.dumps(status))
 
     def test_an_unknown_scope_publishes_nothing(self):
         result = operations.request_service_restart("reformat")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "restart.error.invalid_scope")
         self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_active_restart_is_idempotent_and_a_different_scope_cannot_overwrite_it(self):
+        first = operations.request_service_restart("control")
+        repeated = operations.request_service_restart("control")
+        conflict = operations.request_service_restart("services")
+
+        self.assertEqual(repeated["operation_id"], first["operation_id"])
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["error_code"], "restart.error.busy")
+        request = json.loads((self.root / "service-restart-request.json").read_text())
+        self.assertEqual(request["scope"], "control")
+        self.assertEqual(request["operation_id"], first["operation_id"])
 
     def test_a_request_nothing_consumes_is_reported_instead_of_waited_on(self):
         operations.request_service_restart("control")
@@ -820,6 +836,18 @@ class DeviceRescanApiTests(unittest.IsolatedAsyncioTestCase):
             missing = main.api_devices_rescan_progress()
         self.assertEqual(missing["state"], "failed")
         self.assertEqual(missing["error_code"], "rescan.error.device_not_present")
+
+    async def test_control_pcsc_reconciliation_has_a_hard_deadline(self):
+        status = {"state": "success", "operation_id": "0123456789abcdef",
+                  "scope": "all", "updated_at": 100}
+        with patch.object(main.operations, "device_rescan_status", return_value=status), \
+                patch.object(main.hub, "device_rescan_applied", "previous"), \
+                patch.object(main.time, "time",
+                             return_value=100 + main.DEVICE_RESCAN_CONTROL_TIMEOUT_SECONDS + 1):
+            failed = main.api_devices_rescan_progress()
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["error_code"], "rescan.error.pcsc_timeout")
 
 
 if __name__ == "__main__":

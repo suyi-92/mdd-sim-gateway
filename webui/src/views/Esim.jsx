@@ -26,6 +26,30 @@ function resolveDownloadStep(step) {
   return idx >= 0 ? DOWNLOAD_STEPS[idx][0] : null
 }
 
+function downloadFromOperation(operation, t) {
+  if (!operation?.operation_id) return null
+  const state = operation.state
+  const errors = {
+    interrupted: 'The gateway restarted during the eSIM download. The write was not replayed.',
+    reader_busy: 'The eSIM reader is busy.', card_unavailable: 'The eSIM card became unavailable.',
+    download_timeout: 'The eSIM download reached its time limit.',
+    remote_rejected: 'The remote eSIM service rejected the download.',
+    network_transport: 'The eSIM download network request failed.',
+    process_error: 'The eSIM helper process failed.',
+    cancelled: 'The eSIM download was cancelled.',
+    profile_already_installed: 'This eSIM profile is already installed.',
+    not_euicc: 'This card is not an eUICC / eSIM.', unknown_error: 'The eSIM download failed.',
+  }
+  return {
+    operationId: operation.operation_id,
+    step: resolveDownloadStep(operation.step) || operation.step || 'started',
+    event: state === 'cancelling' ? 'cancelling' : state,
+    done: state === 'success',
+    error: ['failed', 'cancelled'].includes(state)
+      ? t(errors[operation.error_code] || errors.unknown_error) : '',
+  }
+}
+
 function isNonEuiccError(msg) {
   const s = String(msg || '')
   return /euicc_init|does not appear to be an eUICC|not an eUICC|ordinary USIM/i.test(s)
@@ -296,7 +320,7 @@ function seTarget(reader, se) {
   }
 }
 
-function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast }) {
+function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast, active = true }) {
   const { t } = useI18n()
   const dual = (ses || []).length > 1
   const [mode, setMode] = useState('code') // code | manual
@@ -346,6 +370,7 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
   readQrRef.current = readQr
 
   useEffect(() => { // a pasted screenshot anywhere in the dialog counts as a QR upload
+    if (!active) return undefined
     const onPaste = (e) => {
       const item = Array.from(e.clipboardData?.items || []).find((i) => i.type.startsWith('image/'))
       if (item) {
@@ -355,7 +380,7 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [])
+  }, [active])
 
   const submit = async () => {
     setErr('')
@@ -376,8 +401,8 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
     }
     setBusy(true)
     try {
-      await api.esimDownload(body)
-      onStarted?.()
+      const result = await api.esimDownload(body)
+      onStarted?.(result?.operation)
       onClose()
     } catch (e) {
       setErr(e.message)
@@ -502,7 +527,7 @@ function isLineRunning(inst) {
   return !!(st && st !== 'STOPPED')
 }
 
-export default function Esim({ cards, instances, refresh, subscribe, showToast, initialLoading, loadErrors }) {
+export default function Esim({ cards, instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
   const { t } = useI18n()
   const present = useMemo(
     () => collapseEsimReaders(cards),
@@ -521,6 +546,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   const [err, setErr] = useState('')
   const [showDl, setShowDl] = useState(false)
   const [dl, setDl] = useState(null) // {step, event, metadata, error, done}
+  const [dismissedDownload, setDismissedDownload] = useState('')
   const [renameTarget, setRenameTarget] = useState(null) // { se, profile }
   const [renameStatus, setRenameStatus] = useState(null)
   const renameBusy = useRef(false)
@@ -588,10 +614,38 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     setCachedAt(0)
     setErr('')
     setDl(null)
+    setDismissedDownload('')
     setRenameTarget(null)
     setRenameStatus(null)
     setProfileSwitch(null)
   }, [identityKey])
+
+  // Download jobs are owned by Control, not this page or WebSocket connection. Rehydrate the
+  // safe snapshot after navigation/reload and poll while active so a missed WS completion is
+  // still visible. Generation fencing prevents an old card's result landing on a replacement.
+  useEffect(() => {
+    if (!reader) return undefined
+    let cancelled = false, timer
+    const owner = session.current
+    const poll = async () => {
+      try {
+        const result = await api.esimDownloadOperation(reader)
+        if (cancelled || owner !== session.current || !owner.mounted) return
+        const operation = result?.operation
+        if (operation?.generation != null && selectedCard?.generation != null
+            && operation.generation !== selectedCard.generation) return
+        const restored = downloadFromOperation(operation, t)
+        if (restored && restored.operationId !== dismissedDownload) setDl(restored)
+        if (['running', 'cancelling'].includes(operation?.state)) {
+          timer = setTimeout(poll, 1000)
+        }
+      } catch {
+        if (!cancelled) timer = setTimeout(poll, 2000)
+      }
+    }
+    void poll()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [reader, identityKey, selectedCard?.generation, dl?.operationId, dismissedDownload, t])
 
   // Without a fresh read, show the gateway's persisted last read for this card (matched
   // server-side by the inserted card's ICCID) so switching profiles does not force a
@@ -614,19 +668,27 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
     const owner = session.current
     const serial = ++requestSerial.current
     const current = () => owner === session.current && owner.mounted && serial === requestSerial.current
-    setLoading(true)
-    setErr('')
-    setSes([])
-    setMeta({ imei: '' })
+    if (current()) {
+      setLoading(true)
+      setErr('')
+      setSes([])
+      setMeta({ imei: '' })
+    }
     try {
       const st = await api.esimStatus()
-      if (!current()) return
-      setStatus(st)
-      setStatusError(false)
-      setStatusLoading(false)
+      // Navigation can unmount this view after it stopped a line. Finish the accepted
+      // read for the same card; only presentation belongs to the component lifetime.
+      if (owner !== session.current) return
+      if (current()) {
+        setStatus(st)
+        setStatusError(false)
+        setStatusLoading(false)
+      }
       if (!st.available) {
-        setErr(t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.'))
-        setLoaded(false)
+        if (current()) {
+          setErr(t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.'))
+          setLoaded(false)
+        }
         return
       }
       // One call loads every SE (chip + profiles + notifications).
@@ -680,8 +742,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (lineRunning && matchedInst) {
         await api.stop(matchedInst.id)
       }
-      if (!current()) return
+      if (owner !== session.current) return
       const res = await api.esimEnable(p.iccid, target)
+      await refresh?.()
       if (!current()) return
       // The confirmed WebSocket event normally updates this as soon as lpac succeeds. Keep
       // the response path as a fallback for a reconnecting browser.
@@ -712,7 +775,6 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         setProfileSwitch({ iccid: p.iccid, phase: 'started' })
         showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
       }
-      await refresh?.()
     } catch (e) {
       if (!current()) return
       showToast?.(e.message)
@@ -733,6 +795,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
 
   const requestLoad = useCallback(async () => {
     if (!reader || loading || busyOp || switchActive) return
+    const owner = session.current
+    const current = () => owner === session.current && owner.mounted
     if (lineRunning && matchedInst) {
       const label = matchedInst.name
         ? `${t('line')} ${matchedInst.id} (${matchedInst.name})`
@@ -744,14 +808,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setBusyOp('stop')
       try {
         await api.stop(matchedInst.id)
-        showToast?.(t('Line {id} stopped', { id: matchedInst.id }))
+        if (current()) showToast?.(t('Line {id} stopped', { id: matchedInst.id }))
         await refresh?.()
       } catch (e) {
-        showToast?.(e.message)
-        setBusyOp('')
+        if (current()) { showToast?.(e.message); setBusyOp('') }
         return
       }
-      setBusyOp('')
+      if (current()) setBusyOp('')
     }
     await loadAll()
   }, [reader, loading, busyOp, switchActive, lineRunning, matchedInst, loadAll, refresh, showToast, t])
@@ -836,7 +899,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (msg.type !== 'esim_download') return
       if (reader && msg.reader && msg.reader !== reader) return
       if (msg.event === 'started') {
-        setDl({ step: 'started', event: 'started', done: false })
+        setDl((current) => ({ ...(current || {}), operationId: msg.operation_id
+          || current?.operationId, step: 'started', event: 'started', done: false }))
       } else if (msg.event === 'progress' || msg.event === 'preview') {
         // lpac emits cancel_session progress on failure — ignore non-pipeline steps so the bar
         // does not jump back to step 1 before the error event arrives.
@@ -925,10 +989,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
         await api.stop(runningId)
         stopped = true
       }
-      if (!current()) return
+      if (owner !== session.current) return
       feedback(t('Saving…'))
       const result = await api.esimNickname(profile.iccid, nick, target)
-      if (!current()) return
       renamed = true
       if (result.reader_ready === false || result.recovery_error) {
         readerReady = false
@@ -936,7 +999,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       }
       // The nickname API updates the gateway cache. A fresh exclusive read is unnecessary,
       // and would fail once the original line owns the reader again.
-      setSes(list => list.map(item => item.id !== se.id ? item : {
+      if (current()) setSes(list => list.map(item => item.id !== se.id ? item : {
         ...item, profiles: (item.profiles || []).map(p => p.iccid !== profile.iccid ? p
           : { ...p, profileNickname: result.nickname ?? nick }),
       }))
@@ -944,7 +1007,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       failure = e.message
       if (e.data?.detail?.reader_recovery_failed) readerReady = false
     } finally {
-      if (stopped && readerReady && current()) {
+      // Once stopped for this transaction, the original line still needs its matching
+      // recovery even if its page disappeared. A real card replacement remains a fence.
+      if (stopped && readerReady && owner === session.current) {
         feedback(t('Restarting the original line…'))
         try {
           await api.start(runningId)
@@ -1041,7 +1106,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                 </button>
               )}
               {(dl.done || dl.error) && (
-                <button className="btn btn-ghost" onClick={() => setDl(null)}>{t('Dismiss')}</button>
+                <button className="btn btn-ghost" onClick={() => {
+                  setDismissedDownload(dl.operationId || '')
+                  setDl(null)
+                }}>{t('Dismiss')}</button>
               )}
             </div>
           </div>
@@ -1340,8 +1408,13 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
           ses={ses}
           imeiDefault={imeiDefault}
           showToast={showToast}
+          active={pageVisible}
           onClose={() => setShowDl(false)}
-          onStarted={() => setDl({ step: 'started', event: 'started', done: false })}
+          onStarted={operation => {
+            setDismissedDownload('')
+            setDl(downloadFromOperation(operation, t)
+              || { step: 'started', event: 'started', done: false })
+          }}
         />
       )}
 
