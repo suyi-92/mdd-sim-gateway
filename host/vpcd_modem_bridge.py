@@ -320,6 +320,12 @@ class ModemCard:
             raise ModemError("MANAGE CHANNEL OPEN failed: %s" % response.hex())
         channel = response[0]
         if channel not in (1, 2, 3):
+            # This OPEN succeeded, so this process owns the returned channel even though the
+            # three-slot bridge cannot encode it.  Release exactly that channel before
+            # failing.  Losing track of channels 4+ on repeated starts exhausts the UICC and
+            # turns one stale predecessor session into a bridge outage that survives service
+            # restarts.
+            self.close_channel(channel)
             raise ModemError("unsupported logical channel allocated: %d" % channel)
         return channel
 

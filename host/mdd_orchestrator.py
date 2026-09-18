@@ -404,6 +404,12 @@ BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
 BRIDGE_TERMINAL_FAILURE_ATTEMPTS = 3
+# A ModemManager-backed bridge can already be inside one 10-second AT command when SIGTERM
+# arrives, then must close three owned logical channels through the same serialized path.
+# Eight seconds killed it before that cleanup and leaked channels across every managed update.
+# Keep the force-kill fallback bounded below systemd's 90-second service stop timeout, but give
+# the child enough time to publish its stopped generation and release only its own channels.
+BRIDGE_STOP_GRACE_SECONDS = 60.0
 ESIM_CELLULAR_RECOVERY_SECONDS = float(
     os.environ.get("MDD_ESIM_CELLULAR_RECOVERY_SECONDS", "600"))
 ESIM_CELLULAR_IDENTITY_WAIT_SECONDS = float(
@@ -1104,13 +1110,7 @@ class Orchestrator:
             if device_id in self._bridge_terminal:
                 self._bridge_terminal.pop(device_id, None)
                 self._persist_bridge_terminal()
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+            self._stop_bridge_process(proc)
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
             assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(device_id) or {}
@@ -1754,16 +1754,22 @@ class Orchestrator:
         for hwid in list(self.bridges):
             self.stop_bridge(hwid)
 
+    @staticmethod
+    def _stop_bridge_process(proc):
+        """Let one bridge release its proven channel list before force-killing it."""
+        if not proc or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(BRIDGE_STOP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
     def stop_bridge(self, device_id: str):
         """Release one modem AT bridge without disrupting any other device."""
         proc = self.bridges.get(device_id)
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+        self._stop_bridge_process(proc)
         self.bridges.pop(device_id, None)
         self.bridge_ports.pop(device_id, None)
 

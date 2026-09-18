@@ -1,5 +1,12 @@
 # VMware 故障排查
 
+`1.9.4-vmware.30` 修复更新重启后模块 VPCD reader 仍在、但 eSIM 页面只剩原生读卡器的故障。
+若日志先出现 `unsupported logical channel allocated: 4`，随后出现
+`MANAGE CHANNEL OPEN failed: 006a81`，表示旧桥接的逻辑通道未及时释放，且失败重试继续耗尽了
+后续通道；这不表示 USB 模块或 eSIM 配置被删除。新版给桥接完整的有界清理时间，并只回收当前
+进程刚申请或明确持有的通道。已经耗尽的旧会话仍需对同一物理模块执行一次有界 SIM/UIM 槽刷新
+或完整 USB 重插；不得猜测通道号逐个关闭，也不得使用无型号证据的通用 `AT+CFUN=1,1`。
+
 `1.9.4-vmware.28` 区分选网操作历史与当前驻网事实。`operation_timeout` / `network_timeout` 表示
 截止时未确认，并不等于运营商拒绝；模块可能在超时后继续注册。只有 `finished_at` 之后的新鲜
 ModemManager 样本、有效 PLMN、SIM/设备仍在场且状态为 home/roaming/registered 时，界面才将

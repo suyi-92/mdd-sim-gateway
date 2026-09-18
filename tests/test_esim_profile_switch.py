@@ -36,7 +36,7 @@ class BridgeRestartHandshakeTests(unittest.TestCase):
             app.process_bridge_restart_requests()
 
             old.terminate.assert_called_once()
-            old.wait.assert_called_once_with(8)
+            old.wait.assert_called_once_with(mdd_orchestrator.BRIDGE_STOP_GRACE_SECONDS)
             other.terminate.assert_not_called()
             self.assertNotIn("modem-1", app.bridges)
             status_path = app.bridge_restart_status_dir / f"{request_id}.json"

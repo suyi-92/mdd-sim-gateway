@@ -1,3 +1,4 @@
+import subprocess
 import threading
 import unittest
 from types import SimpleNamespace
@@ -225,6 +226,18 @@ class ModemBackendTests(unittest.TestCase):
             allocate_logical_channels_with_recovery(card, 3)
         self.assertEqual(card.closed, [])
 
+    def test_unsupported_channel_opened_by_this_process_is_closed(self):
+        card = ModemCard.__new__(ModemCard)
+        card.lock = threading.RLock()
+        opened = bytes.fromhex("049000")
+        with patch.object(card, "csim", side_effect=[opened, bytes.fromhex("9000")]) as csim:
+            with self.assertRaisesRegex(ModemError, "unsupported logical channel allocated: 4"):
+                card.open_channel()
+        self.assertEqual(
+            [call.args[0] for call in csim.call_args_list],
+            [bytes.fromhex("0070000001"), bytes.fromhex("0070800400")],
+        )
+
     class FakeCard:
         def __init__(self, values):
             self.values = iter(values)
@@ -265,6 +278,37 @@ class ModemBackendTests(unittest.TestCase):
         with patch.object(mdd_orchestrator, "run", side_effect=fake_run):
             self.assertEqual(Orchestrator.modemmanager_modem_for_tty("/dev/ttyUSB2"),
                              "/org/freedesktop/ModemManager1/Modem/2")
+
+    def test_bridge_stop_waits_for_owned_channel_cleanup_before_force_kill(self):
+        app = Orchestrator.__new__(Orchestrator)
+        proc = Mock()
+        proc.poll.return_value = None
+        app.bridges = {"modem-a": proc}
+        app.bridge_ports = {"modem-a": 36000}
+
+        app.stop_bridge("modem-a")
+
+        proc.terminate.assert_called_once_with()
+        proc.wait.assert_called_once_with(mdd_orchestrator.BRIDGE_STOP_GRACE_SECONDS)
+        proc.kill.assert_not_called()
+        self.assertNotIn("modem-a", app.bridges)
+        self.assertNotIn("modem-a", app.bridge_ports)
+
+    def test_bridge_stop_force_kills_only_after_cleanup_budget_expires(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired("bridge", mdd_orchestrator.BRIDGE_STOP_GRACE_SECONDS),
+            0,
+        ]
+
+        Orchestrator._stop_bridge_process(proc)
+
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+        self.assertEqual(proc.wait.call_args_list[0].args,
+                         (mdd_orchestrator.BRIDGE_STOP_GRACE_SECONDS,))
+        self.assertEqual(proc.wait.call_args_list[1].args, ())
 
     def test_a_slot_pcscd_never_opens_stops_logging_and_backs_off(self):
         """A reader can expose fewer slots than the modem offers. Retrying that every
