@@ -202,6 +202,11 @@ export default function Softphone({
   }, [id])
   useEffect(() => { loadCalls(true); loadVoicemails() }, [loadCalls, loadVoicemails])
   useEffect(() => { setCallSelMode(false); setCallSel(new Set()); setCallTransport('vowifi') }, [id])
+  // The call surface stays mounted so SIP and active calls survive navigation. Its bulk-delete
+  // checkboxes are only page-local action targets and must not survive that navigation.
+  useEffect(() => {
+    if (!pageVisible) { setCallSelMode(false); setCallSel(new Set()) }
+  }, [pageVisible])
   useEffect(() => {
     if (!cellularReady && callTransport === 'cellular') setCallTransport('vowifi')
   }, [cellularReady, callTransport])

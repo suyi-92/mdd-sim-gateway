@@ -247,8 +247,8 @@ export default function App() {
   const presentDeviceCount=physicallyPresentDevices(devices).length
   const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
   const pages={
-    overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>,
-    messages:<Messages {...common}/>, esim:<Esim {...common} pageVisible={view === 'esim'}/>, keepalive:<Keepalive {...common}/>,
+    overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common} pageVisible={view === 'devices'}/>,
+    messages:<Messages {...common} pageVisible={view === 'messages'}/>, esim:<Esim {...common} pageVisible={view === 'esim'}/>, keepalive:<Keepalive {...common}/>,
     egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }

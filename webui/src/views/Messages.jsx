@@ -3,7 +3,7 @@ import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 
-export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors }) {
+export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors, pageVisible = true }) {
   const { t: tr } = useI18n()
   const id = selected?.id
   const [threads, setThreads] = useState([])
@@ -96,6 +96,11 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   }, [peer, loadMsgs])
   // leaving/refreshing a thread resets the selection UI
   useEffect(() => { setSelMode(false); setSelIds(new Set()) }, [peer])
+  // A bulk selection is only a transient action target. Keep conversation and compose drafts,
+  // but never carry checked rows through navigation to another page.
+  useEffect(() => {
+    if (!pageVisible) { setSelMode(false); setSelIds(new Set()) }
+  }, [pageVisible])
   // if the open conversation empties (delete/clear), leave select mode so its toolbar
   // (rendered only while msgs.length>0) can't strand the UI in select state.
   useEffect(() => { if (!msgs.length) { setSelMode(false); setSelIds(new Set()) } }, [msgs.length])

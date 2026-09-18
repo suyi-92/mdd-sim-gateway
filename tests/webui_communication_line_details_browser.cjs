@@ -43,6 +43,7 @@ let networks = []
 let operationNumber = 0
 let applying = false
 let registrationFailure = false
+let showMessageHistory = false
 const json = (response, value, status = 200) => {
   response.writeHead(status, { 'Content-Type': 'application/json' })
   response.end(JSON.stringify(value))
@@ -58,15 +59,23 @@ const server = http.createServer((request, response) => {
       '/api/system/status': { version: 'fixture', repository_url: 'https://example.invalid/repo' },
     }
     if (/\/softphone$/.test(url.pathname)) return json(response, { enabled: false })
-    if (/\/calls$/.test(url.pathname)) return json(response, { calls: [] })
+    if (/\/calls$/.test(url.pathname)) return json(response, { calls: [{ id: 701,
+      peer: '+12025550123', direction: 'out', start_ts: 1_700_000_000, status: 'answered' }] })
     if (/\/voicemails$/.test(url.pathname)) return json(response, { voicemails: [] })
-    if (/\/messages\/threads$/.test(url.pathname)) return json(response, { threads: [] })
+    if (/\/messages\/threads$/.test(url.pathname)) return json(response, { threads: showMessageHistory
+      ? [{ peer: '+12025550123', last_body: 'Fixture message' }] : [] })
     if (/\/messages\/binary$/.test(url.pathname)) return json(response, { payloads: [] })
     if (/\/messages\/reimport-cellular$/.test(url.pathname)) {
+      showMessageHistory = true
       return json(response, { ok: true, imported: 2, retained: 2 })
     }
+    if (/\/messages\/%2B12025550123$/i.test(url.pathname)) return json(response, { messages: [{
+      id: 801, peer: '+12025550123', direction: 'in', body: 'Fixture message',
+      ts: 1_700_000_000, status: 'delivered', transport: 'vowifi',
+    }] })
     if (/\/cellular\/network-operation$/.test(url.pathname)) {
-      return json(response, { context: 'fixture-context', networks, operation })
+      return json(response, { context: 'fixture-context', networks, operation,
+        saved_selection: devices[1].cellular_network })
     }
     if (/\/cellular\/networks\/scan$/.test(url.pathname)) {
       operation = { id: `scan-${++operationNumber}`, action: 'scan', state: 'running', selection: {} }
@@ -147,6 +156,11 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const switchedOption = await page.locator('.u-line-selector:visible select option:checked').innerText()
     assert.ok(switchedOption.includes('••••7654'))
     assert.equal(switchedOption.includes('+1555**7654#'), false)
+    const callHistory = page.locator('.u-history-panel')
+    await callHistory.getByText('+12025550123', { exact: true }).waitFor()
+    await callHistory.getByRole('button', { name: '选择', exact: true }).click()
+    await callHistory.locator('.hover-row').first().click()
+    assert.equal(await callHistory.locator('input[type="checkbox"]').isChecked(), true)
 
     await page.setViewportSize({ width: 2048, height: 900 })
     const selectBox = await page.locator('.u-line-selector:visible select').boundingBox()
@@ -178,12 +192,27 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.screenshot({ path: path.join(output, `calls-${width}.png`), fullPage: true, animations: 'disabled' })
     }
 
-    await page.goto(origin + '/#/messages')
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /短信/ }).click()
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /通话/ }).click()
+    assert.equal(await callHistory.getByRole('button', { name: '选择', exact: true }).isVisible(), true)
+    assert.equal(await callHistory.locator('input[type="checkbox"]').count(), 0)
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /短信/ }).click()
     await verifyFirstLine('messages')
     await page.locator('.u-line-selector:visible select').selectOption('2')
     page.once('dialog', dialog => dialog.accept())
     await page.getByRole('button', { name: '重新导入模块保留短信' }).click()
     await page.getByText('已重新导入 2 条模块保留短信。', { exact: true }).waitFor()
+    await page.locator('.u-message-thread-list').getByText('+12025550123', { exact: true }).click()
+    const conversation = page.locator('.u-message-conversation')
+    await conversation.getByText('Fixture message', { exact: true }).waitFor()
+    await conversation.getByRole('button', { name: '选择', exact: true }).click()
+    await conversation.getByText('Fixture message', { exact: true }).click()
+    assert.equal(await conversation.locator('input[type="checkbox"]').isChecked(), true)
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /概览/ }).click()
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /短信/ }).click()
+    assert.equal(await conversation.getByRole('button', { name: '选择', exact: true }).isVisible(), true)
+    assert.equal(await conversation.locator('input[type="checkbox"]').count(), 0)
     for (const width of [3420, 2048, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false,
@@ -243,6 +272,26 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await page.getByRole('radio', { name: /中国电信/ }).isEnabled(), false)
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).locator('b').innerText(), '中国移动')
     assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).locator('small').innerText(), 'China Mobile')
+    await page.getByRole('radio', { name: /China Mobile/ }).click()
+    // An unsubmitted radio choice is a view-local draft. Switching either the device tab or
+    // the top-level page must return to the saved automatic mode, while scan results remain.
+    await page.locator('.u-tabs').getByRole('button', { name: '硬件', exact: true }).click()
+    await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    assert.equal(await page.getByRole('button', { name: '自动', exact: true }).getAttribute('aria-pressed'), 'true')
+    assert.equal(await page.getByRole('radio', { name: /China Mobile/ }).count(), 0)
+    await page.getByRole('button', { name: '手动', exact: true }).click()
+    await page.getByRole('radio', { name: /China Mobile/ }).click()
+    await page.locator('.u-device-sidebar .u-device-option').filter({ hasText: 'SCR Prime' }).click()
+    await page.locator('.u-device-sidebar .u-device-option').filter({ hasText: 'Travel modem' }).click()
+    await page.locator('.u-tabs').getByRole('button', { name: '蜂窝数据（4G）' }).click()
+    assert.equal(await page.getByRole('button', { name: '自动', exact: true }).getAttribute('aria-pressed'), 'true')
+    await page.getByRole('button', { name: '手动', exact: true }).click()
+    await page.getByRole('radio', { name: /China Mobile/ }).click()
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /概览/ }).click()
+    await page.locator('.u-sidebar nav').getByRole('button', { name: /设备/ }).click()
+    assert.equal(await page.getByRole('button', { name: '自动', exact: true }).getAttribute('aria-pressed'), 'true')
+    await page.getByRole('button', { name: '手动', exact: true }).click()
     await page.getByRole('radio', { name: /China Mobile/ }).click()
     applying = true
     page.once('dialog', dialog => dialog.accept())

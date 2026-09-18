@@ -325,7 +325,7 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   </div>
 }
 
-function CellularNetworkControl({ device, refreshDevices, showToast }) {
+function CellularNetworkControl({ device, refreshDevices, showToast, active = true }) {
   const { t, language } = useI18n()
   const saved = device.cellular_network || {}
   cellularNetworkState.ensure(device)
@@ -335,6 +335,10 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
   )
   const { mode, operatorId, networks, operation } = state
   const refreshedOperation = useRef('')
+  useEffect(() => {
+    cellularNetworkState.setActive(device.id, active)
+    return () => cellularNetworkState.setActive(device.id, false)
+  }, [active, device.id])
   useEffect(() => {
     if (!operation || operation.state === 'running') return
     const key = `${operation.id}:${operation.state}`
@@ -723,7 +727,7 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
   </div>
 }
 
-export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab = 'status', setDeviceTab }) {
+export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab = 'status', setDeviceTab, pageVisible = true }) {
   const { t, language } = useI18n(); const tab = deviceTab; const setTab = setDeviceTab
   const [showDisconnected, setShowDisconnected] = useState(false)
   const { visibleDevices, disconnectedCount, activeDeviceId: active, device: d } = useMemo(
@@ -768,7 +772,8 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
           <div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div>
           <div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div>
         </div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on cellular data to let the per-device ModemManager backend establish a data bearer.')} />}
-        <CellularNetworkControl key={d.id} device={d} refreshDevices={refreshDevices} showToast={showToast}/>
+        <CellularNetworkControl key={d.id} device={d} refreshDevices={refreshDevices} showToast={showToast}
+          active={pageVisible}/>
       </div>}
       {tab==='vowifi' && <div className="card u-panel"><h3>VoWiFi</h3><CountryExitControl device={d} refresh={refresh} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><VowifiHistory instanceId={d.instance_id} subscribe={subscribe}/><div className="u-details cols"><div className="u-detail"><span>ePDG / IKE</span><b>{typeof d.vowifi?.epdg === 'object' ? (d.vowifi.epdg.ike_reason || (d.vowifi.epdg.pcscf ? t('Tunnel connected') : t('Waiting'))) : (d.vowifi?.epdg || d.status?.state || t('Not connected'))}</b></div><div className="u-detail"><span>IMS / SIP</span><b>{d.vowifi?.ims || d.status?.label || t('Not connected')}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t)} /></b></div><div className="u-detail"><span>{t('Rekey')}</span><b>{d.vowifi?.rekey_minutes ?? 30} {t('minutes')}</b></div><div className="u-detail"><span>{t('IKE rekey')}</span><b>{d.vowifi?.ike_rekey_minutes ?? 150} {t('minutes')}</b></div></div>{!!d.egress?.pinned_node && d.egress.pinned_node !== d.egress.node && !!exitChangeReason(d.egress, t, language) && <p className="u-note u-proxy-node-text"><ProxyNodeName text={exitChangeReason(d.egress, t, language)} /></p>}<p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
       {tab==='hardware' && <HardwarePanel key={d.id} device={d} refreshDevices={refreshDevices} refresh={refresh} showToast={showToast}/>}

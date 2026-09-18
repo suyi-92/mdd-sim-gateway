@@ -195,6 +195,15 @@ class PageRhythmTests(unittest.TestCase):
         dock = css_rule(".u-call-dock-shell")
         self.assertIn("pointer-events:none", dock)
 
+    def test_transient_action_selections_reset_when_their_page_is_left(self):
+        self.assertIn("pageVisible={view === 'devices'}", APP)
+        self.assertIn("pageVisible={view === 'messages'}", APP)
+        self.assertIn("cellularNetworkState.setActive(device.id, active)", UNIFIED)
+        self.assertIn("if (!pageVisible) { setSelMode(false); setSelIds(new Set()) }", MESSAGES)
+        self.assertIn("if (!pageVisible) { setCallSelMode(false); setCallSel(new Set()) }", SOFTPHONE)
+        self.assertIn("if (!pageVisible) {", ESIM)
+        self.assertIn("setShowDl(false)", ESIM)
+
     def test_active_call_surface_has_click_and_keyboard_dtmf_at_all_widths(self):
         self.assertIn("export const CALL_KEYS", CALL_SURFACE)
         self.assertIn('className="u-call-dtmf-grid"', CALL_SURFACE)

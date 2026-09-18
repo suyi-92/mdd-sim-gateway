@@ -553,6 +553,16 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   const [busyOp, setBusyOp] = useState('')
   const [profileSwitch, setProfileSwitch] = useState(null) // { iccid, phase }
 
+  // Background downloads and profile switches are server-owned and remain visible after
+  // returning. A not-yet-submitted modal is only a local draft, so leaving the page closes it
+  // instead of retaining an eUICC choice or activation data in a hidden view.
+  useEffect(() => {
+    if (!pageVisible) {
+      setShowDl(false)
+      if (!renameBusy.current) setRenameTarget(null)
+    }
+  }, [pageVisible])
+
   useEffect(() => {
     if (!reader && present[0]) setReader(present[0].name)
     if (reader && !present.find((c) => c.name === reader) && present[0]) setReader(present[0].name)

@@ -21,26 +21,57 @@ test('eSIM reset selects automatic even before the device poll refreshes saved s
   assert.equal(store.get(device.id).operation, null)
 })
 
-test('draft, scan names and running application survive page unsubscription', async () => {
-  let status = { context: 'fixture-context', networks: [network], operation: null }
+test('leaving the view resets an unsubmitted choice but keeps scan results', async () => {
+  const saved = { mode: 'manual', operator_id: '00101' }
+  let status = { context: 'fixture-context', networks: [network,
+    { operator_id: '00102', name: 'Other Mobile', status: 'available' }],
+  operation: null, saved_selection: saved }
+  const store = createCellularNetworkState({ cellularNetworkOperation: async () => status }, timers)
+  store.ensure({ ...device, cellular_network: saved })
+  store.setActive(device.id, true)
+  await store.refresh(device.id)
+  store.edit(device.id, { operatorId: '00102' })
+  assert.equal(store.get(device.id).operatorId, '00102')
+  store.setActive(device.id, false)
+  assert.equal(store.get(device.id).mode, 'manual')
+  assert.equal(store.get(device.id).operatorId, '00101')
+  assert.equal(store.get(device.id).networks.length, 2)
+})
+
+test('a submitted application survives navigation and adopts the authoritative saved result', async () => {
+  let status = { context: 'fixture-context', networks: [network], operation: null,
+    saved_selection: { mode: 'automatic', operator_id: '' } }
   const client = { cellularNetworkOperation: async () => status,
     selectCellularNetwork: async () => (status = running('apply')) }
   const store = createCellularNetworkState(client, timers)
   store.ensure(device)
-  const leave = store.subscribe(device.id, () => {})
+  store.setActive(device.id, true)
   await store.refresh(device.id)
   store.edit(device.id, { mode: 'manual', operatorId: '00101' })
   await store.start(device.id, 'apply', { mode: 'manual', operator_id: '00101' })
-  leave()
+  store.setActive(device.id, false)
   assert.equal(store.get(device.id).operation.state, 'running')
   assert.equal(store.get(device.id).networks[0].name, 'Fixture Mobile')
-  status = { ...status, operation: { ...status.operation, state: 'success', result: { registration: { operator_id: '00101' } } } }
-  const again = store.subscribe(device.id, () => {})
+  status = { ...status, saved_selection: { mode: 'manual', operator_id: '00101' },
+    operation: { ...status.operation, state: 'success', result: { registration: { operator_id: '00101' } } } }
   await store.refresh(device.id)
   assert.equal(store.get(device.id).operation.state, 'success')
   assert.equal(store.get(device.id).mode, 'manual')
   assert.equal(store.get(device.id).operatorId, '00101')
-  again()
+})
+
+test('a failed hidden application returns to the previous saved selection', async () => {
+  let status = running('apply')
+  status.saved_selection = { mode: 'automatic', operator_id: '' }
+  const store = createCellularNetworkState({ cellularNetworkOperation: async () => status }, timers)
+  store.ensure(device)
+  store.setActive(device.id, true)
+  await store.refresh(device.id)
+  store.setActive(device.id, false)
+  status = { ...status, operation: { ...status.operation, state: 'failed', error: { code: 'network_timeout' } } }
+  await store.refresh(device.id)
+  assert.equal(store.get(device.id).mode, 'automatic')
+  assert.equal(store.get(device.id).operatorId, '')
 })
 
 test('a fresh browser recovers backend progress and prevents duplicate commands', async () => {
