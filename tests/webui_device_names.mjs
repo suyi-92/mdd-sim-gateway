@@ -28,8 +28,8 @@ test('a user display name overrides the default in every consumer', () => {
 })
 
 test('modem profile names remain stable defaults', () => {
-  assert.equal(deviceTitle({ default_name: 'DJI/Quectel EC25' }, 0, t),
-    'DJI/Quectel EC25')
+  assert.equal(deviceTitle({ default_name: 'DJI/Quectel cellular modem' }, 0, t),
+    'DJI/Quectel cellular modem')
   assert.equal(deviceTitle({ name: 'VoWiFi Modem fixture 00 00' }, 0, t),
     '蜂窝通信模块')
 })

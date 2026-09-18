@@ -113,6 +113,11 @@ git remote -v
 - 普通 PC/SC reader 可以没有 IMEI；缺少 SMSC 只能禁用主动 VoWiFi 短信，不能阻止通话。
 - 端口分配同时探测真实 TCP 与 UDP 占用；Engine 启动失败必须清理 Docker `Created` 残留。
 - eSIM profile 首次启用时继续等待陈旧 `disabled` 出口状态刷新。
+- eSIM 切换须分别证明 profile、桥接卡身份与基带 SIM 身份；飞行模式中的未完成初始化持久延后，
+  只对同一 USB/卡代次在恢复射频前继续。不得仅凭 VID/PID 猜模块型号、发送通用 CFUN 重启或
+  盲关无所有权证据的逻辑通道。
+- 读卡 UI 软截止不得释放仍运行的 PC/SC 所有权；硬截止必须能真正终止底层工作。网络拒绝须按
+  MM 服务、USB 与 SIM 代次绑定，原因码 7 与 SIM 可读、普通超时和数据开关分别呈现。
 - 切换 eSIM 后蜂窝访问网络选择默认恢复自动，清除原手动 PLMN 与旧候选草稿；号码地区、
   eSIM 品牌和 SIM 技术归属网分别呈现，不以号码地区改写真实 MCC/MNC 或国家出口配置。
 - Fake-IP 环境下，ePDG 必须在选定国家出口内解析并固定真实地址；浏览器 SDP 必须过滤

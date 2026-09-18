@@ -1,6 +1,7 @@
 """eSIM switch regressions; no production devices or services are accessed."""
 import hashlib
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,57 +89,124 @@ class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProfileModemRefreshTests(unittest.TestCase):
+    def test_flight_mode_defers_baseband_work_and_restart_resumes_same_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = host.Orchestrator(root / "data", root)
+            app.root.mkdir(parents=True, exist_ok=True)
+            host.atomic_json(app.hw_state_path, {"assignments": {"modem-a": {
+                "tty": "/dev/ttyUSB2", "usb_generation": "generation-a"}}})
+            host.atomic_json(app.bridge_restart_request_dir / "fixture.json", {
+                "request_id": "fixture", "device_id": "modem-a",
+                "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest(),
+                "cellular_refresh": True})
+            app.process_bridge_restart_requests()
+            modem = {"id": "modem-a", "tty": "/dev/ttyUSB2",
+                     "usb_generation": "generation-a"}
+            self.assertEqual(app.process_cellular_recoveries(
+                [modem], {"modem-a": {"flight_mode": True}}, False), set())
+            self.assertEqual(app._cellular_recoveries["modem-a"]["state"],
+                             "waiting_flight_mode")
+
+            # A service restart loads the task and completes it only for the same USB/card.
+            resumed = host.Orchestrator(root / "data", root)
+            with patch.object(resumed, "modem_snapshot", return_value={
+                    "sim_iccid": "new-card",
+                    "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
+                    patch.object(host, "run") as run:
+                blocked = resumed.process_cellular_recoveries(
+                    [modem], {"modem-a": {"flight_mode": False}}, True)
+            self.assertEqual(blocked, set())
+            self.assertEqual(resumed._cellular_recoveries["modem-a"]["state"], "ready")
+            run.assert_not_called()
+
+    def test_usb_generation_change_cancels_deferred_initialization(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = host.Orchestrator(Path(temp), Path(temp))
+            app._cellular_recoveries["modem-a"] = {
+                "device_id": "modem-a", "state": "waiting_flight_mode",
+                "usb_generation": "old-generation", "deadline_at": time.time() + 60,
+                "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest(),
+            }
+            app.process_cellular_recoveries(
+                [{"id": "modem-a", "usb_generation": "new-generation"}],
+                {"modem-a": {"flight_mode": False}}, True)
+            self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "cancelled")
+            self.assertEqual(app._cellular_recoveries["modem-a"]["error_code"],
+                             "device_generation_changed")
+
+    def test_failed_initialization_keeps_radio_enable_blocked_until_explicit_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = host.Orchestrator(Path(temp), Path(temp))
+            app._cellular_recoveries["modem-a"] = {
+                "device_id": "modem-a", "state": "failed",
+                "error_code": "sim_identity_unavailable",
+            }
+            blocked = app.process_cellular_recoveries(
+                [{"id": "modem-a", "usb_generation": "generation-a"}],
+                {"modem-a": {"flight_mode": False}}, True)
+            self.assertEqual(blocked, {"modem-a"})
+
     def test_only_target_with_stale_sim_is_reset_and_returning_usb_is_awaited(self):
         with tempfile.TemporaryDirectory() as temp:
             app = host.Orchestrator(Path(temp), Path(temp))
             old, other = Mock(), Mock()
             old.poll.return_value = other.poll.return_value = None
             app.bridges = {"modem-a": old, "modem-b": other}
-            host.atomic_json(app.hw_state_path, {"assignments": {"modem-a": {"tty": "/dev/ttyUSB2"}}})
+            host.atomic_json(app.hw_state_path, {"assignments": {"modem-a": {
+                "tty": "/dev/ttyUSB2", "usb_generation": "generation-a"}}})
             host.atomic_json(app.bridge_restart_request_dir / "fixture.json", {
                 "request_id": "fixture", "device_id": "modem-a",
                 "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest()})
+            app.process_bridge_restart_requests()
+            self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "pending")
+            other.terminate.assert_not_called()
+            modem = {"id": "modem-a", "tty": "/dev/ttyUSB2",
+                     "usb_generation": "generation-a"}
             with patch.object(app, "modem_snapshot", return_value={
                     "sim_iccid": "old-card", "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
                     patch.object(host, "run", return_value=SimpleNamespace(
                         returncode=0, stdout="modem.generic.device: /sys/devices/fixture\n"
                         "modem.generic.primary-port: cdc-wdm9\nmodem.generic.primary-sim-slot: 1")) as run:
-                app.process_bridge_restart_requests()
+                blocked = app.process_cellular_recoveries(
+                    [modem], {"modem-a": {"flight_mode": False}}, True)
+            self.assertEqual(blocked, {"modem-a"})
             self.assertEqual([call.args[0] for call in run.call_args_list], [
                 ["mmcli", "-m", "/org/freedesktop/ModemManager1/Modem/9", "--output-keyvalue"],
                 ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", "/dev/cdc-wdm9", "--uim-sim-power-off=1"],
                 ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", "/dev/cdc-wdm9", "--uim-sim-power-on=1"]])
             other.terminate.assert_not_called()
-            app.finish_bridge_restart_requests(set())
-            self.assertEqual(app._bridge_restarts["fixture"]["state"], "stopped")
-            app.bridges["modem-a"] = SimpleNamespace(pid=22, poll=lambda: None)
-            host.atomic_json(app.data / "modems" / "modem-a.json", {
-                **verified_bridge(), "bridge_pid": 22, "iccid": "new-card",
-                "channel_allocated": 3})
-            app.cellular_states["modem-a"] = {"sim_iccid": "old-card"}
-            app.finish_bridge_restart_requests({"modem-a"})
-            self.assertEqual(app._bridge_restarts["fixture"]["state"], "spawned")
-            app.cellular_states["modem-a"] = {"sim_iccid": "new-card"}
-            app.finish_bridge_restart_requests({"modem-a"})
-            self.assertEqual(app._bridge_restarts["fixture"]["state"], "channels_ready")
+            self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "waiting_identity")
+            with patch.object(app, "modem_snapshot", return_value={
+                    "sim_iccid": "new-card", "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}):
+                blocked = app.process_cellular_recoveries(
+                    [modem], {"modem-a": {"flight_mode": False}}, True)
+            self.assertEqual(blocked, set())
+            self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "ready")
 
     def test_matching_sim_is_not_reset_and_failure_is_explicit(self):
         for current, code in (("new-card", 0), ("old-card", 1)):
             with self.subTest(current=current), tempfile.TemporaryDirectory() as temp:
                 app = host.Orchestrator(Path(temp), Path(temp))
-                host.atomic_json(app.hw_state_path, {"assignments": {"modem-a": {"tty": "/dev/ttyUSB2"}}})
+                host.atomic_json(app.hw_state_path, {"assignments": {"modem-a": {
+                    "tty": "/dev/ttyUSB2", "usb_generation": "generation-a"}}})
                 host.atomic_json(app.bridge_restart_request_dir / "fixture.json", {
                     "request_id": "fixture", "device_id": "modem-a",
                     "expected_iccid_sha256": hashlib.sha256(b"new-card").hexdigest()})
+                app.process_bridge_restart_requests()
+                modem = {"id": "modem-a", "tty": "/dev/ttyUSB2",
+                         "usb_generation": "generation-a"}
                 with patch.object(app, "modem_snapshot", return_value={
                         "sim_iccid": current, "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
                         patch.object(host, "run", side_effect=[
                             SimpleNamespace(returncode=0, stdout="modem.generic.device: /sys/devices/fixture\n"
                                             "modem.generic.primary-port: cdc-wdm9\nmodem.generic.primary-sim-slot: 1"),
                             SimpleNamespace(returncode=code), SimpleNamespace(returncode=code)]) as run:
-                    app.process_bridge_restart_requests()
+                    app.process_cellular_recoveries(
+                        [modem], {"modem-a": {"flight_mode": False}}, True)
                 if current == "new-card":
                     run.assert_not_called()
+                    self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "ready")
                 else:
-                    self.assertEqual(app._bridge_restarts["fixture"]["state"], "failed")
+                    self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "retry_wait")
                     self.assertIn("--uim-sim-power-on=1", run.call_args.args[0])

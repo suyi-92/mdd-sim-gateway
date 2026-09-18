@@ -30,11 +30,14 @@ NotificationProcessedCb = Callable[[], Awaitable[None] | None]
 class LpaError(Exception):
     """Raised when lpac exits with a non-success payload or cannot be started."""
 
-    def __init__(self, message: str, *, detail: Any = None, code: int = -1):
+    def __init__(self, message: str, *, detail: Any = None, code: int = -1,
+                 stage: str = "", category: str = ""):
         super().__init__(message)
         self.message = message
         self.detail = detail
         self.code = code
+        self.stage = stage
+        self.category = category
 
     def user_message(self) -> str:
         """User-facing text; maps raw lpac function names to plain language."""
@@ -71,6 +74,45 @@ class LpaResult:
 def _reader_busy_error(error: LpaError) -> bool:
     detail = f"{error.message} {error.detail}".lower()
     return any(value in detail for value in ("8010000b", "scard_e_sharing_violation", "sharing violation"))
+
+
+def classify_lpa_error(error: BaseException) -> str:
+    """Reduce an LPA failure to a closed, identity-free diagnostic category."""
+    if isinstance(error, asyncio.CancelledError):
+        return "interrupted"
+    if not isinstance(error, LpaError):
+        return "unknown_error"
+    if error.category:
+        return error.category
+    if _reader_busy_error(error):
+        return "reader_busy"
+    text = f"{error.message} {error.detail}".casefold()
+    if any(value in text for value in (
+        "scard_e_no_smartcard", "scard_w_removed_card", "no smartcard",
+        "no smart card", "card absent", "card removed", "card not present",
+    )):
+        return "card_unavailable"
+    if "timed out" in text or "timeout" in text:
+        return "notification_timeout"
+    if any(value in text for value in (
+        "cancelled", "canceled", "interrupted", "sigint",
+    )):
+        return "interrupted"
+    if any(value in text for value in (
+        "http 400", "http 401", "http 403", "http 404", "http 409",
+        "forbidden", "unauthorized", "remote rejected", "server rejected",
+    )):
+        return "remote_rejected"
+    if any(value in text for value in (
+        "curl", "network", "dns", "resolve", "connection refused",
+        "connection reset", "tls", "certificate", "transport",
+    )):
+        return "network_transport"
+    if any(value in text for value in (
+        "failed to spawn", "produced no result", "broken pipe", "exit=",
+    )):
+        return "process_error"
+    return "unknown_error"
 
 
 # Active download process per reader name — used by cancel_download().
@@ -210,12 +252,14 @@ async def run_lpac(
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     _signal_cancel(proc)
-                    raise LpaError("lpac timed out", code=-1)
+                    raise LpaError("lpac timed out", code=-1, stage=operation,
+                                   category="notification_timeout")
                 try:
                     line_b = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
                 except asyncio.TimeoutError:
                     _signal_cancel(proc)
-                    raise LpaError("lpac timed out", code=-1) from None
+                    raise LpaError("lpac timed out", code=-1, stage=operation,
+                                   category="notification_timeout") from None
             else:
                 line_b = await proc.stdout.readline()
             if not line_b:
@@ -261,14 +305,15 @@ async def run_lpac(
     if final is None:
         # Process died without a final envelope (e.g. driver failed to open reader).
         detail = stderr_txt or f"exit={rc}"
-        raise LpaError(f"lpac produced no result ({detail})", detail=detail, code=rc or -1)
+        raise LpaError(f"lpac produced no result ({detail})", detail=detail,
+                       code=rc or -1, stage=operation, category="process_error")
 
     code = int(final.get("code", -1))
     message = final.get("message") or ("success" if code == 0 else "error")
     data = final.get("data")
     if code != 0:
         detail = data if data not in (None, "", {}) else stderr_txt or None
-        raise LpaError(str(message), detail=detail, code=code)
+        raise LpaError(str(message), detail=detail, code=code, stage=operation)
 
     result.data = data
     log.info("lpac complete operation=%s duration_ms=%d",
@@ -344,9 +389,11 @@ async def profile_enable(
     on_notifications_processed: NotificationProcessedCb | None = None,
     process_notifications: bool = True,
     on_notification_status: ProgressCb | None = None,
+    refresh: bool = True,
 ) -> Any:
     r = await run_lpac(
-        "profile", "enable", iccid, reader_name=reader_name, aid=aid, timeout=90)
+        "profile", "enable", iccid, "1" if refresh else "0",
+        reader_name=reader_name, aid=aid, timeout=90)
     if process_notifications:
         await maybe_process_notifications(
             reader_name, aid=aid, on_processed=on_notifications_processed,
@@ -503,10 +550,17 @@ async def maybe_process_notifications(
     on_status: ProgressCb | None = None,
 ) -> bool:
     """Bounded best-effort delivery; only transient PC/SC sharing conflicts retry."""
-    async def report(state, attempts, reason_code=""):
+    started_at = asyncio.get_running_loop().time()
+
+    async def report(state, attempts, reason_code="", stage="notification_process"):
         if on_status:
             try:
-                result = on_status({"state": state, "attempts": attempts, "reason_code": reason_code})
+                result = on_status({
+                    "state": state, "attempts": attempts, "reason_code": reason_code,
+                    "stage": stage,
+                    "elapsed_ms": max(0, round(
+                        (asyncio.get_running_loop().time() - started_at) * 1000)),
+                })
                 if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
                     await result
             except Exception as error:  # noqa - feedback cannot turn an enabled profile into a failure
@@ -534,10 +588,12 @@ async def maybe_process_notifications(
             busy = _reader_busy_error(error)
             if busy and attempts < 3:
                 continue
-            code = ("reader_busy" if busy else "notification_timeout"
-                    if error.message == "lpac timed out" else "notification_failed")
-        except Exception:  # noqa - do not publish arbitrary endpoint/card details
-            code = "notification_failed"
+            code = classify_lpa_error(error)
+        except asyncio.CancelledError:
+            await report("failed", attempts, "interrupted")
+            raise
+        except Exception as error:  # noqa - do not publish arbitrary endpoint/card details
+            code = classify_lpa_error(error)
         log.warning("auto notification process failed reader=%s code=%s attempts=%d",
                     reader_name, code, attempts)
         await report("failed", attempts, code)

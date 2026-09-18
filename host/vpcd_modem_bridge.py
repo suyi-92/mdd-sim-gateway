@@ -109,26 +109,19 @@ def allocate_logical_channels(card, count):
 
 
 def allocate_logical_channels_with_recovery(card, count):
-    """Allocate normally, clearing stale channels only after the first attempt proves it must.
+    """Allocate channels without closing sessions this process cannot prove it owns.
 
-    A graceful bridge shutdown already closes every channel it owned. Closing channels 1-3
-    again on every profile switch added three slow AT+CSIM exchanges to the healthy path. A
-    crashed or interrupted predecessor can still leak channels, so retain the same cleanup as
-    a bounded recovery step and retry the full allocation once.
+    A graceful predecessor closes its exact channel list.  If a crashed process leaked a
+    session, blindly closing channels 1-3 can instead tear down the baseband or a sibling
+    client.  Surface the bounded allocation failure to the orchestrator; its scoped UIM
+    recovery has physical-device and USB-generation evidence.
     """
     try:
         return allocate_logical_channels(card, count)
-    except ModemError as first_error:
-        print("[bridge] initial logical channel allocation failed; clearing stale channels "
-              "and retrying once: %s" % first_error, flush=True)
-        for channel in range(1, LOGICAL_CHANNEL_CAPACITY + 1):
-            card.close_channel(channel)
-        try:
-            return allocate_logical_channels(card, count)
-        except ModemError as retry_error:
-            raise ModemError(
-                "SIM logical channel allocation still failed after stale-channel cleanup: %s"
-                % retry_error) from retry_error
+    except ModemError as error:
+        raise ModemError(
+            "SIM logical channel allocation failed without closing unowned channels: %s"
+            % error) from error
 
 
 class ATSerial(serial.Serial if serial else object):
@@ -275,16 +268,38 @@ class ModemCard:
         iccid = self._iccid_from_card()
         verified = bool(iccid)
         if not iccid:
-            for command in ("AT+CCID", "AT+ICCID"):
-                try:
-                    match = ICCID_RE.search(self._at(command))
-                    if match:
-                        iccid = match.group(1).decode("ascii")
-                        break
-                except ModemError:
-                    pass
+            iccid = self.cached_iccid()
         return {"imei": imei, "iccid": iccid, "iccid_verified": verified,
                 "iccid_source": "card" if verified else ("baseband_cache" if iccid else "unknown")}
+
+    def cached_iccid(self):
+        for command in ("AT+CCID", "AT+ICCID"):
+            try:
+                match = ICCID_RE.search(self._at(command))
+                if match:
+                    return match.group(1).decode("ascii")
+            except ModemError:
+                pass
+        return ""
+
+    def refresh_identity(self, previous):
+        """Avoid periodic basic-channel APDUs while the baseband cache is unchanged.
+
+        A newly spawned bridge still performs one direct-card proof.  Later refreshes first
+        consult the baseband cache; a physical replacement changes that cache and triggers a
+        fresh proof, while an eSIM switch explicitly restarts the bridge.  This keeps periodic
+        metadata refreshes from selecting MF on the baseband's basic channel every minute.
+        """
+        previous = dict(previous or {})
+        cached = self.cached_iccid()
+        old = str(previous.get("iccid") or "")
+        if cached and cached == old and previous.get("iccid_verified") is True:
+            return previous
+        direct = self._iccid_from_card()
+        iccid = direct or cached
+        return {**previous, "iccid": iccid, "iccid_verified": bool(direct),
+                "iccid_source": "card" if direct else (
+                    "baseband_cache" if iccid else "unknown")}
 
     def close_channel(self, channel):
         try:
@@ -412,38 +427,46 @@ class ModemManagerCard(ModemCard):
         pass
 
 
-def recv_exact(sock, size):
+def recv_exact(sock, size, stopping=None):
     chunks = bytearray()
     while len(chunks) < size:
-        chunk = sock.recv(size - len(chunks))
+        try:
+            chunk = sock.recv(size - len(chunks))
+        except socket.timeout:
+            if stopping is not None and stopping.is_set():
+                return None
+            continue
         if not chunk:
             return None
         chunks.extend(chunk)
     return bytes(chunks)
 
 
-def serve_slot(card, host, port, slot, channel, atr, debug):
+def serve_slot(card, host, port, slot, channel, atr, debug, stopping=None):
+    managed_stop = stopping is not None
+    stopping = stopping or threading.Event()
     delay = SLOT_RETRY_SECONDS
     reported = ""
-    while True:
+    while not stopping.is_set():
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=10)
-            sock.settimeout(None)
+            # A bounded timeout lets shutdown stop slot traffic before owned channels close.
+            sock.settimeout(1.0)
             delay, reported = SLOT_RETRY_SECONDS, ""
             print(
                 "[bridge] slot %d connected to %s:%d on channel %d"
                 % (slot, host, port, channel),
                 flush=True,
             )
-            while True:
-                header = recv_exact(sock, 2)
+            while not stopping.is_set():
+                header = recv_exact(sock, 2, stopping)
                 if header is None:
                     break
                 (length,) = struct.unpack(">H", header)
                 if length == 0:
                     continue
-                payload = recv_exact(sock, length)
+                payload = recv_exact(sock, length, stopping)
                 if payload is None:
                     break
                 if length == 1:
@@ -477,7 +500,11 @@ def serve_slot(card, host, port, slot, channel, atr, debug):
                     sock.close()
                 except OSError:
                     pass
-        time.sleep(delay)
+        if managed_stop:
+            if stopping.wait(delay):
+                break
+        else:
+            time.sleep(delay)
         delay = min(delay * 2, SLOT_RETRY_CEILING_SECONDS)
 
 
@@ -512,13 +539,13 @@ def retain_hardware_identity(previous, observed):
     return result
 
 
-def refresh_metadata(card, path, static, interval, initial_identity=None):
+def refresh_metadata(card, path, static, interval, initial_identity=None, stopping=None):
     """Refresh ICCID after a hot SIM swap without competing for the exclusive AT port."""
     identity = dict(initial_identity or {})
-    while True:
-        time.sleep(interval)
+    stopping = stopping or threading.Event()
+    while not stopping.wait(interval):
         try:
-            identity = retain_hardware_identity(identity, card.identity())
+            identity = retain_hardware_identity(identity, card.refresh_identity(identity))
             write_metadata(path, {**static, **identity, "updated_at": int(time.time())})
         except Exception as exc:
             print("[bridge] identity refresh failed: %s" % exc, flush=True)
@@ -580,6 +607,7 @@ def main():
     print("[bridge] allocated logical channels %r" % channels, flush=True)
 
     atr = bytes.fromhex(args.atr)
+    stopping = threading.Event()
     threads = []
     for slot, channel in enumerate(channels):
         thread = threading.Thread(
@@ -592,6 +620,7 @@ def main():
                 channel,
                 atr,
                 args.debug,
+                stopping,
             ),
             daemon=True,
         )
@@ -599,11 +628,13 @@ def main():
         threads.append(thread)
 
     if args.metadata_file and args.identity_refresh > 0:
-        threading.Thread(target=refresh_metadata,
-                         args=(card, args.metadata_file, static_metadata,
-                               args.identity_refresh, identity), daemon=True).start()
+        metadata_thread = threading.Thread(
+            target=refresh_metadata,
+            args=(card, args.metadata_file, static_metadata,
+                  args.identity_refresh, identity, stopping), daemon=True)
+        metadata_thread.start()
+        threads.append(metadata_thread)
 
-    stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
     try:
@@ -612,6 +643,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stopping.set()
+        for thread in threads:
+            thread.join(3)
         # Release the UICC logical channels before handing the modem to ModemManager.
         # A raw SIGTERM used to leak all three channels until the next modem reset.
         for channel in channels:

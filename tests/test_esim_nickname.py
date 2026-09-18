@@ -29,8 +29,9 @@ class EsimNicknameRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.usim_ready = False  # ISD-R remains selected after lpac's logical close.
         self.steps.append("nickname")
 
-    async def rebuild(self, hardware, active):
+    async def rebuild(self, hardware, active, **kwargs):
         self.assertEqual((hardware, active), ("modem-fixture", "active-profile"))
+        self.assertIs(kwargs.get("cellular_refresh"), False)
         self.assertTrue(all(main.hub.lpa_busy.get(name) for name in self.names))
         self.steps.append("bridge")
         self.usim_ready = True
@@ -139,10 +140,10 @@ class EsimNicknameRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_rename_waits_until_all_slots_are_restored(self):
         entered, release = asyncio.Event(), asyncio.Event()
         original = self.bridge.side_effect
-        async def delayed(*args):
+        async def delayed(*args, **kwargs):
             entered.set()
             await release.wait()
-            return await original(*args)
+            return await original(*args, **kwargs)
         self.bridge.side_effect = delayed
         first = asyncio.create_task(self.rename())
         await entered.wait()

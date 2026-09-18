@@ -36,16 +36,50 @@ function notificationFeedback(status, t) {
     return t('Processing the eSIM notification…')
   }
   if (status?.state === 'failed') {
-    return status.reason_code === 'reader_busy'
-      ? t('The reader was busy. eSIM notification pending; click Load, then Process all to retry.')
-      : t('eSIM notification pending; click Load, then Process all to retry.')
+    const messages = {
+      reader_busy: 'The reader remained busy; the eSIM notification is still pending.',
+      card_unavailable: 'The card became unavailable while processing the eSIM notification.',
+      reader_unavailable: 'The reader became unavailable while processing the eSIM notification.',
+      process_error: 'The notification helper process failed; the notification is still pending.',
+      network_transport: 'The notification could not reach the remote service; it is still pending.',
+      remote_rejected: 'The remote service rejected the eSIM notification; it is still pending.',
+      notification_timeout: 'eSIM notification processing reached its time limit; it is still pending.',
+      interrupted: 'eSIM notification processing was interrupted; it is still pending.',
+      unknown_error: 'eSIM notification processing failed for an unknown reason; it is still pending.',
+    }
+    const summary = t(messages[status.reason_code] || 'eSIM notification pending; click Load, then Process all to retry.')
+    return `${summary} ${t('Stage: notification delivery · {attempts} attempt(s) · {seconds}s', {
+      attempts: status.attempts || 0, seconds: Math.ceil((status.elapsed_ms || 0) / 1000),
+    })}`
   }
   return ''
+}
+
+function recoveryFeedback(status, t) {
+  if (!status || ['success', 'cancelled'].includes(status.state)) return ''
+  if (status.state === 'network_rejected') {
+    const rejection = status.network_reject || {}
+    return Number(rejection.cause_code) === 7
+      ? t('The eSIM is readable, but LTE/EPS service was rejected (cause 7: EPS services not allowed).')
+      : t('The eSIM is readable, but cellular service was rejected by the network.')
+  }
+  if (status.state === 'failed') return t('The eSIM profile is enabled, but cellular recovery failed: {code}', {
+    code: status.error_code || t('unknown error'),
+  })
+  if (status.state === 'waiting_flight_mode') return t('Profile enabled; cellular initialization will continue when flight mode is turned off.')
+  if (status.state === 'registering') return t('Profile enabled; applying automatic network selection and waiting for registration…')
+  return t('Profile enabled; completing SIM and baseband initialization…')
 }
 
 function withNotificationStatus(list, iccid, status) {
   return list.map((se) => ({ ...se, profiles: (se.profiles || []).map((profile) => (
     profile.iccid === iccid ? { ...profile, notification_status: status } : profile
+  )) }))
+}
+
+function withRecoveryStatus(list, iccid, status) {
+  return list.map((se) => ({ ...se, profiles: (se.profiles || []).map((profile) => (
+    profile.iccid === iccid ? { ...profile, recovery_status: status } : profile
   )) }))
 }
 
@@ -657,6 +691,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (res?.notification_status) {
         setSes((list) => withNotificationStatus(list, p.iccid, res.notification_status))
       }
+      if (res?.cellular_recovery) {
+        setSes((list) => withRecoveryStatus(list, p.iccid, res.cellular_recovery))
+      }
       if (res?.recovery_error) {
         // The eUICC switched but the line did not come back on its own — say exactly
         // that, so the user starts the line instead of retrying an already-done switch.
@@ -747,6 +784,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       if (msg.type === 'esim_notification_status') {
         if (msg.reader !== reader) return
         setSes((list) => withNotificationStatus(list, msg.iccid, msg.notification_status))
+        return
+      }
+      if (msg.type === 'esim_recovery_status') {
+        if (msg.reader && msg.reader !== reader) return
+        setSes((list) => withRecoveryStatus(list, msg.iccid, msg.recovery_status))
         return
       }
       if (msg.type === 'esim_notifications') {
@@ -1153,7 +1195,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
                         const notification = notificationFeedback(p.notification_status, t)
-                        const feedback = renameFeedback?.message || notification
+                        const recovery = recoveryFeedback(p.recovery_status, t)
+                        const feedback = renameFeedback?.message || recovery || notification
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
                             border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
@@ -1173,7 +1216,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
-                                marginTop: 4, fontSize: 12, color: !renameFeedback && notification && p.notification_status?.state === 'failed' ? 'var(--warning, #b45309)' : 'var(--text-mute)',
+                                marginTop: 4, fontSize: 12, color: !renameFeedback && ((recovery && ['failed', 'network_rejected'].includes(p.recovery_status?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
                                 height: 18, lineHeight: '18px',
                                 fontFamily: feedback ? 'inherit' : 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',

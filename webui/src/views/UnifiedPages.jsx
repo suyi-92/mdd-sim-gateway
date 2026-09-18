@@ -12,7 +12,8 @@ import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
 import { BackupImport, BackupRecord } from './BackupTransfer.jsx'
 import { cellularRegistrationDetail, currentCellularNetwork, networkName, networkLabel,
-  cellularOperationOutcome, cellularOperationProgress, networkAvailability } from '../cellularPresentation.js'
+  cellularNetworkRejectDetail, cellularOperationOutcome, cellularOperationProgress,
+  networkAvailability } from '../cellularPresentation.js'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
 const CAPABILITY_ON_DETAILS = {
@@ -364,9 +365,12 @@ function CellularNetworkControl({ device, refreshDevices, showToast }) {
         interrupted: 'The gateway restarted. The previous operation could not be confirmed; check the current device state.',
         device_changed: 'The device or SIM changed. Refresh its state before trying again.',
       }
+      const failureText = detail.code === 'network_rejected'
+        ? cellularNetworkRejectDetail({ network_reject: detail.network_reject }, t, language)
+        : t(messages[detail.code] || (operation.action === 'scan' ? 'Network scan failed'
+          : 'Network selection failed. Try automatic selection or re-detect this device.'))
       feedback = partial ? `${t('Found {count} cellular networks.', { count: networks.length })} ${recoveryText(detail.recovery)}`
-        : `${t(messages[detail.code] || (operation.action === 'scan' ? 'Network scan failed'
-          : 'Network selection failed. Try automatic selection or re-detect this device.'))} ${recoveryText(detail.recovery)}`.trim()
+        : `${failureText} ${recoveryText(detail.recovery)}`.trim()
     }
   }
   const scan = async () => {
@@ -603,7 +607,13 @@ function DeviceRescanControl({ device = null, refresh, showToast, compact = fals
         throw new Error(t(completed.error_code || 'Full device detection failed'))
       }
       if (device) {
-        setFeedback(t('Device detection completed. Review the refreshed hardware and SIM state below.'))
+        const simResult = t({ readable: 'SIM identity confirmed', pin_required: 'SIM PIN required',
+          unreadable: 'SIM present but unreadable', not_present: 'No SIM present' }[completed.sim_state]
+          || 'SIM state unknown')
+        const registration = completed.registration_state || 'unknown'
+        setFeedback(t('Hardware detection completed · {sim} · cellular registration: {registration}', {
+          sim: simResult, registration,
+        }))
         showToast?.(t('Device detection completed'))
       } else {
         const modems = Number(completed.modems_detected || 0)
@@ -692,7 +702,7 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>
         {d.cellular ? <div className="u-details cols">
-          <div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div>
+          <div className="u-detail"><span>{t('Registration')}</span><b>{cellularRegistrationDetail(d, t, language) || d.cellular.registration || t('Not connected')}</b></div>
           <div className="u-detail"><span>{t('Access technology')}</span><b>{String(d.cellular.access_technology || '').toUpperCase() || t('Waiting')}</b></div>
           <div className="u-detail"><span>{t('Packet service')}</span><b>{d.cellular.packet_service === 'attached' ? t('Attached') : d.cellular.packet_service === 'detached' ? t('Detached') : t('Waiting')}</b></div>
           <div className="u-detail u-cellular-operator-detail"><span>{t('Operator')}</span><CellularOperator network={currentCellularNetwork(d)} connected={currentCellularNetwork(d).connected}/></div>

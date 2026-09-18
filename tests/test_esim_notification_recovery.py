@@ -107,7 +107,7 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertFalse(main.hub.lpa_busy)
             self.assertEqual(main.hub.cards[name]['identity_state'], 'confirmed')
-        self.assertEqual(order, [('profile', 'enable'), 'bridge', ('notification', 'process'), 'verify', 'automatic'])
+        self.assertEqual(order, [('profile', 'enable'), 'bridge', ('notification', 'process'), 'verify'])
         self.assertEqual(result['notification_status']['state'], 'processed')
         self.assertEqual(result['recovery_skipped'], 'vowifi_disabled')
 
@@ -193,5 +193,8 @@ class VerifiedHandoffTests(unittest.IsolatedAsyncioTestCase):
                         await main.card_monitor()
                 if invalidation == 'none':
                     read.assert_not_awaited()
+                elif invalidation == 'rescan':
+                    read.assert_awaited_once_with(
+                        name, 0, verify=True, operation_id='fixture-rescan')
                 else:
                     read.assert_awaited_once_with(name, 0, verify=True)

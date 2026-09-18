@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cellularRegistrationDetail, networkName, networkLabel, currentCellularNetwork,
+import { cellularRegistrationDetail, cellularNetworkRejectDetail, networkName, networkLabel, currentCellularNetwork,
   cellularOperationOutcome, cellularOperationProgress, networkAvailability } from '../src/cellularPresentation.js'
 
 const t = (value, args = {}) => value.replace('{signal}', String(args.signal ?? ''))
@@ -32,6 +32,17 @@ test('an unregistered modem does not claim base-station attachment', () => {
   assert.equal(cellularRegistrationDetail({ cellular: {
     registration: 'searching', access_technology: 'lte', signal: 40,
   } }, t), '')
+})
+
+test('EPS reject cause 7 is not displayed as an ordinary search timeout', () => {
+  const detail = cellularNetworkRejectDetail({ cellular: { network_reject: {
+    observed_at: 100, cause_code: 7, cause: 'ps-services-not-allowed',
+    rat: 'lte', service_domain: 'ps', operator_id: '',
+  } } }, translated)
+  assert.match(detail, /Cellular service rejected by the network/)
+  assert.match(detail, /EPS services not allowed \(cause 7\)/)
+  assert.match(detail, /Unknown network/)
+  assert.doesNotMatch(detail, /timeout/i)
 })
 
 const translated = (value, args = {}) => value.replace(/\{([^}]+)\}/g, (_, key) => String(args[key]))

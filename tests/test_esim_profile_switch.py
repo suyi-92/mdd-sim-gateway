@@ -578,7 +578,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["iccid"], "profile-target")
-        self.assertEqual(result["recovery_error"], "bridge failed")
+        self.assertEqual(result["recovery_error"], "The modem SIM bridge did not recover.")
         self.assertEqual(result["notification_status"]["state"], "failed")
         self.assertEqual(result["notification_status"]["reason_code"], "reader_unavailable")
         restore.assert_not_awaited()
@@ -618,7 +618,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["recovery_pending"])
-        self.assertEqual(len(scheduled), 2)
+        self.assertEqual(len(scheduled), 1)
         self.assertEqual(
             [call.args[2] for call in events.await_args_list],
             ["switching", "enabled"])

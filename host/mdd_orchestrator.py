@@ -400,6 +400,14 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
+BRIDGE_TERMINAL_FAILURE_ATTEMPTS = 3
+ESIM_CELLULAR_RECOVERY_SECONDS = float(
+    os.environ.get("MDD_ESIM_CELLULAR_RECOVERY_SECONDS", "600"))
+ESIM_CELLULAR_IDENTITY_WAIT_SECONDS = float(
+    os.environ.get("MDD_ESIM_CELLULAR_IDENTITY_WAIT_SECONDS", "120"))
+NETWORK_REJECT_MAX_AGE_SECONDS = float(
+    os.environ.get("MDD_NETWORK_REJECT_MAX_AGE", "900"))
+NETWORK_REJECT_BIND_SECONDS = 15.0
 # Control runs natively under systemd in the VMware edition. Keep its diagnostic SOCKS entry on
 # loopback, removing the old Docker-Control bridge dependency and keeping the TCP control stream
 # and UDP relay on one unambiguous local path.
@@ -785,6 +793,9 @@ class Orchestrator:
         self.device_status_path = self.root / "devices-status.json"
         self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
+        self.cellular_recovery_path = self.root / "esim-cellular-recovery.json"
+        self.bridge_recovery_path = self.root / "bridge-recovery.json"
+        self.network_rejection_path = self.root / "network-rejections.json"
         self.exit_test_request_dir = self.root / "exit-test-requests"
         self.backup_operation_request_path = self.root / "backup-operation-request.json"
         self.device_rescan_request_path = self.root / "device-rescan-request.json"
@@ -917,6 +928,10 @@ class Orchestrator:
         # status document reported every freshly respawned process as a running bridge.
         self._bridge_started: dict[str, float] = {}
         self._bridge_failures: dict[str, dict] = {}
+        bridge_recovery = read_json(self.bridge_recovery_path)
+        self._bridge_terminal: dict[str, dict] = (
+            bridge_recovery.get("devices") or {}
+            if isinstance(bridge_recovery.get("devices"), dict) else {})
         # Whether this gateway is configured VoWiFi-only (hardware.modem_backend = serial).
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
@@ -929,6 +944,64 @@ class Orchestrator:
             request_id = str(value.get("request_id") or "")
             if request_id and value.get("state") not in {"channels_ready", "failed"}:
                 self._bridge_restarts[request_id] = value
+        cellular_recovery = read_json(self.cellular_recovery_path)
+        self._cellular_recoveries: dict[str, dict] = (
+            cellular_recovery.get("devices") or {}
+            if isinstance(cellular_recovery.get("devices"), dict) else {})
+        rejection_doc = read_json(self.network_rejection_path)
+        self._network_rejections: dict[str, dict] = (
+            rejection_doc.get("devices") or {}
+            if isinstance(rejection_doc.get("devices"), dict) else {})
+        self._network_reject_cursor_us = int(rejection_doc.get("cursor_us") or 0)
+        self._network_reject_invocation = str(rejection_doc.get("invocation_id") or "")
+        self._network_reject_events: dict[str, dict] = {}
+        self._network_reject_scan_at = 0.0
+
+    def _persist_cellular_recoveries(self) -> None:
+        atomic_json(self.cellular_recovery_path, {
+            "version": 1, "updated_at": int(time.time()),
+            "devices": self._cellular_recoveries,
+        })
+
+    def _persist_bridge_terminal(self) -> None:
+        atomic_json(self.bridge_recovery_path, {
+            "version": 1, "updated_at": int(time.time()),
+            "devices": self._bridge_terminal,
+        })
+
+    def _persist_network_rejections(self) -> None:
+        atomic_json(self.network_rejection_path, {
+            "version": 1, "updated_at": int(time.time()),
+            "cursor_us": self._network_reject_cursor_us,
+            "invocation_id": self._network_reject_invocation,
+            "devices": self._network_rejections,
+        })
+
+    @staticmethod
+    def _usb_generation(node: Path) -> str:
+        """A non-secret token that changes when the same USB path re-enumerates."""
+        values = [node.name]
+        for field in ("busnum", "devnum"):
+            try:
+                values.append(node.joinpath(field).read_text().strip())
+            except OSError:
+                values.append("")
+        return hashlib.sha256(":".join(values).encode()).hexdigest()[:16]
+
+    def _set_cellular_recovery(self, device_id: str, state: str, **fields) -> dict:
+        previous = self._cellular_recoveries.get(device_id) or {}
+        value = {**previous, **fields, "device_id": device_id, "state": state,
+                 "updated_at": time.time()}
+        self._cellular_recoveries[device_id] = value
+        self._persist_cellular_recoveries()
+        return value
+
+    @staticmethod
+    def _recovery_public(value: dict | None) -> dict:
+        value = value or {}
+        allowed = ("operation_id", "state", "phase", "error_code", "requested_at",
+                   "updated_at", "deadline_at", "attempts")
+        return {key: value[key] for key in allowed if key in value}
 
     def _bridge_restart_status(self, request: dict, state: str, **extra) -> dict:
         value = {**request, **extra, "state": state, "updated_at": time.time()}
@@ -955,10 +1028,12 @@ class Orchestrator:
             request_id = str(request.get("request_id") or "")
             device_id = str(request.get("device_id") or "")
             expected_iccid_sha256 = str(request.get("expected_iccid_sha256") or "")
+            cellular_refresh = request.get("cellular_refresh", True)
             if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id)
                     or request_id != path.stem
                     or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", device_id)
-                    or not re.fullmatch(r"[0-9a-f]{64}", expected_iccid_sha256)):
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_iccid_sha256)
+                    or not isinstance(cellular_refresh, bool)):
                 if request_id and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id):
                     self._bridge_restart_status(
                         {"request_id": request_id, "device_id": device_id}, "failed",
@@ -972,6 +1047,7 @@ class Orchestrator:
                 "request_id": request_id,
                 "device_id": device_id,
                 "expected_iccid_sha256": expected_iccid_sha256,
+                "cellular_refresh": cellular_refresh,
                 "requested_at": requested_at,
                 "started_at": time.time(),
             }
@@ -985,6 +1061,9 @@ class Orchestrator:
             self.bridge_ports.pop(device_id, None)
             self._bridge_started.pop(device_id, None)
             self._bridge_failures.pop(device_id, None)
+            if device_id in self._bridge_terminal:
+                self._bridge_terminal.pop(device_id, None)
+                self._persist_bridge_terminal()
             if proc and proc.poll() is None:
                 proc.terminate()
                 try:
@@ -994,41 +1073,143 @@ class Orchestrator:
                     proc.wait()
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
-            # LPA changes the card behind MM's cached SIM object. Reinitialise only
-            # this physical modem when that object still identifies the old profile.
             assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(device_id) or {}
-            if assignment.get("tty") and not self._serial_mode and not self.dry_run:
-                snapshot = self.modem_snapshot({"id": device_id, "tty": assignment["tty"]})
-                actual = str(snapshot.get("sim_iccid") or "")
-                obj = str(snapshot.get("mm_object") or "")
-                if (actual and hashlib.sha256(actual.encode()).hexdigest() != expected_iccid_sha256
-                        and re.fullmatch(r"/org/freedesktop/ModemManager1/Modem/[0-9]+", obj)):
-                    detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
-                    port = self._kv(detail.stdout or "", "modem.generic.primary-port")
-                    slot = self._kv(detail.stdout or "", "modem.generic.primary-sim-slot")
-                    if (detail.returncode or not re.fullmatch(r"cdc-wdm[0-9]+", port)
-                            or not re.fullmatch(r"[1-8]", slot)):
-                        self._bridge_restart_status(request, "failed",
-                                                    error="cellular SIM refresh has no confirmed QMI device and SIM slot")
-                        continue
-                    # Cycle only the active SIM slot. DMS/Modem.Reset can leave DJI
-                    # compatibility firmware stuck offline and must not be used here.
-                    # Record before the power cycle so a manager restart cannot repeat it.
-                    request = self._bridge_restart_status(request, "resetting", modem_reset=True)
-                    self.cellular_states.pop(device_id, None)
-                    self.radio_states.pop(device_id, None)
-                    qmi = ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", f"/dev/{port}"]
-                    try:
-                        off = run([*qmi, f"--uim-sim-power-off={slot}"])
-                    finally:
-                        # Always restore power, even after an uncertain off reply. UIM's
-                        # removal/insertion indications make MM rebuild its own SIM object.
-                        result = run([*qmi, f"--uim-sim-power-on={slot}"])
-                    if off.returncode or result.returncode:
-                        self._bridge_restart_status(request, "failed",
-                                                    error="cellular SIM refresh failed")
-                    else:
-                        self._bridge_restart_status(request, "stopped")
+            if cellular_refresh:
+                now = time.time()
+                self._set_cellular_recovery(
+                    device_id, "pending", phase="baseband_initialization",
+                    operation_id=request_id,
+                    expected_iccid_sha256=expected_iccid_sha256,
+                    usb_generation=str(assignment.get("usb_generation") or ""),
+                    requested_at=requested_at, deadline_at=now + ESIM_CELLULAR_RECOVERY_SECONDS,
+                    attempts=0, power_cycle_completed=False,
+                    identity_deadline_at=0.0, next_attempt_at=0.0,
+                )
+
+    def process_cellular_recoveries(
+        self,
+        discovered: list[dict],
+        desired_devices: dict,
+        through_modemmanager: bool,
+    ) -> set[str]:
+        """Advance durable post-switch baseband initialization for the target modem only.
+
+        The bridge proves the eUICC profile, not that the baseband consumed REFRESH.  A UIM
+        slot cycle is therefore scheduled independently and survives service restarts.  RF
+        enable is blocked until the same USB generation exposes the target SIM identity.
+        """
+        now = time.time()
+        current = {str(item.get("id") or ""): item for item in discovered}
+        blocked: set[str] = set()
+        for device_id, recovery in list(self._cellular_recoveries.items()):
+            state = str(recovery.get("state") or "")
+            wanted = desired_devices.get(device_id) or {}
+            flight_mode = bool(wanted.get("flight_mode"))
+            if state in {"ready", "cancelled"}:
+                continue
+            if state == "failed":
+                if not flight_mode:
+                    blocked.add(device_id)
+                continue
+            modem = current.get(device_id)
+            deadline = float(recovery.get("deadline_at") or 0)
+            if deadline and now >= deadline:
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_initialization",
+                    error_code="initialization_timeout")
+                continue
+            if not modem:
+                self._set_cellular_recovery(
+                    device_id, "waiting_device", phase="baseband_initialization")
+                if not flight_mode:
+                    blocked.add(device_id)
+                continue
+            generation = str(modem.get("usb_generation") or "")
+            expected_generation = str(recovery.get("usb_generation") or "")
+            if expected_generation and generation != expected_generation:
+                self._set_cellular_recovery(
+                    device_id, "cancelled", phase="baseband_initialization",
+                    error_code="device_generation_changed")
+                continue
+            if not expected_generation:
+                recovery = self._set_cellular_recovery(
+                    device_id, state or "pending", usb_generation=generation)
+            if flight_mode:
+                self._set_cellular_recovery(
+                    device_id, "waiting_flight_mode", phase="baseband_initialization")
+                continue
+            blocked.add(device_id)
+            if not through_modemmanager:
+                self._set_cellular_recovery(
+                    device_id, "waiting_modemmanager", phase="baseband_initialization")
+                continue
+
+            snapshot = self.modem_snapshot(modem)
+            actual = str(snapshot.get("sim_iccid") or "")
+            expected = str(recovery.get("expected_iccid_sha256") or "")
+            if actual and hashlib.sha256(actual.encode()).hexdigest() == expected:
+                self._set_cellular_recovery(
+                    device_id, "ready", phase="automatic_selection", error_code="")
+                blocked.discard(device_id)
+                continue
+
+            if recovery.get("power_cycle_completed"):
+                identity_deadline = float(recovery.get("identity_deadline_at") or 0)
+                if identity_deadline and now >= identity_deadline:
+                    self._set_cellular_recovery(
+                        device_id, "failed", phase="baseband_identity",
+                        error_code=("sim_identity_mismatch" if actual
+                                    else "sim_identity_unavailable"))
+                else:
+                    self._set_cellular_recovery(
+                        device_id, "waiting_identity", phase="baseband_identity")
+                continue
+            if now < float(recovery.get("next_attempt_at") or 0):
+                continue
+
+            obj = str(snapshot.get("mm_object") or "")
+            if not re.fullmatch(r"/org/freedesktop/ModemManager1/Modem/[0-9]+", obj):
+                self._set_cellular_recovery(
+                    device_id, "waiting_modemmanager", phase="baseband_initialization")
+                continue
+            detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
+            port = self._kv(detail.stdout or "", "modem.generic.primary-port")
+            slot = self._kv(detail.stdout or "", "modem.generic.primary-sim-slot")
+            if (detail.returncode or not re.fullmatch(r"cdc-wdm[0-9]+", port)
+                    or not re.fullmatch(r"[1-8]", slot)):
+                self._set_cellular_recovery(
+                    device_id, "waiting_qmi", phase="baseband_initialization")
+                continue
+
+            # Stop only this bridge before the UIM session changes.  Do not use generic
+            # Modem.Reset/CFUN reboot: 2c7c:0125 does not establish an EC25 command contract.
+            self.stop_bridge(device_id)
+            attempts = int(recovery.get("attempts") or 0) + 1
+            self._set_cellular_recovery(
+                device_id, "resetting_sim", phase="baseband_initialization",
+                attempts=attempts)
+            self.cellular_states.pop(device_id, None)
+            self.radio_states.pop(device_id, None)
+            qmi = ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", f"/dev/{port}"]
+            off = None
+            try:
+                off = run([*qmi, f"--uim-sim-power-off={slot}"])
+            finally:
+                power_on = run([*qmi, f"--uim-sim-power-on={slot}"])
+            if off is not None and not off.returncode and not power_on.returncode:
+                self._set_cellular_recovery(
+                    device_id, "waiting_identity", phase="baseband_identity",
+                    power_cycle_completed=True,
+                    identity_deadline_at=now + ESIM_CELLULAR_IDENTITY_WAIT_SECONDS)
+            elif attempts >= 2:
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_initialization",
+                    error_code="sim_power_cycle_failed")
+            else:
+                self._set_cellular_recovery(
+                    device_id, "retry_wait", phase="baseband_initialization",
+                    next_attempt_at=now + 15)
+        return blocked
 
     def finish_bridge_restart_requests(self, present_ids: set[str]):
         """Advance stopped requests only when the replacement bridge is authoritative."""
@@ -1040,14 +1221,12 @@ class Orchestrator:
                 continue
             device_id = str(request.get("device_id") or "")
             elapsed = now - float(request.get("started_at") or now)
-            limit = 100 if request.get("modem_reset") else 45
+            limit = 45
             if elapsed > limit:
                 self._bridge_restart_status(
                     request, "failed", error="timed out rebuilding the VPCD bridge and SIM identity")
                 continue
             if device_id not in present_ids:
-                if request.get("modem_reset"):
-                    continue  # Reset can temporarily remove the target USB device.
                 self._bridge_restart_status(
                     request, "failed", error="modem disappeared during bridge rebuild")
                 continue
@@ -1072,14 +1251,12 @@ class Orchestrator:
             actual = str(identity.get("iccid") or "")
             if expected and hashlib.sha256(actual.encode()).hexdigest() != expected:
                 continue
-            if request.get("modem_reset"):
-                cellular = self.cellular_states.get(device_id) or {}
-                current = str(cellular.get("sim_iccid") or "")
-                if not current or hashlib.sha256(current.encode()).hexdigest() != expected:
-                    continue
+            cellular_recovery = self._recovery_public(
+                self._cellular_recoveries.get(device_id)) if request.get("cellular_refresh") else {}
             self._bridge_restart_status(
                 request, "channels_ready", bridge_pid=int(proc.pid),
-                channel_allocated=int(identity.get("channel_allocated") or 0))
+                channel_allocated=int(identity.get("channel_allocated") or 0),
+                cellular_recovery=cellular_recovery)
             self.log(f"VPCD bridge ready after eUICC profile refresh: {device_id}")
 
     @staticmethod
@@ -1132,6 +1309,17 @@ class Orchestrator:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "pcsc-maintenance").write_text(
             str(int(time.time())), encoding="ascii")
+        retry_devices = (set(self._cellular_recoveries) if scope == "all"
+                         else {device_id} if device_type == "modem" else set())
+        for retry_device in retry_devices:
+            recovery = self._cellular_recoveries.get(retry_device) or {}
+            if recovery.get("state") in {"failed", "waiting_device", "waiting_modemmanager",
+                                         "waiting_qmi", "retry_wait"}:
+                self._set_cellular_recovery(
+                    retry_device, "pending", phase="baseband_initialization",
+                    error_code="", attempts=0, power_cycle_completed=False,
+                    identity_deadline_at=0.0, next_attempt_at=0.0,
+                    deadline_at=time.time() + ESIM_CELLULAR_RECOVERY_SECONDS)
         assignments = read_json(self.hw_state_path).get("assignments") or {}
         if scope == "device" and device_type == "modem" and device_id not in assignments:
             publish("failed", error_code="rescan.error.device_not_present")
@@ -1147,12 +1335,17 @@ class Orchestrator:
         if scope == "all":
             for value in maps:
                 value.clear()
+            if self._bridge_terminal:
+                self._bridge_terminal.clear()
+                self._persist_bridge_terminal()
             self._claim_evidence = {}
             self._unclaimed_since.clear()
             self.modem_profiles_swept = False
         elif device_type == "modem":
             for value in maps:
                 value.pop(device_id, None)
+            if self._bridge_terminal.pop(device_id, None) is not None:
+                self._persist_bridge_terminal()
             target_tty = str((assignments.get(device_id) or {}).get("tty") or "")
             if target_tty:
                 self._unclaimed_since.pop(target_tty, None)
@@ -1354,6 +1547,7 @@ class Orchestrator:
             wanted = desired_devices.get(device_id) or DEFAULT_DEVICE_CAPABILITIES
             bridge = self.bridges.get(device_id)
             bridge_failure = self._bridge_failures.get(device_id)
+            bridge_terminal = self._bridge_terminal.get(device_id)
             bridge_alive = bool(bridge and bridge.poll() is None)
             # A process that was just respawned over a recorded failure has not proven
             # anything yet: reporting it as a running bridge is what made a crash loop
@@ -1380,14 +1574,20 @@ class Orchestrator:
             # refused read as an indefinite spinner with no explanation; the reason belongs
             # in the error field instead.
             degraded = self._degraded.get(device_id, "")
-            device_transitioning = bool(transitioning or (not degraded and
+            cellular_recovery = self._recovery_public(
+                self._cellular_recoveries.get(device_id))
+            recovery_active = cellular_recovery.get("state") not in {
+                None, "", "ready", "failed", "cancelled", "waiting_flight_mode"}
+            recovery_failed = cellular_recovery.get("state") == "failed"
+            device_transitioning = bool(not recovery_failed and (
+                transitioning or (not degraded and
                 present and (target_data_active != observed_data_active or
                              (not sim_missing and backend_active
                               and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
                              (not self._serial_mode
                               and not bool(wanted.get("flight_mode"))
-                              and not backend_active))))
+                              and not backend_active) or recovery_active))))
             devices[device_id] = {
                 "id": device_id,
                 "name": assignment.get("name") or "USB modem",
@@ -1395,6 +1595,7 @@ class Orchestrator:
                 "mm_object": self.modemmanager_modem_for_tty(assignment.get("tty") or "")
                     if mm_active and assignment.get("tty") else "",
                 "desired": wanted,
+                "usb_generation": str(assignment.get("usb_generation") or ""),
                 # Registration and bearer state come from this device's ModemManager object.
                 "actual": {"cellular_backend_active": backend_active,
                            "cellular_radio_enabled": radio_enabled,
@@ -1411,11 +1612,19 @@ class Orchestrator:
                            # must present it as unsupported rather than forever starting.
                            "cellular_supported": not self._serial_mode},
                 "cellular": cellular_state,
+                "cellular_recovery": cellular_recovery,
+                "bridge_recovery": self._recovery_public(bridge_terminal),
                 "present": present,
                 "transitioning": device_transitioning,
                 "error": (error or ("device is not connected" if not present else "")
                           or " ".join(part for part in (
                               degraded,
+                              ("SIM access recovery reached a terminal failure through both "
+                               "ModemManager and direct serial."
+                               if bridge_terminal else ""),
+                              ("Cellular SIM initialization failed after the eSIM switch "
+                               f"({cellular_recovery.get('error_code') or 'unknown'})."
+                               if recovery_failed else ""),
                               # The exit record is the only place the actual exception
                               # lands; without it a failing takeover reads as success.
                               (f"The SIM bridge keeps exiting "
@@ -1459,38 +1668,16 @@ class Orchestrator:
         self.bridges.pop(device_id, None)
         self.bridge_ports.pop(device_id, None)
 
-    def reset_modems_after_cellular(self):
-        """Reset EC25-class modems after ModemManager releases QMI/UIM ownership."""
-        if serial is None:
-            raise RuntimeError("pyserial is required to reset the modem after ModemManager releases it")
-        assignments = read_json(self.hw_state_path).get("assignments") or {}
-        ports = sorted({str(value.get("tty") or "") for value in assignments.values()
-                        if value.get("tty")})
-        if not ports:
-            ports = sorted(str(path) for path in Path("/dev").glob("ttyUSB2"))
-        errors = []
-        reset = 0
-        for port in ports:
-            if not Path(port).exists():
-                continue
-            try:
-                modem = serial.Serial(port, 115200, timeout=.5, write_timeout=2,
-                                      exclusive=True)
-                try:
-                    modem.reset_input_buffer()
-                    modem.write(b"AT+CFUN=1,1\r")
-                    modem.flush()
-                    time.sleep(1)
-                finally:
-                    modem.close()
-                reset += 1
-            except Exception as exc:
-                errors.append(f"{port}: {exc}")
-        if not reset and errors:
-            raise RuntimeError("modem reset failed: " + "; ".join(errors))
-        if reset:
-            # USB serial ports disappear and return after the module reboot.
-            time.sleep(12)
+    @staticmethod
+    def settle_modems_after_cellular():
+        """Let ModemManager and qmi-proxy release descriptors without resetting hardware.
+
+        A USB VID/PID does not prove an EC25 command contract.  In particular a generic
+        ``AT+CFUN=1,1`` can reboot compatible-looking QDC firmware and invalidate the USB
+        generation while a scoped recovery is in progress.  The direct bridge has bounded
+        retries and reports a terminal SIM-access failure instead of issuing a blind reset.
+        """
+        time.sleep(2)
 
     def _bridge_stderr_path(self, hwid: str):
         # Since 1.3.10 this carries the bridge's stdout too: its activity lines used to go
@@ -1555,25 +1742,44 @@ class Orchestrator:
         """Keep an exited bridge visible instead of silently respawning over it."""
         uptime = time.time() - started if started else 0.0
         previous = self._bridge_failures.get(hwid)
+        command = self._bridge_commands.get(hwid) or []
+        backend = "modemmanager" if "--modemmanager" in command else "direct-serial"
         # A crash after a long healthy run is a fresh incident, not an escalation.
-        count = previous["count"] + 1 if previous and uptime < BRIDGE_STABLE_SECONDS else 1
+        count = (previous["count"] + 1 if previous and previous.get("backend") == backend
+                 and uptime < BRIDGE_STABLE_SECONDS else 1)
         reason = self._bridge_stderr_tail(hwid)
         self._bridge_failures[hwid] = {"count": count, "at": time.time(), "reason": reason,
                                        "returncode": proc.returncode,
-                                       "uptime": round(uptime, 1)}
+                                       "uptime": round(uptime, 1), "backend": backend}
         lowered = reason.casefold()
-        if count >= 3 and "logical channel allocation failed" in lowered and \
-                ("phonefailure" in lowered or "phone failure" in lowered):
+        sim_access_failed = ("logical channel allocation failed" in lowered and
+                             ("phonefailure" in lowered or "phone failure" in lowered))
+        if count >= BRIDGE_TERMINAL_FAILURE_ATTEMPTS and sim_access_failed and \
+                backend == "modemmanager":
             self._degraded[hwid] = (
                 "ModemManager owns the modem but its AT command path cannot access the SIM; "
-                "using direct serial for the VoWiFi bridge while cellular data stays disabled.")
+                "trying bounded direct-serial recovery while cellular data stays disabled.")
             self.log(f"ModemManager SIM access failed repeatedly for {hwid}; "
                      "falling back to direct serial")
+        elif count >= BRIDGE_TERMINAL_FAILURE_ATTEMPTS and sim_access_failed and \
+                backend == "direct-serial":
+            assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(hwid) or {}
+            self._bridge_terminal[hwid] = {
+                "state": "failed", "error_code": "sim_access_failed_both_paths",
+                "backend": backend, "attempts": count, "updated_at": time.time(),
+                "usb_generation": str(assignment.get("usb_generation") or ""),
+            }
+            self._persist_bridge_terminal()
+            self._degraded[hwid] = (
+                "SIM access failed through both ModemManager and direct serial; "
+                "bounded recovery ended. Re-detect this device after checking the SIM session.")
         self.log(f"SIM bridge for {hwid} exited after {uptime:.0f}s "
                  f"(rc={proc.returncode}, attempt {count})"
                  + (f": {reason}" if reason else ""))
 
     def _bridge_retry_due(self, hwid: str) -> bool:
+        if hwid in self._bridge_terminal:
+            return False
         failure = self._bridge_failures.get(hwid)
         if not failure:
             return True
@@ -1852,6 +2058,127 @@ class Orchestrator:
         digest = hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:12]
         return f"mdd-cell-{digest}"
 
+    def _scan_network_reject_journal(self) -> None:
+        """Consume only ModemManager's closed network-reject fields for this invocation."""
+        if self.dry_run:
+            return
+        now = time.time()
+        if now - self._network_reject_scan_at < .75:
+            return
+        self._network_reject_scan_at = now
+        invocation_result = run([
+            "systemctl", "show", "ModemManager.service", "-p", "InvocationID", "--value"])
+        invocation = ((invocation_result.stdout or "").strip().lower()
+                      if not invocation_result.returncode else "")
+        if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+            return
+        if invocation != self._network_reject_invocation:
+            self._network_reject_invocation = invocation
+            self._network_reject_cursor_us = max(0, int((now - 30) * 1_000_000))
+            self._network_reject_events.clear()
+            self._network_rejections.clear()
+        since = max(0, self._network_reject_cursor_us - 1_000_000) / 1_000_000
+        result = run([
+            "journalctl", "-u", "ModemManager.service", "--no-pager", "-o", "json",
+            f"--since=@{since:.6f}", "-n", "400",
+            f"_SYSTEMD_INVOCATION_ID={invocation}",
+        ])
+        if result.returncode:
+            return
+        pending: dict[str, dict] = {}
+        changed = False
+        for raw in (result.stdout or "").splitlines():
+            try:
+                record = json.loads(raw)
+                timestamp_us = int(record.get("__REALTIME_TIMESTAMP") or 0)
+                message = str(record.get("MESSAGE") or "")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            self._network_reject_cursor_us = max(self._network_reject_cursor_us, timestamp_us)
+            match = re.search(r"\[modem([0-9]+)\]\s+(.*)$", message)
+            if not match:
+                continue
+            modem_index, body = match.group(1), match.group(2).strip().lower()
+            if body == "network reject indication received":
+                pending[modem_index] = {
+                    "observed_at": timestamp_us / 1_000_000,
+                    "invocation_id": invocation,
+                }
+                self._network_reject_events[modem_index] = pending[modem_index]
+                changed = True
+                continue
+            event = pending.get(modem_index) or self._network_reject_events.get(modem_index)
+            if not event:
+                continue
+            for prefix, key in (("service domain:", "service_domain"),
+                                ("radio interface:", "rat"),
+                                ("reject cause:", "cause"),
+                                ("mcc:", "mcc"), ("mnc:", "mnc")):
+                if body.startswith(prefix):
+                    value = body[len(prefix):].strip()
+                    if key in {"mcc", "mnc"}:
+                        value = value if value.isdigit() and len(value) <= 3 else ""
+                    else:
+                        value = value if re.fullmatch(r"[a-z0-9_-]{1,64}", value) else ""
+                    if value:
+                        event[key] = value
+                        changed = True
+                    break
+        if changed:
+            self._persist_network_rejections()
+
+    def _network_rejection_for(
+        self, modem: dict, obj: str, sim_iccid: str, registration: str,
+    ) -> dict:
+        now = time.time()
+        self._scan_network_reject_journal()
+        device_id = str(modem.get("id") or "")
+        generation = str(modem.get("usb_generation") or "")
+        if registration in {"home", "roaming", "registered"}:
+            if self._network_rejections.pop(device_id, None) is not None:
+                self._persist_network_rejections()
+            return {}
+        match = re.search(r"/Modem/([0-9]+)$", obj)
+        event = self._network_reject_events.get(match.group(1)) if match else None
+        current = self._network_rejections.get(device_id) or {}
+        if (event and sim_iccid
+                and 0 <= now - float(event.get("observed_at") or 0)
+                <= NETWORK_REJECT_BIND_SECONDS
+                and float(event.get("observed_at") or 0) > float(
+                    current.get("observed_at") or 0)):
+            cause = str(event.get("cause") or "unknown")
+            code = {"ps-services-not-allowed": 7}.get(cause)
+            mcc, mnc = str(event.get("mcc") or ""), str(event.get("mnc") or "")
+            current = {
+                "observed_at": float(event.get("observed_at") or 0),
+                "invocation_id": self._network_reject_invocation,
+                "usb_generation": generation,
+                "sim_iccid_sha256": hashlib.sha256(sim_iccid.encode()).hexdigest(),
+                "service_domain": str(event.get("service_domain") or "unknown"),
+                "rat": str(event.get("rat") or "unknown"),
+                "cause": cause,
+                "cause_code": code,
+                "operator_id": (mcc + mnc) if mcc and mnc else "",
+            }
+            self._network_rejections[device_id] = current
+            self._persist_network_rejections()
+        valid = bool(
+            current and sim_iccid
+            and current.get("invocation_id") == self._network_reject_invocation
+            and current.get("usb_generation") == generation
+            and current.get("sim_iccid_sha256")
+            == hashlib.sha256(sim_iccid.encode()).hexdigest()
+            and now - float(current.get("observed_at") or 0)
+            <= NETWORK_REJECT_MAX_AGE_SECONDS
+        )
+        if not valid:
+            if self._network_rejections.pop(device_id, None) is not None:
+                self._persist_network_rejections()
+            return {}
+        return {key: current[key] for key in (
+            "observed_at", "service_domain", "rat", "cause", "cause_code", "operator_id")
+            if key in current}
+
     def modem_snapshot(self, modem: dict) -> dict:
         obj = self.modemmanager_modem_for_tty(modem.get("tty") or "")
         if not obj:
@@ -1963,6 +2290,10 @@ class Orchestrator:
                 snapshot["rx_bytes"] = int(rx) if rx.isdigit() else 0
                 snapshot["tx_bytes"] = int(tx) if tx.isdigit() else 0
                 break
+        rejection = self._network_rejection_for(
+            modem, obj, sim_iccid, registration) if sim_present else {}
+        if rejection:
+            snapshot["network_reject"] = rejection
         return snapshot
 
     @staticmethod
@@ -2195,7 +2526,7 @@ class Orchestrator:
         run(["pkill", "-x", "qmi-proxy"])
         time.sleep(1)
         if modemmanager_was_active and reset_modems:
-            self.reset_modems_after_cellular()
+            self.settle_modems_after_cellular()
 
         self.applied_cellular_backend = False
 
@@ -2352,8 +2683,57 @@ class Orchestrator:
             })
         return devices, changed
 
+    @staticmethod
+    def _serial_at(port: str, command: str, timeout: float = 3.0) -> str:
+        """Run one bounded AT exchange without tcdrain/flush on mixed USB tty firmware."""
+        if serial is None:
+            raise RuntimeError("pyserial is required for direct modem radio control")
+        modem = serial.Serial(port, 115200, timeout=.2, write_timeout=2, exclusive=True)
+        try:
+            modem.reset_input_buffer()
+            modem.write((command + "\r").encode("ascii"))
+            data = bytearray()
+            deadline = time.monotonic() + max(.5, float(timeout))
+            while time.monotonic() < deadline:
+                chunk = modem.read(1024)
+                if chunk:
+                    data.extend(chunk)
+                    lines = bytes(data).replace(b"\r", b"\n").splitlines()
+                    if any(line.strip() == b"OK" for line in lines):
+                        return bytes(data).decode("ascii", "replace")
+                    if any(line.strip() == b"ERROR"
+                           or line.strip().startswith(b"+CME ERROR:") for line in lines):
+                        raise RuntimeError("modem rejected the radio command")
+            raise TimeoutError("modem radio command timed out")
+        finally:
+            modem.close()
+
+    @classmethod
+    def _set_direct_radio(cls, modem: dict, enabled: bool) -> bool:
+        usb_path = str(modem.get("usb_path") or "")
+        expected_generation = str(modem.get("usb_generation") or "")
+
+        def generation_matches() -> bool:
+            if not usb_path or not expected_generation:
+                return True
+            node = Path("/sys/bus/usb/devices") / usb_path
+            return node.exists() and cls._usb_generation(node) == expected_generation
+
+        if not generation_matches():
+            raise RuntimeError("USB modem generation changed before radio control")
+        wanted = 1 if enabled else 4
+        cls._serial_at(str(modem["tty"]), f"AT+CFUN={wanted}")
+        reply = cls._serial_at(str(modem["tty"]), "AT+CFUN?")
+        match = re.search(r"\+CFUN:\s*([0-9]+)", reply)
+        if not match or int(match.group(1)) != wanted:
+            raise RuntimeError("modem radio state was not confirmed")
+        if not generation_matches():
+            raise RuntimeError("USB modem generation changed during radio control")
+        return True
+
     def apply_device_radios(self, discovered: list[dict], desired_devices: dict,
-                            through_modemmanager: bool):
+                            through_modemmanager: bool,
+                            blocked_devices: set[str] | None = None):
         """Apply independent RF (flight mode) and cellular-data intent per modem."""
         # Configured serial mode is VoWiFi-only: the UI publishes both cellular data and
         # flight mode as unsupported, and the direct SIM bridge must be the sole owner of
@@ -2364,12 +2744,17 @@ class Orchestrator:
         # tolerant serial implementation, so leave the modem entirely to it in this mode.
         if self._serial_mode:
             return
+        blocked_devices = blocked_devices or set()
         for modem in discovered:
             device_id = modem["id"]
             wanted = desired_devices.get(device_id) or {}
             plan = self.device_capability_plan(wanted)
             data_enabled = plan["cellular_data_enabled"]
             radio_enabled = plan["radio_enabled"]
+            if device_id in blocked_devices and radio_enabled:
+                # A deferred eSIM switch must reinitialise and identify the baseband card
+                # before RF is restored. Radio-off intent remains valid and needs no block.
+                continue
             if not through_modemmanager and self.radio_states.get(device_id) == radio_enabled:
                 continue
             if self.dry_run:
@@ -2416,24 +2801,21 @@ class Orchestrator:
                 if result.returncode and "already" not in output.lower():
                     self.log(f"could not set cellular radio for {device_id}: {output.strip()}")
                     continue
-            else:
-                if serial is None:
+                confirmed = self.modem_snapshot(modem)
+                if (not confirmed.get("available")
+                        or bool(confirmed.get("radio_enabled")) != radio_enabled):
+                    self.cellular_states[device_id] = confirmed
+                    self.log(f"cellular radio state was not confirmed for {device_id}")
                     continue
+            else:
                 try:
-                    modem_port = serial.Serial(modem["tty"], 115200, timeout=.5,
-                                               write_timeout=2, exclusive=True)
-                    try:
-                        modem_port.write(b"AT+CFUN=1\r" if radio_enabled else b"AT+CFUN=4\r")
-                        modem_port.flush()
-                        time.sleep(.3)
-                    finally:
-                        modem_port.close()
+                    self._set_direct_radio(modem, radio_enabled)
                 except Exception as exc:
                     self.log(f"could not set cellular radio for {device_id}: {exc}")
                     continue
             self.radio_states[device_id] = radio_enabled
             if through_modemmanager:
-                fresh = self.modem_snapshot(modem)
+                fresh = confirmed
                 if radio_enabled and data_enabled:
                     self.ensure_modem_data(modem, fresh)
                 else:
@@ -3471,7 +3853,9 @@ class Orchestrator:
             except OSError: pass
             hwid = slug(f"{key[0]}-{key[1]}-{serial or node.name}")
             result.append({"id": hwid, "name": profile.get("name") or "USB modem", "tty": str(tty),
-                           "usb_path": node.name, "vid": key[0], "pid": key[1]})
+                           "usb_path": node.name,
+                           "usb_generation": self._usb_generation(node),
+                           "vid": key[0], "pid": key[1]})
         return sorted(result, key=lambda x: x["id"])
 
     def migrate_device_ids(self, discovered: list[dict]):
@@ -3544,7 +3928,8 @@ class Orchestrator:
             if old_id in assignments:
                 moved = assignments.pop(old_id)
                 if new_id not in assignments:
-                    moved.update({key: modem[key] for key in ("id", "tty", "usb_path")
+                    moved.update({key: modem[key] for key in (
+                        "id", "tty", "usb_path", "usb_generation")
                                   if key in modem})
                     assignments[new_id] = moved
                 hardware_doc["assignments"] = assignments
@@ -3693,12 +4078,22 @@ class Orchestrator:
         # modem is the operator's way to ask for ModemManager to be tried again.
         live_ttys = {modem["tty"] for modem in modems}
         live_ids = {modem["id"] for modem in modems}
+        generations = {modem["id"]: str(modem.get("usb_generation") or "")
+                       for modem in modems}
         self._unclaimed_since = {tty: seen for tty, seen in self._unclaimed_since.items()
                                  if tty in live_ttys}
         self._degraded = {device_id: reason for device_id, reason in self._degraded.items()
                           if device_id in live_ids}
         self._bridge_failures = {device_id: value for device_id, value
                                  in self._bridge_failures.items() if device_id in live_ids}
+        retained_terminal = {
+            device_id: value for device_id, value in self._bridge_terminal.items()
+            if device_id in live_ids and str(value.get("usb_generation") or "")
+            == generations.get(device_id, "")
+        }
+        if retained_terminal != self._bridge_terminal:
+            self._bridge_terminal = retained_terminal
+            self._persist_bridge_terminal()
         old = read_json(self.hw_state_path).get("assignments") or {}
         ports = [BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(VPCD_PORT_SLOTS)]
         # A port saved by a release that started at vpcd's own default is migrated here:
@@ -3914,8 +4309,12 @@ class Orchestrator:
                     time.sleep(self.interval)
                     continue
 
-            self.apply_device_radios(discovered, active_desired,
-                                     through_modemmanager=cellular_required)
+            recovery_blocked = self.process_cellular_recoveries(
+                discovered, active_desired, cellular_required)
+            self.apply_device_radios(
+                discovered, active_desired,
+                through_modemmanager=cellular_required,
+                blocked_devices=recovery_blocked)
             if cellular_required:
                 self.modem_profiles_swept = False
             else:
@@ -3986,6 +4385,10 @@ class Orchestrator:
             # Neither MM finishing SIM discovery nor a child publishing ready metadata
             # changes our input documents. Poll these in-flight transitions promptly;
             # completed/failed requests return to the normal idle cadence.
+            seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
+        if any(value.get("state") not in {"ready", "failed", "cancelled",
+                                          "waiting_flight_mode"}
+               for value in self._cellular_recoveries.values()):
             seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
         deadline = time.time() + seconds
         poll_interval = min(self.interval, INPUT_WAKE_POLL_SECONDS)

@@ -1,10 +1,28 @@
 from bridge_identity_fixture import verified_bridge
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from control.app import config, main
+
+
+class HardwareProfileMigrationTests(unittest.TestCase):
+    def test_retired_ec25_default_becomes_model_neutral_without_overwriting_custom_name(self):
+        for saved, expected in (("DJI/Quectel EC25", "DJI/Quectel cellular modem"),
+                                ("Lab modem", "Lab modem")):
+            with self.subTest(saved=saved), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "config.yaml"
+                path.write_text(
+                    "settings:\n  hardware:\n    modem_profiles:\n"
+                    f"      - name: {saved}\n        vid: 2c7c\n        pid: '0125'\n"
+                    "        at_interface: 2\n", encoding="utf-8")
+                with patch.object(config, "DATA_DIR", temp), \
+                        patch.object(config, "CONFIG_PATH", str(path)):
+                    profile = config.load()["settings"]["hardware"]["modem_profiles"][0]
+                self.assertEqual(profile["name"], expected)
 
 
 class AutoProvisionTests(unittest.TestCase):
@@ -474,8 +492,8 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_modem_display_name_is_editable_without_restarting_the_line(self):
         device = {
             "id": "modem-test", "device_type": "modem",
-            "name": "DJI/Quectel EC25", "default_name": "DJI/Quectel EC25",
-            "display_name": "", "hardware_name": "DJI/Quectel EC25",
+            "name": "DJI/Quectel cellular modem", "default_name": "DJI/Quectel cellular modem",
+            "display_name": "", "hardware_name": "DJI/Quectel cellular modem",
             "stable_path": "1-2", "instance_id": "16", "imei": "490154203237518",
         }
         with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
@@ -489,14 +507,14 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["name"], "Main modem")
         self.assertEqual(result["display_name"], "Main modem")
         set_hardware.assert_called_once_with("modem-test", {
-            "device_type": "modem", "name": "DJI/Quectel EC25",
+            "device_type": "modem", "name": "DJI/Quectel cellular modem",
             "stable_path": "1-2", "display_name": "Main modem",
         })
         running.assert_not_called()
 
     async def test_modem_name_edit_does_not_make_its_hardware_imei_editable(self):
         device = {"id": "modem-test", "device_type": "modem",
-                  "name": "DJI/Quectel EC25", "imei": "490154203237518"}
+                  "name": "DJI/Quectel cellular modem", "imei": "490154203237518"}
         with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])):
             with self.assertRaises(main.HTTPException) as raised:
                 await main.api_device_hardware("modem-test", {"imei": "350000000000018"})

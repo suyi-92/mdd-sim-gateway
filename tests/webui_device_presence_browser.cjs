@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..')
 const dist = path.join(root, 'webui/dist')
 const output = process.env.MDD_UI_TEST_OUTPUT || '/tmp/mdd-device-ui-check/results'
 fs.mkdirSync(output, { recursive: true })
-const modem = { id: 'modem-fixture', name: 'DJI/Quectel EC25', default_name: 'DJI/Quectel EC25', device_type: 'modem', present: true,
+const modem = { id: 'modem-fixture', name: 'DJI/Quectel cellular modem', default_name: 'DJI/Quectel cellular modem', device_type: 'modem', present: true,
   sim: { present: false }, capabilities: {
     cellular: { supported: true, available: true, desired: false, actual: 'off' },
     flight: { supported: true, available: true, desired: true, actual: 'on' },
@@ -99,7 +99,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const heading = name => page.getByRole('heading', { name, exact: true })
     const options = page.locator('.u-device-option')
     const history = page.getByLabel(/显示已断开的设备/)
-    await heading('DJI/Quectel EC25').waitFor()
+    await heading('DJI/Quectel 蜂窝模块').waitFor()
     assert.equal(await options.count(), 2)
     assert.equal(await page.locator('.u-device-page-heading button').count(), 0)
     const fullDetection = page.locator('.u-device-sidebar>.u-device-rescan').getByRole('button', { name: '重新完整检测', exact: true })
@@ -124,7 +124,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     page.once('dialog', dialog => dialog.accept())
     await deviceDetection.click()
     await page.clock.fastForward(1200)
-    await page.getByText('设备检测已完成，请查看下方刷新的硬件和 SIM 状态。', { exact: true }).waitFor()
+    await page.getByText('硬件检测已完成 · SIM 状态未知 · 蜂窝驻网：unknown', { exact: true }).waitFor()
     assert.deepEqual(await deviceDetection.boundingBox(), detectionBefore, 'per-device feedback must not move the button')
     for (const width of [2560, 1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
@@ -144,7 +144,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.clock.fastForward(11000)
     await heading('三体电子 SCR Prime 读卡器').waitFor()
     assert.equal(await options.count(), 1)
-    assert.equal(await page.getByRole('heading', { name: 'DJI/Quectel EC25', exact: true }).count(), 0)
+    assert.equal(await page.getByRole('heading', { name: 'DJI/Quectel 蜂窝模块', exact: true }).count(), 0)
     assert.equal(await page.getByRole('button', { name: '蜂窝数据（4G）', exact: true }).count(), 0)
     assert.equal(await history.isChecked(), false)
     for (const width of [1440, 900, 390]) {
@@ -155,11 +155,11 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     }
 
     await history.check()
-    await page.getByRole('button', { name: /DJI\/Quectel EC25/ }).click()
+    await page.getByRole('button', { name: /DJI\/Quectel 蜂窝模块/ }).click()
     await page.getByRole('button', { name: '硬件', exact: true }).click()
     assert.equal(await page.getByRole('button', { name: '重新检测此设备', exact: true }).isEnabled(), false)
     const deviceNameInput = page.locator('.u-hardware-name input')
-    assert.equal(await deviceNameInput.getAttribute('placeholder'), 'DJI/Quectel EC25')
+    assert.equal(await deviceNameInput.getAttribute('placeholder'), 'DJI/Quectel 蜂窝模块')
     assert.equal(await deviceNameInput.isEnabled(), true)
     assert.deepEqual(mutations, [
       ['POST', '/api/devices/rescan'],
@@ -170,7 +170,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await heading('Main modem').waitFor()
     await page.locator('.u-hardware-name input').fill('')
     await page.locator('.u-hardware-name button').click()
-    await heading('DJI/Quectel EC25').waitFor()
+    await heading('DJI/Quectel 蜂窝模块').waitFor()
     assert.equal(await page.getByRole('button', { name: '删除设备', exact: true }).isEnabled(), true)
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
@@ -190,7 +190,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
 
     devices = [modem, { ...reader, present: false }]
     await page.clock.fastForward(11000)
-    await heading('DJI/Quectel EC25').waitFor()
+    await heading('DJI/Quectel 蜂窝模块').waitFor()
     assert.equal(await options.count(), 1)
     assert.equal(devices[0].capabilities.flight.desired, true)
     assert.equal(devices[0].capabilities.vowifi.desired, true)

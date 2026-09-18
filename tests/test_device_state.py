@@ -1410,14 +1410,14 @@ modem.3gpp.registration-state : unknown
                        side_effect=lambda args, **k: calls.append(args) or stub), \
                     patch.object(app, "service_active", return_value=True), \
                     patch.object(app, "stop_bridges"), \
-                    patch.object(app, "reset_modems_after_cellular") as reset, \
+                    patch.object(app, "settle_modems_after_cellular") as settle, \
                     patch("host.mdd_orchestrator.time.sleep"):
                 app.apply_cellular_backend(False, reset_modems=False)
-                reset.assert_not_called()
+                settle.assert_not_called()
                 self.assertIn(["systemctl", "stop", "ModemManager.service"], calls)
 
                 app.apply_cellular_backend(False)
-                reset.assert_called_once()
+                settle.assert_called_once()
 
     def test_replug_retires_the_degraded_verdict(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1434,6 +1434,80 @@ modem.3gpp.registration-state : unknown
 
             self.assertEqual(app._degraded, {})
             self.assertEqual(app._unclaimed_since, {})
+
+    def test_network_reject_is_structured_and_bound_to_current_sim_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            timestamp = int(time.time() * 1_000_000)
+            messages = [
+                "<wrn> [fixture] [modem9] network reject indication received",
+                "<wrn> [fixture] [modem9]   service domain: ps",
+                "<wrn> [fixture] [modem9]   radio interface: lte",
+                "<wrn> [fixture] [modem9]   reject cause: ps-services-not-allowed",
+            ]
+            journal = "\n".join(json.dumps({
+                "__REALTIME_TIMESTAMP": str(timestamp + index), "MESSAGE": message,
+            }) for index, message in enumerate(messages))
+            invocation = "a" * 32
+
+            def fake_run(args, **_kwargs):
+                if args[:2] == ["systemctl", "show"]:
+                    return SimpleNamespace(returncode=0, stdout=invocation + "\n", stderr="")
+                if args and args[0] == "journalctl":
+                    return SimpleNamespace(returncode=0, stdout=journal, stderr="")
+                raise AssertionError(args)
+
+            modem = {"id": "modem-a", "usb_generation": "generation-a"}
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                value = app._network_rejection_for(
+                    modem, "/org/freedesktop/ModemManager1/Modem/9",
+                    "fixture-card", "searching")
+            self.assertEqual(value["cause_code"], 7)
+            self.assertEqual(value["rat"], "lte")
+            self.assertEqual(value["service_domain"], "ps")
+            self.assertEqual(value["operator_id"], "")
+            self.assertNotIn("fixture-card", str(value))
+
+            # A replacement card on the same path cannot inherit the old rejection.
+            app._network_reject_scan_at = time.time()
+            self.assertEqual(app._network_rejection_for(
+                modem, "/org/freedesktop/ModemManager1/Modem/9",
+                "replacement-card", "searching"), {})
+
+    def test_direct_radio_requires_command_and_query_confirmation(self):
+        modem = {"id": "modem-a", "tty": "/dev/ttyUSB2"}
+        with patch.object(Orchestrator, "_serial_at",
+                          side_effect=["\r\nOK\r\n", "\r\n+CFUN: 1\r\nOK\r\n"]) as command:
+            self.assertTrue(Orchestrator._set_direct_radio(modem, True))
+        self.assertEqual([call.args[1] for call in command.call_args_list],
+                         ["AT+CFUN=1", "AT+CFUN?"])
+        with patch.object(Orchestrator, "_serial_at",
+                          side_effect=["\r\nOK\r\n", "\r\n+CFUN: 4\r\nOK\r\n"]):
+            with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+                Orchestrator._set_direct_radio(modem, True)
+
+    def test_both_sim_access_paths_end_in_a_generation_bound_terminal_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            app.root.mkdir(parents=True, exist_ok=True)
+            mdd_orchestrator.atomic_json(app.hw_state_path, {"assignments": {
+                "modem-a": {"usb_generation": "generation-a"}}})
+            reason = ("SIM logical channel allocation failed: "
+                      "MobileEquipment.PhoneFailure: Phone failure")
+            proc = SimpleNamespace(returncode=1)
+            with patch.object(app, "_bridge_stderr_tail", return_value=reason):
+                app._bridge_commands["modem-a"] = ["bridge", "--modemmanager", "0"]
+                for _ in range(3):
+                    app._record_bridge_exit("modem-a", proc, time.time() - 1)
+                self.assertIn("modem-a", app._degraded)
+                self.assertNotIn("modem-a", app._bridge_terminal)
+                app._bridge_commands["modem-a"] = ["bridge", "--modem", "/dev/ttyUSB2"]
+                for _ in range(3):
+                    app._record_bridge_exit("modem-a", proc, time.time() - 1)
+            terminal = app._bridge_terminal["modem-a"]
+            self.assertEqual(terminal["error_code"], "sim_access_failed_both_paths")
+            self.assertEqual(terminal["usb_generation"], "generation-a")
+            self.assertFalse(app._bridge_retry_due("modem-a"))
 
     def test_claimed_tty_leaves_no_stale_unclaimed_evidence(self):
         detail = ("modem.generic.ports.value[1]            : ttyUSB2 (at)\n")

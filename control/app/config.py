@@ -146,7 +146,7 @@ DEFAULTS = {
             "modem_backend": "auto",
             "vpcd_slots": 3,
             "modem_profiles": [
-                {"name": "DJI/Quectel EC25", "vid": "2c7c", "pid": "0125",
+                {"name": "DJI/Quectel cellular modem", "vid": "2c7c", "pid": "0125",
                  "at_interface": 2},
             ],
         },
@@ -338,6 +338,23 @@ def load() -> dict:
         # merge defaults (shallow for settings)
         out = deepcopy(DEFAULTS)
         out["settings"].update(data.get("settings", {}))
+        saved_hardware = data.get("settings", {}).get("hardware", {}) or {}
+        if not isinstance(saved_hardware, dict):
+            saved_hardware = {}
+        hardware = {**DEFAULTS["settings"]["hardware"], **saved_hardware}
+        profiles = []
+        for profile in hardware.get("modem_profiles") or []:
+            item = dict(profile) if isinstance(profile, dict) else {}
+            if (str(item.get("vid") or "").lower(), str(item.get("pid") or "").lower(),
+                    str(item.get("name") or "")) == (
+                    "2c7c", "0125", "DJI/Quectel EC25"):
+                # USB identity selects a compatible transport profile, not an exact module
+                # model. Preserve operator-defined names; migrate only our retired default.
+                item["name"] = "DJI/Quectel cellular modem"
+            if item:
+                profiles.append(item)
+        hardware["modem_profiles"] = profiles
+        out["settings"]["hardware"] = hardware
         out["settings"]["max_sim_lines"] = sim_line_limit(out["settings"])
         if "tls" in data.get("settings", {}):
             out["settings"]["tls"] = {**DEFAULTS["settings"]["tls"], **data["settings"]["tls"]}
@@ -429,7 +446,7 @@ def load() -> dict:
             })
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
-        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults",
+        for key in ("proxy", "security", "maintenance", "device_defaults",
                     "live_translation"):
             candidate = data.get("settings", {}).get(key, {}) or {}
             saved = candidate if isinstance(candidate, dict) else {}

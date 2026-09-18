@@ -91,6 +91,26 @@ class ManageChannelTests(unittest.TestCase):
 
 
 class ModemBackendTests(unittest.TestCase):
+    def test_periodic_identity_refresh_avoids_unchanged_basic_channel_read(self):
+        card = ModemCard.__new__(ModemCard)
+        previous = {"imei": "fixture", "iccid": "8900000000000000001",
+                    "iccid_verified": True, "iccid_source": "card"}
+        with patch.object(card, "cached_iccid", return_value=previous["iccid"]), \
+                patch.object(card, "_iccid_from_card") as direct:
+            self.assertEqual(card.refresh_identity(previous), previous)
+        direct.assert_not_called()
+
+    def test_changed_baseband_cache_requires_new_direct_card_proof(self):
+        card = ModemCard.__new__(ModemCard)
+        previous = {"iccid": "8900000000000000001", "iccid_verified": True}
+        replacement = "8900000000000000002"
+        with patch.object(card, "cached_iccid", return_value=replacement), \
+                patch.object(card, "_iccid_from_card", return_value=replacement) as direct:
+            value = card.refresh_identity(previous)
+        direct.assert_called_once_with()
+        self.assertTrue(value["iccid_verified"])
+        self.assertEqual(value["iccid"], replacement)
+
     def test_preallocated_slot_emulates_manage_channel_open_and_its_exact_close(self):
         card = ModemCard.__new__(ModemCard)
         with patch.object(card, "csim") as csim, \
@@ -147,11 +167,12 @@ class ModemBackendTests(unittest.TestCase):
         self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 3])
         self.assertEqual(card.closed, [])
 
-    def test_failed_bridge_start_clears_stale_channels_and_retries_once(self):
+    def test_failed_bridge_start_never_closes_unowned_stale_channels(self):
         card = self.FakeCard((ModemError("no channel available"), 1, 2, 3))
 
-        self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 3])
-        self.assertEqual(card.closed, [1, 2, 3])
+        with self.assertRaisesRegex(ModemError, "without closing unowned channels"):
+            allocate_logical_channels_with_recovery(card, 3)
+        self.assertEqual(card.closed, [])
 
     class FakeCard:
         def __init__(self, values):

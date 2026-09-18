@@ -11,6 +11,7 @@ the retry counter with a status query (63Cx) that does not consume a try.
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -25,6 +26,14 @@ from . import usbreader
 log = logging.getLogger("vowifi.sim")
 
 MIN_TRIES = 2  # never verify/spend when <= this many attempts remain (avoid PUK lock)
+
+
+class CardProbeTimeout(TimeoutError):
+    """A card worker exceeded its hard ownership deadline and was terminated."""
+
+
+class CardProbeError(RuntimeError):
+    """A bounded card worker exited without returning a usable result."""
 
 
 @dataclass
@@ -549,6 +558,85 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
         except Exception:
             pass
     return info
+
+
+# A PC/SC transmit is implemented by a native library and cannot be cancelled safely from an
+# asyncio task.  ``wait_for(to_thread(...))`` only cancels the waiter: the native call keeps
+# the reader open while the Python lock is released, allowing the next probe to overlap it.
+# Run monitor/maintenance probes in a short-lived spawned process instead.  A hard timeout can
+# then terminate the process (and therefore its PC/SC context) before ownership is released.
+_ORIGINAL_READ_CARD = read_card
+_ORIGINAL_READ_ICCID = read_iccid
+
+
+def _bounded_probe_worker(send, kind: str, reader_index: int, pin: str | None):
+    try:
+        value = (_ORIGINAL_READ_CARD(reader_index, pin)
+                 if kind == "card" else _ORIGINAL_READ_ICCID(reader_index))
+        send.send({"ok": True, "value": value.dict() if kind == "card" else value})
+    except BaseException as exc:  # noqa: BLE001 - cross-process envelope is deliberately closed
+        send.send({"ok": False, "error_type": type(exc).__name__})
+    finally:
+        send.close()
+
+
+def _bounded_probe(kind: str, reader_index: int, pin: str | None, timeout: float):
+    context = multiprocessing.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_bounded_probe_worker,
+        args=(send, kind, int(reader_index), pin),
+        name=f"mdd-card-{kind}",
+        daemon=True,
+    )
+    process.start()
+    send.close()
+    try:
+        if not receive.poll(max(0.1, float(timeout))):
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+            raise CardProbeTimeout(f"{kind} probe exceeded its hard deadline")
+        try:
+            envelope = receive.recv()
+        except EOFError as exc:
+            raise CardProbeError(f"{kind} probe exited without a result") from exc
+    finally:
+        receive.close()
+        if process.is_alive():
+            process.join(1)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+    if not envelope.get("ok"):
+        raise CardProbeError(
+            f"{kind} probe failed ({str(envelope.get('error_type') or 'unknown')[:80]})")
+    return envelope.get("value")
+
+
+def read_card_bounded(reader_index: int = 0, pin: str | None = None,
+                      timeout: float = 45.0) -> CardInfo:
+    """Read a full identity with a real process deadline and deterministic cleanup."""
+    # Unit tests and integrations often replace ``read_card`` with a fixture.  Keep those
+    # fixtures in-process; only the native implementation needs process isolation.
+    if read_card is not _ORIGINAL_READ_CARD:
+        return read_card(reader_index) if pin is None else read_card(reader_index, pin)
+    value = _bounded_probe("card", reader_index, pin, timeout)
+    if not isinstance(value, dict):
+        raise CardProbeError("card probe returned an invalid result")
+    return CardInfo(**{key: value.get(key) for key in CardInfo.__dataclass_fields__})
+
+
+def read_iccid_bounded(reader_index: int = 0, timeout: float = 20.0) -> str:
+    """Read EF_ICCID with a real process deadline and deterministic cleanup."""
+    if read_iccid is not _ORIGINAL_READ_ICCID:
+        return read_iccid(reader_index)
+    value = _bounded_probe("iccid", reader_index, None, timeout)
+    if not isinstance(value, str):
+        raise CardProbeError("ICCID probe returned an invalid result")
+    return value
 
 
 def _find_conn(reader_index: int):

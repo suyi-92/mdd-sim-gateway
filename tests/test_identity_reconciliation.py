@@ -261,8 +261,10 @@ class MaintenanceReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await monitor
 
-        inserted.assert_awaited_once_with(name, 0, verify=True)
-        self.assertTrue(main.hub.scanned)
+        inserted.assert_awaited_once_with(
+            name, 0, verify=True, operation_id='0123456789abcdef')
+        self.assertFalse(main.hub.scanned)
+        self.assertNotEqual(main.hub.device_rescan_applied, '0123456789abcdef')
 
     async def test_scoped_modem_rescan_never_reprobes_another_reader(self):
         import asyncio
@@ -300,7 +302,8 @@ class MaintenanceReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await monitor
 
-        inserted.assert_awaited_once_with(target, 0, verify=True)
+        inserted.assert_awaited_once_with(
+            target, 0, verify=True, operation_id='0123456789abcdef')
 
     async def test_esim_refresh_updates_saved_subscription_not_only_memory(self):
         from control.app.sim import CardInfo
@@ -316,6 +319,59 @@ class MaintenanceReconciliationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hard_timeout_releases_ownership_with_terminal_feedback(self):
+        name = 'fixture-reader'
+        cards = {}
+        with patch.object(main.hub, 'cards', cards), \
+                patch.object(main.hub, 'reader_locks', {}), \
+                patch.object(main.hub, 'card_probes', {}), \
+                patch.object(main.hub, 'card_probe_operations', {}), \
+                patch.object(main.hub, 'card_probe_results', {}), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'broadcast', new=AsyncMock()), \
+                patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                patch.object(main, '_find_running_by_reader', return_value=None), \
+                patch.object(main.sim, 'read_card_bounded',
+                             side_effect=main.sim.CardProbeTimeout('fixture timeout')):
+            await main._on_card_insert(name, 0, verify=True)
+            self.assertFalse(main.hub.reader_lock(name).locked())
+        self.assertEqual(cards[name]['identity_state'], 'failed')
+        self.assertEqual(cards[name]['identity_reason'], 'read_timeout')
+
+    async def test_slow_success_broadcasts_final_identity_after_soft_deadline(self):
+        import asyncio
+        from control.app.sim import CardInfo
+        name = 'fixture-reader'
+        gate = asyncio.Event()
+
+        async def delayed(*_args):
+            await gate.wait()
+            return CardInfo(name, 0, True, iccid='fixture',
+                            imsi='001010000000001', mcc='001', mnc='01')
+
+        broadcast = AsyncMock()
+        cards = {}
+        with patch.object(main.hub, 'cards', cards), \
+                patch.object(main.hub, 'reader_locks', {}), \
+                patch.object(main.hub, 'card_probes', {}), \
+                patch.object(main.hub, 'card_probe_operations', {}), \
+                patch.object(main.hub, 'card_probe_results', {}), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'broadcast', new=broadcast), \
+                patch.object(main, 'CARD_PROBE_TIMEOUT_SECONDS', .01), \
+                patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                patch.object(main, '_find_running_by_reader', return_value=None), \
+                patch.object(main, '_probe_inserted_card', new=AsyncMock(side_effect=delayed)), \
+                patch.object(main, '_match_instance_by_iccid', return_value=None), \
+                patch.object(main.cfg, 'card_auto_create_suppressed', return_value=True):
+            self.assertFalse(await main._on_card_insert(name, 0))
+            self.assertEqual(main.hub.cards[name]['identity_state'], 'reading')
+            task = main.hub.card_probes[name]
+            gate.set()
+            await task
+        self.assertEqual(cards[name]['identity_state'], 'confirmed')
+        self.assertGreaterEqual(broadcast.await_count, 2)
+
     async def test_timed_out_read_keeps_lock_and_cannot_publish_after_replacement(self):
         import asyncio
         from control.app.sim import CardInfo
@@ -333,7 +389,7 @@ class OwnershipTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, '_find_running_by_reader', return_value=None), \
                 patch.object(main, '_probe_inserted_card', new=AsyncMock(side_effect=delayed)) as probe:
             await main._on_card_insert(name, 0)
-            self.assertEqual(main.hub.cards[name]['identity_state'], 'failed')
+            self.assertEqual(main.hub.cards[name]['identity_state'], 'reading')
             self.assertTrue(main.hub.reader_lock(name).locked())
             await main._on_card_insert(name, 0)
             probe.assert_awaited_once()

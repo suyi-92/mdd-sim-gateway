@@ -73,10 +73,14 @@ try {
    const action = page.getByRole('button',{name:'Rename',exact:true})
    const before = await action.boundingBox()
    await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'failed',reason_code:'reader_busy'}}))
-   await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).waitFor()
+   await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).waitFor()
    assert.deepEqual(await action.boundingBox(),before,'notification feedback must not move profile actions')
+   await page.evaluate(()=>window.deliver({type:'esim_recovery_status',reader:'fixture-reader',iccid:'card-b',recovery_status:{state:'waiting_flight_mode',phase:'baseband_initialization'}}))
+   await page.getByText('Profile enabled; cellular initialization will continue when flight mode is turned off.',{exact:true}).waitFor()
+   assert.deepEqual(await action.boundingBox(),before,'cellular recovery feedback must not move profile actions')
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
    await page.screenshot({path:path.join(output,`identity-${width}.png`),fullPage:true})
+   await page.evaluate(()=>window.deliver({type:'esim_recovery_status',reader:'fixture-reader',iccid:'card-b',recovery_status:{state:'success'}}))
    await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'processed'}}))
    await page.getByText('card-b',{exact:true}).last().waitFor()
  }
@@ -84,9 +88,9 @@ try {
  notificationStatus={state:'failed',reason_code:'reader_busy'}
  await page.reload()
  await page.evaluate(()=>window.changeCard('card-b',4))
- await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).waitFor()
+ await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).waitFor()
  await page.evaluate(()=>window.deliver({type:'esim_notifications',reader:'fixture-reader',se_id:'one'}))
- assert.equal(await page.getByText('The reader was busy. eSIM notification pending; click Load, then Process all to retry.',{exact:true}).count(),0)
+ assert.equal(await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).count(),0)
  notificationStatus=null
  // Late failed response after card replacement must not clear new results or show an error.
  await page.getByRole('button',{name:'Load',exact:true}).click()

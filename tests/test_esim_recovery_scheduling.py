@@ -112,12 +112,8 @@ class RecoverySchedulingTests(unittest.TestCase):
         with patch.object(self.app._stop_event, 'wait', side_effect=wait):
             self.app._sleep_for_work(15)
         self.app.finish_bridge_restart_requests({'fixture-modem'})
-        self.assertEqual(self.app._bridge_restarts['fixture-request']['state'], 'spawned')
-        self.app.cellular_states['fixture-modem'] = {'sim_iccid': 'fixture-card'}
-        self.app._sleep_for_work(15)
-        self.app.finish_bridge_restart_requests({'fixture-modem'})
         self.assertEqual(self.app._bridge_restarts['fixture-request']['state'], 'channels_ready')
-        self.assertLessEqual(sum(self.sleeps), 2)
+        self.assertLessEqual(sum(self.sleeps), 1)
         self.sleeps.clear()
         self.app._sleep_for_work(15)
         self.assertEqual(sum(self.sleeps), 15, 'successful recovery must restore idle backoff')

@@ -74,7 +74,9 @@ export function cellularOperationProgress(operation, t) {
 export function cellularRegistrationDetail(device, t = value => value, language = 'zh') {
   const cellular = device?.cellular || {}
   const registration = String(cellular.registration || '').toLowerCase()
-  if (!['home', 'roaming', 'registered'].includes(registration)) return ''
+  if (!['home', 'roaming', 'registered'].includes(registration)) {
+    return cellularNetworkRejectDetail(device, t, language)
+  }
   const pieces = [registration === 'roaming' ? t('Roaming registered') : t('Home network registered')]
   const technology = String(cellular.access_technology || '').toUpperCase()
   if (technology) pieces.push(technology)
@@ -83,4 +85,20 @@ export function cellularRegistrationDetail(device, t = value => value, language 
   if (cellular.signal != null) pieces.push(t('Signal {signal}%', { signal: cellular.signal }))
   pieces.push(cellular.data_active ? t('Data bearer connected') : t('No data bearer'))
   return pieces.join(' · ')
+}
+
+export function cellularNetworkRejectDetail(device, t = value => value, language = 'zh') {
+  const rejection = device?.cellular?.network_reject || device?.network_reject || {}
+  if (!rejection.observed_at) return ''
+  const rat = String(rejection.rat || '').toUpperCase()
+  const domain = String(rejection.service_domain || '').toUpperCase()
+  const operator = /^[0-9]{5,6}$/.test(rejection.operator_id || '')
+    ? rejection.operator_id : t('Unknown network')
+  const cause = Number(rejection.cause_code) === 7
+    ? t('EPS services not allowed (cause 7)')
+    : rejection.cause_code != null
+      ? t('Network rejection cause {code}', { code: rejection.cause_code })
+      : t('Unknown network rejection cause')
+  return [t('Cellular service rejected by the network'), rat, domain, cause,
+    t('Access network: {network}', { network: operator })].filter(Boolean).join(' · ')
 }
