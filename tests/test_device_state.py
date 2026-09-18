@@ -1274,13 +1274,14 @@ modem.3gpp.registration-state : unknown
                 "ModemError: SIM logical channel allocation failed (0/3 allocated): "
                 "GDBus.Error:org.freedesktop.ModemManager1.Error.MobileEquipment."
                 "PhoneFailure: Phone failure\n")
+            app._bridge_commands["a"] = ["bridge", "--modemmanager", "0"]
             proc = SimpleNamespace(returncode=1)
 
             for _ in range(3):
                 app._record_bridge_exit("a", proc, time.time() - 1)
 
             self.assertIn("a", app._degraded)
-            self.assertIn("direct serial", app._degraded["a"])
+            self.assertIn("direct-serial", app._degraded["a"])
             plan = Orchestrator.capability_plan({
                 "a": {"cellular_enabled": False, "flight_mode": True,
                       "vowifi_enabled": True},
@@ -1506,8 +1507,53 @@ modem.3gpp.registration-state : unknown
                     app._record_bridge_exit("modem-a", proc, time.time() - 1)
             terminal = app._bridge_terminal["modem-a"]
             self.assertEqual(terminal["error_code"], "sim_access_failed_both_paths")
+            self.assertEqual(terminal["attempted_paths"],
+                             ["modemmanager", "direct-serial"])
             self.assertEqual(terminal["usb_generation"], "generation-a")
             self.assertFalse(app._bridge_retry_due("modem-a"))
+
+    def test_flight_mode_direct_failure_does_not_claim_modemmanager_was_tried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            app.root.mkdir(parents=True, exist_ok=True)
+            mdd_orchestrator.atomic_json(app.hw_state_path, {"assignments": {
+                "modem-a": {"usb_generation": "generation-a"}}})
+            reason = ("SIM logical channel allocation failed: "
+                      "MobileEquipment.PhoneFailure: Phone failure")
+            app._bridge_commands["modem-a"] = ["bridge", "--modem", "/dev/ttyUSB2"]
+            with patch.object(app, "_bridge_stderr_tail", return_value=reason):
+                for _ in range(3):
+                    app._record_bridge_exit(
+                        "modem-a", SimpleNamespace(returncode=1), time.time() - 1)
+            self.assertEqual(app._bridge_terminal["modem-a"]["error_code"],
+                             "sim_access_failed_direct")
+            self.assertEqual(app._bridge_terminal["modem-a"]["attempted_paths"],
+                             ["direct-serial"])
+            self.assertIn("Direct-serial", app._degraded["modem-a"])
+
+    def test_legacy_ambiguous_terminal_is_migrated_to_direct_only_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            recovery_path = data / "orchestrator" / "bridge-recovery.json"
+            mdd_orchestrator.atomic_json(recovery_path, {
+                "version": 1,
+                "devices": {"modem-a": {
+                    "state": "failed",
+                    "error_code": "sim_access_failed_both_paths",
+                    "backend": "direct-serial",
+                    "attempts": 3,
+                    "usb_generation": "generation-a",
+                }},
+            })
+
+            app = Orchestrator(data, Path(temp), dry_run=True)
+
+            terminal = app._bridge_terminal["modem-a"]
+            self.assertEqual(terminal["error_code"], "sim_access_failed_direct")
+            self.assertEqual(terminal["attempted_paths"], ["direct-serial"])
+            persisted = mdd_orchestrator.read_json(recovery_path)["devices"]["modem-a"]
+            self.assertEqual(persisted["error_code"], "sim_access_failed_direct")
+            self.assertEqual(persisted["attempted_paths"], ["direct-serial"])
 
     def test_claimed_tty_leaves_no_stale_unclaimed_evidence(self):
         detail = ("modem.generic.ports.value[1]            : ttyUSB2 (at)\n")

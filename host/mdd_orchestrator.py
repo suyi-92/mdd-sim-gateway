@@ -932,6 +932,32 @@ class Orchestrator:
         self._bridge_terminal: dict[str, dict] = (
             bridge_recovery.get("devices") or {}
             if isinstance(bridge_recovery.get("devices"), dict) else {})
+        # 1.9.4-vmware.25 labelled every terminal direct-serial PhoneFailure as a
+        # two-path failure, even when flight mode meant ModemManager was never started.
+        # Those records contain no durable evidence that the MM path ran, so migrate them
+        # to the narrower claim on load. New records carry attempted_paths and retain the
+        # two-path label only when this process observed both failures.
+        migrated_bridge_terminal = False
+        for device_id, value in list(self._bridge_terminal.items()):
+            if not isinstance(value, dict):
+                self._bridge_terminal.pop(device_id, None)
+                migrated_bridge_terminal = True
+                continue
+            if (value.get("error_code") == "sim_access_failed_both_paths"
+                    and not value.get("attempted_paths")):
+                self._bridge_terminal[device_id] = {
+                    **value,
+                    "error_code": "sim_access_failed_direct",
+                    "attempted_paths": ["direct-serial"],
+                }
+                migrated_bridge_terminal = True
+            elif (value.get("error_code") == "sim_access_failed_direct"
+                  and not value.get("attempted_paths")):
+                self._bridge_terminal[device_id] = {
+                    **value, "attempted_paths": ["direct-serial"]}
+                migrated_bridge_terminal = True
+        if migrated_bridge_terminal:
+            self._persist_bridge_terminal()
         # Whether this gateway is configured VoWiFi-only (hardware.modem_backend = serial).
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
@@ -1619,8 +1645,11 @@ class Orchestrator:
                 "error": (error or ("device is not connected" if not present else "")
                           or " ".join(part for part in (
                               degraded,
-                              ("SIM access recovery reached a terminal failure through both "
-                               "ModemManager and direct serial."
+                              (("SIM access recovery reached a terminal failure through both "
+                                "ModemManager and direct serial.")
+                               if (bridge_terminal or {}).get("error_code")
+                               == "sim_access_failed_both_paths" else
+                               "Direct-serial SIM access recovery reached a terminal failure."
                                if bridge_terminal else ""),
                               ("Cellular SIM initialization failed after the eSIM switch "
                                f"({cellular_recovery.get('error_code') or 'unknown'})."
@@ -1764,15 +1793,25 @@ class Orchestrator:
         elif count >= BRIDGE_TERMINAL_FAILURE_ATTEMPTS and sim_access_failed and \
                 backend == "direct-serial":
             assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(hwid) or {}
+            mm_failed_first = str(self._degraded.get(hwid) or "").startswith(
+                "ModemManager owns the modem but its AT command path cannot access the SIM")
+            error_code = ("sim_access_failed_both_paths" if mm_failed_first
+                          else "sim_access_failed_direct")
             self._bridge_terminal[hwid] = {
-                "state": "failed", "error_code": "sim_access_failed_both_paths",
+                "state": "failed", "error_code": error_code,
                 "backend": backend, "attempts": count, "updated_at": time.time(),
+                "attempted_paths": (["modemmanager", "direct-serial"]
+                                    if mm_failed_first else ["direct-serial"]),
                 "usb_generation": str(assignment.get("usb_generation") or ""),
             }
             self._persist_bridge_terminal()
-            self._degraded[hwid] = (
+            self._degraded[hwid] = ((
                 "SIM access failed through both ModemManager and direct serial; "
-                "bounded recovery ended. Re-detect this device after checking the SIM session.")
+                "bounded recovery ended. Re-detect this device after checking the SIM session."
+            ) if mm_failed_first else (
+                "Direct-serial SIM access failed; bounded recovery ended. "
+                "Re-detect this device after checking the SIM session."
+            ))
         self.log(f"SIM bridge for {hwid} exited after {uptime:.0f}s "
                  f"(rc={proc.returncode}, attempt {count})"
                  + (f": {reason}" if reason else ""))

@@ -1,5 +1,10 @@
 # VMware 故障排查
 
+`1.9.4-vmware.26` 区分 direct-serial 单路径终态与 MM+direct 双路径终态。飞行模式下
+ModemManager 没有运行，direct 返回 PhoneFailure 只能写为 `sim_access_failed_direct`；不得据此
+声称 MM 路径也失败。新版终态会保存已尝试路径；旧版没有这项证据的双路径记录按单路径保守
+迁移。两种终态都停止自动重试，后续恢复须由明确的设备重检或新 USB 代次触发。
+
 `1.9.4-vmware.25` 修复大疆模块真实换卡后旧桥接仍显示 ready 的问题。桥接首次直接读卡成功
 后，确认另一身份会立即结束当前代次；连续三轮身份不可验证也会发布
 `card_identity_unavailable` 并退出，编排器随后有界重建。换卡后的旧 PIN、SWu、IMS 文件只属
