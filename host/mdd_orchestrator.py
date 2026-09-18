@@ -379,6 +379,9 @@ EXIT_TEST_MAX_AGE_SECONDS = 90.0
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
 INPUT_WAKE_POLL_SECONDS = max(
     0.1, float(os.environ.get("MDD_INPUT_WAKE_POLL_INTERVAL", "0.5")))
+# SIM recovery is unfinished work even when USB assignments and device settings
+# are unchanged. Keep advancing MM discovery and the bridge handshake until terminal.
+BRIDGE_RECOVERY_POLL_SECONDS = 1.0
 # A modem is plugged in so its SIM can be read; cellular data is a per-device capability, not
 # the box's route to the internet. Set this when the modem genuinely IS the only uplink.
 MODEM_MAY_PROVIDE_DEFAULT_ROUTE = os.environ.get(
@@ -973,6 +976,8 @@ class Orchestrator:
                 "started_at": time.time(),
             }
             self._bridge_restart_status(request, "stopping")
+            self.log("eSIM bridge restart accepted queue_ms="
+                     f"{max(0, request['started_at'] - requested_at) * 1000:.0f}")
             self.root.mkdir(parents=True, exist_ok=True)
             (self.root / "pcsc-maintenance").write_text(
                 str(int(time.time())), encoding="ascii")
@@ -3830,6 +3835,9 @@ class Orchestrator:
         # be completed by the process that comes back.
         self.settle_service_restart()
         while not self.stop:
+            # Capture before consuming requests. A request arriving during reconciliation
+            # must wake the next pass, not become the baseline for a new idle sleep.
+            cycle_inputs = self._input_mtimes()
             self.process_backup_operation_request()
             self.process_service_restart_request()
             self.process_bridge_restart_requests()
@@ -3934,7 +3942,8 @@ class Orchestrator:
                                       vowifi_required, mm_active, assignments], sort_keys=True)
             idle = fingerprint == self._last_conclusion
             self._last_conclusion = fingerprint
-            self._sleep_for_work(IDLE_INTERVAL_SECONDS if idle else self.interval)
+            self._sleep_for_work(IDLE_INTERVAL_SECONDS if idle else self.interval,
+                                 observed_inputs=cycle_inputs)
 
     def _input_mtimes(self) -> tuple:
         """Cheap change detector for the documents an operator action writes."""
@@ -3964,23 +3973,29 @@ class Orchestrator:
         except OSError:
             return (0.0, 0)
 
-    def _sleep_for_work(self, seconds: float) -> None:
+    def _sleep_for_work(self, seconds: float, *, observed_inputs: tuple | None = None) -> None:
         """Wait, but wake immediately when an input document changes.
 
         Backing off must not make the gateway feel unresponsive: a settings save or a line
         start writes one of these files, and noticing that costs a stat rather than the
         fifteen subprocesses a full reconcile spends.
         """
-        watched = self._input_mtimes()
+        watched = self._input_mtimes() if observed_inputs is None else observed_inputs
+        if any(request.get("state") not in {"channels_ready", "failed"}
+               for request in self._bridge_restarts.values()):
+            # Neither MM finishing SIM discovery nor a child publishing ready metadata
+            # changes our input documents. Poll these in-flight transitions promptly;
+            # completed/failed requests return to the normal idle cadence.
+            seconds = min(seconds, BRIDGE_RECOVERY_POLL_SECONDS)
         deadline = time.time() + seconds
         poll_interval = min(self.interval, INPUT_WAKE_POLL_SECONDS)
         while not self.stop:
+            if self._input_mtimes() != watched:
+                return
             remaining = deadline - time.time()
             if remaining <= 0:
                 return
             if self._stop_event.wait(min(poll_interval, max(0.1, remaining))):
-                return
-            if self._input_mtimes() != watched:
                 return
 
     def request_stop(self):
