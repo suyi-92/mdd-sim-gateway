@@ -112,7 +112,10 @@ def logical_channel_view(identity: dict | None, bridge_active: bool) -> dict:
         except (TypeError, ValueError):
             continue
         role = str(value.get("role") or "")
-        if channel not in range(1, capacity + 1) or slot not in range(capacity) or role not in roles:
+        # ``capacity`` is the number of bridge slots, not the largest UICC channel number.
+        # ETSI extended channels 4-19 are valid when another baseband client occupies one of
+        # the first three channel numbers.
+        if channel not in range(1, 20) or slot not in range(capacity) or role not in roles:
             continue
         items.append({"slot": slot, "channel": channel, "role": role})
     try:

@@ -86,6 +86,17 @@ class ManageChannelTests(unittest.TestCase):
         self.assertEqual(rewritten[0], 0x03)
         self.assertEqual(rewritten[1:], select[1:])
 
+    def test_extended_channel_uses_further_interindustry_cla_coding(self):
+        select = bytes.fromhex("00A40400" + "10" + "A0000005591010FFFFFFFF8900000100")
+        proprietary = bytes.fromhex("80E2000000")
+
+        rewritten, response = ModemCard.on_channel(select, 4)
+        self.assertIsNone(response)
+        self.assertEqual(rewritten, bytes.fromhex("40") + select[1:])
+        rewritten, response = ModemCard.on_channel(proprietary, 19)
+        self.assertIsNone(response)
+        self.assertEqual(rewritten, bytes.fromhex("CF") + proprietary[1:])
+
     def test_an_unknown_manage_channel_variant_is_still_refused(self):
         _rewritten, response = ModemCard.on_channel(bytes.fromhex("0070400001"), 1)
         self.assertEqual(response, bytes.fromhex("6A86"))
@@ -219,6 +230,12 @@ class ModemBackendTests(unittest.TestCase):
         self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 3])
         self.assertEqual(card.closed, [])
 
+    def test_bridge_accepts_three_owned_slots_with_an_extended_channel_number(self):
+        card = self.FakeCard((1, 2, 4))
+
+        self.assertEqual(allocate_logical_channels_with_recovery(card, 3), [1, 2, 4])
+        self.assertEqual(card.closed, [])
+
     def test_failed_bridge_start_never_closes_unowned_stale_channels(self):
         card = self.FakeCard((ModemError("no channel available"), 1, 2, 3))
 
@@ -226,17 +243,35 @@ class ModemBackendTests(unittest.TestCase):
             allocate_logical_channels_with_recovery(card, 3)
         self.assertEqual(card.closed, [])
 
-    def test_unsupported_channel_opened_by_this_process_is_closed(self):
+    def test_extended_channel_opened_by_this_process_is_retained(self):
         card = ModemCard.__new__(ModemCard)
         card.lock = threading.RLock()
         opened = bytes.fromhex("049000")
+        with patch.object(card, "csim", return_value=opened) as csim:
+            self.assertEqual(card.open_channel(), 4)
+        csim.assert_called_once_with(bytes.fromhex("0070000001"))
+
+    def test_out_of_range_channel_opened_by_this_process_is_closed(self):
+        card = ModemCard.__new__(ModemCard)
+        card.lock = threading.RLock()
+        opened = bytes.fromhex("149000")
         with patch.object(card, "csim", side_effect=[opened, bytes.fromhex("9000")]) as csim:
-            with self.assertRaisesRegex(ModemError, "unsupported logical channel allocated: 4"):
+            with self.assertRaisesRegex(ModemError, "unsupported logical channel allocated: 20"):
                 card.open_channel()
         self.assertEqual(
             [call.args[0] for call in csim.call_args_list],
-            [bytes.fromhex("0070000001"), bytes.fromhex("0070800400")],
+            [bytes.fromhex("0070000001"), bytes.fromhex("0070801400")],
         )
+
+    def test_extended_channel_can_be_recycled_after_lpa_close(self):
+        card = ModemCard.__new__(ModemCard)
+        card.lock = threading.RLock()
+        close = bytes.fromhex("0070800400")
+        with patch.object(card, "csim", side_effect=[bytes.fromhex("9000"),
+                                                      bytes.fromhex("049000")]) as csim:
+            self.assertEqual(card.transmit(close, 4), bytes.fromhex("9000"))
+        self.assertEqual([call.args[0] for call in csim.call_args_list],
+                         [close, bytes.fromhex("0070000001")])
 
     class FakeCard:
         def __init__(self, values):

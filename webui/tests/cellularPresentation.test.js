@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { cellularRegistrationDetail, cellularNetworkRejectDetail, networkName, networkLabel, currentCellularNetwork,
-  cellularOperationOutcome, cellularOperationProgress, networkAvailability } from '../src/cellularPresentation.js'
+  cellularOperationOutcome, cellularOperationProgress, esimRecoveryOutcome,
+  networkAvailability } from '../src/cellularPresentation.js'
 
 const t = (value, args = {}) => value.replace('{signal}', String(args.signal ?? ''))
 
@@ -128,4 +129,36 @@ test('late registration on another PLMN does not confirm a manual target', () =>
   assert.match(matching.text, /selection mode was not confirmed/)
   assert.equal(cellularOperationOutcome(
     { ...manual, error: { code: 'network_rejected' } }, live(mobile), [mobile], 'zh', translated), null)
+})
+
+test('newer same-profile bridge and registration resolve only the eSIM presentation', () => {
+  const status = { id: 'recovery-1', device_id: 'modem-1', state: 'failed',
+    error_code: 'bridge_rebuild_failed', finished_at: 100 }
+  const device = { id: 'modem-1', present: true,
+    esim_recovery: { id: 'recovery-1', state: 'failed' },
+    cellular_recovery: { state: 'ready' },
+    logical_channels: { status: 'ready', capacity: 3, allocated: 3 },
+    sim: { present: true },
+    cellular: { registration: 'roaming', operator_code: '46001',
+      operator: 'China Unicom', operator_zh: '中国联通', observed_at: 200 } }
+  const profile = { iccid: 'fixture-card', profileState: 'enabled' }
+  const card = { hardware_id: 'modem-1', iccid: 'fixture-card', present: true }
+
+  const outcome = esimRecoveryOutcome(status, device, profile, card, 'zh', translated)
+  assert.equal(outcome.tone, 'info')
+  assert.equal(outcome.resolved, true)
+  assert.match(outcome.text, /bridge_rebuild_failed/)
+  assert.match(outcome.text, /中国联通 \(46001\)/)
+  assert.match(outcome.text, /remains recorded as failed/)
+
+  assert.equal(esimRecoveryOutcome(status,
+    { ...device, cellular: { ...device.cellular, observed_at: 100 } },
+    profile, card, 'zh', translated), null)
+  assert.equal(esimRecoveryOutcome(status, device,
+    { ...profile, iccid: 'other-card' }, card, 'zh', translated), null)
+  assert.equal(esimRecoveryOutcome(status,
+    { ...device, logical_channels: { status: 'error', capacity: 3, allocated: 0 } },
+    profile, card, 'zh', translated), null)
+  assert.equal(esimRecoveryOutcome(
+    { ...status, state: 'network_rejected' }, device, profile, card, 'zh', translated), null)
 })

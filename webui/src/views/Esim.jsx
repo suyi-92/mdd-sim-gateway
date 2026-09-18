@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { deviceTitle } from '../deviceNames.js'
 import { waitForEsimLine } from '../esimRecovery.js'
+import { esimRecoveryOutcome } from '../cellularPresentation.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -527,8 +528,8 @@ function isLineRunning(inst) {
   return !!(st && st !== 'STOPPED')
 }
 
-export default function Esim({ cards, instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
-  const { t } = useI18n()
+export default function Esim({ cards, devices = [], instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
+  const { t, language } = useI18n()
   const present = useMemo(
     () => collapseEsimReaders(cards),
     [cards],
@@ -569,6 +570,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
   }, [present, reader])
 
   const selectedCard = present.find((c) => c.name === reader)
+  const selectedDevice = devices.find((device) => (
+    String(device.id || '') === String(selectedCard?.hardware_id || '')
+  ))
   const identityKey = JSON.stringify([reader, selectedCard?.iccid,
     selectedCard?.generation])
   const session = useRef({ key: identityKey, serial: 0, mounted: true })
@@ -1273,7 +1277,9 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
                         const notification = notificationFeedback(p.notification_status, t)
-                        const recovery = recoveryFeedback(p.recovery_status, t)
+                        const recovered = esimRecoveryOutcome(
+                          p.recovery_status, selectedDevice, p, selectedCard, language, t)
+                        const recovery = recovered?.text || recoveryFeedback(p.recovery_status, t)
                         const feedback = renameFeedback?.message || recovery || notification
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
@@ -1294,7 +1300,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
-                                marginTop: 4, fontSize: 12, color: !renameFeedback && ((recovery && ['failed', 'network_rejected'].includes(p.recovery_status?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
+                                marginTop: 4, fontSize: 12, color: !renameFeedback && (((recovery && !recovered && ['failed', 'network_rejected'].includes(p.recovery_status?.state))) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
                                 height: 18, lineHeight: '18px',
                                 fontFamily: feedback ? 'inherit' : 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',

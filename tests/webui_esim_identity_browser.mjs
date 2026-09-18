@@ -14,10 +14,12 @@ import {I18nProvider} from '/src/i18n.jsx';
 import '/src/index.css';
 let eventHandler;
 function App() {
- const [cards, setCards] = React.useState([{name:'fixture-reader',index:0,present:true,iccid:'card-a',generation:1}]);
- window.changeCard = (iccid, generation) => setCards([{name:'fixture-reader',index:0,present:true,iccid,generation}]);
+ const [cards, setCards] = React.useState([{name:'fixture-reader',index:0,present:true,iccid:'card-a',generation:1,hardware_id:'modem-1'}]);
+ const [devices, setDevices] = React.useState([]);
+ window.changeCard = (iccid, generation) => setCards([{name:'fixture-reader',index:0,present:true,iccid,generation,hardware_id:'modem-1'}]);
+ window.changeDevices = setDevices;
  window.deliver = msg => eventHandler?.(msg);
- return <I18nProvider><Esim cards={cards} instances={[]} subscribe={fn => {eventHandler=fn;return ()=>{eventHandler=null}}}/></I18nProvider>
+ return <I18nProvider><Esim cards={cards} devices={devices} instances={[]} subscribe={fn => {eventHandler=fn;return ()=>{eventHandler=null}}}/></I18nProvider>
 }
 const root=createRoot(document.getElementById('root')); window.unmount=()=>root.unmount(); root.render(<App/>);`
 const server = await createServer({ root, configFile: false, plugins: [{
@@ -102,6 +104,16 @@ try {
  await page.reload()
  await page.evaluate(()=>window.changeCard('card-b',4))
  await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).waitFor()
+ // A terminal recovery remains in the audit record, while strictly newer evidence from the
+ // same modem/profile resolves its presentation after bridge, baseband and PLMN all recover.
+ await page.evaluate(()=>window.deliver({type:'esim_recovery_status',reader:'fixture-reader',iccid:'card-b',recovery_status:{
+   id:'recovery-1',device_id:'modem-1',state:'failed',phase:'automatic_selection',error_code:'operation_timeout',finished_at:100}}))
+ await page.evaluate(()=>window.changeDevices([{
+   id:'modem-1',present:true,esim_recovery:{id:'recovery-1',state:'failed'},cellular_recovery:{state:'ready'},
+   logical_channels:{status:'ready',capacity:3,allocated:3},sim:{present:true},
+   cellular:{registration:'roaming',operator_code:'46001',operator:'China Unicom',operator_zh:'中国联通',observed_at:200}}]))
+ await page.getByText(/newer state confirms that this enabled eSIM now has a ready SIM bridge and is registered on China Unicom \(46001\)/).waitFor()
+ assert.equal(await page.getByText(/cellular recovery failed: operation_timeout/).count(),0)
  await page.evaluate(()=>window.deliver({type:'esim_notifications',reader:'fixture-reader',se_id:'one'}))
  assert.equal(await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).count(),0)
  notificationStatus=null

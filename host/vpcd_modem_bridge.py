@@ -32,6 +32,7 @@ IMEI_RE = re.compile(rb'(?<!\d)(\d{15})(?!\d)')
 ICCID_RE = re.compile(rb'(?<!\d)(89\d{17,20})(?!\d)')
 LOGICAL_CHANNEL_CAPACITY = 3
 LOGICAL_CHANNEL_ROLES = ("pin", "swu", "ims")
+LOGICAL_CHANNEL_MAX = 19
 # A slot pcscd never opens a socket for is a normal steady state, not an incident: the reader
 # may expose fewer slots than the modem offers. Retrying every second and logging every attempt
 # turned that into a permanent write stream — one line per slot per second, forever, on hosts
@@ -319,15 +320,28 @@ class ModemCard:
         if len(response) != 3 or response[-2:] != b"\x90\x00":
             raise ModemError("MANAGE CHANNEL OPEN failed: %s" % response.hex())
         channel = response[0]
-        if channel not in (1, 2, 3):
+        if channel not in range(1, LOGICAL_CHANNEL_MAX + 1):
             # This OPEN succeeded, so this process owns the returned channel even though the
-            # three-slot bridge cannot encode it.  Release exactly that channel before
-            # failing.  Losing track of channels 4+ on repeated starts exhausts the UICC and
-            # turns one stale predecessor session into a bridge outage that survives service
-            # restarts.
+            # UICC returned a value outside the ISO/ETSI logical-channel range. Release exactly
+            # that channel before failing; never guess at a different client's channel.
             self.close_channel(channel)
             raise ModemError("unsupported logical channel allocated: %d" % channel)
         return channel
+
+    @staticmethod
+    def channel_cla(cla, channel):
+        """Encode one standard or extended UICC logical channel in the CLA byte.
+
+        ETSI TS 102 221 uses the first interindustry coding for channels 0-3 and the
+        further-interindustry coding for channels 4-19.  The bridge exposes three PC/SC
+        slots, but their UICC channel numbers need not be 1, 2 and 3: a baseband client may
+        legitimately occupy one of those numbers while MANAGE CHANNEL gives this process 4+.
+        """
+        if channel in range(0, 4):
+            return (int(cla) & 0x9C) | channel
+        if channel in range(4, LOGICAL_CHANNEL_MAX + 1):
+            return (int(cla) & 0xB0) | 0x40 | (channel - 4)
+        raise ModemError("cannot encode unsupported logical channel: %d" % channel)
 
     @staticmethod
     def on_channel(apdu, channel):
@@ -352,7 +366,7 @@ class ModemCard:
         # 0xA0 is the legacy GSM class and has no logical-channel encoding.
         if apdu[0] == 0xA0:
             return None, bytes.fromhex("6881")
-        rewritten = bytes(((apdu[0] & 0xFC) | channel,)) + apdu[1:]
+        rewritten = bytes((ModemCard.channel_cla(apdu[0], channel),)) + apdu[1:]
         return rewritten, None
 
     @staticmethod
@@ -366,7 +380,7 @@ class ModemCard:
         close/reset must therefore close and reopen the physical channel. Never silently
         rebind the slot to a different channel: its number is also returned to LPA clients.
         """
-        if channel not in (1, 2, 3):
+        if channel not in range(1, LOGICAL_CHANNEL_MAX + 1):
             raise ModemError("cannot reset an unowned logical channel")
         with self.lock:
             response = self.csim(bytes((0x00, 0x70, 0x80, channel, 0x00)))

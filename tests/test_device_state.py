@@ -59,14 +59,15 @@ class DeviceStateTests(unittest.TestCase):
             "logical_channels": [
                 {"slot": 0, "channel": 1, "role": "pin"},
                 {"slot": 1, "channel": 2, "role": "swu"},
-                {"slot": 2, "channel": 3, "role": "ims"},
-                {"slot": 3, "channel": 4, "role": "invalid"},
+                {"slot": 2, "channel": 4, "role": "ims"},
+                {"slot": 3, "channel": 20, "role": "invalid"},
             ],
         }, True)
         self.assertEqual(value["allocated"], 3)
         self.assertEqual(value["capacity"], 3)
         self.assertEqual(len(value["items"]), 3)
         self.assertEqual(value["items"][1]["role"], "swu")
+        self.assertEqual(value["items"][2]["channel"], 4)
 
     def test_legacy_channel_metadata_uses_bridge_state_without_inventing_ids(self):
         value = device_state.logical_channel_view({"slots": 3}, True)

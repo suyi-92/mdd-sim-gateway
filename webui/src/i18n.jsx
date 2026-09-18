@@ -386,6 +386,7 @@ const zh = {
   'The eSIM is readable, but LTE/EPS service was rejected (cause 7: EPS services not allowed).': 'eSIM 已可读取，但 LTE/EPS 服务被网络拒绝（原因码 7：EPS 服务不允许）。',
   'The eSIM is readable, but cellular service was rejected by the network.': 'eSIM 已可读取，但蜂窝服务被网络拒绝。',
   'The eSIM profile is enabled, but cellular recovery failed: {code}': 'eSIM 配置文件已启用，但蜂窝恢复失败：{code}',
+  'The earlier cellular recovery ended with {code}, but newer state confirms that this enabled eSIM now has a ready SIM bridge and is registered on {network}. The original recovery attempt remains recorded as failed.': '此前蜂窝恢复曾以 {code} 结束，但更新状态已确认当前启用的 eSIM 桥接就绪并已驻网：{network}。原恢复任务仍保留为失败记录。',
   'Profile enabled; cellular initialization will continue when flight mode is turned off.': '配置文件已启用；关闭飞行模式后将继续完成蜂窝初始化。',
   'Profile enabled; applying automatic network selection and waiting for registration…': '配置文件已启用；正在应用自动选网并等待驻网…',
   'Profile enabled; completing SIM and baseband initialization…': '配置文件已启用；正在完成 SIM 与基带初始化…',

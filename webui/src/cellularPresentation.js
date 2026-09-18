@@ -79,6 +79,33 @@ export function cellularOperationOutcome(operation, current, networks, language,
   return null
 }
 
+// A durable eSIM recovery result is historical once it reaches a terminal state.  Resolve its
+// presentation only from a strictly newer, same-device, same-profile observation that proves
+// every layer needed by the profile card: current VPCD channels, baseband identity and PLMN
+// registration.  The stored task itself remains failed for auditability.
+export function esimRecoveryOutcome(status, device = {}, profile = {}, card = {}, language = 'zh', t) {
+  if (status?.state !== 'failed' || !Number(status.finished_at || 0)) return null
+  if (!status.id || status.id !== device.esim_recovery?.id
+      || status.device_id !== device.id || card.hardware_id !== device.id) return null
+  if (card.present !== true || !card.iccid || card.iccid !== profile.iccid
+      || String(profile.profileState || '').toLowerCase() !== 'enabled') return null
+  const channels = device.logical_channels || {}
+  const bridgeReady = channels.status === 'ready'
+    && Number(channels.capacity || 0) > 0
+    && Number(channels.allocated || 0) === Number(channels.capacity || 0)
+  if (!bridgeReady || device.cellular_recovery?.state !== 'ready'
+      || device.sim?.present !== true) return null
+  const current = currentCellularNetwork(device)
+  if (!current.connected || current.observed_at <= Number(status.finished_at)) return null
+  return {
+    tone: 'info', resolved: true,
+    text: t(
+      'The earlier cellular recovery ended with {code}, but newer state confirms that this enabled eSIM now has a ready SIM bridge and is registered on {network}. The original recovery attempt remains recorded as failed.',
+      { code: status.error_code || t('unknown error'), network: networkLabel(current, language) },
+    ),
+  }
+}
+
 export function cellularOperationProgress(operation, t) {
   const stages = {
     queued: 'Preparing network selection…',
