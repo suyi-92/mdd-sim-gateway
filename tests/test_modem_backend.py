@@ -8,7 +8,7 @@ from host.mdd_orchestrator import Orchestrator
 from host.vpcd_modem_bridge import (ModemCard, ModemError, ModemManagerCard,
                                     allocate_logical_channels,
                                     allocate_logical_channels_with_recovery,
-                                    logical_channel_metadata, serve_slot)
+                                    logical_channel_metadata, refresh_metadata, serve_slot)
 
 
 class ManageChannelTests(unittest.TestCase):
@@ -91,6 +91,57 @@ class ManageChannelTests(unittest.TestCase):
 
 
 class ModemBackendTests(unittest.TestCase):
+    def test_confirmed_hot_swap_retires_the_bridge_generation(self):
+        stopping = threading.Event()
+        old = {"iccid": "8900000000000000001", "iccid_verified": True,
+               "iccid_source": "card", "imei": "490154203237518"}
+        new = {**old, "iccid": "8900000000000000002"}
+        card = SimpleNamespace(refresh_identity=Mock(return_value=new))
+        published = []
+        static = {**logical_channel_metadata([1, 2, 3]), "bridge_pid": 7}
+        with patch("host.vpcd_modem_bridge.write_metadata",
+                   side_effect=lambda _path, value: published.append(value)), \
+                patch("builtins.print"):
+            refresh_metadata(card, "/fixture", static, 0, old, stopping)
+        self.assertTrue(stopping.is_set())
+        self.assertEqual(card.refresh_identity.call_count, 1)
+        self.assertEqual(published[-1]["channel_status"], "error")
+        self.assertEqual(published[-1]["channel_error"], "card_identity_changed")
+
+    def test_repeated_identity_loss_retires_but_one_missed_sample_recovers(self):
+        old = {"iccid": "8900000000000000001", "iccid_verified": True,
+               "iccid_source": "card", "imei": "490154203237518"}
+        missing = {**old, "iccid": "", "iccid_verified": False,
+                   "iccid_source": "unknown"}
+        static = {**logical_channel_metadata([1, 2, 3]), "bridge_pid": 7}
+
+        stopping = threading.Event()
+        card = SimpleNamespace(refresh_identity=Mock(return_value=missing))
+        published = []
+        with patch("host.vpcd_modem_bridge.IDENTITY_LOSS_LIMIT", 2), \
+                patch("host.vpcd_modem_bridge.write_metadata",
+                      side_effect=lambda _path, value: published.append(value)), \
+                patch("builtins.print"):
+            refresh_metadata(card, "/fixture", static, 0, old, stopping)
+        self.assertTrue(stopping.is_set())
+        self.assertEqual(card.refresh_identity.call_count, 2)
+        self.assertEqual(published[-1]["channel_error"], "card_identity_unavailable")
+
+        stopping = threading.Event()
+        samples = iter((missing, old))
+        def recover(_previous):
+            value = next(samples)
+            if value is old:
+                stopping.set()
+            return value
+        card = SimpleNamespace(refresh_identity=Mock(side_effect=recover))
+        published = []
+        with patch("host.vpcd_modem_bridge.write_metadata",
+                   side_effect=lambda _path, value: published.append(value)):
+            refresh_metadata(card, "/fixture", static, 0, old, stopping)
+        self.assertEqual(card.refresh_identity.call_count, 2)
+        self.assertTrue(all(value["channel_status"] == "ready" for value in published))
+
     def test_periodic_identity_refresh_avoids_unchanged_basic_channel_read(self):
         card = ModemCard.__new__(ModemCard)
         previous = {"imei": "fixture", "iccid": "8900000000000000001",

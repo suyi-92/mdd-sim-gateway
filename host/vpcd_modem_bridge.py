@@ -46,6 +46,10 @@ SLOT_RETRY_CEILING_SECONDS = 60.0
 # takes both lines down over a transport artefact.
 CHANNEL_OPEN_ATTEMPTS = 3
 CHANNEL_SETTLE_SECONDS = 0.5
+# One missing refresh can be ordinary AT/APDU contention. Repeated loss after this bridge
+# already proved a card is evidence that its physical SIM generation changed or became
+# unusable; the current logical channels must then be retired instead of serving stale state.
+IDENTITY_LOSS_LIMIT = 3
 
 
 class ModemError(RuntimeError):
@@ -307,7 +311,7 @@ class ModemCard:
             # Le=00 so MANAGE CHANNEL CLOSE is accepted and an interrupted bridge does not
             # leak channels until the modem is reset.
             self.csim(bytes((0x00, 0x70, 0x80, channel, 0x00)))
-        except ModemError:
+        except (ModemError, OSError):
             pass
 
     def open_channel(self):
@@ -540,15 +544,53 @@ def retain_hardware_identity(previous, observed):
 
 
 def refresh_metadata(card, path, static, interval, initial_identity=None, stopping=None):
-    """Refresh ICCID after a hot SIM swap without competing for the exclusive AT port."""
+    """Refresh identity and retire this channel generation after a proven hot swap/loss."""
     identity = dict(initial_identity or {})
     stopping = stopping or threading.Event()
+    last_verified = (str(identity.get("iccid") or "")
+                     if identity.get("iccid_verified") is True else "")
+    consecutive_loss = 0
+
+    def retire(reason, observed):
+        nonlocal identity
+        identity = retain_hardware_identity(identity, observed)
+        failed = logical_channel_metadata(
+            [], int(static.get("channel_requested") or 0), "error", reason)
+        write_metadata(path, {**static, **failed, **identity,
+                              "updated_at": int(time.time())})
+        print("[bridge] card identity generation changed; retiring bridge (%s)" % reason,
+              flush=True)
+        stopping.set()
+
     while not stopping.wait(interval):
         try:
-            identity = retain_hardware_identity(identity, card.refresh_identity(identity))
+            observed = retain_hardware_identity(identity, card.refresh_identity(identity))
+            verified = (str(observed.get("iccid") or "")
+                        if observed.get("iccid_verified") is True else "")
+            if last_verified and verified and verified != last_verified:
+                retire("card_identity_changed", observed)
+                return
+            if last_verified and not verified:
+                consecutive_loss += 1
+            else:
+                consecutive_loss = 0
+            identity = observed
             write_metadata(path, {**static, **identity, "updated_at": int(time.time())})
+            if verified:
+                last_verified = verified
+            if last_verified and consecutive_loss >= IDENTITY_LOSS_LIMIT:
+                retire("card_identity_unavailable", identity)
+                return
         except Exception as exc:
-            print("[bridge] identity refresh failed: %s" % exc, flush=True)
+            identity = retain_hardware_identity(identity, {
+                "iccid": "", "iccid_verified": False, "iccid_source": "unknown"})
+            write_metadata(path, {**static, **identity, "updated_at": int(time.time())})
+            consecutive_loss = consecutive_loss + 1 if last_verified else 0
+            print("[bridge] identity refresh failed error_type=%s" % type(exc).__name__,
+                  flush=True)
+            if last_verified and consecutive_loss >= IDENTITY_LOSS_LIMIT:
+                retire("card_identity_unavailable", identity)
+                return
 
 
 def main():
