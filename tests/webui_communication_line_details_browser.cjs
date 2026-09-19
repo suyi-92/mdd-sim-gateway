@@ -125,6 +125,29 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
 
+    const verifyStableCopyHover = async locator => {
+      await locator.waitFor()
+      assert.equal(await locator.getAttribute('title'), null,
+        'copy controls must not open a browser-native tooltip')
+      await page.mouse.move(0, 0)
+      const snapshot = element => {
+        const style = getComputedStyle(element)
+        const box = element.getBoundingClientRect()
+        return {
+          x: box.x, y: box.y, width: box.width, height: box.height,
+          color: style.color, backgroundColor: style.backgroundColor,
+          textDecorationColor: style.textDecorationColor,
+          fontSize: style.fontSize, fontWeight: style.fontWeight, lineHeight: style.lineHeight,
+          cursor: style.cursor,
+        }
+      }
+      const before = await locator.evaluate(snapshot)
+      await locator.hover()
+      const after = await locator.evaluate(snapshot)
+      assert.deepEqual(after, before, 'hovering a copyable number must not alter its layout or appearance')
+      assert.equal(after.cursor, 'pointer')
+    }
+
     const verifyFirstLine = async view => {
       const details = page.locator('.u-line-selector-meta:visible')
       await details.getByText('Fixture Mobile (234-33)', { exact: true }).waitFor()
@@ -136,6 +159,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       assert.equal(text.includes('承载网络'), false)
       assert.equal(text.includes('Visited Network · EE'), false)
       const number = details.getByRole('button', { name: '复制号码' })
+      await verifyStableCopyHover(number)
       await number.click()
       assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
       const selectedOption = await page.locator('.u-line-selector:visible select option:checked').innerText()
@@ -224,6 +248,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     const overviewNumber = page.locator('.u-device-card').first().getByRole('button', { name: '复制号码' })
     await overviewNumber.waitFor()
     assert.equal(await overviewNumber.innerText(), '+447700900357')
+    await verifyStableCopyHover(overviewNumber)
     await overviewNumber.click()
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), '+447700900357')
     for (const width of [3420, 2048, 1440, 900, 390]) {
@@ -434,7 +459,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       ['PUT', '/api/devices/modem-2/cellular/network'],
       ['POST', '/api/devices/modem-2/cellular/networks/scan'],
     ])
-    console.log('PASS: line details, retained-SMS confirmation, cellular network selection, registered-without-bearer status, and wide/narrow layouts; fixture API only')
+    console.log('PASS: line details, stable copy hover, retained-SMS confirmation, cellular network selection, registered-without-bearer status, and wide/narrow layouts; fixture API only')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))

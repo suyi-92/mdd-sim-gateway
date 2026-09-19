@@ -12,7 +12,7 @@ export default function CopyableText({ value, showToast, className = '', childre
   }
 
   return <button type="button" className={`u-copyable-text ${className}`.trim()}
-    aria-label={t('Copy phone number')} title={t('Click to copy phone number')} onClick={copy}>
+    aria-label={t('Copy phone number')} onClick={copy}>
     {children ?? text}
   </button>
 }

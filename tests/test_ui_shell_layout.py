@@ -20,6 +20,7 @@ CONTROL_MAIN = (ROOT / "control/app/main.py").read_text(encoding="utf-8")
 SIM_CONFIG = (ROOT / "webui/src/views/SimConfig.jsx").read_text(encoding="utf-8")
 SIM_SELECTOR = (ROOT / "webui/src/views/SimSelector.jsx").read_text(encoding="utf-8")
 SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
+COPYABLE_TEXT = (ROOT / "webui/src/CopyableText.jsx").read_text(encoding="utf-8")
 
 
 def css_rule(selector: str) -> str:
@@ -104,6 +105,12 @@ class PageRhythmTests(unittest.TestCase):
         self.assertNotIn("['Home network', details.network]", SIM_SELECTOR)
         self.assertIn("<CopyableText value={value}", SIM_SELECTOR)
         self.assertIn("<CopyableText value={number}", UNIFIED)
+
+    def test_copyable_number_hover_does_not_mutate_the_control(self):
+        self.assertNotIn("title=", COPYABLE_TEXT)
+        self.assertIn("aria-label={t('Copy phone number')}", COPYABLE_TEXT)
+        self.assertIn("cursor:pointer", css_rule(".u-copyable-text"))
+        self.assertNotIn(".u-copyable-text:hover", CSS)
 
     def test_esim_reader_selector_collapses_one_modems_logical_slots(self):
         self.assertIn("function collapseEsimReaders(cards)", ESIM)
