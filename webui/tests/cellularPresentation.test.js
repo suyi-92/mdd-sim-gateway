@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { cellularRegistrationDetail, cellularNetworkRejectDetail, networkName, networkLabel, currentCellularNetwork,
-  cellularOperationOutcome, cellularOperationProgress, esimRecoveryOutcome,
+  cellularOperationOutcome, cellularOperationProgress, isEsimRecoverySuperseded,
   networkAvailability } from '../src/cellularPresentation.js'
 
 const t = (value, args = {}) => value.replace('{signal}', String(args.signal ?? ''))
@@ -131,7 +131,7 @@ test('late registration on another PLMN does not confirm a manual target', () =>
     { ...manual, error: { code: 'network_rejected' } }, live(mobile), [mobile], 'zh', translated), null)
 })
 
-test('newer same-profile bridge and registration resolve only the eSIM presentation', () => {
+test('newer same-profile bridge and registration supersede only the matching eSIM warning', () => {
   const status = { id: 'recovery-1', device_id: 'modem-1', state: 'failed',
     error_code: 'bridge_rebuild_failed', finished_at: 100 }
   const device = { id: 'modem-1', present: true,
@@ -144,21 +144,16 @@ test('newer same-profile bridge and registration resolve only the eSIM presentat
   const profile = { iccid: 'fixture-card', profileState: 'enabled' }
   const card = { hardware_id: 'modem-1', iccid: 'fixture-card', present: true }
 
-  const outcome = esimRecoveryOutcome(status, device, profile, card, 'zh', translated)
-  assert.equal(outcome.tone, 'info')
-  assert.equal(outcome.resolved, true)
-  assert.match(outcome.text, /bridge_rebuild_failed/)
-  assert.match(outcome.text, /中国联通 \(46001\)/)
-  assert.match(outcome.text, /remains recorded as failed/)
+  assert.equal(isEsimRecoverySuperseded(status, device, profile, card), true)
 
-  assert.equal(esimRecoveryOutcome(status,
+  assert.equal(isEsimRecoverySuperseded(status,
     { ...device, cellular: { ...device.cellular, observed_at: 100 } },
-    profile, card, 'zh', translated), null)
-  assert.equal(esimRecoveryOutcome(status, device,
-    { ...profile, iccid: 'other-card' }, card, 'zh', translated), null)
-  assert.equal(esimRecoveryOutcome(status,
+    profile, card), false)
+  assert.equal(isEsimRecoverySuperseded(status, device,
+    { ...profile, iccid: 'other-card' }, card), false)
+  assert.equal(isEsimRecoverySuperseded(status,
     { ...device, logical_channels: { status: 'error', capacity: 3, allocated: 0 } },
-    profile, card, 'zh', translated), null)
-  assert.equal(esimRecoveryOutcome(
-    { ...status, state: 'network_rejected' }, device, profile, card, 'zh', translated), null)
+    profile, card), false)
+  assert.equal(isEsimRecoverySuperseded(
+    { ...status, state: 'network_rejected' }, device, profile, card), false)
 })

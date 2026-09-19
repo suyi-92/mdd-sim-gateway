@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { deviceTitle } from '../deviceNames.js'
 import { waitForEsimLine } from '../esimRecovery.js'
-import { esimRecoveryOutcome } from '../cellularPresentation.js'
+import { isEsimRecoverySuperseded } from '../cellularPresentation.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -529,7 +529,7 @@ function isLineRunning(inst) {
 }
 
 export default function Esim({ cards, devices = [], instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
-  const { t, language } = useI18n()
+  const { t } = useI18n()
   const present = useMemo(
     () => collapseEsimReaders(cards),
     [cards],
@@ -1271,15 +1271,20 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                   ) : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {seProfiles.map((p) => {
-                        const enabled = !['pending', 'failed'].includes(selectedCard?.identity_state) && String(p.profileState || '').toLowerCase() === 'enabled'
+                        const profileEnabled = String(p.profileState || '').toLowerCase() === 'enabled'
+                        const enabled = !['pending', 'failed'].includes(selectedCard?.identity_state) && profileEnabled
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
                         const notification = notificationFeedback(p.notification_status, t)
-                        const recovered = esimRecoveryOutcome(
-                          p.recovery_status, selectedDevice, p, selectedCard, language, t)
-                        const recovery = recovered?.text || recoveryFeedback(p.recovery_status, t)
+                        // Recovery results are durable audit records, not permanent row alerts.
+                        // A disabled profile cannot be the modem's current recovery target; for
+                        // the enabled profile, newer end-to-end health supersedes an old failure.
+                        const recoveryStatus = profileEnabled ? p.recovery_status : null
+                        const recoverySuperseded = isEsimRecoverySuperseded(
+                          recoveryStatus, selectedDevice, p, selectedCard)
+                        const recovery = recoverySuperseded ? '' : recoveryFeedback(recoveryStatus, t)
                         const feedback = renameFeedback?.message || recovery || notification
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
@@ -1300,7 +1305,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
-                                marginTop: 4, fontSize: 12, color: !renameFeedback && (((recovery && !recovered && ['failed', 'network_rejected'].includes(p.recovery_status?.state))) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
+                                marginTop: 4, fontSize: 12, color: !renameFeedback && ((recovery && ['failed', 'network_rejected'].includes(recoveryStatus?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
                                 height: 18, lineHeight: '18px',
                                 fontFamily: feedback ? 'inherit' : 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',

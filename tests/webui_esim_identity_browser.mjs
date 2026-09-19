@@ -43,7 +43,11 @@ try {
  const errors=[]; page.on('pageerror', e=>errors.push(e.message))
  await page.addInitScript(()=>localStorage.setItem('mdd-language','en'))
  let current='card-a', pending, cacheReads=0, notificationStatus=null, downloadOperation=null
- const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[{iccid:card,profileNickname:card,profileState:'enabled',notification_status:notificationStatus}]}]})
+ const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[
+   {iccid:card,profileNickname:card,profileState:'enabled',notification_status:notificationStatus},
+   {iccid:'old-bridge',profileNickname:'old-bridge',profileState:'disabled',recovery_status:{state:'failed',error_code:'bridge_rebuild_failed',finished_at:50}},
+   {iccid:'old-timeout',profileNickname:'old-timeout',profileState:'disabled',recovery_status:{state:'failed',error_code:'operation_timeout',finished_at:60}},
+ ]}]})
  await page.route('**/api/**', async route => {
    const url=new URL(route.request().url())
    if(url.pathname==='/api/esim/status') return route.fulfill({json:{available:true}})
@@ -59,6 +63,8 @@ try {
  const address=server.httpServer.address()
  await page.goto('http://127.0.0.1:'+address.port+'/fixture')
  await page.getByText('card-a',{exact:true}).last().waitFor()
+ assert.equal(await page.getByText(/cellular recovery failed: bridge_rebuild_failed/).count(),0)
+ assert.equal(await page.getByText(/cellular recovery failed: operation_timeout/).count(),0)
  // Initial operation status was idle. Starting a new download must start polling; no WS
  // completion is delivered, so only the persisted GET can finish this card.
  await page.getByRole('button',{name:'Download eSIM',exact:true}).click()
@@ -85,7 +91,7 @@ try {
  await page.getByText('Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.',{exact:true}).waitFor()
  for(const width of [1440,900,390]) {
    await page.setViewportSize({width,height:900})
-   const action = page.getByRole('button',{name:'Rename',exact:true})
+   const action = page.getByRole('button',{name:'Rename',exact:true}).first()
    const before = await action.boundingBox()
    await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'failed',reason_code:'reader_busy'}}))
    await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).waitFor()
@@ -112,10 +118,12 @@ try {
    id:'modem-1',present:true,esim_recovery:{id:'recovery-1',state:'failed'},cellular_recovery:{state:'ready'},
    logical_channels:{status:'ready',capacity:3,allocated:3},sim:{present:true},
    cellular:{registration:'roaming',operator_code:'46001',operator:'China Unicom',operator_zh:'中国联通',observed_at:200}}]))
- await page.getByText(/newer state confirms that this enabled eSIM now has a ready SIM bridge and is registered on China Unicom \(46001\)/).waitFor()
+ await page.waitForTimeout(50)
  assert.equal(await page.getByText(/cellular recovery failed: operation_timeout/).count(),0)
+ assert.equal(await page.getByText(/newer state confirms that this enabled eSIM/).count(),0)
  await page.evaluate(()=>window.deliver({type:'esim_notifications',reader:'fixture-reader',se_id:'one'}))
  assert.equal(await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).count(),0)
+ await page.getByText('card-b',{exact:true}).nth(1).waitFor()
  notificationStatus=null
  // Late failed response after card replacement must not clear new results or show an error.
  await page.getByRole('button',{name:'Load',exact:true}).click()
