@@ -6,6 +6,7 @@ import CallSurface, { DialKeypad, DtmfKeypad } from '../CallSurface.jsx'
 import { LiveSubtitlePanel, subtitleButtonLabel, useLiveSubtitles } from '../LiveSubtitles.jsx'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
+import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
 import { CALL_STATUS_LABEL, SETTLED_CODE_STATUS, hasSettledCallStatus,
   ordinaryCallEndIsFailure, ordinaryCallEndLabel } from '../call-status.js'
 
@@ -662,7 +663,7 @@ export default function Softphone({
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 16 }}>
             <Avatar label={call.number} />
             <div>
-              <div className="mono" style={{ fontSize: 22, fontWeight: 700 }}>{call.number}</div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700 }}>{formatPhoneNumberDisplay(call.number)}</div>
               <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 4 }}>{call.serviceCode
                 ? t('Sending the code to the carrier…')
                 : (call.state === 'ringing' ? t('Ringing…') : t('Calling…'))}</div>
@@ -678,7 +679,7 @@ export default function Softphone({
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 14 }}>
             <Avatar label={call.number} color={GREEN} size={84} />
             <div>
-              <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number ? formatPhoneNumberDisplay(call.number) : 'Unknown'}</div>
               {call.serviceCode
                 ? <div style={{ fontSize: 13, color: GREEN, marginTop: 4 }}>{call.ussdText || t('Carrier accepted the code. Waiting for its reply…')}</div>
                 : <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>}
@@ -709,7 +710,7 @@ export default function Softphone({
         {call?.state === 'ended' && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
             <Avatar label={call.number} color={displayedEndFailed ? RED : 'var(--text-mute)'} />
-            <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+            <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number ? formatPhoneNumberDisplay(call.number) : 'Unknown'}</div>
             {call.ussdText && (
               <div style={{ maxWidth: 320, margin: '0 auto', padding: '12px 14px', borderRadius: 10,
                 background: 'var(--input-bg)', border: '1px solid var(--border-strong)',
@@ -835,7 +836,7 @@ export default function Softphone({
                   background: checked ? 'var(--active)' : 'var(--input-bg)' }}>
                 {callSelMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0 }} />}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="mono" style={{ fontWeight: 600 }}>{c.peer}</div>
+                  <div className="mono" style={{ fontWeight: 600 }}>{formatPhoneNumberDisplay(c.peer)}</div>
                   <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}{c.transport === 'cellular' ? ` · ${t('Cellular modem')}` : ''}</div>
                   {c.ussd_text && (
                     <div title={c.ussd_text} style={{ fontSize: 11.5, marginTop: 3, color: 'var(--text-soft)',

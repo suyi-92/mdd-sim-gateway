@@ -8,6 +8,7 @@ import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
 import CopyableText from '../CopyableText.jsx'
 import { defaultDeviceName, deviceTitle } from '../deviceNames.js'
+import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
 import SimConfig from './SimConfig.jsx'
 import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
@@ -516,7 +517,7 @@ function DeviceIdentityLine({ device, showToast }) {
   if (device.sim?.present === false) return t('No SIM inserted')
   const number = device.sim?.number || device.number
   return <>{simName(device, t)} · {number
-    ? <CopyableText value={number} showToast={showToast}>{number}</CopyableText>
+    ? <CopyableText value={number} showToast={showToast}>{formatPhoneNumberDisplay(number)}</CopyableText>
     : t('SIM detected')}</>
 }
 

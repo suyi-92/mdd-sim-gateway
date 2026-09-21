@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
+import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
 import AllowancePanel from './AllowancePanel.jsx'
 
 // A number is kept alive by CHARGEABLE use, not by being registered: carriers reclaim numbers
@@ -155,7 +156,7 @@ function AbsentLines({ lines, onChanged, showToast }) {
   const [busy, setBusy] = useState('')
 
   const remove = async (line) => {
-    const label = `${line.name}${line.msisdn ? ` (${line.msisdn})` : ''}`
+    const label = `${line.name}${line.msisdn ? ` (${formatPhoneNumberDisplay(line.msisdn)})` : ''}`
     if (!window.confirm(t('Delete SIM line “{name}” (ID {id})? Its IMS settings, saved PIN and runtime files are removed. Messages and call records are kept.',
       { name: label, id: line.instance }))) return
     const typed = window.prompt(t('Type the line ID “{id}” to confirm deletion.', { id: line.instance }), '')
@@ -191,7 +192,7 @@ function AbsentLines({ lines, onChanged, showToast }) {
           style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1.4fr) 1fr 1fr 1fr auto',
             gap: 10, alignItems: 'center', padding: '11px 16px', fontSize: 13,
             borderBottom: '1px solid var(--border)', opacity: .75 }}>
-          <Cell sub={line.msisdn || t('number unknown')}>
+          <Cell sub={line.msisdn ? formatPhoneNumberDisplay(line.msisdn) : t('number unknown')}>
             <b style={{ fontSize: 14 }}>{line.name}</b>
             {line.carrier ? <span style={{ color: 'var(--text-mute)', fontWeight: 400 }}> · {line.carrier}</span> : null}
           </Cell>
@@ -284,7 +285,7 @@ export default function Keepalive({ showToast }) {
         return <React.Fragment key={line.instance}>
           <div className="u-keepalive-grid" style={{ ...GRID, borderBottom: '1px solid var(--border)', fontSize: 13, cursor: 'pointer', background: isOpen ? 'var(--hover)' : undefined }}
             onClick={() => setOpen(isOpen ? null : line.instance)}>
-            <Cell sub={line.msisdn || t('number unknown')}><b style={{ fontSize: 14 }}>{line.name}</b>
+            <Cell sub={line.msisdn ? formatPhoneNumberDisplay(line.msisdn) : t('number unknown')}><b style={{ fontSize: 14 }}>{line.name}</b>
               {line.carrier ? <span style={{ color: 'var(--text-mute)', fontWeight: 400 }}> · {line.carrier}</span> : null}</Cell>
             <div><span className={`u-badge ${online ? 'cap-on' : 'cap-error'}`}><i className="u-dot" />{online ? t('Online') : t('Offline')}</span></div>
             <Cell tone={online ? 'ok' : 'crit'}

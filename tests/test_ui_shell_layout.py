@@ -21,6 +21,7 @@ SIM_CONFIG = (ROOT / "webui/src/views/SimConfig.jsx").read_text(encoding="utf-8"
 SIM_SELECTOR = (ROOT / "webui/src/views/SimSelector.jsx").read_text(encoding="utf-8")
 SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
 COPYABLE_TEXT = (ROOT / "webui/src/CopyableText.jsx").read_text(encoding="utf-8")
+PHONE_DISPLAY = (ROOT / "webui/src/phoneNumberDisplay.js").read_text(encoding="utf-8")
 
 
 def css_rule(selector: str) -> str:
@@ -111,6 +112,19 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("aria-label={t('Copy phone number')}", COPYABLE_TEXT)
         self.assertIn("cursor:pointer", css_rule(".u-copyable-text"))
         self.assertNotIn(".u-copyable-text:hover", CSS)
+
+    def test_phone_numbers_are_formatted_only_at_display_boundaries(self):
+        self.assertIn("export function formatPhoneNumberDisplay", PHONE_DISPLAY)
+        self.assertIn("formatPhoneNumberDisplay(msg.message.peer)", APP)
+        self.assertIn("formatPhoneNumberDisplay(msg.call.peer)", APP)
+        self.assertIn("formatPhoneNumberDisplay(value)", SIM_SELECTOR)
+        self.assertIn("formatPhoneNumberDisplay(number)", UNIFIED)
+        self.assertIn("formatPhoneNumberDisplay(call.number)", CALL_SURFACE)
+        self.assertIn("formatPhoneNumberDisplay(c.peer)", SOFTPHONE)
+        self.assertIn("formatPhoneNumberDisplay(t.peer)", MESSAGES)
+        self.assertIn("formatPhoneNumberDisplay(p.peer)", MESSAGES)
+        self.assertIn("formatPhoneNumberDisplay(line.msisdn)", KEEPALIVE)
+        self.assertNotIn("formatPhoneNumberDisplay(form.msisdn)", SIM_CONFIG)
 
     def test_esim_reader_selector_collapses_one_modems_logical_slots(self):
         self.assertIn("function collapseEsimReaders(cards)", ESIM)

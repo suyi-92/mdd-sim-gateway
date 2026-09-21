@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react'
 import CopyableText from '../CopyableText.jsx'
 import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
+import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
 import { communicationLineDetails } from '../simLineDetails.js'
 
 // Per-page SIM/line picker for multi-SIM setups. Labels each line with the physical reader
@@ -79,7 +80,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
       {details && <dl className="u-line-selector-meta" aria-label={t('Current line details')}>
         {detailFields.map(([name, value, copyable]) => <div key={name}><dt>{t(name)}</dt><dd title={copyable ? undefined : value}>
           {copyable && value !== t('Number unavailable')
-            ? <CopyableText value={value} showToast={showToast}>{value}</CopyableText>
+            ? <CopyableText value={value} showToast={showToast}>{formatPhoneNumberDisplay(value)}</CopyableText>
             : value}
         </dd></div>)}
       </dl>}

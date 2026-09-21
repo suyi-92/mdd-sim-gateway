@@ -9,6 +9,7 @@ import Keepalive from './views/Keepalive.jsx'
 import { deviceTitle } from './deviceNames.js'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage, physicallyPresentDevices } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
+import { formatPhoneNumberDisplay } from './phoneNumberDisplay.js'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
@@ -236,8 +237,8 @@ export default function App() {
     }
     if(['device','hardware','capability','cellular','engine'].includes(msg.type)) refresh()
     wsEvents.current.handlers.forEach(h=>h(msg))
-    if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:msg.message.peer}))
-    if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
+    if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:formatPhoneNumberDisplay(msg.message.peer)}))
+    if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:formatPhoneNumberDisplay(msg.call.peer)}))
   },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>

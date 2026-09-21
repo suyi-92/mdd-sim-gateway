@@ -1,5 +1,6 @@
 import React from 'react'
 import { LiveSubtitlePanel, subtitleButtonLabel } from './LiveSubtitles.jsx'
+import { formatPhoneNumberDisplay } from './phoneNumberDisplay.js'
 
 export const CALL_KEYS = [
   ['1', ''], ['2', 'ABC'], ['3', 'DEF'],
@@ -84,7 +85,7 @@ export default function CallSurface({
 
       <div className="u-call-identity">
         <div className="u-call-avatar" aria-hidden="true">☎</div>
-        <div className="u-call-number mono">{call.number || t('Unknown')}</div>
+        <div className="u-call-number mono">{call.number ? formatPhoneNumberDisplay(call.number) : t('Unknown')}</div>
         <div className="u-call-line">{line || t('VoWiFi line')}</div>
         {state === 'active' && <div className="u-call-duration mono">{duration}</div>}
       </div>

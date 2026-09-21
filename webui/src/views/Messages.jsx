@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
+import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
 
 export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors, pageVisible = true }) {
   const { t: tr } = useI18n()
@@ -170,7 +171,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
 
   const deleteThread = async (p, e) => {
     if (e) e.stopPropagation()
-    if (!confirm(`Delete the entire conversation with ${p}? This removes all its messages.`)) return
+    if (!confirm(`Delete the entire conversation with ${formatPhoneNumberDisplay(p)}? This removes all its messages.`)) return
     const forId = id
     try {
       await api.deleteMessages(forId, { peer: p })
@@ -238,10 +239,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
             style={{ padding: 10, borderRadius: 10, cursor: 'pointer', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8,
               background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }} className="mono">{t.peer}</div>
+              <div style={{ fontWeight: 600, fontSize: 14 }} className="mono">{formatPhoneNumberDisplay(t.peer)}</div>
               <div style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.last_body}</div>
             </div>
-            <button className="row-del" title="Delete conversation" aria-label={`Delete conversation with ${t.peer}`}
+            <button className="row-del" title="Delete conversation" aria-label={`Delete conversation with ${formatPhoneNumberDisplay(t.peer)}`}
               onClick={(e) => deleteThread(t.peer, e)}>🗑</button>
           </div>
         ))}
@@ -259,7 +260,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
 
       <div className="card u-message-conversation" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
         <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-          {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
+          {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{formatPhoneNumberDisplay(peer)}</span>
             : <input placeholder={tr('Recipient number e.g. +1...')} value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
           {peer && msgs.length > 0 && (
             selMode ? (
@@ -405,7 +406,7 @@ function BinaryPayloads({ payloads, tr }) {
           {payloads.map((p) => (
             <div key={p.id} style={{ padding: '6px 6px 7px', borderRadius: 8, marginBottom: 2, background: 'var(--hover)' }}>
               <div onClick={() => toggle(p.id)} style={{ cursor: 'pointer', display: 'flex', alignItems: 'baseline', gap: 6 }}>
-                <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{p.peer}</span>
+                <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{formatPhoneNumberDisplay(p.peer)}</span>
                 <span style={{ fontSize: 10, color: 'var(--text-mute)', flex: 1 }}>
                   {new Date(p.ts * 1000).toLocaleString()}
                 </span>
