@@ -105,6 +105,29 @@ try {
    await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',notification_status:{state:'processed'}}))
    await page.getByText('card-b',{exact:true}).last().waitFor()
  }
+ // Drop completion WS entirely: the device snapshot must clear cached progress without
+ // Load, navigation or any card access, at each supported container width.
+ const waiting = 'Profile enabled; applying automatic network selection and waiting for registration…'
+ for (const width of [1440,900,390]) {
+   await page.setViewportSize({width,height:900})
+   await page.evaluate(()=>window.changeDevices([]))
+   await page.evaluate(()=>window.deliver({type:'esim_recovery_status',reader:'fixture-reader',iccid:'card-b',
+     recovery_status:{id:'poll-task',device_id:'modem-1',state:'registering',created_at:100,updated_at:110}}))
+   await page.getByText(waiting,{exact:true}).waitFor()
+   const action = page.getByRole('button',{name:'Rename',exact:true}).first()
+   const before = await action.boundingBox(), reads = cacheReads
+   await page.evaluate(()=>window.changeDevices([{id:'modem-1',esim_recovery:{
+     id:'poll-task',device_id:'modem-1',state:'success',created_at:100,updated_at:120}}]))
+   await page.getByText(waiting,{exact:true}).waitFor({state:'hidden'})
+   assert.equal(cacheReads,reads,'recovery catch-up must not read the eUICC or reload its cache')
+   assert.deepEqual(await action.boundingBox(),before,'completion must not move profile actions')
+   // Delayed progress also cannot override the newer polled completion.
+   await page.evaluate(()=>window.deliver({type:'esim_recovery_status',reader:'fixture-reader',iccid:'card-b',
+     recovery_status:{id:'poll-task',device_id:'modem-1',state:'registering',created_at:100,updated_at:115}}))
+   assert.equal(await page.getByText(waiting,{exact:true}).count(),0)
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
+   await page.screenshot({path:path.join(output,`recovery-poll-${width}.png`),fullPage:true})
+ }
  // Persisted delivery failure survives a page reload and a new card-monitor generation.
  notificationStatus={state:'failed',reason_code:'reader_busy'}
  await page.reload()

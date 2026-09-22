@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { deviceTitle } from '../deviceNames.js'
-import { waitForEsimLine } from '../esimRecovery.js'
+import { newerEsimRecovery, profileRecoveryStatus, waitForEsimLine } from '../esimRecovery.js'
 import { isEsimRecoverySuperseded } from '../cellularPresentation.js'
 import { useI18n } from '../i18n.jsx'
 
@@ -104,7 +104,8 @@ function withNotificationStatus(list, iccid, status) {
 
 function withRecoveryStatus(list, iccid, status) {
   return list.map((se) => ({ ...se, profiles: (se.profiles || []).map((profile) => (
-    profile.iccid === iccid ? { ...profile, recovery_status: status } : profile
+    profile.iccid === iccid
+      ? { ...profile, recovery_status: newerEsimRecovery(profile.recovery_status, status) } : profile
   )) }))
 }
 
@@ -1281,7 +1282,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                         // Recovery results are durable audit records, not permanent row alerts.
                         // A disabled profile cannot be the modem's current recovery target; for
                         // the enabled profile, newer end-to-end health supersedes an old failure.
-                        const recoveryStatus = profileEnabled ? p.recovery_status : null
+                        const recoveryStatus = profileRecoveryStatus(p, selectedDevice, selectedCard)
                         const recoverySuperseded = isEsimRecoverySuperseded(
                           recoveryStatus, selectedDevice, p, selectedCard)
                         const recovery = recoverySuperseded ? '' : recoveryFeedback(recoveryStatus, t)
