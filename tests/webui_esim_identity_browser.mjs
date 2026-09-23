@@ -42,8 +42,8 @@ try {
  const page = await browser.newPage()
  const errors=[]; page.on('pageerror', e=>errors.push(e.message))
  await page.addInitScript(()=>localStorage.setItem('mdd-language','en'))
- let current='card-a', pending, cacheReads=0, notificationStatus=null, downloadOperation=null
- const payload = (card) => ({ok:true,cached:true,ts:100,ses:[{id:'one',eid:'fixture-euicc',profiles:[
+ let current='card-a', pending, cacheReads=0, notificationStatus=null, downloadOperation=null, cacheTimestamp=100
+ const payload = (card) => ({ok:true,cached:true,ts:cacheTimestamp,ses:[{id:'one',eid:'fixture-euicc',profiles:[
    {iccid:card,profileNickname:card,profileState:'enabled',notification_status:notificationStatus},
    {iccid:'old-bridge',profileNickname:'old-bridge',profileState:'disabled',recovery_status:{state:'failed',error_code:'bridge_rebuild_failed',finished_at:50}},
    {iccid:'old-timeout',profileNickname:'old-timeout',profileState:'disabled',recovery_status:{state:'failed',error_code:'operation_timeout',finished_at:60}},
@@ -148,6 +148,29 @@ try {
  assert.equal(await page.getByText(/The reader remained busy; the eSIM notification is still pending\./).count(),0)
  await page.getByText('card-b',{exact:true}).nth(1).waitFor()
  notificationStatus=null
+ // A bridge failure before the first notification attempt is historical after
+ // same-card recovery. Retain an actionable verification notice in its own panel.
+ await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',
+   notification_status:{state:'failed',reason_code:'reader_unavailable',attempts:0,elapsed_ms:0,updated_at:101}}))
+ const verifyNotice='The reader has recovered. Click Load to check whether eSIM notifications still need processing.'
+ await page.getByText(verifyNotice,{exact:true}).waitFor()
+ for (const width of [1440,900,390]) {
+   await page.setViewportSize({width,height:900})
+   assert.equal(await page.getByText(/The reader became unavailable while processing/).count(),0)
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
+   await page.screenshot({path:path.join(output,`notification-recovered-${width}.png`),fullPage:true})
+ }
+ // Lose the completion WS: a newer cache-only snapshot must still clear the old
+ // delivery failure. A delayed old failure cannot resurrect it afterwards.
+ notificationStatus={state:'failed',reason_code:'reader_busy',attempts:3,updated_at:201}
+ await page.evaluate(status=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',
+   iccid:'card-b',notification_status:status}),notificationStatus)
+ await page.getByText(/The reader remained busy/).waitFor()
+ notificationStatus=null; cacheTimestamp=220
+ await page.getByText(/The reader remained busy/).waitFor({state:'hidden',timeout:15000})
+ await page.evaluate(()=>window.deliver({type:'esim_notification_status',reader:'fixture-reader',iccid:'card-b',
+   notification_status:{state:'failed',reason_code:'reader_busy',attempts:3,updated_at:201}}))
+ assert.equal(await page.getByText(/The reader remained busy/).count(),0)
  // Late failed response after card replacement must not clear new results or show an error.
  await page.getByRole('button',{name:'Load',exact:true}).click()
  while(!pending) await new Promise(r=>setTimeout(r,10))

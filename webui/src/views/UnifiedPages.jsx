@@ -728,7 +728,7 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
   </div>
 }
 
-export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab = 'status', setDeviceTab, pageVisible = true }) {
+export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, onInstanceSaved, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab = 'status', setDeviceTab, pageVisible = true }) {
   const { t, language } = useI18n(); const tab = deviceTab; const setTab = setDeviceTab
   const [showDisconnected, setShowDisconnected] = useState(false)
   const { visibleDevices, disconnectedCount, activeDeviceId: active, device: d } = useMemo(
@@ -759,7 +759,7 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
         <DeviceRescanControl key={d.id} compact device={d} refresh={refresh} showToast={showToast}/>
       </div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><DraftProvisioningNotice device={d} setTab={setTab}/><ProvisioningWarnings device={d}/><LineActivity device={d}/><div className="u-note-stack"><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the cellular-data switch only connects or disconnects the data bearer. With flight mode off, the modem can remain registered to the cellular network while data is off.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div></div>}
-      {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
+      {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} onInstanceSaved={onInstanceSaved} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
       {tab==='cellular' && <div className="card u-panel"><h3>{t('Cellular data (4G)')}</h3>
         {d.cellular ? <div className="u-details cols">
           <div className="u-detail"><span>{t('Registration')}</span><b>{cellularRegistrationDetail(d, t, language) || d.cellular.registration || t('Not connected')}</b></div>

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, connectWs, setCsrf } from './api.js'
 import { createRefreshCoordinator } from './refreshCoordinator.js'
+import { savedLineMetadata, mergeSavedLine, mergeSavedDevice } from './savedLineMetadata.js'
 import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Messages from './views/Messages.jsx'
@@ -132,6 +133,19 @@ export default function App() {
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
   const namedHardware = useRef({ devices: [], cards: [] })
   const refreshCoordinator = useRef(null)
+  const metadataEpoch = useRef(0)
+  const snapshotEpoch = useRef({})
+  const onInstanceSaved = useCallback(value => {
+    const saved = savedLineMetadata(value)
+    if (!saved) return
+    metadataEpoch.current += 1
+    setInstances(list => mergeSavedLine(list, saved))
+    setDevices(list => mergeSavedDevice(list, saved))
+  }, [])
+  const readSnapshot = (scope, read) => {
+    snapshotEpoch.current[scope] = metadataEpoch.current
+    return read()
+  }
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('theme', theme) }, [theme])
   useEffect(() => {
@@ -166,8 +180,13 @@ export default function App() {
   },[])
 
   if (!refreshCoordinator.current) refreshCoordinator.current = createRefreshCoordinator(
-    { instances: () => api.instances(), cards: () => api.cards(), devices: () => api.devices() },
+    { instances: () => readSnapshot('instances', () => api.instances()), cards: () => api.cards(),
+      devices: () => readSnapshot('devices', () => api.devices()) },
     (scope, result, results) => {
+      // A GET started before a confirmed save must not put the old number back.
+      // The save/event queues a fresh trailing batch through the coordinator.
+      if (['instances', 'devices'].includes(scope)
+          && snapshotEpoch.current[scope] !== metadataEpoch.current) return
       setLoadErrors(previous => ({ ...previous,
         [scope]: result.status === 'rejected' && !(scope === 'devices' && result.reason?.status === 404),
       }))
@@ -190,6 +209,8 @@ export default function App() {
       // endpoint. A transient network failure must not turn every saved line and reader into
       // a temporary "device" until the next poll succeeds.
       if (results.devices?.status === 'rejected' && results.devices.reason?.status === 404
+          && snapshotEpoch.current.instances === metadataEpoch.current
+          && snapshotEpoch.current.devices === metadataEpoch.current
           && results.instances?.status === 'fulfilled' && results.cards?.status === 'fulfilled') {
         unifiedAvailable.current=false
         setDevices(legacyDevices(results.instances.value.instances || [], results.cards.value.cards || []))
@@ -219,6 +240,7 @@ export default function App() {
   }, [refresh, authState?.authenticated])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
+    if (msg.type === 'instance_updated') { onInstanceSaved(msg.line); refresh() }
     if(msg.type==='status'){
       const status=Object.fromEntries(Object.entries(msg).filter(([k])=>!['type','instance'].includes(k)))
       setInstances(list=>list.map(i=>String(i.id)===String(msg.instance)?{...i,status}:i))
@@ -239,14 +261,14 @@ export default function App() {
     wsEvents.current.handlers.forEach(h=>h(msg))
     if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:formatPhoneNumberDisplay(msg.message.peer)}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:formatPhoneNumberDisplay(msg.call.peer)}))
-  },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth])
+  },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth,onInstanceSaved])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>
   if (!authState.authenticated) return <AuthScreen configured={authState.configured} accountUsername={authState.username} t={t} onDone={result=>{setCsrf(result.csrf);setAuthState(s=>({...s,configured:true,authenticated:true,csrf:result.csrf}))}} />
   const sel=instances.find(i=>String(i.id)===String(selected))
   const callSel=instances.find(i=>String(i.id)===String(callSelected))
   const presentDeviceCount=physicallyPresentDevices(devices).length
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,onInstanceSaved,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
   const pages={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common} pageVisible={view === 'devices'}/>,
     messages:<Messages {...common} pageVisible={view === 'messages'}/>, esim:<Esim {...common} pageVisible={view === 'esim'}/>, keepalive:<Keepalive {...common}/>,

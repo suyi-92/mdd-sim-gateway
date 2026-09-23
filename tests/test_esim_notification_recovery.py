@@ -52,6 +52,39 @@ class NotificationCacheTests(unittest.IsolatedAsyncioTestCase):
         status = main._esim_cache_for_iccid('fixture-card')['ses'][0]['profiles'][0]['notification_status']
         self.assertEqual(status['state'], 'failed')
 
+    async def test_only_a_confirmed_empty_live_list_replaces_an_old_failure(self):
+        for loaded, notes, expected in [(False, [], 'failed'),
+                                        (True, [{'seqNumber': 1}], 'failed'),
+                                        (True, [], 'empty')]:
+            with self.subTest(loaded=loaded, notes=notes):
+                await main._esim_notification_status_callback('reader', 'fixture-card')({
+                    'state': 'failed', 'reason_code': 'reader_unavailable', 'attempts': 0})
+                await main._esim_notification_status_callback('reader', 'other-card')({
+                    'state': 'failed', 'reason_code': 'network_transport', 'attempts': 1})
+                fresh = [{'id': 'one', 'eid': 'fixture-euicc',
+                          'notifications_loaded': loaded, 'notifications': notes,
+                          'notifications_checked_at': main.time.time(),
+                          'profiles': [{'iccid': 'fixture-card'}]},
+                         {'id': 'two', 'eid': 'fixture-second',
+                          'notifications_loaded': False, 'notifications': [],
+                          'profiles': [{'iccid': 'other-card'}]}]
+                main._esim_cache_store(fresh, '')
+                self.assertEqual(fresh[0]['profiles'][0]['notification_status']['state'], expected)
+                self.assertEqual(fresh[1]['profiles'][0]['notification_status']['state'], 'failed')
+                stored = main._esim_cache_for_iccid('fixture-card')['ses'][0]
+                self.assertEqual(stored['notifications'], [])
+                self.assertFalse(stored['notifications_loaded'])
+                self.assertGreater(fresh[0]['profiles'][0]['notification_status']['updated_at'], 0)
+
+    async def test_a_new_attempt_after_the_list_read_is_not_cleared_by_that_old_read(self):
+        fresh = [{'id': 'one', 'eid': 'fixture-euicc', 'notifications_loaded': True,
+                  'notifications': [], 'notifications_checked_at': main.time.time() - 1,
+                  'profiles': [{'iccid': 'fixture-card'}]}]
+        status = await main._esim_notification_status_callback('reader', 'fixture-card')({
+            'state': 'processing', 'attempts': 1})
+        main._esim_cache_store(fresh, '')
+        self.assertEqual(fresh[0]['profiles'][0]['notification_status'], status)
+
 
 class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_enable_rebuild_notify_verify_in_that_order_before_line_start(self):

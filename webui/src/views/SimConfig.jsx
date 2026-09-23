@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { deviceTitle } from '../deviceNames.js'
 import { useI18n } from '../i18n.jsx'
@@ -21,7 +21,7 @@ function nextInstanceId(instances) {
   return String(candidate)
 }
 
-export default function SimConfig({ instances, selected, refresh, cards, setSelected, targetDevice }) {
+export default function SimConfig({ instances, selected, refresh, onInstanceSaved, cards, setSelected, targetDevice }) {
   const { t } = useI18n()
   const [readers, setReaders] = useState([])
   const [readersLoading, setReadersLoading] = useState(true)
@@ -29,6 +29,9 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const [pin, setPin] = useState('')
   const [pinMsg, setPinMsg] = useState('')
   const [form, setForm] = useState(emptyInstance())
+  const [numberDirty, setNumberDirty] = useState(false)
+  const activeFormId = useRef(form.id)
+  activeFormId.current = form.id
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteHistory, setDeleteHistory] = useState(true)
@@ -86,6 +89,11 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
     setCreating(managedSelected.provisioning_state === 'draft')
     setForm({ ...emptyInstance(), ...managedSelected })
   }, [managedSelected?.id, managedSelected?.provisioning_state, targetDevice?.present])
+  useEffect(() => { setNumberDirty(false) }, [managedSelected?.id])
+  useEffect(() => {
+    if (managedSelected && !numberDirty) setForm(current => ({ ...current,
+      msisdn: managedSelected.msisdn || '', msisdn_source: managedSelected.msisdn_source || '' }))
+  }, [managedSelected?.id, managedSelected?.msisdn, managedSelected?.msisdn_source, numberDirty])
   // Opening the SIM tab for an unconfigured physical reader starts a new-line form bound to
   // that reader. This avoids silently editing the currently selected (unrelated) line.
   useEffect(() => {
@@ -190,6 +198,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       // Strip runtime-only fields that ride along on the instance object from /api/instances
       // (they are computed per-request, not config — never persist them).
       delete body.status; delete body.has_pin
+      delete body.number_country; delete body.applied
       // Never send an empty PIN — the stored PIN (tied to this IMSI) must survive edits to
       // unrelated fields. `pin` state is only set when the user re-enters/verifies a PIN
       // here; only then do we forward it to update the saved credential.
@@ -199,7 +208,11 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       delete body.imei; delete body.imeisv
       if (pin) body.pin = pin
       const res = creating ? await api.provision(body) : await api.saveInstance(body)
-      await refresh()
+      onInstanceSaved?.(creating ? res.instance : res)
+      if (String(activeFormId.current) === String(body.id)) setNumberDirty(false)
+      // The successful save response is already authoritative. A failed follow-up
+      // poll must not leave other pages with the old number or report the save as failed.
+      void refresh().catch(() => {})
       if (creating) {
         setCreating(false)
         setSelected(String(res.instance.id))
@@ -339,7 +352,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           <Field label={t('Proxy country override')}><input className="mono" value={form.proxy_country || ''} maxLength={2}
             onChange={(e) => upd({ proxy_country: e.target.value.replace(/[^a-z]/gi, '').toLowerCase() })}
             placeholder={`auto (${(form.proxy_country_effective || 'MCC').toUpperCase()})`} /></Field>
-          <Field label={t('Phone number (MSISDN)')}><input className="mono" value={form.msisdn} onChange={(e) => upd({ msisdn: e.target.value })} placeholder={t('auto-learned')} /></Field>
+          <Field label={t('Phone number (MSISDN)')}><input className="mono" value={form.msisdn} onChange={(e) => { setNumberDirty(true); upd({ msisdn: e.target.value }) }} placeholder={t('auto-learned')} /></Field>
           <Field label={t('SMS centre (SMSC)')}>
             <div style={{ display: 'flex', gap: 12, marginBottom: 6, fontSize: 13 }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>

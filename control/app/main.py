@@ -6854,6 +6854,11 @@ async def api_instance_upsert(body: dict):
     if "name" in body and cfg.instance_name_taken(body.get("name"), exclude_iid=iid):
         raise HTTPException(409, "another line already uses that name")
     previous = cfg.get_instance(iid)
+    if "msisdn" in body and str(body.get("msisdn") or "").strip() != str(
+            (previous or {}).get("msisdn") or "").strip():
+        # A saved operator edit is authoritative even when an older client carries
+        # the previous automatic source along with its form.
+        body["msisdn_source"] = "manual" if str(body.get("msisdn") or "").strip() else ""
     was_running = await asyncio.to_thread(engine.is_running, iid)
     try:
         inst = cfg.upsert_instance(body)
@@ -6883,6 +6888,10 @@ async def api_instance_upsert(body: dict):
         egress.publish()
     safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity", "ims_home_domain")}
     safe["applied"] = applied      # true => config was re-applied to the running engine
+    safe["number_country"] = phone_identity.number_country(inst.get("msisdn") or "")
+    await hub.broadcast({"type": "instance_updated", "line": {
+        key: safe.get(key, "") for key in
+        ("id", "iccid", "name", "msisdn", "msisdn_source", "number_country")}})
     return safe
 
 
@@ -8733,6 +8742,7 @@ def _esim_cache_store(ses: list, imei: str):
     if not eid or any(se.get("error") for se in ses):
         return
     data = _esim_cache_load()
+    checked_at = time.time()
     # A live profile-list read has no delivery status. Retain the independently
     # confirmed outcome for the same eUICC/SE/profile, including in this response.
     previous = {(str(se.get("id") or ""), p.get("iccid")): p.get("notification_status")
@@ -8745,7 +8755,18 @@ def _esim_cache_store(ses: list, imei: str):
     for se in ses:
         for profile in se.get("profiles") or []:
             status = previous.get((str(se.get("id") or ""), profile.get("iccid")))
-            if status:
+            notification_checked_at = float(se.get("notifications_checked_at") or 0)
+            if (se.get("notifications_loaded") is True and se.get("notifications") == []
+                    and notification_checked_at > 0
+                    and notification_checked_at >= float((status or {}).get("updated_at") or 0)):
+                # A successful empty notification-list read is current evidence. A
+                # failed/unsupported read also returns [], but must not clear a warning.
+                # Keep a timestamped empty result so late events cannot resurrect it.
+                profile["notification_status"] = {
+                    "state": "empty", "stage": "notification_list",
+                    "updated_at": notification_checked_at,
+                }
+            elif status:
                 profile["notification_status"] = status
             recovery = previous_recovery.get((str(se.get("id") or ""), profile.get("iccid")))
             if recovery:
@@ -8754,8 +8775,8 @@ def _esim_cache_store(ses: list, imei: str):
     # notification list is transient: automatic delivery can remove it moments after this
     # snapshot. Persisting it made an already-sent installation result reappear after every
     # page load, so notifications are live-read/WS state only.
-    cached_ses = [{**se, "notifications": []} for se in ses]
-    data[eid] = {"ses": cached_ses, "imei": imei or "", "ts": int(time.time())}
+    cached_ses = [{**se, "notifications": [], "notifications_loaded": False} for se in ses]
+    data[eid] = {"ses": cached_ses, "imei": imei or "", "ts": checked_at}
     _esim_cache_write(data)
 
 
@@ -8802,7 +8823,7 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
             changed = True
             entry_changed = True
         if entry_changed:
-            entry["ts"] = int(time.time())
+            entry["ts"] = time.time()
     if changed:
         _esim_cache_write(data)
 
@@ -8851,7 +8872,7 @@ def _esim_cache_remove_notifications(
                 changed = True
             touched = True
         if touched:
-            entry["ts"] = int(time.time())
+            entry["ts"] = time.time()
             changed = True
     if changed:
         _esim_cache_write(data)
@@ -8872,7 +8893,8 @@ async def _esim_notifications_changed(
         generation = (hub.cards.get(reader) or {}).get("generation")
     await asyncio.to_thread(_esim_cache_remove_notifications, cache_iccid, se_id, seq)
     payload = {"type": "esim_notifications", "reader": reader,
-               "se_id": str(se_id or ""), "event": event, "generation": generation}
+               "se_id": str(se_id or ""), "event": event, "generation": generation,
+               "updated_at": time.time()}
     if seq is not None:
         payload["seq"] = int(seq)
     await hub.broadcast(payload)
@@ -8944,7 +8966,7 @@ async def api_esim_chip_cached(reader_index: int = 0, reader: str | None = None)
                      "profileState": ("enabled" if p.get("iccid") == iccid else "disabled")
                      if confirmed else "unknown"}
                     for p in se.get("profiles") or []]
-        cached_ses.append({**se, "notifications": [], "profiles": profiles,
+        cached_ses.append({**se, "notifications": [], "notifications_loaded": False, "profiles": profiles,
                            "active_state_verified": confirmed})
     return {"ok": True, "cached": True, "reader": name, "reader_index": idx,
             "ses": cached_ses, "active_state_verified": unique,

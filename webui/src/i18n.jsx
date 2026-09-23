@@ -331,6 +331,8 @@ const zh = {
   'Call declined': '通话已拒接', Busy: '忙线', 'Call cancelled': '通话已取消', 'Call ended': '通话结束',
   'New message': '新短信', 'Clear all conversations': '清空所有会话', 'Loading conversations…': '正在读取会话…', 'No conversations yet.': '暂无会话。',
   'Loading messages…': '正在读取短信…', 'No messages in this conversation.': '此会话暂无短信。',
+  'The reader has recovered. Click Load to check whether eSIM notifications still need processing.': '读卡器已恢复，请点击“读取”核验是否还有待处理的 eSIM 通知。',
+  'Could not read eSIM notifications. Click Load to retry.': '未能读取 eSIM 通知，请点击“读取”重试。',
   'Recipient number e.g. +1...': '收件号码，例如 +86…', selected: '已选择', Select: '选择', 'Delete all': '全部删除', Send: '发送',
   'Type a message…': '输入短信…', 'Failed to deliver': '发送失败', 'sending…': '发送中…', Sent: '已发送', 'Delivered ✓': '已送达 ✓',
   'Send via': '发送通道', 'Auto (VoWiFi first)': '自动（优先 VoWiFi）', 'Cellular network (Modem)': '蜂窝网络（Modem）',

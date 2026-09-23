@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from control.app import config
 
@@ -97,6 +97,24 @@ class UniquenessTests(unittest.TestCase):
 
 @unittest.skipIf(main is None, "manager runtime dependencies are unavailable")
 class RenameApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saved_phone_number_is_manual_and_broadcast_without_secrets(self):
+        with TempConfig() as cfg_temp:
+            cfg_temp.add('1', 'Fixture', iccid=ICCID_A, msisdn='', msisdn_source='modemmanager',
+                         pin='fixture-secret', ims_home_domain='private.example.invalid')
+            with patch.object(main.engine, 'is_running', return_value=False), \
+                    patch.object(main.hub, 'broadcast', new=AsyncMock()) as broadcast:
+                saved = await main.api_instance_upsert({
+                    'id': '1', 'msisdn': '+15555550100', 'msisdn_source': 'modemmanager'})
+            self.assertEqual(config.get_instance('1')['msisdn_source'], 'manual')
+            self.assertEqual(saved['msisdn'], '+15555550100')
+            event = broadcast.await_args.args[0]
+            self.assertEqual(event['type'], 'instance_updated')
+            self.assertEqual(event['line']['msisdn'], saved['msisdn'])
+            self.assertEqual(set(event['line']), {
+                'id', 'iccid', 'name', 'msisdn', 'msisdn_source', 'number_country'})
+            self.assertNotIn('fixture-secret', str(event))
+            self.assertNotIn('private.example.invalid', str(event))
+
     async def test_a_running_line_rename_does_not_restart_its_engine(self):
         with TempConfig() as cfg_temp:
             before = cfg_temp.add("1", "Old name", mcc="234", mnc="010")

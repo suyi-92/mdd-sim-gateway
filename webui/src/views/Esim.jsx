@@ -3,6 +3,8 @@ import { api } from '../api.js'
 import { deviceTitle } from '../deviceNames.js'
 import { newerEsimRecovery, profileRecoveryStatus, waitForEsimLine } from '../esimRecovery.js'
 import { isEsimRecoverySuperseded } from '../cellularPresentation.js'
+import { mergeNotificationSnapshot, newerNotificationStatus, notificationReaderFailureRecovered } from '../esimNotifications.js'
+import { boundedRead } from '../pollRequest.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -98,7 +100,8 @@ function recoveryFeedback(status, t) {
 
 function withNotificationStatus(list, iccid, status) {
   return list.map((se) => ({ ...se, profiles: (se.profiles || []).map((profile) => (
-    profile.iccid === iccid ? { ...profile, notification_status: status } : profile
+    profile.iccid === iccid ? { ...profile,
+      notification_status: newerNotificationStatus(profile.notification_status, status) } : profile
   )) }))
 }
 
@@ -600,6 +603,9 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     () => ses.flatMap((se) => se.notifications || []),
     [ses],
   )
+  const notificationReadFailed = loaded && ses.some(se => se.notifications_loaded === false)
+  const deferredNotification = profiles.some(profile =>
+    notificationReaderFailureRecovered(profile, selectedDevice, selectedCard))
   const hasEuicc = ses.some((se) => se.eid || se.chip || (se.profiles || []).length)
   const switchActive = ['switching', 'recovering', 'notifying', 'starting', 'retrying'].includes(profileSwitch?.phase)
 
@@ -677,6 +683,27 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     }).catch(() => {})
     return () => { cancelled = true }
   }, [loaded, loading, ses.length, reader, identityKey])
+
+  // A missed completion event must not preserve an old warning until navigation.
+  // This endpoint reads only the server cache, never the reader or its ownership.
+  useEffect(() => {
+    if (!reader || !pageVisible) return undefined
+    let cancelled = false, timer
+    const owner = session.current
+    const poll = async () => {
+      try {
+        const result = await boundedRead(signal => api.esimChipCached(reader, undefined, signal))
+        if (cancelled || owner !== session.current || !owner.mounted) return
+        if (result.generation != null && result.generation !== selectedCard?.generation) return
+        setSes(list => mergeNotificationSnapshot(list, result))
+      } catch { /* Keep the last outcome until a successful, same-card snapshot arrives. */ }
+      finally {
+        if (!cancelled && owner === session.current && owner.mounted) timer = setTimeout(poll, 10000)
+      }
+    }
+    timer = setTimeout(poll, 10000)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [reader, identityKey, selectedCard?.generation, pageVisible])
 
   const loadAll = useCallback(async () => {
     if (!reader || session.current.key !== identityKey) return
@@ -878,7 +905,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
             ? []
             : current.filter((item) => `${item.seqNumber ?? item.seq ?? ''}` !== `${msg.seq}`)
           return { ...se, notifications, profiles: (se.profiles || []).map((profile) => (
-            msg.seq == null ? { ...profile, notification_status: null } : profile
+            msg.seq == null ? { ...profile, notification_status: newerNotificationStatus(
+              profile.notification_status, { state: 'empty', updated_at: msg.updated_at || 0 }) } : profile
           )) }
         }))
         return
@@ -1278,7 +1306,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                         const title = profileDisplayName(p, t('Profile'))
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
-                        const notification = notificationFeedback(p.notification_status, t)
+                        const notification = notificationReaderFailureRecovered(p, selectedDevice, selectedCard)
+                          ? '' : notificationFeedback(p.notification_status, t)
                         // Recovery results are durable audit records, not permanent row alerts.
                         // A disabled profile cannot be the modem's current recovery target; for
                         // the enabled profile, newer end-to-end health supersedes an old failure.
@@ -1371,6 +1400,10 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           <div style={{ color: 'var(--text-mute)', fontSize: 13 }}>
             {loading
               ? t('Reading…')
+              : deferredNotification
+                ? t('The reader has recovered. Click Load to check whether eSIM notifications still need processing.')
+                : notificationReadFailed
+                  ? t('Could not read eSIM notifications. Click Load to retry.')
               : !loaded
                 ? t('Click Load to list notifications.')
                 : hasEuicc

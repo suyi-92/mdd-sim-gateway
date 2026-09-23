@@ -25,6 +25,28 @@ class LpaErrorMessageTests(unittest.TestCase):
 
 
 class NotificationProcessingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_notification_result_is_not_a_confirmed_empty_list(self):
+        for data in [None, {}, 'invalid']:
+            with self.subTest(data=data), patch.object(lpa, 'run_lpac', new=AsyncMock(
+                    return_value=lpa.LpaResult(data=data))):
+                with self.assertRaises(LpaError):
+                    await lpa.notification_list('fixture-reader')
+
+    async def test_empty_notification_list_is_distinct_from_failed_read(self):
+        from control.app import estkme
+        for failure in [False, True]:
+            with self.subTest(failure=failure), \
+                    patch.object(estkme, 'discover_ses', return_value=[{
+                        'id': 'one', 'label': 'one', 'aid': None}]), \
+                    patch.object(lpa, 'chip_info', new=AsyncMock(return_value={'eid': 'fixture-euicc'})), \
+                    patch.object(lpa, 'profile_list', new=AsyncMock(return_value=[])), \
+                    patch.object(lpa, 'notification_list', new=AsyncMock(
+                        side_effect=LpaError('reader unavailable') if failure else None,
+                        return_value=[])):
+                result = await lpa.load_all_ses('fixture-reader')
+                self.assertEqual(result['ses'][0]['notifications'], [])
+                self.assertEqual(result['ses'][0]['notifications_loaded'], not failure)
+
     def test_notification_error_categories_are_closed_and_specific(self):
         cases = [
             (LpaError('euicc_init', detail='SCARD_E_NO_SMARTCARD'), 'card_unavailable'),

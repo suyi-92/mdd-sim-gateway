@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import signal
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -503,7 +504,7 @@ async def notification_list(reader_name: str, *, aid: str | None = None) -> list
     data = r.data
     if isinstance(data, list):
         return data
-    return []
+    raise LpaError("notification list returned an invalid result")
 
 
 async def notification_process(
@@ -631,6 +632,7 @@ async def load_all_ses(reader_name: str, reader_index: int = 0) -> dict:
             "rootDsAddress": None,
             "profiles": [],
             "notifications": [],
+            "notifications_loaded": False,
             "error": None,
         }
         try:
@@ -649,6 +651,8 @@ async def load_all_ses(reader_name: str, reader_index: int = 0) -> dict:
                 entry["profiles"].append(p)
             try:
                 notes = await notification_list(reader_name, aid=aid)
+                entry["notifications_loaded"] = True
+                entry["notifications_checked_at"] = time.time()
             except LpaError:
                 notes = []
             for n in notes:
