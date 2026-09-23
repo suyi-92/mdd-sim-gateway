@@ -4,6 +4,7 @@ import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, us
 import { api } from '../api.js'
 import { cellularNetworkState } from '../cellularNetworkState.js'
 import { capabilityOperationState } from '../capabilityOperationState.js'
+import { capabilityDetail } from '../capabilityPresentation.js'
 import { useI18n } from '../i18n.jsx'
 import { activeBackupOperation, backupOperationRunning } from '../backup-operation.js'
 import CopyableText from '../CopyableText.jsx'
@@ -18,16 +19,6 @@ import { cellularRegistrationDetail, currentCellularNetwork, networkName, networ
   networkAvailability } from '../cellularPresentation.js'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
-const CAPABILITY_ON_DETAILS = {
-  cellular: 'Working — connected to the carrier over the cellular network.',
-  flight: 'Flight mode is active; the cellular radio is disabled.',
-  vowifi: 'Working — connected to the carrier over Wi-Fi.',
-}
-const CAPABILITY_OFF_DETAILS = {
-  cellular: 'Mobile data is disconnected; the modem radio can remain registered to the cellular network.',
-  flight: 'Flight mode is off; the cellular radio is available.',
-  vowifi: 'VoWiFi is disabled.',
-}
 const COMMON_TIMEZONES = [
   ['Asia/Shanghai', 'China · Shanghai'],
   ['Asia/Hong_Kong', 'China · Hong Kong'],
@@ -294,19 +285,11 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   const pendingTarget = operationActive && operationTargetsThis ? !!operation.target[field] : null
   const displayedDesired = pendingTarget == null ? c.desired : pendingTarget
   const displayedState = pendingTarget == null ? c.actual : (pendingTarget ? 'starting' : 'stopping')
-  // A healthy line is reported by two feeds: the periodic device snapshot and live status
-  // events. One includes the detailed OK reason while the other may omit it. Render one
-  // canonical healthy message so those feeds cannot make the text flicker every few seconds.
   const draft = kind === 'vowifi' && device?.provisioning?.state === 'draft'
   const missing = provisioningMissingText(device, t, language)
   const registeredCellular = kind === 'cellular' ? cellularRegistrationDetail(device, t, language) : ''
   const operationActualMatches = operationTargetsThis
     && (!!operation.target[field] ? c.actual === 'on' : c.actual === 'off')
-  const stateDetail = c.actual === 'on'
-    ? t(CAPABILITY_ON_DETAILS[kind] || 'cap.help.on')
-    : c.actual === 'off' && CAPABILITY_OFF_DETAILS[kind]
-      ? t(CAPABILITY_OFF_DETAILS[kind])
-      : t(`cap.help.${c.actual}`)
   const operationFeedback = operationState?.readError && operationActive
     ? t('Capability operation status is unavailable. Retrying…')
     : operationTargetsThis && operationActive
@@ -317,7 +300,7 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   const detail = operationFeedback || (draft
     ? t('Complete SIM and hardware setup before enabling VoWiFi. Missing: {items}.', { items: missing || t('SIM or hardware identity') })
     : registeredCellular
-      || (c.reason ? t(c.reason) : stateDetail)
+      || capabilityDetail(kind, c, device, t)
   )
   return <div className={`u-capability ${compact ? 'compact' : ''}`}>
     <div><b>{title}</b><div className="u-cap-detail">{detail}</div></div>

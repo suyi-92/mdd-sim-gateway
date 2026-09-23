@@ -254,7 +254,7 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("access_technology", CELLULAR_PRESENTATION)
         self.assertIn("No data bearer", CELLULAR_PRESENTATION)
         self.assertIn("d.cellular.packet_service === 'attached'", UNIFIED)
-        self.assertIn("registeredCellular\n      || (c.reason", UNIFIED)
+        self.assertIn("registeredCellular\n      || capabilityDetail(kind, c, device, t)", UNIFIED)
 
     def test_cellular_network_selection_is_scanned_confirmed_and_responsive(self):
         self.assertIn("cellularNetworkState.start(device.id, 'scan')", UNIFIED)

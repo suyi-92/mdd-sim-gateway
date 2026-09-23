@@ -8,6 +8,8 @@ SOURCE = (Path(__file__).resolve().parent.parent
           / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
 I18N = (Path(__file__).resolve().parent.parent
         / "webui/src/i18n.jsx").read_text(encoding="utf-8")
+PRESENTATION = (Path(__file__).resolve().parent.parent
+                / "webui/src/capabilityPresentation.js").read_text(encoding="utf-8")
 
 
 class CapabilitySwitchStateTests(unittest.TestCase):
@@ -24,10 +26,10 @@ class CapabilitySwitchStateTests(unittest.TestCase):
     def test_enabled_help_text_is_specific_to_each_capability(self):
         self.assertIn(
             "cellular: 'Working — connected to the carrier over the cellular network.'",
-            SOURCE)
+            PRESENTATION)
         self.assertIn(
-            "flight: 'Flight mode is active; the cellular radio is disabled.'", SOURCE)
-        self.assertIn("vowifi: 'Working — connected to the carrier over Wi-Fi.'", SOURCE)
+            "flight: 'Flight mode is active; the cellular radio is disabled.'", PRESENTATION)
+        self.assertIn("vowifi: 'Working — connected to the carrier over Wi-Fi.'", PRESENTATION)
         self.assertIn("'运行正常：已通过蜂窝网络连接运营商。'", I18N)
 
     def test_cellular_control_is_named_as_data_not_base_station_registration(self):
@@ -35,7 +37,7 @@ class CapabilitySwitchStateTests(unittest.TestCase):
         self.assertNotIn("t('4G network')", SOURCE)
         self.assertIn(
             "cellular: 'Mobile data is disconnected; the modem radio can remain registered",
-            SOURCE)
+            PRESENTATION)
         self.assertIn("'蜂窝数据（4G）'", I18N)
         self.assertIn("模块仍可保持注册到蜂窝网络", I18N)
 
