@@ -5161,7 +5161,11 @@ async def _unified_devices() -> list[dict]:
         host_cell_current = bool(shared.get("modemmanager_active")
                                  and host_cell.get("available"))
         bridge_current = _device_bridge_identity_current(identity, observed)
-        identity_pending = bool(bridge_current and host_cell.get("sim_iccid")
+        # A stopped/unavailable ModemManager retains its last SIM snapshot. That
+        # cache cannot prove ongoing refresh work (especially in flight mode).
+        # Keep mismatched live samples hidden, without promoting stale ones to
+        # a capability transition or masking explicit recovery wait/failure states.
+        identity_pending = bool(host_cell_current and bridge_current and host_cell.get("sim_iccid")
                                 and host_cell["sim_iccid"] != identity["iccid"])
         if identity_pending:
             # Do not attach the old profile's number/registration to the new SIM.

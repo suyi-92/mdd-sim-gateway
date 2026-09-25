@@ -29,14 +29,47 @@ class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
                 select.assert_not_awaited()
 
     async def test_verified_new_profile_outranks_old_mm_and_monitor_snapshots(self):
+        await self.check_profile_identity_state(
+            mm_active=True, available=True, flight=False, recovery="",
+            expected_state="starting", expected_reason="Refreshing cellular SIM identity after profile switch")
+
+    async def test_inactive_mm_cache_does_not_start_disabled_cellular_data(self):
+        await self.check_profile_identity_state(
+            mm_active=False, available=True, flight=True, recovery="",
+            expected_state="off", expected_reason="")
+
+    async def test_unavailable_mm_sample_does_not_start_disabled_cellular_data(self):
+        await self.check_profile_identity_state(
+            mm_active=True, available=False, flight=False, recovery="",
+            expected_state="off", expected_reason="")
+
+    async def test_stale_identity_does_not_mask_explicit_recovery_state(self):
+        for recovery, flight, actual, reason in (
+            ("waiting_flight_mode", True, "off",
+             "Cellular SIM initialization will continue when flight mode is disabled"),
+            ("waiting_identity", False, "starting",
+             "Completing cellular SIM initialization after profile switch"),
+            ("failed", True, "error",
+             "Cellular SIM initialization failed after profile switch"),
+        ):
+            with self.subTest(recovery=recovery):
+                await self.check_profile_identity_state(
+                    mm_active=False, available=True, flight=flight, recovery=recovery,
+                    expected_state=actual, expected_reason=reason)
+
+    async def check_profile_identity_state(self, *, mm_active, available, flight,
+                                          recovery, expected_state, expected_reason):
         identity = {**verified_bridge(), "hardware_id": "modem-a", "iccid": "new-card"}
-        observed = {"shared": {"modemmanager_active": True}, "devices": {"modem-a": {
-            "present": True, "actual": {"vowifi_bridge_active": True, "cellular_radio_enabled": True},
-            "cellular": {"available": True, "sim_present": True, "sim_iccid": "old-card",
+        desired = {"devices": {"modem-a": {
+            "cellular_enabled": False, "flight_mode": flight, "vowifi_enabled": True}}}
+        observed = {"shared": {"modemmanager_active": mm_active}, "devices": {"modem-a": {
+            "present": True, "actual": {"vowifi_bridge_active": True, "cellular_radio_enabled": not flight},
+            "cellular_recovery": {"state": recovery} if recovery else {},
+            "cellular": {"available": available, "sim_present": True, "sim_iccid": "old-card",
                          "registration": "roaming", "operator": "Old network"}}}}
         lines = [{"id": "old", "iccid": "old-card", "mcc": "515", "mnc": "02"},
                  {"id": "new", "iccid": "new-card", "mcc": "454", "mnc": "00"}]
-        with patch.object(main, "_device_sources", return_value=({}, observed, {})), \
+        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
                 patch.object(main, "_device_identities", return_value={"modem-a": identity}), \
                 patch.object(main.hub, "cards_list", return_value=[{
                     "hardware_id": "modem-a", "present": True, "iccid": "old-card"}]), \
@@ -51,6 +84,11 @@ class ProfileIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(devices[0]["sim"]["present"])
         self.assertIsNone(devices[0]["cellular"])
         self.assertEqual(devices[0]["sim"]["carrier"]["plmn"], "454-00")
+        self.assertFalse(devices[0]["capabilities"]["cellular"]["desired"])
+        self.assertEqual(devices[0]["capabilities"]["cellular"]["actual"], expected_state)
+        self.assertEqual(devices[0]["capabilities"]["cellular"]["reason"], expected_reason)
+        self.assertEqual(devices[0]["capabilities"]["flight"]["actual"],
+                         "on" if flight else "stopping" if recovery == "waiting_identity" else "off")
 
     def test_no_bridge_or_confirmed_card_removal_cannot_override_mm(self):
         identity = {**verified_bridge(), "iccid": "new-card"}
