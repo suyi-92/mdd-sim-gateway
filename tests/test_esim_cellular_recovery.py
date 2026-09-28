@@ -63,7 +63,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         return {"devices": {"modem-a": {
             "present": True, "usb_generation": "generation-a",
             "desired": {"flight_mode": False},
-            "cellular_recovery": {"state": "ready"},
+            "cellular_recovery": {"state": "ready", "operation_id": "request"},
             "cellular": {"sim_iccid": "fixture-card"},
         }}}
 
@@ -71,7 +71,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         task = self.store.schedule(
             "modem-a", "fixture-card", "reader", "generation-a")
         task = self.store.update(task["id"], "waiting_baseband",
-                                 local_identity_verified=True)
+                                 local_identity_verified=True, bridge_request_id="request")
         with patch.object(main.device_state, "status", return_value=self.observed()), \
                 patch.object(main, "_device_identities", return_value={}), \
                 patch.object(main.capability_lock, "locked", return_value=False), \
@@ -86,7 +86,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         task = self.store.schedule(
             "modem-a", "fixture-card", "reader", "generation-a")
         task = self.store.update(task["id"], "registering",
-                                 local_identity_verified=True)
+                                 local_identity_verified=True, bridge_request_id="request")
         operation = {"state": "failed", "error": {
             "code": "network_rejected", "network_reject": {
                 "cause_code": 7, "cause": "ps-services-not-allowed",
@@ -108,7 +108,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         task = self.store.schedule(
             "modem-a", "fixture-card", "reader", "generation-a")
         task = self.store.update(task["id"], "waiting_baseband",
-                                 local_identity_verified=True)
+                                 local_identity_verified=True, bridge_request_id="request")
         with patch.object(main.device_state, "status", return_value=self.observed()), \
                 patch.object(main, "_device_identities", return_value={
                     "modem-a": {"iccid": "replacement-card"}}), \
@@ -121,7 +121,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             task = self.store.schedule(
                 'modem-a', 'fixture-card', 'reader', 'generation-a')
             self.store.update(task['id'], 'waiting_flight_mode',
-                              local_identity_verified=True)
+                              local_identity_verified=True, bridge_request_id="request")
             clock.return_value = 87400
             task = self.store.active()[0]
             observed = self.observed()
@@ -139,7 +139,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             task = self.store.schedule(
                 'modem-a', 'fixture-card', 'reader', 'generation-a')
             self.store.update(task['id'], 'waiting_flight_mode',
-                              local_identity_verified=True)
+                              local_identity_verified=True, bridge_request_id="request")
             clock.return_value = 87400
             with patch.object(main.device_state, 'status', return_value=self.observed()), \
                     patch.object(main, '_device_identities', return_value={}), \

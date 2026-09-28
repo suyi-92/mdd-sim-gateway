@@ -3942,6 +3942,8 @@ def _esim_write_bridge_restart_request(
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump({"request_id": request_id, "device_id": hardware_id,
                    "expected_iccid_sha256": hashlib.sha256(iccid.encode()).hexdigest(),
+                   "usb_generation": str(((device_state.status().get("devices") or {}).get(
+                       hardware_id) or {}).get("usb_generation") or ""),
                    "cellular_refresh": bool(cellular_refresh),
                    "requested_at": time.time()}, handle)
     os.chmod(temporary, 0o600)
@@ -4126,7 +4128,6 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
             phase=("baseband_initialization" if state != "automatic_selection"
                    else "automatic_selection"),
             bridge_request_id=str(bridge.get("request_id") or ""),
-            hardware_generation=str(bridge.get("usb_generation") or ""),
             error_code=str(cellular_recovery.get("error_code") or ""))
     if after_bridge:
         async with hub.reader_lock(name):
@@ -4230,6 +4231,13 @@ async def _update_esim_recovery(task_id: str, state: str | None = None, **fields
     return task
 
 
+def _esim_host_recovery(task: dict, observed: dict) -> dict:
+    """A previous card's host success/failure is never this request's result."""
+    recovery = observed.get("cellular_recovery") or {}
+    request_id = str(task.get("bridge_request_id") or "")
+    return recovery if request_id and recovery.get("operation_id") == request_id else {}
+
+
 async def _defer_unreadable_subscription(task_id: str, exc: Exception) -> bool:
     if _esim_recovery_failure_code(exc) != "subscription_unavailable":
         return False
@@ -4237,7 +4245,7 @@ async def _defer_unreadable_subscription(task_id: str, exc: Exception) -> bool:
     if not task or not task.get("bridge_request_id"):
         return False
     observed = (device_state.status().get("devices") or {}).get(task.get("device_id")) or {}
-    host_state = str((observed.get("cellular_recovery") or {}).get("state") or "")
+    host_state = str(_esim_host_recovery(task, observed).get("state") or "")
     if host_state in {"ready", "failed", "cancelled"}:
         return False
     waiting = (observed.get("desired") or {}).get("flight_mode") or host_state == "waiting_flight_mode"
@@ -4260,7 +4268,7 @@ async def _reconcile_failed_profile_outcomes() -> None:
         if (task.get("state") not in {"failed", "cancelled"}
                 or task.get("phase") != "profile_enable"
                 or task.get("error_code") not in {"profile_enable_failed", "profile_enable_unconfirmed"}
-                or int(task.get("outcome_checks") or 0) >= 3
+                or task.get("outcome_result") == "different_profile"
                 or time.time() - float(task.get("outcome_checked_at") or 0) < 60):
             continue
         device_id, iccid, reader = (str(task.get(key) or "") for key in ("device_id", "iccid", "reader"))
@@ -4284,15 +4292,42 @@ async def _reconcile_failed_profile_outcomes() -> None:
             await asyncio.to_thread(esim_recoveries.update, task['id'],
                                    outcome_checks=int(task.get("outcome_checks") or 0) + 1,
                                    outcome_checked_at=time.time())
+            unavailable = False
+            listed = False
+            profiles = []
             try:
                 for name in names:
                     await asyncio.to_thread(_esim_guard_engine, name)
-                profiles = await lpa.profile_list(reader, aid=task.get("se_aid") or None, timeout=10)
-            except (lpa.LpaError, HTTPException):
+                if int(task.get("outcome_checks") or 0) < 3:
+                    profiles = await lpa.profile_list(reader, aid=task.get("se_aid") or None, timeout=10)
+                    listed = True
+                else:
+                    unavailable = True
+            except lpa.LpaError as exc:
+                unavailable = lpa.classify_lpa_error(exc) in {
+                    "reader_busy", "card_unavailable", "notification_timeout"}
+                if not unavailable:
+                    await asyncio.to_thread(esim_recoveries.update, task['id'], outcome_result="different_profile")
+            except HTTPException:
+                continue
+            if (unavailable and int(task.get("outcome_checks") or 0) >= 2
+                    and same_generation()):
+                # Restore access to the exact card selected by the accepted operation.
+                # This is a bounded SIM-session repair, NOT proof of EnableProfile success.
+                # No profile/line is marked enabled until a fresh selected-SE read succeeds.
+                resumed = await asyncio.to_thread(
+                    esim_recoveries.schedule, device_id, iccid, reader, task["hardware_generation"])
+                await _update_esim_recovery(
+                    resumed['id'], "access_recovery", phase="card_access",
+                    profile_confirmation_pending=True, resumed_from=task['id'],
+                    se_id=task.get("se_id") or "", se_aid=task.get("se_aid") or "")
+                log.info("scheduled bounded eSIM access recovery for the same card generation")
                 continue
             enabled = [p.get("iccid") for p in profiles if isinstance(p, dict)
                        and p.get("profileState") == "enabled"]
             if enabled != [iccid] or not same_generation():
+                if listed:
+                    await asyncio.to_thread(esim_recoveries.update, task['id'], outcome_result="different_profile")
                 continue
             resumed = await asyncio.to_thread(
                 esim_recoveries.schedule, device_id, iccid, reader, task["hardware_generation"])
@@ -4301,6 +4336,84 @@ async def _reconcile_failed_profile_outcomes() -> None:
                 se_id=task.get("se_id") or "", se_aid=task.get("se_aid") or "",
                 resumed_from=task['id'])
             log.info("resumed failed eSIM enable after same-generation profile confirmation")
+
+
+async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> None:
+    """Repair access once, then prove profile state before the ordinary recovery path."""
+    if capability_lock.locked() or network_operations.busy():
+        return
+    reader, device_id = str(task.get("reader") or ""), str(task.get("device_id") or "")
+    task_id, iccid = str(task['id']), str(task.get("iccid") or "")
+    async with capability_lock, hub.esim_switch_lock(device_id):
+        names = _esim_modem_reader_names(reader, device_id)
+        current = (device_state.status().get("devices") or {}).get(device_id) or {}
+        identity = _device_identities().get(device_id) or {}
+        if (not current.get("present") or current.get("usb_generation") != task.get("hardware_generation")
+                or (not task.get("bridge_request_id")
+                    and (not _bridge_card_evidence(identity) or identity.get("iccid") != iccid))):
+            await _update_esim_recovery(task_id, "cancelled", phase="card_access", error_code="device_changed")
+            return
+        if any(hub.lpa_busy.get(name) for name in names):
+            return
+        async with hub.reader_lock(reader):
+            for name in names:
+                await asyncio.to_thread(_esim_guard_engine, name)
+        previous = {name: hub.lpa_busy.get(name) for name in names}
+        for name in names:
+            hub.lpa_busy[name] = True
+        try:
+            if not task.get("bridge_request_id"):
+                request_id, _ = await asyncio.to_thread(
+                    _esim_write_bridge_restart_request, device_id, iccid)
+                task = await _update_esim_recovery(
+                    task_id, "waiting_baseband", phase="card_access",
+                    bridge_request_id=request_id) or task
+                return
+            host = _esim_host_recovery(task, observed)
+            state = str(host.get("state") or "")
+            if state in {"failed", "cancelled"}:
+                await _update_esim_recovery(
+                    task_id, "failed", phase="card_access",
+                    error_code=str(host.get("error_code") or "baseband_initialization_failed"))
+                return
+            if (observed.get("desired") or {}).get("flight_mode") or state == "waiting_flight_mode":
+                if task.get("state") != "waiting_flight_mode":
+                    await _update_esim_recovery(task_id, "waiting_flight_mode", phase="card_access")
+                return
+            if task.get("state") == "waiting_flight_mode":
+                await _update_esim_recovery(task_id, "waiting_baseband", phase="card_access")
+            if state != "ready" or time.time() - float(task.get("profile_checked_at") or 0) < 30:
+                return
+            if not _bridge_card_evidence(identity) or identity.get("iccid") != iccid:
+                return
+            checks = int(task.get("profile_checks") or 0) + 1
+            await _update_esim_recovery(task_id, profile_checks=checks, profile_checked_at=time.time())
+            try:
+                async with hub.reader_lock(reader):
+                    profiles = await lpa.profile_list(reader, aid=task.get("se_aid") or None, timeout=20)
+            except lpa.LpaError:
+                if checks >= 3:
+                    await _update_esim_recovery(task_id, "failed", phase="card_access",
+                                               error_code="profile_enable_unconfirmed")
+                return
+            current = (device_state.status().get("devices") or {}).get(device_id) or {}
+            identity = _device_identities().get(device_id) or {}
+            enabled = [p.get("iccid") for p in profiles if p.get("profileState") == "enabled"]
+            if (not current.get("present") or current.get("usb_generation") != task.get("hardware_generation")
+                    or not _bridge_card_evidence(identity) or identity.get("iccid") != iccid):
+                await _update_esim_recovery(task_id, "cancelled", phase="card_access", error_code="device_changed")
+            elif enabled == [iccid]:
+                await _update_esim_recovery(task_id, "profile_enabled", phase="profile_enabled",
+                                           profile_confirmation_pending=False)
+            else:
+                await _update_esim_recovery(task_id, "failed", phase="card_access",
+                                           error_code="profile_enable_unconfirmed")
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    hub.lpa_busy.pop(name, None)
+                else:
+                    hub.lpa_busy[name] = value
 
 
 async def _resume_persisted_esim_bridge(task: dict) -> None:
@@ -4380,6 +4493,10 @@ async def _advance_esim_cellular_recovery(task: dict) -> None:
         await _update_esim_recovery(
             task_id, "cancelled", phase="cancelled", error_code="profile_changed")
         return
+    if task.get("profile_confirmation_pending"):
+        if bridge_iccid == iccid or task.get("bridge_request_id"):
+            await _recover_unconfirmed_profile_access(task, observed)
+        return
     if state == "switching":
         # A restart during lpac has no success envelope. Resume only with positive current-card
         # evidence; otherwise expire as interrupted rather than repeating a profile write.
@@ -4398,7 +4515,7 @@ async def _advance_esim_cellular_recovery(task: dict) -> None:
         return
     if not task.get("local_identity_verified"):
         if task.get("bridge_request_id"):
-            host_state = str((observed.get("cellular_recovery") or {}).get("state") or "")
+            host_state = str(_esim_host_recovery(task, observed).get("state") or "")
             if host_state in {"failed", "cancelled"}:
                 await _update_esim_recovery(task_id, host_state, phase="baseband_initialization",
                                            error_code="baseband_initialization_failed")
@@ -4415,7 +4532,7 @@ async def _advance_esim_cellular_recovery(task: dict) -> None:
             await _resume_persisted_esim_bridge(task)
         return
 
-    host_recovery = observed.get("cellular_recovery") or {}
+    host_recovery = _esim_host_recovery(task, observed)
     host_state = str(host_recovery.get("state") or "")
     if host_state in {"failed", "cancelled"}:
         await _update_esim_recovery(
@@ -6133,7 +6250,8 @@ async def api_device_diagnostics(device_id: str):
             "checked_at": int(time.time()), "checks": checks}
 
 
-async def _wait_for_device_request(device_id: str, wanted: dict, timeout: float = 120) -> dict:
+async def _wait_for_device_request(device_id: str, wanted: dict, timeout: float = 120,
+                                   *, requested: dict | None = None) -> dict:
     deadline = time.monotonic() + timeout
     latest = {}
     while time.monotonic() < deadline:
@@ -6151,6 +6269,19 @@ async def _wait_for_device_request(device_id: str, wanted: dict, timeout: float 
                 continue
             if current.get("error") or (latest.get("shared") or {}).get("error"):
                 raise RuntimeError(current.get("error") or latest["shared"]["error"])
+            actual = current.get("actual") or {}
+            cellular = current.get("cellular") or {}
+            radio_target = not bool(wanted.get("flight_mode"))
+            check_radio = requested is None or "flight_mode" in requested or bool(requested.get("cellular_enabled"))
+            if check_radio and radio_target and cellular.get("failed_reason"):
+                raise RuntimeError("The modem has not initialized its SIM; radio enable was not confirmed.")
+            if check_radio and actual.get("cellular_radio_enabled") is not radio_target:
+                await asyncio.sleep(.5)
+                continue
+            data_target = radio_target and bool(wanted.get("cellular_enabled"))
+            if bool(cellular.get("data_active")) != data_target:
+                await asyncio.sleep(.5)
+                continue
             return latest
         await asyncio.sleep(.5)
     raise TimeoutError("device capability transition timed out")
@@ -6266,6 +6397,9 @@ async def _apply_device_capabilities(device_id: str, body: dict,
             and (not target_instance.get("enabled", True)
                  or not await asyncio.to_thread(engine.is_running, target_iid)))
         if not cellular_changed and not vowifi_changed and not flight_changed and not vowifi_retry:
+            if {"flight_mode", "cellular_enabled"} & set(body):
+                await _capability_progress(operation_id, "reconciling")
+                await _wait_for_device_request(device_id, wanted, requested=body)
             devices = await _unified_devices()
             return next(item for item in devices if item["id"] == device_id)
         vowifi_action = vowifi_changed or vowifi_retry
@@ -6314,7 +6448,7 @@ async def _apply_device_capabilities(device_id: str, body: dict,
         try:
             if cellular_changed or flight_changed:
                 await _capability_progress(operation_id, "reconciling")
-                await _wait_for_device_request(device_id, wanted)
+                await _wait_for_device_request(device_id, wanted, requested=body)
             elif vowifi_action and wanted["vowifi_enabled"]:
                 await _capability_progress(operation_id, "reconciling")
                 await _wait_for_vowifi_bridge(device_id)

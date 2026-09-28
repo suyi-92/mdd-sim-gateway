@@ -18,6 +18,7 @@ function App() {
  const [devices, setDevices] = React.useState([]);
  window.changeCard = (iccid, generation) => setCards([{name:'fixture-reader',index:0,present:true,iccid,generation,hardware_id:'modem-1'}]);
  window.changeDevices = setDevices;
+ window.changeIdentityState = state => setCards(cards => cards.map(card => ({...card,identity_state:state})));
  window.deliver = msg => eventHandler?.(msg);
  return <I18nProvider><Esim cards={cards} devices={devices} instances={[]} subscribe={fn => {eventHandler=fn;return ()=>{eventHandler=null}}}/></I18nProvider>
 }
@@ -183,6 +184,23 @@ try {
  await pending.fulfill({status:500,json:{detail:'obsolete failure'}}); pending=null
  await page.waitForTimeout(100)
  assert.equal(await page.getByText('obsolete failure',{exact:true}).count(),0)
+ // A pending subscriber read must retain historical profile states without offering
+ // another Enable for the previously enabled profile or any other card mutation.
+ await page.evaluate(()=>window.changeIdentityState('pending'))
+ await page.getByText('Card number detected; SIM subscription is not readable yet. Cached profile states are historical.',{exact:true}).waitFor()
+ for (const width of [1440,900,390]) {
+   await page.setViewportSize({width,height:900})
+   assert.equal(await page.getByText('Previously enabled',{exact:true}).count(),1)
+   assert.equal(await page.getByText('Previously disabled',{exact:true}).count(),2)
+   assert.equal(await page.getByRole('button',{name:'Enable',exact:true}).count(),2)
+   for (const name of ['Enable','Disable','Rename','Delete','Download eSIM']) {
+     for (const button of await page.getByRole('button',{name,exact:true}).all()) assert.equal(await button.isDisabled(),true)
+   }
+   assert.equal(await page.getByRole('button',{name:'Load',exact:true}).isEnabled(),true)
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
+   await page.screenshot({path:path.join(output,`subscription-pending-${width}.png`),fullPage:true})
+ }
+ await page.evaluate(()=>window.changeIdentityState('confirmed'))
  await page.getByRole('button',{name:'Load',exact:true}).click()
  while(!pending) await new Promise(r=>setTimeout(r,10))
  await page.evaluate(()=>window.unmount())

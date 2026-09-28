@@ -6,6 +6,11 @@ from control.app.lpa import LpaError
 
 
 class LpaErrorMessageTests(unittest.TestCase):
+    def test_initialization_failure_does_not_prove_an_ordinary_sim(self):
+        message = LpaError('euicc_init').user_message()
+        self.assertIn('unconfirmed', message)
+        self.assertNotIn('Ordinary USIM', message)
+
     def test_pcsc_sharing_violation_is_not_misreported_as_non_euicc(self):
         message = LpaError("euicc_init", detail="SCardConnect() failed: 8010000B").user_message()
         self.assertIn("temporarily busy", message)

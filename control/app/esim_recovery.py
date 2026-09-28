@@ -17,6 +17,7 @@ TERMINAL_STATES = {"success", "network_rejected", "failed", "cancelled"}
 ACTIVE_STATES = {
     "switching", "profile_enabled", "bridge_recovery", "waiting_flight_mode",
     "waiting_baseband", "automatic_selection", "registering",
+    "access_recovery",
 }
 
 

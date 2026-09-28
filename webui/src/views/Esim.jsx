@@ -84,6 +84,11 @@ function notificationFeedback(status, t) {
 
 function recoveryFeedback(status, t) {
   if (!status || ['success', 'cancelled'].includes(status.state)) return ''
+  if (status.phase === 'card_access') return t(status.state === 'failed'
+    ? 'Card access recovery failed; profile state is still unconfirmed.'
+    : status.state === 'waiting_flight_mode'
+      ? 'Card access recovery will continue when flight mode is turned off; profile state is still unconfirmed.'
+      : 'Recovering card access; profile state is still unconfirmed.')
   if (status.state === 'network_rejected') {
     const rejection = status.network_reject || {}
     return Number(rejection.cause_code) === 7
@@ -205,7 +210,7 @@ function withEnabledProfile(list, iccid) {
   })
 }
 
-function StatePill({ state, pending = false }) {
+function StatePill({ state, pending = false, cached = false }) {
   const { t } = useI18n()
   const enabled = String(state || '').toLowerCase() === 'enabled'
   return (
@@ -215,7 +220,8 @@ function StatePill({ state, pending = false }) {
       background: pending ? '#fef3c7' : enabled ? '#dcfce7' : 'var(--hover)',
       color: pending ? '#92400e' : enabled ? '#166534' : 'var(--text-dim)',
     }}>
-      {t(pending ? 'Switching…' : enabled ? 'Enabled' : String(state || '').toLowerCase() === 'disabled' ? 'Disabled' : 'Unconfirmed')}
+      {t(pending ? 'Switching…' : enabled ? (cached ? 'Previously enabled' : 'Enabled')
+        : String(state || '').toLowerCase() === 'disabled' ? (cached ? 'Previously disabled' : 'Disabled') : 'Unconfirmed')}
     </span>
   )
 }
@@ -1108,7 +1114,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           {t(loading ? 'Loading…' : 'Load')}
         </button>
         <button className="btn btn-primary" onClick={requestDownload}
-          disabled={!status?.available || !hasEuicc || !!busyOp || switchActive || !!dl && !dl.done && !dl.error}
+          disabled={!status?.available || !hasEuicc || !!busyOp || switchActive
+            || ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state) || !!dl && !dl.done && !dl.error}
           title={!hasEuicc ? t('Read this eSIM once before downloading a new one.') : ''}>
           {t('Download eSIM')}
         </button>
@@ -1135,7 +1142,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       <div role="status" style={{ minHeight: 24, minWidth: 0 }}>
         {loading ? t('Loading…') : selectedCard?.identity_state === 'failed' ? t('Card read timed out; waiting for the reader session to finish')
           : selectedCard?.identity_state === 'pending'
-          ? t('Card identity not confirmed') : cachedAt > 0 ? t('Cached profile list') : ''}
+          ? t(selectedCard?.iccid ? 'Card number detected; SIM subscription is not readable yet. Cached profile states are historical.'
+            : 'Card identity not confirmed') : cachedAt > 0 ? t('Cached profile list') : ''}
       </div>
       {err && (
         <div className="card" style={{ padding: 14, color: '#b91c1c', borderColor: '#fecaca' }}>
@@ -1254,7 +1262,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
         </div>
         {cachedAt > 0 && !loaded && (
           <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 10 }}>
-            {t('Cached view from {time} — switching works from here; click Load for a live read.', { time: new Date(cachedAt).toLocaleString() })}
+            {t('Cached view from {time}; click Load to verify current profile states.', { time: new Date(cachedAt).toLocaleString() })}
           </div>
         )}
         <div className="u-esim-switch-feedback" role="status" aria-live="polite">
@@ -1310,7 +1318,9 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {seProfiles.map((p) => {
                         const profileEnabled = String(p.profileState || '').toLowerCase() === 'enabled'
-                        const enabled = !['pending', 'failed'].includes(selectedCard?.identity_state) && profileEnabled
+                        const enabled = profileEnabled
+                        const profileActionsBlocked = loading || ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state)
+                          || !['enabled', 'disabled'].includes(String(p.profileState || '').toLowerCase())
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
@@ -1340,7 +1350,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                                 }}>
                                   {title}
                                 </span>
-                                <StatePill state={['pending', 'failed'].includes(selectedCard?.identity_state) ? 'unknown' : p.profileState}
+                                <StatePill state={p.profileState} cached={cachedAt > 0}
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
@@ -1354,25 +1364,25 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                             </div>
                             <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {!enabled && (
-                                <button className="btn btn-primary" disabled={!!busyOp || switchActive}
+                                <button className="btn btn-primary" disabled={!!busyOp || switchActive || profileActionsBlocked}
                                   onClick={() => switchProfile(p, se)}>
                                   {t('Enable')}
                                 </button>
                               )}
                               {enabled && (
-                                <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
+                                <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning || profileActionsBlocked}
                                   onClick={() => runProfileOp('Disable', () => api.esimDisable(p.iccid, target))}>
                                   {t('Disable')}
                                 </button>
                               )}
-                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || loading}
+                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || profileActionsBlocked}
                                 onClick={() => {
                                   setRenameStatus(null)
                                   setRenameTarget({ se, profile: p, runningLine: lineRunning ? matchedInst : null })
                                 }}>
                                 {t('Rename')}
                               </button>
-                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning}
+                              <button className="btn btn-ghost" disabled={!!busyOp || switchActive || lineRunning || profileActionsBlocked}
                                 onClick={() => {
                                   if (!confirm(t('Delete profile {iccid}?', { iccid: p.iccid }))) return
                                   runProfileOp('Delete', () => api.esimDelete(p.iccid, target))

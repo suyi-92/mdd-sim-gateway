@@ -1049,6 +1049,22 @@ class Orchestrator:
                    "updated_at", "deadline_at", "attempts")
         return {key: value[key] for key in allowed if key in value}
 
+    def _current_cellular_recovery(self, device_id: str, assignment: dict) -> dict:
+        """Publish only the recovery for this USB/card, retaining old private audit state."""
+        value = self._cellular_recoveries.get(device_id) or {}
+        if not value:
+            return {}
+        generation = str(value.get("usb_generation") or "")
+        if generation and generation != str(assignment.get("usb_generation") or ""):
+            return {}
+        if value.get("state") == "ready":
+            current = self.cellular_states.get(device_id) or {}
+            iccid = str(current.get("sim_iccid") or "")
+            if (not iccid or not current.get("sim_present") or not current.get("subscription_available")
+                    or hashlib.sha256(iccid.encode()).hexdigest() != value.get("expected_iccid_sha256")):
+                return {}
+        return self._recovery_public(value)
+
     def _bridge_restart_status(self, request: dict, state: str, **extra) -> dict:
         value = {**request, **extra, "state": state, "updated_at": time.time()}
         request_id = str(value["request_id"])
@@ -1089,6 +1105,12 @@ class Orchestrator:
                 requested_at = float(request.get("requested_at") or time.time())
             except (TypeError, ValueError):
                 requested_at = time.time()
+            assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(device_id) or {}
+            generation = str(assignment.get("usb_generation") or "")
+            expected_generation = str(request.get("usb_generation") or "")
+            if expected_generation and expected_generation != generation:
+                self._bridge_restart_status(request, "failed", error="device generation changed")
+                continue
             request = {
                 "request_id": request_id,
                 "device_id": device_id,
@@ -1096,6 +1118,7 @@ class Orchestrator:
                 "cellular_refresh": cellular_refresh,
                 "requested_at": requested_at,
                 "started_at": time.time(),
+                "usb_generation": generation,
             }
             self._bridge_restart_status(request, "stopping")
             self.log("eSIM bridge restart accepted queue_ms="
@@ -1113,7 +1136,6 @@ class Orchestrator:
             self._stop_bridge_process(proc)
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
-            assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(device_id) or {}
             if cellular_refresh:
                 now = time.time()
                 self._set_cellular_recovery(
@@ -1188,7 +1210,10 @@ class Orchestrator:
             snapshot = self.modem_snapshot(modem)
             actual = str(snapshot.get("sim_iccid") or "")
             expected = str(recovery.get("expected_iccid_sha256") or "")
-            if actual and hashlib.sha256(actual.encode()).hexdigest() == expected:
+            if (actual and hashlib.sha256(actual.encode()).hexdigest() == expected
+                    and snapshot.get("sim_present") is True
+                    and snapshot.get("subscription_available") is True
+                    and not snapshot.get("failed_reason")):
                 self._set_cellular_recovery(
                     device_id, "ready", phase="automatic_selection", error_code="")
                 blocked.discard(device_id)
@@ -1199,7 +1224,8 @@ class Orchestrator:
                 if identity_deadline and now >= identity_deadline:
                     self._set_cellular_recovery(
                         device_id, "failed", phase="baseband_identity",
-                        error_code=("sim_identity_mismatch" if actual
+                        error_code=("subscription_unavailable" if actual and hashlib.sha256(actual.encode()).hexdigest() == expected
+                                    else "sim_identity_mismatch" if actual
                                     else "sim_identity_unavailable"))
                 else:
                     self._set_cellular_recovery(
@@ -1633,8 +1659,7 @@ class Orchestrator:
             # refused read as an indefinite spinner with no explanation; the reason belongs
             # in the error field instead.
             degraded = self._degraded.get(device_id, "")
-            cellular_recovery = self._recovery_public(
-                self._cellular_recoveries.get(device_id))
+            cellular_recovery = self._current_cellular_recovery(device_id, assignment)
             recovery_active = cellular_recovery.get("state") not in {
                 None, "", "ready", "failed", "cancelled", "waiting_flight_mode"}
             recovery_failed = cellular_recovery.get("state") == "failed"
@@ -2323,6 +2348,7 @@ class Orchestrator:
             text, re.MULTILINE)
         sim_iccid = ""
         sim_mcc = ""
+        sim_imsi = ""
         sim_object = self._kv(text, "modem.generic.sim")
         sim_present = bool(sim_object and sim_object not in {"--", "/"})
         if failed_reason == "sim-missing":
@@ -2384,6 +2410,7 @@ class Orchestrator:
             # copies OwnNumbers into a line configuration.
             "msisdn": msisdn, "sim_iccid": sim_iccid,
             "sim_present": sim_present,
+            "subscription_available": 5 <= len(sim_imsi) <= 15,
         }
         bearer_paths = re.findall(r"modem\.generic\.bearers\.value\[\d+\]\s*:\s*(\S+)", text)
         for bearer in bearer_paths:

@@ -149,7 +149,7 @@ class ProfileModemRefreshTests(unittest.TestCase):
             # A service restart loads the task and completes it only for the same USB/card.
             resumed = host.Orchestrator(root / "data", root)
             with patch.object(resumed, "modem_snapshot", return_value={
-                    "sim_iccid": "new-card",
+                    "sim_iccid": "new-card", "sim_present": True, "subscription_available": True,
                     "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
                     patch.object(host, "run") as run:
                 blocked = resumed.process_cellular_recoveries(
@@ -216,7 +216,7 @@ class ProfileModemRefreshTests(unittest.TestCase):
             other.terminate.assert_not_called()
             self.assertEqual(app._cellular_recoveries["modem-a"]["state"], "waiting_identity")
             with patch.object(app, "modem_snapshot", return_value={
-                    "sim_iccid": "new-card", "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}):
+                    "sim_iccid": "new-card", "sim_present": True, "subscription_available": True, "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}):
                 blocked = app.process_cellular_recoveries(
                     [modem], {"modem-a": {"flight_mode": False}}, True)
             self.assertEqual(blocked, set())
@@ -235,7 +235,7 @@ class ProfileModemRefreshTests(unittest.TestCase):
                 modem = {"id": "modem-a", "tty": "/dev/ttyUSB2",
                          "usb_generation": "generation-a"}
                 with patch.object(app, "modem_snapshot", return_value={
-                        "sim_iccid": current, "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
+                        "sim_iccid": current, "sim_present": True, "subscription_available": True, "mm_object": "/org/freedesktop/ModemManager1/Modem/9"}), \
                         patch.object(host, "run", side_effect=[
                             SimpleNamespace(returncode=0, stdout="modem.generic.device: /sys/devices/fixture\n"
                                             "modem.generic.primary-port: cdc-wdm9\nmodem.generic.primary-sim-slot: 1"),

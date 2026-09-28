@@ -52,8 +52,7 @@ class LpaError(Exception):
         elif detail not in (None, "", {}):
             detail_s = str(detail)
         if msg == "euicc_init" or msg.startswith("euicc_init"):
-            return ("This card does not appear to be an eUICC / eSIM. "
-                    "Ordinary USIM cards cannot be managed here.")
+            return "Could not initialize eSIM access. The card type and profile state are unconfirmed."
         if msg in ("cancelled", "cancel"):
             return "Operation cancelled."
         if "timed out" in msg:
