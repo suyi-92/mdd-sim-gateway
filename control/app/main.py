@@ -909,6 +909,12 @@ async def _on_card_insert(name, idx, *, verify=False, operation_id: str = ""):
             await _stop_instance(iid, "card_identity_changed")
         info = hub.cards.get(name) or {}
         terminal = info.get("identity_state") in {"confirmed", "pin_required", "failed"}
+        state = str(info.get("identity_state") or "unknown")
+        log.info("card identity result state=%s identity_available=%s subscription_available=%s "
+                 "line_matched=%s pin_required=%s",
+                 state if state in {"confirmed", "pin_required", "failed", "pending", "reading"}
+                 else "unknown", bool(info.get("iccid")), bool(info.get("imsi")),
+                 bool(info.get("matched")), info.get("pin_enabled") is True)
         if operation_id and terminal:
             hub.card_probe_results[name] = operation_id
         # The soft waiter may already have returned to card_monitor. Publish the eventual
@@ -1039,6 +1045,12 @@ async def _on_card_insert_locked(
                         mnc_len=getattr(c, "mnc_len", None), smsc=c.smsc,
                         carrier_identity=_carrier_identity(c))
             if not c.imsi:
+                # Keep APDU status evidence without logging the card or raw transport detail.
+                error = str(getattr(c, "error", "") or "")
+                status = re.fullmatch(r"IMSI read failed sw=([0-9a-fA-F]{4})", error)
+                log.info("card subscription unavailable pin_required=%s status_word=%s error_present=%s",
+                         c.pin_enabled is True, status.group(1).lower() if status else "none",
+                         bool(error))
                 locked_inst = _match_instance_by_iccid(c.iccid)
                 info["matched"] = locked_inst["id"] if locked_inst else None
                 if c.pin_enabled:

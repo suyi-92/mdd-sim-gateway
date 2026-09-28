@@ -107,6 +107,29 @@ class OwnershipTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(info['identity_state'], 'pending')
             self.assertFalse(main.hub.reader_lock('reader').locked())
 
+    async def test_slow_pin_required_result_is_terminal_and_logged_without_identity(self):
+        info = {'name': 'private-reader', 'present': True, 'identity_state': 'pending'}
+        release = asyncio.Event()
+        async def read(*args, **kwargs):
+            await release.wait()
+            info.update(identity_state='pin_required', iccid='private-card', pin_enabled=True)
+        with patch.object(main.hub, 'cards', {'private-reader': info}), \
+                patch.object(main.hub, 'card_probes', {}), \
+                patch.object(main.hub, 'reader_locks', {}), \
+                patch.object(main.hub, 'broadcast', new=AsyncMock()), \
+                patch.object(main, '_client_cards', return_value=[]), \
+                patch.object(main, 'CARD_PROBE_TIMEOUT_SECONDS', 0.01), \
+                patch.object(main, '_on_card_insert_locked', new=read), \
+                self.assertLogs(main.log, level='INFO') as logs:
+            self.assertFalse(await main._on_card_insert('private-reader', 0))
+            worker = main.hub.card_probes['private-reader']
+            release.set()
+            self.assertTrue(await worker)
+            await asyncio.sleep(0)
+            self.assertEqual(info['identity_state'], 'pin_required')
+        self.assertIn('state=pin_required', str(logs.output))
+        self.assertNotIn('private-', str(logs.output))
+
     async def test_se_discovery_waits_for_sibling_reader_owner(self):
         first, second = 'VoWiFi Modem modem-1 00 00', 'VoWiFi Modem modem-1 00 01'
         with patch.object(main.hub, 'reader_locks', {}), \
