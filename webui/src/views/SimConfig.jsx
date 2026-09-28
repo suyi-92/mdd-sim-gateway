@@ -317,7 +317,7 @@ export default function SimConfig({ instances, selected, refresh, onInstanceSave
             {card.present ? (<>
               ICCID: {card.iccid || '—'}<br />IMSI: {card.imsi || t('(locked)')}<br />
               {card.reader_port && <>{t('USB port')}: {card.reader_port}<br /></>}
-              PIN: {card.pin_enabled ? t('enabled, {tries} tries', { tries: card.pin_tries }) : t('disabled')}
+              PIN: {card.pin_enabled == null ? t('Unknown') : card.pin_enabled ? t('enabled, {tries} tries', { tries: card.pin_tries }) : t('disabled')}
             </>) : (<>{t('No SIM card in reader {reader}.', { reader: card.reader_index })}</>)}
           </div>
         )}

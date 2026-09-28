@@ -90,6 +90,10 @@ try {
  await page.evaluate(()=>window.deliver({type:'esim_profile',reader:'fixture-reader',generation:2,iccid:'card-b',event:'line_disabled',profile_state:'enabled'}))
  await page.getByText('Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.',{exact:true}).waitFor()
  for(const width of [1440,900,390]) {
+   await page.evaluate(()=>window.deliver({type:'esim_profile',reader:'fixture-reader',generation:2,
+     iccid:'card-b',event:'initialization_pending',profile_state:'enabled'}))
+   await page.getByText('Profile enabled; completing SIM and baseband initialization…',{exact:true}).waitFor()
+   assert.equal(await page.getByText('The profile is enabled, but automatic line recovery failed. Start the line from Devices.',{exact:true}).count(),0)
    await page.setViewportSize({width,height:900})
    const action = page.getByRole('button',{name:'Rename',exact:true}).first()
    const before = await action.boundingBox()

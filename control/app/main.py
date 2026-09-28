@@ -1036,7 +1036,7 @@ async def _on_card_insert_locked(
             if claimed and str(claimed.get("iccid") or "") != str(c.iccid):
                 if retire is not None:
                     retire.append(str(claimed["id"]))
-            info.update(identity_state="confirmed", identity_source="card", identity_attempts=0,
+            info.update(identity_state="confirmed", identity_source="card",
                         identity_retry_at=None, identity_reason="", verified_at=time.time())
             idx = getattr(c, "reader_index", idx)
             info["index"] = idx
@@ -1058,6 +1058,7 @@ async def _on_card_insert_locked(
                 else:
                     _identity_pending(info, "subscription_unreadable")
                 return
+            info["identity_attempts"] = 0
         except sim.CardProbeTimeout:
             _identity_failed(info, "read_timeout")
             return
@@ -2921,7 +2922,7 @@ def _esim_recovery_failure_code(exc: Exception) -> str:
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
         code = str(detail.get("code") or "")
-        if code in {"slot_identity_unconfirmed", "card_unreadable", "device_changed"}:
+        if code in {"slot_identity_unconfirmed", "card_unreadable", "device_changed", "subscription_unavailable"}:
             return code
     if isinstance(exc, HTTPException):
         return "bridge_rebuild_failed" if exc.status_code >= 500 else "profile_recovery_failed"
@@ -4023,6 +4024,11 @@ async def _esim_refresh_modem_readers(
             actual = str(card_data.iccid or "")
             if actual != str(iccid):
                 raise RuntimeError("primary SIM slot does not match the target profile")
+            if not card_data.imsi:
+                raise HTTPException(409, {
+                    "code": "subscription_unavailable",
+                    "message": "The profile is enabled, but its SIM subscription is not readable yet.",
+                })
             # All logical readers terminate at channels opened by the same freshly spawned
             # bridge.  Keep proving every slot's ICCID, but avoid repeating the full IMSI,
             # carrier-files and SMSC scan on each serial channel: field measurements were
@@ -4060,6 +4066,9 @@ async def _esim_refresh_modem_readers(
             await hub.broadcast({"type": "cards", "cards": _client_cards()})
             return primary or {}, refreshed
         except Exception as exc:  # noqa
+            if (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+                    and exc.detail.get("code") == "subscription_unavailable"):
+                raise
             last_error = type(exc).__name__
         await asyncio.sleep(ESIM_CARD_REFRESH_INTERVAL)
     log.warning("eSIM slot verification failed error_type=%s", last_error or "unknown")
@@ -4221,6 +4230,79 @@ async def _update_esim_recovery(task_id: str, state: str | None = None, **fields
     return task
 
 
+async def _defer_unreadable_subscription(task_id: str, exc: Exception) -> bool:
+    if _esim_recovery_failure_code(exc) != "subscription_unavailable":
+        return False
+    task = await asyncio.to_thread(esim_recoveries.update, task_id)
+    if not task or not task.get("bridge_request_id"):
+        return False
+    observed = (device_state.status().get("devices") or {}).get(task.get("device_id")) or {}
+    host_state = str((observed.get("cellular_recovery") or {}).get("state") or "")
+    if host_state in {"ready", "failed", "cancelled"}:
+        return False
+    waiting = (observed.get("desired") or {}).get("flight_mode") or host_state == "waiting_flight_mode"
+    await _update_esim_recovery(
+        task_id, "waiting_flight_mode" if waiting else "waiting_baseband",
+        phase="baseband_initialization", error_code="subscription_unavailable",
+        local_identity_verified=False)
+    return True
+
+
+async def _reconcile_failed_profile_outcomes() -> None:
+    """Recover only the latest failed enable proved committed on the same USB/card generation.
+
+    Older releases cancelled recovery solely because the command lost its reply. Never
+    replay EnableProfile or resurrect a user's cancellation, replacement card or device.
+    """
+    if capability_lock.locked() or network_operations.busy():
+        return
+    for task in await asyncio.to_thread(esim_recoveries.latest_all):
+        if (task.get("state") not in {"failed", "cancelled"}
+                or task.get("phase") != "profile_enable"
+                or task.get("error_code") not in {"profile_enable_failed", "profile_enable_unconfirmed"}
+                or int(task.get("outcome_checks") or 0) >= 3
+                or time.time() - float(task.get("outcome_checked_at") or 0) < 60):
+            continue
+        device_id, iccid, reader = (str(task.get(key) or "") for key in ("device_id", "iccid", "reader"))
+        def same_generation():
+            observed = (device_state.status().get("devices") or {}).get(device_id) or {}
+            identity = _device_identities().get(device_id) or {}
+            return (bool(task.get("hardware_generation")) and observed.get("present")
+                    and observed.get("usb_generation") == task.get("hardware_generation")
+                    and _bridge_card_evidence(identity) and identity.get("iccid") == iccid)
+        if not reader or not iccid or not same_generation():
+            continue
+        lock = hub.esim_switch_lock(device_id)
+        if lock.locked():
+            continue
+        async with capability_lock, lock, hub.reader_lock(reader):
+            if not same_generation():
+                continue
+            names = _esim_modem_reader_names(reader, device_id)
+            if any(hub.lpa_busy.get(name) for name in names):
+                continue
+            await asyncio.to_thread(esim_recoveries.update, task['id'],
+                                   outcome_checks=int(task.get("outcome_checks") or 0) + 1,
+                                   outcome_checked_at=time.time())
+            try:
+                for name in names:
+                    await asyncio.to_thread(_esim_guard_engine, name)
+                profiles = await lpa.profile_list(reader, aid=task.get("se_aid") or None, timeout=10)
+            except (lpa.LpaError, HTTPException):
+                continue
+            enabled = [p.get("iccid") for p in profiles if isinstance(p, dict)
+                       and p.get("profileState") == "enabled"]
+            if enabled != [iccid] or not same_generation():
+                continue
+            resumed = await asyncio.to_thread(
+                esim_recoveries.schedule, device_id, iccid, reader, task["hardware_generation"])
+            await _update_esim_recovery(
+                resumed['id'], "profile_enabled", phase="profile_enabled",
+                se_id=task.get("se_id") or "", se_aid=task.get("se_aid") or "",
+                resumed_from=task['id'])
+            log.info("resumed failed eSIM enable after same-generation profile confirmation")
+
+
 async def _resume_persisted_esim_bridge(task: dict) -> None:
     """Continue a profile enable that survived Control but not its bridge transaction."""
     if capability_lock.locked() or network_operations.busy():
@@ -4236,6 +4318,9 @@ async def _resume_persisted_esim_bridge(task: dict) -> None:
     readers = _esim_modem_reader_names(reader, device_id)
     async with capability_lock:
         async with hub.esim_switch_lock(device_id):
+            # Drain an already-running card probe before the bridge transaction starts.
+            async with hub.reader_lock(reader):
+                pass
             for name in readers:
                 hub.lpa_busy[name] = True
             try:
@@ -4264,6 +4349,8 @@ async def _resume_persisted_esim_bridge(task: dict) -> None:
                         reader, device_id, iccid, str(recovery["instance_id"]),
                         pin_preflight_proof=recovery.get("pin_preflight_proof")))
             except Exception as exc:  # noqa - persisted task receives a closed failure code
+                if await _defer_unreadable_subscription(str(task.get("id") or ""), exc):
+                    return
                 await _update_esim_recovery(
                     str(task.get("id") or ""), "failed", phase="bridge_recovery",
                     error_code=_esim_recovery_failure_code(exc))
@@ -4310,6 +4397,20 @@ async def _advance_esim_cellular_recovery(task: dict) -> None:
         await _resume_persisted_esim_bridge(task)
         return
     if not task.get("local_identity_verified"):
+        if task.get("bridge_request_id"):
+            host_state = str((observed.get("cellular_recovery") or {}).get("state") or "")
+            if host_state in {"failed", "cancelled"}:
+                await _update_esim_recovery(task_id, host_state, phase="baseband_initialization",
+                                           error_code="baseband_initialization_failed")
+                return
+            if (observed.get("desired") or {}).get("flight_mode") or host_state == "waiting_flight_mode":
+                if state != "waiting_flight_mode":
+                    await _update_esim_recovery(task_id, "waiting_flight_mode", phase="baseband_initialization")
+                return
+            if host_state != "ready":
+                if state != "waiting_baseband":
+                    await _update_esim_recovery(task_id, "waiting_baseband", phase="baseband_initialization")
+                return
         if bridge_iccid == iccid:
             await _resume_persisted_esim_bridge(task)
         return
@@ -4373,6 +4474,7 @@ async def _advance_esim_cellular_recovery(task: dict) -> None:
 async def esim_cellular_recovery_poller() -> None:
     while True:
         try:
+            await _reconcile_failed_profile_outcomes()
             for task in await asyncio.to_thread(esim_recoveries.active):
                 await _advance_esim_cellular_recovery(task)
         except asyncio.CancelledError:
@@ -9271,10 +9373,19 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                     name, hardware_id, iccid, after_bridge=process_after_bridge,
                     recovery_task_id=recovery_task_id)
             except Exception as exc:  # noqa
-                await _update_esim_recovery(
-                    recovery_task_id, "failed",
-                    phase="baseband_initialization",
-                    error_code=_esim_recovery_failure_code(exc))
+                deferred = await _defer_unreadable_subscription(recovery_task_id, exc)
+                if not deferred:
+                    await _update_esim_recovery(
+                        recovery_task_id, "failed", phase="baseband_initialization",
+                        error_code=_esim_recovery_failure_code(exc))
+                if deferred:
+                    egress.publish()
+                    await _esim_profile_event(
+                        name, iccid, "initialization_pending", profile_state="enabled")
+                    return {"ok": True, "iccid": iccid, "se_id": se["id"],
+                            "card": hub.cards.get(name), "notification_status": notification_status,
+                            "subscription_pending": True, "cellular_recovery": esim_recoveries.public(
+                                await asyncio.to_thread(esim_recoveries.update, recovery_task_id))}
                 if (notification_status or {}).get("state") in {"pending", "processing"}:
                     notification_status = await report_notification({
                         "state": "failed", "reason_code": "reader_unavailable"})

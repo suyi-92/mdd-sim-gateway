@@ -799,7 +799,10 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       if (res?.cellular_recovery) {
         setSes((list) => withRecoveryStatus(list, p.iccid, res.cellular_recovery))
       }
-      if (res?.recovery_error) {
+      if (res?.subscription_pending) {
+        setProfileSwitch({ iccid: p.iccid, phase: 'deferred' })
+        setErr('')
+      } else if (res?.recovery_error) {
         // The eUICC switched but the line did not come back on its own — say exactly
         // that, so the user starts the line instead of retrying an already-done switch.
         setErr(t('Switched to {name}, but its line could not start automatically: {error}', { name: title, error: res.recovery_error }))
@@ -929,6 +932,10 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           refresh?.()
         } else if (msg.event === 'line_disabled') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'disabled' })
+          refresh?.()
+        } else if (msg.event === 'initialization_pending') {
+          setProfileSwitch({ iccid: msg.iccid, phase: 'deferred' })
+          setErr('')
           refresh?.()
         } else if (msg.event === 'recovery_error') {
           setProfileSwitch({ iccid: msg.iccid, phase: 'error' })
@@ -1265,6 +1272,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                     ? t('Profile switched; the VoWiFi line has started.')
                     : profileSwitch?.phase === 'disabled'
                       ? t('Profile enabled. VoWiFi is off for this device; enable it from Devices when needed.')
+                      : profileSwitch?.phase === 'deferred'
+                        ? t('Profile enabled; completing SIM and baseband initialization…')
                       : profileSwitch?.phase === 'error'
                         ? t('Profile switching needs attention; see the message above.')
                         : '\u00a0'}

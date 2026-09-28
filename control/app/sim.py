@@ -498,7 +498,8 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             # by whether EF_IMSI is actually readable without verification.
             tries = _pin_tries(conn)
             info.pin_tries = tries
-            info.pin_enabled = tries is not None
+            # A retry counter alone does not prove PIN protection is blocking IMSI.
+            info.pin_enabled = None
             # Optionally verify PIN in this same connection so IMSI becomes readable.
             if pin and tries is not None and tries >= MIN_TRIES:
                 body = _pin_body(pin)
@@ -517,12 +518,9 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
                     info.mcc = imsi[:3]
                 else:
                     info.error = info.error or "EF_IMSI returned undecodable data"
-                if not pin:
-                    # Readable WITHOUT our VERIFY -> the PIN is not required right now
-                    # (disabled, or already satisfied by another holder). The 63Cx status
-                    # query only reports the retry counter — some cards return it even
-                    # when the PIN is disabled, so it must not be trusted for "enabled".
-                    info.pin_enabled = False
+                # Readability, not a retry-counter query, determines whether PIN is
+                # required. Preserve a successful explicit PIN verification's state.
+                info.pin_enabled = bool(pin and tries is not None)
             elif (s1, s2) == (0x69, 0x82):
                 info.pin_enabled = True     # security status not satisfied = PIN required
             else:
