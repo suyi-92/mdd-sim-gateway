@@ -171,6 +171,11 @@ def _identity_failed(info: dict, reason: str) -> None:
 
 def _identity_retry_due(info: dict) -> bool:
     """Retry only an unresolved read; confirmed cards are edge-driven, never polled."""
+    if info.get("identity_state") == "reading":
+        owner = hub.card_probes.get(info.get("name"))
+        if owner and not owner.done():
+            return False
+        _identity_pending(info, "read_interrupted")
     return (info.get("identity_state") in {"pending", "failed"}
             and time.monotonic() >= float(info.get("identity_retry_at") or 0))
 
@@ -919,6 +924,9 @@ async def _on_card_insert(name, idx, *, verify=False, operation_id: str = ""):
         if hub.card_probes.get(name) is done:
             hub.card_probes.pop(name, None)
             hub.card_probe_operations.pop(name, None)
+            info = hub.cards.get(name)
+            if info and info.get("identity_state") == "reading":
+                _identity_pending(info, "read_interrupted")
         if not done.cancelled() and done.exception():
             log.warning("card identity coordinator failed error_type=%s", type(done.exception()).__name__)
 
@@ -928,7 +936,8 @@ async def _on_card_insert(name, idx, *, verify=False, operation_id: str = ""):
             asyncio.shield(task), timeout=CARD_PROBE_TIMEOUT_SECONDS))
     except asyncio.TimeoutError:
         info = hub.cards.get(name)
-        if info:
+        if (info and not task.done()
+                and info.get("identity_state") not in {"confirmed", "pin_required", "failed"}):
             _identity_reading(info)
             await hub.broadcast({"type": "cards", "cards": _client_cards()})
         # The worker has its own hard deadline. Keep the asyncio task and reader lock until
@@ -1203,7 +1212,9 @@ async def _reconcile_vpcd_card_identity(name: str, idx: int) -> bool:
     log.info("VPCD card identity changed after reader re-enumeration; refreshing binding "
              "reader=%s", name)
     await _on_card_insert(name, idx, verify=True)
-    hub.cards.get(name, {})["bridge_generation"] = bridge_generation
+    refreshed = hub.cards.get(name) or {}
+    if refreshed.get("identity_state") == "confirmed" and refreshed.get("iccid") == current_iccid:
+        refreshed["bridge_generation"] = bridge_generation
     return True
 
 
@@ -3600,6 +3611,63 @@ def _esim_resolve_se(
         return estkme.resolve_se(ses, se_id=se_id, aid=aid)
     except KeyError as e:
         raise HTTPException(400, str(e)) from e
+
+
+async def _esim_resolve_se_owned(name, idx, se_id=None, aid=None, *, require=False,
+                                 switch_locked=False):
+    if not switch_locked:
+        async with hub.esim_switch_lock(_esim_switch_identity(name)[0]):
+            return await _esim_resolve_se_owned(
+                name, idx, se_id, aid, require=require, switch_locked=True)
+    async with hub.reader_lock(name):
+        hardware_id = device_state.vpcd_modem_hardware_id(name)
+        names = _esim_modem_reader_names(name, hardware_id) if hardware_id else [name]
+        for reader in names:
+            await asyncio.to_thread(_esim_guard_engine, reader)
+        # A cancelled HTTP request must not release ownership while the thread is using PC/SC.
+        worker = asyncio.create_task(asyncio.to_thread(
+            _esim_resolve_se, name, idx, se_id, aid, require=require))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
+
+
+async def _esim_enable_verified(name, iccid, *, aid=None, **kwargs):
+    """A failed command may have committed EnableProfile before REFRESH lost the reply."""
+    previous_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
+    try:
+        return await lpa.profile_enable(name, iccid, aid=aid, **kwargs)
+    except lpa.LpaError as error:
+        # Read the selected SE afresh; neither cached profiles nor AT identity prove this.
+        enabled = []
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(ESIM_CARD_REFRESH_INTERVAL)
+            try:
+                profiles = await lpa.profile_list(name, aid=aid, timeout=10)
+                if not isinstance(profiles, list) or any(not isinstance(p, dict) for p in profiles):
+                    enabled = []
+                    continue
+                enabled = [str(p.get("iccid") or "") for p in profiles
+                           if p.get("profileState") == "enabled"]
+            except lpa.LpaError:
+                enabled = []
+            if enabled == [iccid]:
+                log.warning("eSIM enable reply failed; selected SE confirms target enabled category=%s",
+                            lpa.classify_lpa_error(error))
+                if kwargs.get("process_notifications", True):
+                    await lpa.maybe_process_notifications(
+                        name, aid=aid, on_processed=kwargs.get("on_notifications_processed"),
+                        on_status=kwargs.get("on_notification_status"))
+                return
+        if previous_iccid and previous_iccid != iccid and enabled == [previous_iccid]:
+            raise error
+        raise HTTPException(409, {
+            "code": "profile_enable_unconfirmed",
+            "message": "The enable result is uncertain. Lines remain stopped until the active SIM is verified.",
+        }) from error
 
 
 def _esim_guard_engine(name: str):
@@ -9095,21 +9163,24 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             hub.manual_stops.discard(str(requested_target["id"]))
         # Native readers have no host bridge to recycle and retain the established path.
         if not hardware_id:
-            se = await asyncio.to_thread(
-                _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
-                body.get("aid"), require=True)
             previous = await _esim_prepare_reader_profile_switch(name)
             try:
+                se = await _esim_resolve_se_owned(
+                    name, idx, body.get("se_id") or body.get("seId"),
+                    body.get("aid"), require=True, switch_locked=True)
                 await _esim_profile_event(name, iccid, "switching")
                 await _esim_run(
-                    name, idx, lpa.profile_enable(
+                    name, idx, _esim_enable_verified(
                         name, iccid, aid=se.get("aid"),
                         on_notification_status=_esim_notification_status_callback(name, iccid),
                         on_notifications_processed=_esim_notifications_processed_callback(
                             name, iccid, se.get("id"))),
                     refresh=True, refresh_expect_iccid=iccid, switch_locked=True)
-            except Exception:
-                await _esim_restore_profile_switch(previous)
+            except Exception as exc:
+                uncertain = (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+                             and exc.detail.get("code") == "profile_enable_unconfirmed")
+                if not uncertain:
+                    await _esim_restore_profile_switch(previous)
                 await _esim_profile_event(name, iccid, "switch_failed")
                 raise
             target = _match_instance_by_iccid(iccid)
@@ -9151,14 +9222,14 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             await _esim_profile_event(name, iccid, "switching")
             if _esim_vowifi_requested(hardware_id):
                 await asyncio.to_thread(_esim_prewarm_target_egress, iccid)
-            se = await asyncio.to_thread(
-                _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
-                body.get("aid"), require=True)
+            se = await _esim_resolve_se_owned(
+                name, idx, body.get("se_id") or body.get("seId"),
+                body.get("aid"), require=True, switch_locked=True)
             await _update_esim_recovery(
                 recovery_task_id, None, se_id=str(se.get("id") or ""),
                 se_aid=str(se.get("aid") or ""))
             await _esim_run(
-                name, idx, lpa.profile_enable(
+                name, idx, _esim_enable_verified(
                     name, iccid, aid=se.get("aid"), process_notifications=False),
                 keep_busy=True)
             lpa_succeeded = True
@@ -9244,12 +9315,15 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                     "cellular_recovery": esim_recoveries.public(
                         await asyncio.to_thread(esim_recoveries.update, recovery_task_id)),
                     "recovery_skipped": "" if start_allowed else "vowifi_disabled"}
-        except Exception:
+        except Exception as exc:
             if not lpa_succeeded:
+                uncertain = (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+                             and exc.detail.get("code") == "profile_enable_unconfirmed")
                 await _update_esim_recovery(
-                    recovery_task_id, "cancelled",
-                    phase="profile_enable", error_code="profile_enable_failed")
-                await _esim_restore_profile_switch(previous)
+                    recovery_task_id, "failed" if uncertain else "cancelled",
+                    phase="profile_enable", error_code="profile_enable_unconfirmed" if uncertain else "profile_enable_failed")
+                if not uncertain:
+                    await _esim_restore_profile_switch(previous)
                 await _esim_profile_event(name, iccid, "switch_failed")
             raise
         finally:
@@ -9257,6 +9331,8 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             for reader in set(busy_readers) | set(_esim_modem_reader_names(name, hardware_id)):
                 hub.lpa_busy.pop(reader, None)
                 info = hub.cards.get(reader) or {}
+                if info and not lpa_succeeded:
+                    _identity_pending(info, "enable_result_recheck")
                 if _esim_verified_reader_current(reader, info, _pcsc_maintenance_epoch()):
                     # The monitor may have marked a verified slot pending while lpac owned
                     # the reader. Restore only proof produced by this completed switch.
@@ -9272,8 +9348,8 @@ async def api_esim_disable(iccid: str, body: dict | None = None):
     body = body or {}
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    se = await asyncio.to_thread(
-        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+    se = await _esim_resolve_se_owned(
+        name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
         require=True)
     await _esim_run(
         name, idx, lpa.profile_disable(
@@ -9291,7 +9367,8 @@ async def api_esim_delete(
     se_id: str | None = None, aid: str | None = None,
 ):
     name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
-    se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
+    se = await _esim_resolve_se_owned(
+        name, idx, se_id, aid, require=True)
     await _esim_run(
         name, idx, lpa.profile_delete(
             name, iccid, aid=se.get("aid"),
@@ -9401,38 +9478,42 @@ async def api_esim_download(body: dict):
     """Start a profile download as a background task; progress via WS type=esim_download."""
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    se = await asyncio.to_thread(
-        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
-        require=True)
-    if hub.lpa_busy.get(name):
-        raise HTTPException(409, "an eSIM operation is already running on this reader")
-    await asyncio.to_thread(_esim_guard_engine, name)
-    imei = _esim_imei_for_reader(name, body.get("imei"))
-    notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
-    # Claim busy before returning so a second concurrent POST cannot start another job.
-    if hub.lpa_busy.get(name):
-        raise HTTPException(409, "an eSIM operation is already running on this reader")
-    hub.lpa_busy[name] = True
-    se_id = se["id"]
-    aid = se.get("aid")
-
-    generation = (hub.cards.get(name) or {}).get("generation")
+    switch_key, hardware_id = _esim_switch_identity(name)
+    names = _esim_modem_reader_names(name, hardware_id) if hardware_id else [name]
+    if (hub.esim_switch_lock(switch_key).locked()
+            or any(hub.lpa_busy.get(reader) for reader in names)):
+        raise HTTPException(409, "an eSIM operation is already running on this device")
+    switch_lock = hub.esim_switch_lock(switch_key)
+    await switch_lock.acquire()
+    # No await between admission and reservation, including sibling virtual slots.
+    for reader in names:
+        hub.lpa_busy[reader] = True
     try:
+        se = await _esim_resolve_se_owned(
+            name, idx, body.get("se_id") or body.get("seId"), body.get("aid"), require=True, switch_locked=True)
+        imei = _esim_imei_for_reader(name, body.get("imei"))
+        notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
+        se_id, aid = se["id"], se.get("aid")
+        generation = (hub.cards.get(name) or {}).get("generation")
         operation = await asyncio.to_thread(
             esim_download_operations.start, name, generation, notification_cache_iccid)
-    except esim_operations.DownloadBusy as exc:
-        hub.lpa_busy.pop(name, None)
-        raise HTTPException(409, str(exc)) from exc
-    except OSError as exc:
-        hub.lpa_busy.pop(name, None)
-        raise HTTPException(503, "could not record the eSIM download request") from exc
+    except BaseException as exc:
+        switch_lock.release()
+        for reader in names:
+            hub.lpa_busy.pop(reader, None)
+        if isinstance(exc, esim_operations.DownloadBusy):
+            raise HTTPException(409, str(exc)) from exc
+        if isinstance(exc, OSError):
+            raise HTTPException(503, "could not record the eSIM download request") from exc
+        raise
     operation_id = operation["operation_id"]
 
     async def _job():
         try:
-            async with hub.esim_switch_lock(_esim_switch_identity(name)[0]), hub.reader_lock(name):
+            async with hub.reader_lock(name):
                 try:
-                    await asyncio.to_thread(_esim_guard_engine, name)
+                    for reader in names:
+                        await asyncio.to_thread(_esim_guard_engine, reader)
                     await asyncio.to_thread(esim_download_operations.update,
                                             operation_id, "started", step="started")
                     await hub.broadcast({
@@ -9488,7 +9569,7 @@ async def api_esim_download(body: dict):
                     # lpac puts the failing function name in message (e.g. es9p_authenticate_client).
                     await asyncio.to_thread(
                         esim_download_operations.update, operation_id, "error",
-                        error_code=esim_operations.error_code(e, lpa.classify_lpa_error(e)))
+                        step=e.message, error_code=esim_operations.error_code(e, lpa.classify_lpa_error(e)))
                     err = {
                         "type": "esim_download", "reader": name, "generation": generation, "reader_index": idx,
                         "se_id": se_id, "event": "error",
@@ -9511,7 +9592,9 @@ async def api_esim_download(body: dict):
                                     operation_id, "error", error_code="interrupted")
             raise
         finally:
-            hub.lpa_busy.pop(name, None)
+            switch_lock.release()
+            for reader in names:
+                hub.lpa_busy.pop(reader, None)
 
     task = asyncio.create_task(_job())
     esim_download_tasks.add(task)
@@ -9548,8 +9631,8 @@ async def api_esim_discovery(body: dict | None = None):
     body = body or {}
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    se = await asyncio.to_thread(
-        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+    se = await _esim_resolve_se_owned(
+        name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
         require=True)
     imei = _esim_imei_for_reader(name, body.get("imei"))
     entries = await _esim_run(
@@ -9580,8 +9663,8 @@ async def api_esim_notifications_process(body: dict | None = None):
     body = body or {}
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    se = await asyncio.to_thread(
-        _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
+    se = await _esim_resolve_se_owned(
+        name, idx, body.get("se_id") or body.get("seId"), body.get("aid"),
         require=True)
     seq = body.get("seq")
     remove = bool(body.get("remove", True))
@@ -9606,7 +9689,8 @@ async def api_esim_notification_remove(
     se_id: str | None = None, aid: str | None = None,
 ):
     name, idx = await asyncio.to_thread(_esim_resolve_reader, reader_index, reader)
-    se = await asyncio.to_thread(_esim_resolve_se, name, idx, se_id, aid, require=True)
+    se = await _esim_resolve_se_owned(
+        name, idx, se_id, aid, require=True)
     notification_cache_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
     await _esim_run(name, idx, lpa.notification_remove(name, seq, aid=se.get("aid")))
     await _esim_notifications_changed(

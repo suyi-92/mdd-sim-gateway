@@ -35,10 +35,10 @@ def error_code(error: BaseException, category: str = "") -> str:
     detail = f"{getattr(error, 'message', '')} {getattr(error, 'detail', '')}".casefold()
     if "install_failed_due_to_iccid_already_exists_on_euicc" in detail:
         return "profile_already_installed"
-    if "euicc_init" in detail:
-        return "not_euicc"
     if category == "notification_timeout":
         return "download_timeout"
+    if "euicc_init" in detail and category not in ERROR_CODES - {"unknown_error"}:
+        return "not_euicc"
     return category if category in ERROR_CODES else "unknown_error"
 
 

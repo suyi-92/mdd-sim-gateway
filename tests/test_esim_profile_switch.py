@@ -565,8 +565,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
                 patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
                 patch.object(main, "_esim_profile_event", new=AsyncMock()), \
-                patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
-                patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_resolve_se_owned", new=AsyncMock(return_value={"id": "se", "aid": "a"})), \
+                patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock()), \
                 patch.object(main, "_esim_cache_update_profile"), \
                 patch.object(main, "_esim_recover_profile_switch",
@@ -607,8 +607,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
                 patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
                 patch.object(main, "_esim_profile_event", new=events), \
-                patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
-                patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_resolve_se_owned", new=AsyncMock(return_value={"id": "se", "aid": "a"})), \
+                patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock()), \
                 patch.object(main, "_esim_cache_update_profile"), \
                 patch.object(main, "_esim_recover_profile_switch",
@@ -677,7 +677,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": None}), \
                 patch.object(main, "_esim_prepare_reader_profile_switch",
                              new=AsyncMock(return_value=previous)), \
-                patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock(side_effect=error)), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:
@@ -697,8 +697,8 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
                 patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
                 patch.object(main, "_esim_profile_event", new=AsyncMock()), \
-                patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
-                patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_resolve_se_owned", new=AsyncMock(return_value={"id": "se", "aid": "a"})), \
+                patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock(side_effect=error)), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:

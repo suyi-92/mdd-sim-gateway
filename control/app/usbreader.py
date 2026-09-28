@@ -107,7 +107,9 @@ def _channel_id_bus_dev(reader_name: str):
     """(bus, devnum) for a reader via SCARD_ATTR_CHANNEL_ID, or None. Uses a SHARE_DIRECT
     connection: no card is required and no APDU is sent, so this does NOT disturb a card an
     engine is actively using."""
-    if not _SCARD_OK:
+    # Virtual modem slots have no USB CHANNEL_ID. Even a DIRECT connection can
+    # conflict with an exclusive LPA session on their shared physical card.
+    if not _SCARD_OK or reader_name.startswith("VoWiFi Modem "):
         return None
     hctx = hcard = None
     try:
@@ -182,7 +184,18 @@ def reader_port_paths() -> dict[int, str]:
 
 def port_for_index(index: int) -> str | None:
     """USB port path currently at this reader index, or None."""
-    return reader_port_paths().get(int(index))
+    try:
+        available = readers()
+    except Exception:
+        return None
+    try:
+        selected = available[int(index)] if int(index) >= 0 else None
+    except (IndexError, ValueError, TypeError):
+        return None
+    if selected is None:
+        return None
+    location = _channel_id_bus_dev(str(selected))
+    return _port_path_for(*location) if location else None
 
 
 def index_for_port(port: str) -> int | None:

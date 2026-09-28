@@ -99,6 +99,8 @@ def classify_lpa_error(error: BaseException) -> str:
         "cancelled", "canceled", "interrupted", "sigint",
     )):
         return "interrupted"
+    if "functionexecutionstatus" in text and "failed" in text:
+        return "remote_rejected"
     if any(value in text for value in (
         "http 400", "http 401", "http 403", "http 404", "http 409",
         "forbidden", "unauthorized", "remote rejected", "server rejected",
@@ -288,19 +290,24 @@ async def run_lpac(
             elif typ == "lpa":
                 final = obj.get("payload") or {}
             # ignore type=driver etc.
-        rc = await proc.wait()
-        await stderr_task
-    except asyncio.CancelledError:
-        _signal_cancel(proc)
+        remaining = max(0.01, deadline - asyncio.get_running_loop().time()) if deadline else None
         try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except Exception:  # noqa
-            try:
-                proc.kill()
-            except Exception:  # noqa
-                pass
-        raise
+            rc = await asyncio.wait_for(proc.wait(), remaining)
+        except asyncio.TimeoutError:
+            raise LpaError("lpac timed out", stage=operation, category="notification_timeout") from None
+        await stderr_task
     finally:
+        # The caller's reader lock may only be released after the subprocess exits.
+        if proc.returncode is None:
+            _signal_cancel(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
         if track_key and _active.get(track_key) is proc:
             _active.pop(track_key, None)
 
@@ -317,7 +324,10 @@ async def run_lpac(
     if code != 0:
         detail = data if data not in (None, "", {}) else stderr_txt or None
         safe_step = str(message) if str(message) in {
-            "euicc_init", "es10b_list_notification", "es10b_retrieve_notifications_list",
+            "euicc_init", "es10c_enable_profile", "es9p_authenticate_client",
+            "es9p_initiate_authentication", "es10b_authenticate_server",
+            "es10b_prepare_download", "es9p_get_bound_profile_package",
+            "es10b_load_bound_profile_package", "es10b_list_notification", "es10b_retrieve_notifications_list",
             "es9p_handle_notification", "es10b_remove_notification_from_list",
         } else "other"
         error = LpaError(str(message), detail=detail, code=code, stage=operation)
@@ -381,8 +391,8 @@ async def chip_info(reader_name: str, *, aid: str | None = None) -> dict:
     }
 
 
-async def profile_list(reader_name: str, *, aid: str | None = None) -> list[dict]:
-    r = await run_lpac("profile", "list", reader_name=reader_name, aid=aid, timeout=60)
+async def profile_list(reader_name: str, *, aid: str | None = None, timeout: float = 60) -> list[dict]:
+    r = await run_lpac("profile", "list", reader_name=reader_name, aid=aid, timeout=timeout)
     data = r.data
     if data is None:
         return []
