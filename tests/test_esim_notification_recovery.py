@@ -99,6 +99,8 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
         async def bridge(*args):
             order.append('bridge')
             return {'state': 'channels_ready'}
+        async def ready(*args):
+            order.append('reader_ready')
         async def verify(*args):
             order.append('verify')
             self.assertTrue(main.hub.lpa_busy[name])
@@ -125,6 +127,7 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, '_esim_vowifi_requested', return_value=False), \
                 patch.object(main, '_esim_restart_modem_bridge', new=bridge), \
                 patch.object(main, '_esim_refresh_modem_readers', new=verify), \
+                patch.object(main, '_esim_wait_notification_reader', new=ready), \
                 patch.object(main, '_esim_restore_cellular_selection', new=selection), \
                 patch.object(main, '_match_instance_by_iccid', return_value=target), \
                 patch.object(main, '_refresh_instance_reader_binding', return_value=target), \
@@ -140,7 +143,7 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertFalse(main.hub.lpa_busy)
             self.assertEqual(main.hub.cards[name]['identity_state'], 'confirmed')
-        self.assertEqual(order, [('profile', 'enable'), 'bridge', ('notification', 'process'), 'verify'])
+        self.assertEqual(order, [('profile', 'enable'), 'bridge', 'reader_ready', ('notification', 'process'), 'verify'])
         self.assertEqual(result['notification_status']['state'], 'processed')
         self.assertEqual(result['recovery_skipped'], 'vowifi_disabled')
 
@@ -231,3 +234,78 @@ class VerifiedHandoffTests(unittest.IsolatedAsyncioTestCase):
                         name, 0, verify=True, operation_id='fixture-rescan')
                 else:
                     read.assert_awaited_once_with(name, 0, verify=True)
+
+
+class PhysicalCardSerializationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(main.hub, 'reader_locks', {}))
+        self.enterContext(patch.object(main.hub, 'esim_switch_locks', {}))
+        self.enterContext(patch.object(main.hub, 'lpa_busy', {}))
+        self.enterContext(patch.object(main.hub, 'cards', {}))
+        self.names = [f'VoWiFi Modem modem-a 00 0{i}' for i in range(3)]
+        self.enterContext(patch.object(main, '_esim_switch_identity', return_value=('modem-a', 'modem-a')))
+        self.enterContext(patch.object(main, '_esim_modem_reader_names', return_value=self.names))
+        self.enterContext(patch.object(main, '_esim_guard_engine'))
+
+    async def test_sibling_read_finishes_before_switch_can_take_card(self):
+        started, release, switched = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def read():
+            self.assertTrue(all(main.hub.lpa_busy.get(n) for n in self.names))
+            started.set()
+            await release.wait()
+        async def switch():
+            async with main.hub.esim_switch_lock('modem-a'):
+                switched.set()
+        task = asyncio.create_task(main._esim_run(self.names[0], 0, read()))
+        await started.wait()
+        switching = asyncio.create_task(switch())
+        await asyncio.sleep(0)
+        self.assertFalse(switched.is_set())
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, switching), 1)
+        self.assertTrue(switched.is_set())
+        self.assertFalse(main.hub.lpa_busy)
+
+    async def test_reader_apdu_lock_covers_siblings_but_not_another_modem(self):
+        self.assertIs(main.hub.reader_lock(self.names[0]), main.hub.reader_lock(self.names[1]))
+        self.assertIsNot(main.hub.reader_lock(self.names[0]),
+                         main.hub.reader_lock('VoWiFi Modem modem-b 00 00'))
+
+    async def test_engine_gate_is_checked_after_waiting_for_switch(self):
+        operation = AsyncMock()
+        lock = main.hub.esim_switch_lock('modem-a')
+        await lock.acquire()
+        task = asyncio.create_task(main._esim_run(self.names[0], 0, operation()))
+        await asyncio.sleep(0)
+        with patch.object(main, '_esim_guard_engine', side_effect=main.HTTPException(409, 'running')):
+            lock.release()
+            with self.assertRaises(main.HTTPException):
+                await task
+        operation.assert_not_awaited()
+        self.assertFalse(main.hub.lpa_busy)
+
+    async def test_readiness_waits_for_requested_slot_and_target_identity(self):
+        with patch.object(main.sim, 'list_readers', side_effect=[[], self.names, self.names]), \
+                patch.object(main.sim, 'read_iccid_bounded', side_effect=['old-card', 'target-card']) as read, \
+                patch.object(main.asyncio, 'sleep', new=AsyncMock()), \
+                patch.object(main, 'ESIM_CARD_REFRESH_ATTEMPTS', 3):
+            await main._esim_wait_notification_reader(self.names[1], 'target-card')
+        self.assertEqual(read.call_count, 2)
+        self.assertTrue(all(call.args[0] == 1 for call in read.call_args_list))
+        self.assertTrue(all(0 < call.args[1] <= 3 for call in read.call_args_list))
+
+    async def test_unavailable_or_wrong_card_never_reaches_notification_delivery(self):
+        for value in ['old-card', '', RuntimeError('not ready')]:
+            with self.subTest(value=str(value)), \
+                    patch.object(main.sim, 'list_readers', return_value=self.names), \
+                    patch.object(main.sim, 'read_iccid_bounded', side_effect=value if isinstance(value, Exception) else None,
+                                 return_value=value), \
+                    patch.object(main.asyncio, 'sleep', new=AsyncMock()), \
+                    patch.object(main, 'ESIM_CARD_REFRESH_ATTEMPTS', 2), \
+                    patch.object(main, '_esim_restart_modem_bridge', new=AsyncMock(return_value={})), \
+                    patch.object(main, '_esim_refresh_modem_readers', new=AsyncMock()) as verify:
+                notify = AsyncMock()
+                with self.assertRaises(main.HTTPException):
+                    await main._esim_recover_profile_switch(self.names[1], 'modem-a', 'target-card', after_bridge=notify)
+                notify.assert_not_awaited()
+                verify.assert_not_awaited()

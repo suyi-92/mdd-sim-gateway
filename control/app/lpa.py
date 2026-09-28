@@ -113,6 +113,8 @@ def classify_lpa_error(error: BaseException) -> str:
         "failed to spawn", "produced no result", "broken pipe", "exit=",
     )):
         return "process_error"
+    if str(error.message).strip() == "euicc_init":
+        return "card_unavailable"
     return "unknown_error"
 
 
@@ -314,7 +316,14 @@ async def run_lpac(
     data = final.get("data")
     if code != 0:
         detail = data if data not in (None, "", {}) else stderr_txt or None
-        raise LpaError(str(message), detail=detail, code=code, stage=operation)
+        safe_step = str(message) if str(message) in {
+            "euicc_init", "es10b_list_notification", "es10b_retrieve_notifications_list",
+            "es9p_handle_notification", "es10b_remove_notification_from_list",
+        } else "other"
+        error = LpaError(str(message), detail=detail, code=code, stage=operation)
+        log.warning("lpac failed operation=%s step=%s code=%d category=%s",
+                    operation, safe_step, code, classify_lpa_error(error))
+        raise error
 
     result.data = data
     log.info("lpac complete operation=%s duration_ms=%d",

@@ -50,6 +50,9 @@ class NotificationProcessingTests(unittest.IsolatedAsyncioTestCase):
     def test_notification_error_categories_are_closed_and_specific(self):
         cases = [
             (LpaError('euicc_init', detail='SCARD_E_NO_SMARTCARD'), 'card_unavailable'),
+            (LpaError('euicc_init'), 'card_unavailable'),
+            (LpaError('euicc_init', detail='timeout'), 'notification_timeout'),
+            (LpaError('euicc_init', detail='curl TLS failure'), 'network_transport'),
             (LpaError('notification', detail='curl: connection reset'), 'network_transport'),
             (LpaError('notification', detail='HTTP 403 forbidden'), 'remote_rejected'),
             (LpaError('lpac produced no result (exit=2)'), 'process_error'),
@@ -103,7 +106,7 @@ class NotificationProcessingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_is_bounded_and_classified_without_raw_error(self):
         for detail, count, code in (("SCARD_E_SHARING_VIOLATION", 3, "reader_busy"),
-                                    ("private endpoint unavailable", 1, "unknown_error")):
+                                    ("private endpoint unavailable", 1, "card_unavailable")):
             with self.subTest(code=code):
                 callback, status = AsyncMock(), AsyncMock()
                 with patch.object(lpa, "auto_process_notifications", return_value=True), \

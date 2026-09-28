@@ -675,9 +675,11 @@ class Hub:
         return _with_detected_imei(cards)
 
     def reader_lock(self, name: str) -> asyncio.Lock:
-        if name not in self.reader_locks:
-            self.reader_locks[name] = asyncio.Lock()
-        return self.reader_locks[name]
+        # VPCD slots are separate PC/SC handles to one physical UICC.
+        key = device_state.vpcd_modem_hardware_id(name) or name
+        if key not in self.reader_locks:
+            self.reader_locks[key] = asyncio.Lock()
+        return self.reader_locks[key]
 
     def esim_switch_lock(self, key: str) -> asyncio.Lock:
         if key not in self.esim_switch_locks:
@@ -3693,7 +3695,8 @@ async def _esim_refresh_card(
 
 def _esim_switch_identity(name: str) -> tuple[str, str]:
     identity = _modem_identity_for_reader(name) or {}
-    hardware_id = str(identity.get("hardware_id") or "")
+    hardware_id = str(identity.get("hardware_id")
+                      or device_state.vpcd_modem_hardware_id(name) or "")
     return (hardware_id or f"reader:{name}", hardware_id)
 
 
@@ -3986,6 +3989,29 @@ async def _esim_refresh_modem_readers(
     })
 
 
+async def _esim_wait_notification_reader(name: str, iccid: str) -> None:
+    """Bridge sockets being ready does not prove pcscd has inserted this slot yet."""
+    deadline = time.monotonic() + 20
+    for attempt in range(max(1, ESIM_CARD_REFRESH_ATTEMPTS)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            readers = await asyncio.to_thread(sim.list_readers)
+            if name in readers:
+                actual = await asyncio.to_thread(
+                    sim.read_iccid_bounded, readers.index(name), min(remaining, 3.0))
+                if actual == iccid:
+                    return
+        except Exception:  # readiness only; never publish card identifiers or raw errors
+            pass
+        await asyncio.sleep(min(ESIM_CARD_REFRESH_INTERVAL, max(0, deadline - time.monotonic())))
+    raise HTTPException(503, {
+        "code": "slot_identity_unconfirmed",
+        "message": "The notification reader has not confirmed the target eSIM identity.",
+    })
+
+
 async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
                                      *, after_bridge=None, recovery_task_id: str = "") -> dict:
     """Rebuild the modem bridge, publish the new line, and return before Engine startup.
@@ -4013,6 +4039,9 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
             bridge_request_id=str(bridge.get("request_id") or ""),
             hardware_generation=str(bridge.get("usb_generation") or ""),
             error_code=str(cellular_recovery.get("error_code") or ""))
+    if after_bridge:
+        async with hub.reader_lock(name):
+            await _esim_wait_notification_reader(name, iccid)
     notification_status = await after_bridge() if after_bridge else None
     notifications_done_at = time.monotonic()
     info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
@@ -4407,17 +4436,31 @@ async def _esim_run(
     refresh: bool = False,
     keep_busy: bool = False,
     refresh_expect_iccid: str | None = None,
+    switch_locked: bool = False,
 ):
-    """Serialize an LPA call: engine gate + per-reader lock + lpa_busy + optional refresh."""
-    await asyncio.to_thread(_esim_guard_engine, name)
+    """Serialize LPA and profile switching across all slots of one physical card."""
+    if not switch_locked and not keep_busy:
+        switch_key, _ = _esim_switch_identity(name)
+        try:
+            async with hub.esim_switch_lock(switch_key):
+                return await _esim_run(
+                    name, idx, coro, refresh=refresh, keep_busy=keep_busy,
+                    refresh_expect_iccid=refresh_expect_iccid, switch_locked=True)
+        finally:
+            # A gate or cancellation can reject the operation before it is awaited.
+            if asyncio.iscoroutine(coro):
+                coro.close()
     async with hub.reader_lock(name):
         # No proof from an earlier operation may suppress a later identity check.
         hardware_id = device_state.vpcd_modem_hardware_id(name)
         names = _esim_modem_reader_names(name, hardware_id) if hardware_id else [name]
-        for reader in names:
-            (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
-        hub.lpa_busy[name] = True
+        previous_busy = {reader: hub.lpa_busy.get(reader, False) for reader in names}
         try:
+            for reader in names:
+                await asyncio.to_thread(_esim_guard_engine, reader)
+            for reader in names:
+                (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
+                hub.lpa_busy[reader] = True
             result = await coro
             if refresh:
                 await _esim_refresh_card(
@@ -4429,11 +4472,15 @@ async def _esim_run(
         except FileNotFoundError as e:
             raise HTTPException(503, str(e)) from e
         finally:
+            if asyncio.iscoroutine(coro):
+                coro.close()
             if not keep_busy:
-                hub.lpa_busy.pop(name, None)
-                info = hub.cards.get(name)
-                if info and (not refresh or info.get("identity_state") != "confirmed"):
-                    _identity_pending(info, "lpa_finished")
+                for reader in names:
+                    if not previous_busy[reader]:
+                        hub.lpa_busy.pop(reader, None)
+                    info = hub.cards.get(reader)
+                    if info and (not refresh or info.get("identity_state") != "confirmed"):
+                        _identity_pending(info, "lpa_finished")
 
 
 @app.get("/api/cards")
@@ -9060,7 +9107,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                         on_notification_status=_esim_notification_status_callback(name, iccid),
                         on_notifications_processed=_esim_notifications_processed_callback(
                             name, iccid, se.get("id"))),
-                    refresh=True, refresh_expect_iccid=iccid)
+                    refresh=True, refresh_expect_iccid=iccid, switch_locked=True)
             except Exception:
                 await _esim_restore_profile_switch(previous)
                 await _esim_profile_event(name, iccid, "switch_failed")
@@ -9383,8 +9430,9 @@ async def api_esim_download(body: dict):
 
     async def _job():
         try:
-            async with hub.reader_lock(name):
+            async with hub.esim_switch_lock(_esim_switch_identity(name)[0]), hub.reader_lock(name):
                 try:
+                    await asyncio.to_thread(_esim_guard_engine, name)
                     await asyncio.to_thread(esim_download_operations.update,
                                             operation_id, "started", step="started")
                     await hub.broadcast({
