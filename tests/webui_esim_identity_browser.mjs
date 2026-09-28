@@ -200,7 +200,14 @@ try {
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
    await page.screenshot({path:path.join(output,`subscription-pending-${width}.png`),fullPage:true})
  }
- await page.evaluate(()=>window.changeIdentityState('confirmed'))
+ // A successful live eUICC read is sufficient to select another profile explicitly;
+ // waiting for the broken subscription to recover first would trap the user here.
+ await page.getByRole('button',{name:'Load',exact:true}).click()
+ while(!pending) await new Promise(r=>setTimeout(r,10))
+ await pending.fulfill({json:payload('card-c')}); pending=null
+ await page.getByText('Profile states were read successfully; the SIM subscription is still unavailable for service.',{exact:true}).waitFor()
+ assert.equal(await page.getByRole('button',{name:'Enable',exact:true}).first().isEnabled(),true)
+ assert.equal(await page.getByRole('button',{name:'Disable',exact:true}).isEnabled(),true)
  await page.getByRole('button',{name:'Load',exact:true}).click()
  while(!pending) await new Promise(r=>setTimeout(r,10))
  await page.evaluate(()=>window.unmount())

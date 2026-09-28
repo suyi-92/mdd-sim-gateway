@@ -1115,7 +1115,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
         </button>
         <button className="btn btn-primary" onClick={requestDownload}
           disabled={!status?.available || !hasEuicc || !!busyOp || switchActive
-            || ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state) || !!dl && !dl.done && !dl.error}
+            || ((cachedAt > 0 || !loaded) && ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state))
+            || !!dl && !dl.done && !dl.error}
           title={!hasEuicc ? t('Read this eSIM once before downloading a new one.') : ''}>
           {t('Download eSIM')}
         </button>
@@ -1142,7 +1143,9 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       <div role="status" style={{ minHeight: 24, minWidth: 0 }}>
         {loading ? t('Loading…') : selectedCard?.identity_state === 'failed' ? t('Card read timed out; waiting for the reader session to finish')
           : selectedCard?.identity_state === 'pending'
-          ? t(selectedCard?.iccid ? 'Card number detected; SIM subscription is not readable yet. Cached profile states are historical.'
+          ? t(selectedCard?.iccid ? (cachedAt > 0 || !loaded
+            ? 'Card number detected; SIM subscription is not readable yet. Cached profile states are historical.'
+            : 'Profile states were read successfully; the SIM subscription is still unavailable for service.')
             : 'Card identity not confirmed') : cachedAt > 0 ? t('Cached profile list') : ''}
       </div>
       {err && (
@@ -1319,7 +1322,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                       {seProfiles.map((p) => {
                         const profileEnabled = String(p.profileState || '').toLowerCase() === 'enabled'
                         const enabled = profileEnabled
-                        const profileActionsBlocked = loading || ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state)
+                        const profileActionsBlocked = loading || ((cachedAt > 0 || !loaded)
+                          && ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state))
                           || !['enabled', 'disabled'].includes(String(p.profileState || '').toLowerCase())
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))

@@ -22,6 +22,7 @@ const zh = {
   'Cached view from {time}; click Load to verify current profile states.': '当前显示 {time} 读取的缓存数据；点「读取」核实当前配置状态。',
   'Could not initialize eSIM access. The card type and profile state are unconfirmed.': '无法初始化 eSIM 访问，尚不能确认卡类型和当前配置状态。',
   'Previously enabled': '上次读取：已启用',
+  'Profile states were read successfully; the SIM subscription is still unavailable for service.': '配置状态已读取，但 SIM 订阅仍未就绪，线路暂不可用。',
   'Previously disabled': '上次读取：已禁用',
   'Card number detected; SIM subscription is not readable yet. Cached profile states are historical.': '已识别卡号，但 SIM 订阅尚不可读；缓存中的配置状态仅代表上次读取结果。',
   'Card access recovery failed; profile state is still unconfirmed.': '读卡访问恢复失败，当前配置状态仍未确认。',
