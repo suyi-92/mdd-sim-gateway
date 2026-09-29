@@ -9457,7 +9457,9 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 await _esim_profile_event(name, iccid, "switching")
                 await _esim_run(
                     name, idx, _esim_enable_verified(
-                        name, iccid, aid=se.get("aid"),
+                        # Native PC/SC has no CAT terminal to execute REFRESH.
+                        # The host-side refresh below still verifies the new identity.
+                        name, iccid, aid=se.get("aid"), refresh=False,
                         on_notification_status=_esim_notification_status_callback(name, iccid),
                         on_notifications_processed=_esim_notifications_processed_callback(
                             name, iccid, se.get("id"))),
@@ -9465,7 +9467,9 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                     profile_iccid=iccid)
             except Exception as exc:
                 uncertain = (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
-                             and exc.detail.get("code") == "profile_enable_unconfirmed")
+                             and exc.detail.get("code") in (
+                                 "profile_enable_unconfirmed", "card_unreadable"))
+                # A failed post-write identity probe cannot restore old start intent.
                 if not uncertain:
                     await _esim_restore_profile_switch(previous)
                 await _esim_profile_event(name, iccid, "switch_failed")

@@ -668,6 +668,58 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(lines["7"]["enabled"])
         self.assertEqual(previous, {"7": {"enabled": True, "running": False}})
 
+    async def test_native_enable_omits_cat_refresh_but_requires_host_identity_probe(self):
+        for readable in (True, False):
+            with self.subTest(readable=readable):
+                probe = AsyncMock(side_effect=None if readable else main.HTTPException(
+                    409, {"code": "card_unreadable"}))
+                with patch.object(main, "_esim_resolve_reader", return_value=("reader", 0)), \
+                        patch.object(main, "_esim_switch_identity", return_value=("reader:reader", "")), \
+                        patch.object(main, "_esim_resolve_se_owned", new=AsyncMock(
+                            return_value={"id": "se", "aid": "fixture-aid"})), \
+                        patch.object(main, "_esim_prepare_reader_profile_switch", new=AsyncMock(
+                            return_value={"7": {"enabled": True, "running": False}})), \
+                        patch.object(main, "_esim_guard_engine"), \
+                        patch.object(main, "_match_instance_by_iccid", return_value=None), \
+                        patch.object(main.hub, "cards", {}), \
+                        patch.object(main.hub, "lpa_busy", {}), \
+                        patch.object(main.lpa, "run_lpac", new=AsyncMock(
+                            return_value=SimpleNamespace(data={}))) as command, \
+                        patch.object(main.lpa, "maybe_process_notifications", new=AsyncMock()), \
+                        patch.object(main, "_esim_refresh_card", new=probe), \
+                        patch.object(main, "_esim_profile_operation_result", new=AsyncMock()) as result, \
+                        patch.object(main, "_esim_cache_update_profile") as cache, \
+                        patch.object(main, "_esim_profile_event", new=AsyncMock()), \
+                        patch.object(main, "_esim_restore_profile_switch", new=AsyncMock()) as restore:
+                    if readable:
+                        self.assertTrue((await main._enable_esim_profile("profile-target"))["ok"])
+                        cache.assert_called_once_with("profile-target", state="enabled")
+                        result.assert_awaited_once_with("profile-target")
+                    else:
+                        with self.assertRaises(main.HTTPException) as caught:
+                            await main._enable_esim_profile("profile-target")
+                        self.assertEqual(caught.exception.detail["code"], "card_unreadable")
+                        cache.assert_not_called()
+                        result.assert_not_awaited()
+                    command.assert_awaited_once_with(
+                        "profile", "enable", "profile-target", "0",
+                        reader_name="reader", aid="fixture-aid", timeout=90)
+                    probe.assert_awaited_once_with(
+                        "reader", 0, expect_iccid="profile-target",
+                        attempts=main.ESIM_CARD_REFRESH_ATTEMPTS)
+                    restore.assert_not_awaited()
+                    self.assertEqual(main.hub.lpa_busy, {})
+
+    async def test_modem_enable_retains_cat_refresh_by_default(self):
+        with patch.object(main.lpa, "run_lpac", new=AsyncMock(
+                return_value=SimpleNamespace(data={}))) as command:
+            await main._esim_enable_verified(
+                "VoWiFi Modem modem-1 00 00", "profile-target",
+                aid="fixture-aid", process_notifications=False)
+        command.assert_awaited_once_with(
+            "profile", "enable", "profile-target", "1",
+            reader_name="VoWiFi Modem modem-1 00 00", aid="fixture-aid", timeout=90)
+
     async def test_native_reader_lpa_failure_restores_the_old_line(self):
         previous = {"7": {"enabled": True, "running": False}}
         error = main.HTTPException(400, "lpac failed")
