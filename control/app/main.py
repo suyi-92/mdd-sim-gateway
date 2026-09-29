@@ -3680,6 +3680,7 @@ async def _esim_enable_verified(name, iccid, *, aid=None, **kwargs):
         raise HTTPException(409, {
             "code": "profile_enable_unconfirmed",
             "message": "The enable result is uncertain. Lines remain stopped until the active SIM is verified.",
+            "diagnostic": error.diagnostic(),
         }) from error
 
 
@@ -4736,6 +4737,7 @@ async def _esim_run(
     keep_busy: bool = False,
     refresh_expect_iccid: str | None = None,
     switch_locked: bool = False,
+    profile_iccid: str = "",
 ):
     """Serialize LPA and profile switching across all slots of one physical card."""
     if not switch_locked and not keep_busy:
@@ -4744,7 +4746,8 @@ async def _esim_run(
             async with hub.esim_switch_lock(switch_key):
                 return await _esim_run(
                     name, idx, coro, refresh=refresh, keep_busy=keep_busy,
-                    refresh_expect_iccid=refresh_expect_iccid, switch_locked=True)
+                    refresh_expect_iccid=refresh_expect_iccid, switch_locked=True,
+                    profile_iccid=profile_iccid)
         finally:
             # A gate or cancellation can reject the operation before it is awaited.
             if asyncio.iscoroutine(coro):
@@ -4765,9 +4768,19 @@ async def _esim_run(
                 await _esim_refresh_card(
                     name, idx, expect_iccid=refresh_expect_iccid,
                     attempts=ESIM_CARD_REFRESH_ATTEMPTS if refresh_expect_iccid else 1)
+            if profile_iccid:
+                await _esim_profile_operation_result(profile_iccid)
             return result
         except lpa.LpaError as e:
-            raise HTTPException(400, e.user_message()) from e
+            detail = e.public_detail()
+            if profile_iccid:
+                await _esim_profile_operation_result(profile_iccid, detail)
+            raise HTTPException(400, detail) from e
+        except HTTPException as e:
+            if (profile_iccid and isinstance(e.detail, dict)
+                    and e.detail.get("code") == "profile_enable_unconfirmed"):
+                await _esim_profile_operation_result(profile_iccid, e.detail)
+            raise
         except FileNotFoundError as e:
             raise HTTPException(503, str(e)) from e
         finally:
@@ -6512,8 +6525,8 @@ async def _run_capability_operation(operation_id: str, device_id: str, body: dic
             state="interrupted", error_code="interrupted")
         raise
     except Exception as exc:  # closed code only; arbitrary runtime text stays server-side
-        log.warning("device capability operation failed device=%s error_type=%s",
-                    device_id, type(exc).__name__)
+        log.warning("device capability operation failed device=%s error_type=%s error_code=%s",
+                    device_id, type(exc).__name__, _capability_error_code(exc))
         operation = await asyncio.to_thread(
             capability_operation_store.update, operation_id,
             state="failed", error_code=_capability_error_code(exc))
@@ -9119,6 +9132,10 @@ def _esim_cache_store(ses: list, imei: str):
         (str(se.get("id") or ""), p.get("iccid")): p.get("recovery_status")
         for se in (data.get(eid) or {}).get("ses") or []
         for p in se.get("profiles") or []}
+    previous_operation = {
+        (str(se.get("id") or ""), p.get("iccid")): p.get("operation_status")
+        for se in (data.get(eid) or {}).get("ses") or []
+        for p in se.get("profiles") or []}
     for se in ses:
         for profile in se.get("profiles") or []:
             status = previous.get((str(se.get("id") or ""), profile.get("iccid")))
@@ -9138,6 +9155,10 @@ def _esim_cache_store(ses: list, imei: str):
             recovery = previous_recovery.get((str(se.get("id") or ""), profile.get("iccid")))
             if recovery:
                 profile["recovery_status"] = recovery
+            operation = previous_operation.get((str(se.get("id") or ""), profile.get("iccid")))
+            if operation:
+                # A successful read is not proof that the last write succeeded.
+                profile["operation_status"] = operation
     # Profiles/chip metadata remain useful while a line owns the reader, but the pending
     # notification list is transient: automatic delivery can remove it moments after this
     # snapshot. Persisting it made an already-sent installation result reappear after every
@@ -9161,7 +9182,8 @@ def _esim_cache_for_iccid(iccid: str) -> dict | None:
 def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
                                nickname: str | None = None, remove: bool = False,
                                notification_status: dict | None = None,
-                               recovery_status: dict | None = None):
+                               recovery_status: dict | None = None,
+                               operation_status: dict | None = None):
     """Mirror a successful enable/disable/delete/nickname onto the cached view."""
     data = _esim_cache_load()
     changed = False
@@ -9187,12 +9209,28 @@ def _esim_cache_update_profile(iccid: str, *, state: str | None = None,
                     hit["notification_status"] = notification_status
                 if recovery_status is not None:
                     hit["recovery_status"] = recovery_status
+                if operation_status is not None:
+                    hit["operation_status"] = operation_status
             changed = True
             entry_changed = True
-        if entry_changed:
+        if entry_changed and (operation_status is None or state is not None
+                              or nickname is not None or remove
+                              or notification_status is not None or recovery_status is not None):
             entry["ts"] = time.time()
     if changed:
         _esim_cache_write(data)
+
+
+async def _esim_profile_operation_result(iccid: str, error: dict | None = None):
+    """Retain our closed LPA result across a reader generation change or page reload."""
+    status = {"state": "failed" if error else "success", "updated_at": time.time()}
+    if error:
+        status["error"] = error
+    try:
+        await asyncio.to_thread(_esim_cache_update_profile, iccid, operation_status=status)
+    except OSError as exc:
+        # Persistence failure must neither hide the card result nor replay its write.
+        log.warning("could not persist eSIM operation result error=%s", type(exc).__name__)
 
 
 @_esim_cache_transaction
@@ -9423,7 +9461,8 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                         on_notification_status=_esim_notification_status_callback(name, iccid),
                         on_notifications_processed=_esim_notifications_processed_callback(
                             name, iccid, se.get("id"))),
-                    refresh=True, refresh_expect_iccid=iccid, switch_locked=True)
+                    refresh=True, refresh_expect_iccid=iccid, switch_locked=True,
+                    profile_iccid=iccid)
             except Exception as exc:
                 uncertain = (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
                              and exc.detail.get("code") == "profile_enable_unconfirmed")
@@ -9479,7 +9518,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             await _esim_run(
                 name, idx, _esim_enable_verified(
                     name, iccid, aid=se.get("aid"), process_notifications=False),
-                keep_busy=True)
+                keep_busy=True, profile_iccid=iccid)
             lpa_succeeded = True
             await _update_esim_recovery(
                 recovery_task_id, "profile_enabled", phase="profile_enabled")
@@ -9613,7 +9652,7 @@ async def api_esim_disable(iccid: str, body: dict | None = None):
             name, iccid, aid=se.get("aid"),
             on_notifications_processed=_esim_notifications_processed_callback(
                 name, iccid, se.get("id"))),
-        refresh=True)
+        refresh=True, profile_iccid=iccid)
     await asyncio.to_thread(_esim_cache_update_profile, iccid, state="disabled")
     return {"ok": True, "iccid": iccid, "se_id": se["id"], "card": hub.cards.get(name)}
 
@@ -9631,7 +9670,7 @@ async def api_esim_delete(
             name, iccid, aid=se.get("aid"),
             on_notifications_processed=_esim_notifications_processed_callback(
                 name, iccid, se.get("id"))),
-        refresh=True)
+        refresh=True, profile_iccid=iccid)
     await asyncio.to_thread(_esim_cache_update_profile, iccid, remove=True)
     return {"ok": True, "iccid": iccid, "se_id": se["id"]}
 

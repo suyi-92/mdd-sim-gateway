@@ -21,7 +21,8 @@ export function mergeNotificationSnapshot(ses, snapshot) {
           && Number(snapshot.ts) >= Number(current.updated_at)) {
         status = { state: 'empty', updated_at: snapshot.ts }
       }
-      return { ...profile, notification_status: newerNotificationStatus(current, status) }
+      return { ...profile, notification_status: newerNotificationStatus(current, status),
+        operation_status: newerNotificationStatus(profile.operation_status, incoming.operation_status) }
     }) }
   })
 }

@@ -5,6 +5,7 @@ import { newerEsimRecovery, profileRecoveryStatus, waitForEsimLine } from '../es
 import { isEsimRecoverySuperseded } from '../cellularPresentation.js'
 import { mergeNotificationSnapshot, newerNotificationStatus, notificationReaderFailureRecovered } from '../esimNotifications.js'
 import { boundedRead } from '../pollRequest.js'
+import { esimErrorMessage, profileOperationFeedback } from '../esimErrors.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -828,8 +829,15 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       }
     } catch (e) {
       if (!current()) return
-      showToast?.(e.message)
-      setErr(e.message)
+      const message = esimErrorMessage(e, t)
+      showToast?.(message)
+      setErr(e.data?.detail?.diagnostic ? '' : message)
+      if (e.data?.detail?.diagnostic) {
+        setSes(list => list.map(item => ({ ...item, profiles: (item.profiles || []).map(profile =>
+          item.id === se.id && profile.iccid === p.iccid
+            ? { ...profile, operation_status: { state: 'failed', error: e.data.detail, updated_at: Date.now() / 1000 } }
+            : profile) })))
+      }
       setProfileSwitch({ iccid: p.iccid, phase: 'error' })
       // The request can fail after the card already switched; resync from the gateway's
       // persisted view instead of leaving the stale optimistic-free state on screen.
@@ -1012,6 +1020,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     const current = () => owner === session.current && owner.mounted
     if (switchActive) return
     setBusyOp(label)
+    setErr('')
     try {
       await fn()
       if (!current()) return
@@ -1020,8 +1029,14 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       await refresh?.()
     } catch (e) {
       if (!current()) return
-      showToast?.(e.message)
-      setErr(e.message)
+      const message = esimErrorMessage(e, t)
+      showToast?.(message)
+      setErr(e.data?.detail?.diagnostic ? '' : message)
+      // The cache contains the last safe card result even if monitor re-detection
+      // changes the reader generation before the browser receives this response.
+      api.esimChipCached(reader).then(r => {
+        if (current()) setSes(list => mergeNotificationSnapshot(list, r))
+      }).catch(() => {})
     }
     if (current()) setBusyOp('')
   }
@@ -1286,7 +1301,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                       : profileSwitch?.phase === 'deferred'
                         ? t('Profile enabled; completing SIM and baseband initialization…')
                       : profileSwitch?.phase === 'error'
-                        ? t('Profile switching needs attention; see the message above.')
+                        ? t('Profile switching needs attention; check its operation result.')
                         : '\u00a0'}
         </div>
         {!profiles.length ? (
@@ -1338,7 +1353,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                         const recoverySuperseded = isEsimRecoverySuperseded(
                           recoveryStatus, selectedDevice, p, selectedCard)
                         const recovery = recoverySuperseded ? '' : recoveryFeedback(recoveryStatus, t)
-                        const feedback = renameFeedback?.message || recovery || notification
+                        const operationError = profileOperationFeedback(p.operation_status, t)
+                        const feedback = renameFeedback?.message || operationError || recovery || notification
                         return (
                           <div key={`${se.id}:${p.iccid}`} style={{
                             border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
@@ -1358,7 +1374,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                                   pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
-                                marginTop: 4, fontSize: 12, color: !renameFeedback && ((recovery && ['failed', 'network_rejected'].includes(recoveryStatus?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
+                                marginTop: 4, fontSize: 12, color: !renameFeedback && (operationError || (recovery && ['failed', 'network_rejected'].includes(recoveryStatus?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
                                 height: 18, lineHeight: '18px',
                                 fontFamily: feedback ? 'inherit' : 'ui-monospace, monospace', overflow: 'hidden',
                                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',

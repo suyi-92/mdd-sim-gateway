@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from . import config as cfg
+from . import lpa_diagnostics
 
 log = logging.getLogger("vowifi.lpa")
 
@@ -32,16 +33,32 @@ class LpaError(Exception):
     """Raised when lpac exits with a non-success payload or cannot be started."""
 
     def __init__(self, message: str, *, detail: Any = None, code: int = -1,
-                 stage: str = "", category: str = ""):
+                 stage: str = "", category: str = "", transport_detail: str = ""):
         super().__init__(message)
         self.message = message
         self.detail = detail
         self.code = code
         self.stage = stage
         self.category = category
+        self.transport_detail = transport_detail
+
+    def diagnostic(self) -> dict:
+        result = lpa_diagnostics.diagnostic(
+            self.message, self.detail, operation=self.stage, code=self.code,
+            category=classify_lpa_error(self))
+        transport = lpa_diagnostics.diagnostic(
+            "", self.transport_detail, operation="", code=-1, category="unknown_error")
+        for field in ("pcsc_code", "status_word"):
+            if field in transport:
+                result.setdefault(field, transport[field])
+        return result
+
+    def public_detail(self) -> dict:
+        return {"code": "esim_operation_failed", "message": self.user_message(),
+                "diagnostic": self.diagnostic()}
 
     def user_message(self) -> str:
-        """User-facing text; maps raw lpac function names to plain language."""
+        """User-facing text without raw helper/server payloads or card identifiers."""
         if _reader_busy_error(self):
             return "The eSIM reader is temporarily busy. Wait for the current card operation, then retry."
         msg = (self.message or "").strip().lower()
@@ -51,6 +68,9 @@ class LpaError(Exception):
             detail_s = detail.strip()
         elif detail not in (None, "", {}):
             detail_s = str(detail)
+        reason = self.diagnostic().get("reason")
+        if reason in lpa_diagnostics.REASON_MESSAGES:
+            return lpa_diagnostics.REASON_MESSAGES[reason]
         if msg == "euicc_init" or msg.startswith("euicc_init"):
             return "Could not initialize eSIM access. The card type and profile state are unconfirmed."
         if msg in ("cancelled", "cancel"):
@@ -60,9 +80,7 @@ class LpaError(Exception):
         if "install_failed_due_to_iccid_already_exists_on_euicc" in detail_s.lower():
             return ("This eSIM profile is already installed on this eUICC. "
                     "Refresh the profile list instead of downloading it again.")
-        if detail_s:
-            return f"{self.message}: {detail_s}"
-        return f"eUICC operation failed ({self.message})."
+        return "The eSIM operation failed. The card's detailed result could not be confirmed."
 
 
 @dataclass
@@ -72,7 +90,7 @@ class LpaResult:
 
 
 def _reader_busy_error(error: LpaError) -> bool:
-    detail = f"{error.message} {error.detail}".lower()
+    detail = f"{error.message} {error.detail} {error.transport_detail}".lower()
     return any(value in detail for value in ("8010000b", "scard_e_sharing_violation", "sharing violation"))
 
 
@@ -86,7 +104,7 @@ def classify_lpa_error(error: BaseException) -> str:
         return error.category
     if _reader_busy_error(error):
         return "reader_busy"
-    text = f"{error.message} {error.detail}".casefold()
+    text = f"{error.message} {error.detail} {error.transport_detail}".casefold()
     if any(value in text for value in (
         "scard_e_no_smartcard", "scard_w_removed_card", "no smartcard",
         "no smart card", "card absent", "card removed", "card not present",
@@ -322,16 +340,9 @@ async def run_lpac(
     data = final.get("data")
     if code != 0:
         detail = data if data not in (None, "", {}) else stderr_txt or None
-        safe_step = str(message) if str(message) in {
-            "euicc_init", "es10c_enable_profile", "es9p_authenticate_client",
-            "es9p_initiate_authentication", "es10b_authenticate_server",
-            "es10b_prepare_download", "es9p_get_bound_profile_package",
-            "es10b_load_bound_profile_package", "es10b_list_notification", "es10b_retrieve_notifications_list",
-            "es9p_handle_notification", "es10b_remove_notification_from_list",
-        } else "other"
-        error = LpaError(str(message), detail=detail, code=code, stage=operation)
-        log.warning("lpac failed operation=%s step=%s code=%d category=%s",
-                    operation, safe_step, code, classify_lpa_error(error))
+        error = LpaError(str(message), detail=detail, code=code, stage=operation,
+                         transport_detail=stderr_txt)
+        log.warning("lpac failed diagnostic=%s", json.dumps(error.diagnostic(), sort_keys=True))
         raise error
 
     result.data = data
