@@ -75,6 +75,15 @@ class DownloadOperationStoreTests(unittest.TestCase):
         self.assertEqual(finished["generation"], 8)
         self.assertEqual(self.store.latest("reader")["generation"], 8)
 
+    def test_restart_does_not_leave_completed_download_recovery_spinning(self):
+        operation = self.store.start('reader')
+        self.store.update(operation['operation_id'], 'recovery', line_recovery='recovering')
+        self.store.update(operation['operation_id'], 'completed')
+        self.store.interrupt_running()
+        result = self.store.latest('reader')
+        self.assertEqual(result['state'], 'success')
+        self.assertEqual(result['line_recovery'], 'failed')
+
     def test_private_card_fence_survives_restart_and_rejects_a_replacement(self):
         operation = self.store.start("reader", 7, "fixture-card-a")
         reopened = esim_operations.DownloadOperations(str(self.path))
@@ -153,7 +162,8 @@ class DownloadOperationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.broadcast.await_args.args[0]["operation_id"], operation["operation_id"])
 
     async def test_success_tracks_the_confirmed_post_refresh_generation(self):
-        async def refresh(_name, _idx):
+        async def refresh(_name, _idx, *, auto_start):
+            self.assertFalse(auto_start, 'Downloading must not start a previously stopped line')
             main.hub.cards["fixture reader"]["generation"] = 8
 
         with patch.object(main, "_esim_refresh_card", new=AsyncMock(side_effect=refresh)), \

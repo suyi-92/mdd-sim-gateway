@@ -3,6 +3,7 @@ import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 import { formatPhoneNumberDisplay } from '../phoneNumberDisplay.js'
+import { retainedSmsAvailability, retainedSmsError } from '../cellularSmsAvailability.js'
 
 export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors, pageVisible = true }) {
   const { t: tr } = useI18n()
@@ -37,6 +38,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     && device.device_type === 'modem'
     && String(device.instance_id || '') === String(id || ''))
   const cellularAvailable = Boolean(selectedDevice)
+  const retainedSms = retainedSmsAvailability(selectedDevice, Boolean(loadErrors?.devices))
 
   const loadThreads = useCallback(async (showLoading = false) => {
     if (!id) return
@@ -193,7 +195,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   }
 
   const reimportRetained = async () => {
-    if (!id || threads.length || reimporting) return
+    if (!id || threads.length || reimporting || !retainedSms.available) return
     if (!window.confirm(tr('Re-import SMS still retained by this line’s cellular modem? Previously deleted messages may reappear.'))) return
     const forId = id
     setReimporting(true); setReimportFeedback(''); setReimportFailed(false)
@@ -208,7 +210,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     } catch (error) {
       if (activeId.current !== forId) return
       setReimportFailed(true)
-      setReimportFeedback(`${tr('Re-import failed')}: ${error.message}`)
+      setReimportFeedback(`${tr('Re-import failed')}: ${retainedSmsError(error, tr)}`)
     } finally {
       if (activeId.current === forId) setReimporting(false)
     }
@@ -249,10 +251,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         {threadsLoading && <div aria-live="polite" style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>{tr('Loading conversations…')}</div>}
         {!threadsLoading && threads.length === 0 && <div style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>{tr('No conversations yet.')}</div>}
         {cellularAvailable && (!threads.length || reimportFeedback) && <div className="u-message-reimport">
-          <button className="btn btn-ghost" disabled={reimporting || threadsLoading || !!threads.length}
+          <button className="btn btn-ghost" disabled={reimporting || threadsLoading || !!threads.length || !retainedSms.available}
             onClick={reimportRetained}>{reimporting ? `${tr('Re-importing')}…` : tr('Re-import retained modem SMS')}</button>
           <div className={`u-message-reimport-feedback${reimportFailed ? ' is-error' : ''}`} role="status">
-            {reimportFeedback || '\u00a0'}
+            {reimportFeedback || tr(retainedSms.reason) || '\u00a0'}
           </div>
         </div>}
         <BinaryPayloads payloads={binary} tr={tr} />

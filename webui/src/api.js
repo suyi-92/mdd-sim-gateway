@@ -242,6 +242,7 @@ export const api = {
   // Optional se_id / aid target a specific Secure Element on dual-SE cards.
   esimStatus: () => j('GET', '/api/esim/status'),
   esimChip: (readerOrIndex, maybeName) => j('GET', `/api/esim/chip?${readerQuery(readerOrIndex, maybeName)}`),
+  esimRead: (body) => j('POST', '/api/esim/chip/read', body),
   esimChipCached: (readerOrIndex, maybeName, signal) => j('GET', `/api/esim/chip/cached?${readerQuery(readerOrIndex, maybeName)}`, undefined, signal),
   esimProfiles: (readerOrIndex, maybeName) => j('GET', `/api/esim/profiles?${readerQuery(readerOrIndex, maybeName)}`),
   esimEnable: (iccid, readerOrBody) => j(
@@ -271,6 +272,9 @@ export const api = {
     `/api/esim/profiles/${encodeURIComponent(iccid)}/nickname`,
     readerBody(readerOrBody, { nickname }),
   ),
+  esimLocalLabel: (iccid, label, se) => j('POST',
+    `/api/esim/profiles/${encodeURIComponent(iccid)}/label`,
+    { label, eid: se.eid, se_id: se.id }),
   esimDownload: (body) => j('POST', '/api/esim/download', body),
   esimDownloadOperation: (readerOrIndex, maybeName) => j('GET', `/api/esim/download/operation?${readerQuery(readerOrIndex, maybeName)}`),
   esimDownloadCancel: (readerOrBody) => j('POST', '/api/esim/download/cancel', readerBody(readerOrBody)),

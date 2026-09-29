@@ -18,6 +18,7 @@ from pathlib import Path
 
 ACTIVE_STATES = {"running", "cancelling"}
 STATES = ACTIVE_STATES | {"success", "failed", "cancelled"}
+LINE_RECOVERY_STATES = {"not_needed", "recovering", "started", "failed", "cancelled"}
 STEPS = {
     "queued", "started", "completed", "cancelling",
     "es10a_get_euicc_configured_addresses", "es10b_get_euicc_challenge_and_info",
@@ -68,6 +69,8 @@ class DownloadOperations:
                 or not isinstance(value.get("state"), str) or value["state"] not in STATES):
             return None
         result = {"operation_id": value["operation_id"], "state": value["state"]}
+        if isinstance(value.get("line_recovery"), str) and value["line_recovery"] in LINE_RECOVERY_STATES:
+            result["line_recovery"] = value["line_recovery"]
         if isinstance(value.get("step"), str) and value["step"] in STEPS:
             result["step"] = value["step"]
         if isinstance(value.get("error_code"), str) and value["error_code"] in ERROR_CODES:
@@ -148,13 +151,15 @@ class DownloadOperations:
             return self._public(record)
 
     def update(self, operation_id: str, event: str, *, step: str = "",
-               error_code: str = "", generation=None) -> dict | None:
+               error_code: str = "", generation=None, line_recovery: str = "") -> dict | None:
         with self.lock:
             records = self._load()
             record = next((value for value in records.values()
                            if value["operation_id"] == operation_id), None)
-            if not record or record["state"] not in ACTIVE_STATES:
+            if not record or (record["state"] not in ACTIVE_STATES and event != "recovery"):
                 return self._public(record)
+            if line_recovery in LINE_RECOVERY_STATES:
+                record["line_recovery"] = line_recovery
             step = str(step).split(":", 1)[0]
             if event in {"started", "progress"} and record["state"] == "cancelling":
                 return dict(record)
@@ -171,7 +176,7 @@ class DownloadOperations:
                 cancelled = record["state"] == "cancelling"
                 record.update(state="cancelled" if cancelled else "failed",
                               error_code="cancelled" if cancelled else code)
-            elif event not in {"started", "progress"}:
+            elif event not in {"started", "progress", "recovery"}:
                 raise ValueError("unknown eSIM download event")
             record["updated_at"] = int(time.time())
             if record["state"] not in ACTIVE_STATES:
@@ -185,6 +190,9 @@ class DownloadOperations:
             records = self._load()
             changed = False
             for record in records.values():
+                if record.get("line_recovery") == "recovering":
+                    record["line_recovery"] = "failed"
+                    changed = True
                 if record["state"] in ACTIVE_STATES:
                     record.update(state="failed", error_code="interrupted",
                                   updated_at=int(time.time()), finished_at=int(time.time()))
