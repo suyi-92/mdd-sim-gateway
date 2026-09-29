@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import socket
+import sys
 import threading
 import urllib.parse
 from copy import deepcopy
@@ -209,8 +210,8 @@ DEFAULTS = {
             "notification_history_days": 30,
             "support_bundle_log_lines": 500,
         },
-        # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
-        # $MDD_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
+        # Local lpac (eSIM LPA), built into the managed Control venv.
+        # Empty lpac_bin follows the active generation; explicit overrides remain supported.
         "esim": {
             "lpac_bin": "",
             "download_timeout": 300,
@@ -222,7 +223,9 @@ DEFAULTS = {
 
 
 def default_lpac_bin() -> str:
-    """Default path for the locally-built STANDALONE lpac binary."""
+    """Use the active venv helper, never silently fall back to a stale shared build."""
+    if sys.prefix != sys.base_prefix:
+        return os.path.join(sys.prefix, "bin", "lpac")
     return os.path.join(DATA_DIR, "lpac", "lpac")
 
 

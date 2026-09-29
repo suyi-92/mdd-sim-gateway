@@ -32,3 +32,12 @@ test('last failure survives cache polls and clears after a later successful comm
   const foreign = snapshot(failed); foreign.ses[0].eid = 'other-euicc'
   assert.deepEqual(mergeNotificationSnapshot(merged, foreign), merged)
 })
+
+
+test('native exchange phase and SW survive without leaking arbitrary fields', () => {
+  const message = diagnostic => esimErrorMessage({ data: { detail: { message: 'Unconfirmed', diagnostic } } })
+  assert.match(message({ failure_stage: 'response_status', status_word: '6985' }), /Card status word; SW 6985/)
+  assert.match(message({ failure_stage: 'apdu_transport', pcsc_code: '80100016' }), /Card transport; PC\/SC 80100016/)
+  assert.doesNotMatch(message({ failure_stage: 'private-reader', status_word: 'private-id', raw: 'private-token' }), /private/)
+  assert.doesNotMatch(message({ failure_stage: 'toString' }), /function/)
+})

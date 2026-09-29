@@ -440,35 +440,42 @@ lpac_binary_valid() {
   grep -Fq '"pcsc"' <<<"$drivers" && grep -Fq '"curl"' <<<"$drivers"
 }
 
-ensure_lpac() {
-  local destination="$data_dir/lpac" source="$cache_dir/sources/lpac-$LPAC_VERSION" cmake_bin build temp candidate
-  lpac_binary_valid "$destination/lpac" && return
-  info "building lpac $LPAC_VERSION from pinned source"
+lpac_source_fingerprint() {
+  local source=$1
+  { printf '%s\n' "$LPAC_COMMIT";
+    (cd "$source" && sha256sum patches/lpac/*.patch);
+  } | sha256sum | awk '{print $1}'
+}
+
+build_lpac() (
+  # Build in isolation; never patch the shared source checkout or replace the live helper.
+  local destination=$1 source="$cache_dir/sources/lpac-$LPAC_VERSION" cmake_bin temp candidate
+  info "building generation-local lpac $LPAC_VERSION from pinned source"
   install -d -m 0755 "$(dirname "$source")"
   if [[ ! -d "$source/.git" ]]; then git clone --filter=blob:none --branch "v$LPAC_VERSION" --single-branch https://github.com/estkme-group/lpac.git "$source"; fi
   [[ $(git -C "$source" rev-parse HEAD) == "$LPAC_COMMIT" ]] || die "lpac source commit mismatch"
+  temp=$(mktemp -d /tmp/mdd-lpac.XXXXXX)
+  trap 'rm -rf -- "$temp"' EXIT
+  install -d "$temp/source"
+  git -C "$source" archive "$LPAC_COMMIT" | tar -x -C "$temp/source"
   for candidate in "$source_dir"/patches/lpac/*.patch; do
-    [[ -f "$candidate" ]] || continue
-    if patch -p1 -d "$source" -N --dry-run < "$candidate" >/dev/null 2>&1; then patch -p1 -d "$source" -N < "$candidate"; fi
+    [[ -f "$candidate" ]] || die "lpac patch set is missing"
+    patch --batch --fuzz=0 -p1 -d "$temp/source" < "$candidate" || die "lpac patch failed: ${candidate##*/}"
   done
-  cmake_bin=$(ensure_cmake); build="$source/build-mdd"; temp=$(mktemp -d /tmp/mdd-lpac.XXXXXX)
-  rm -rf -- "$build"
-  "$cmake_bin" -S "$source" -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+  cmake_bin=$(ensure_cmake)
+  "$cmake_bin" -S "$temp/source" -B "$temp/build" -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
     -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_HTTP_CURL=ON -DLPAC_WITH_APDU_AT=OFF \
     -DLPAC_WITH_APDU_QMI=OFF -DLPAC_WITH_APDU_QMI_QRTR=OFF -DLPAC_WITH_APDU_UQMI=OFF \
     -DLPAC_WITH_APDU_MBIM=OFF -DLPAC_WITH_APDU_GBINDER=OFF
-  "$cmake_bin" --build "$build" --parallel "$(nproc)"
-  DESTDIR="$temp" "$cmake_bin" --install "$build"
-  candidate=$(find "$temp" -type f -name lpac -perm /111 -print -quit)
+  "$cmake_bin" --build "$temp/build" --parallel "$(nproc)"
+  DESTDIR="$temp/out" "$cmake_bin" --install "$temp/build"
+  candidate=$(find "$temp/out" -type f -name lpac -perm /111 -print -quit)
   [[ -n "$candidate" ]] || die "lpac binary was not produced"
-  rm -rf -- "$destination.tmp"
-  install -d -m 0700 "$destination.tmp"
-  install -m 0755 "$candidate" "$destination.tmp/lpac"
-  rm -rf -- "$destination"
-  mv "$destination.tmp" "$destination"
-  rm -rf -- "$temp"
-  lpac_binary_valid "$destination/lpac" || die "lpac binary is missing the required PC/SC or curl driver"
-}
+  lpac_binary_valid "$candidate" || die "lpac binary is missing the required PC/SC or curl driver"
+  # Exercise the patched native exchange using a fake APDU transport, never a reader.
+  python3 "$source_dir/tools/check-lpac-diagnostics.py" "$temp/source" "$temp/build"
+  install -m 0755 "$candidate" "$destination"
+)
 
 pcsc_scan_capture() {
   LC_ALL=C timeout "${1:-10}" pcsc_scan -n 2>&1 || true
@@ -760,11 +767,13 @@ verify_prepared_build() {
     warn "build verification failed: Control venv console scripts or dependencies are invalid"
     return 1
   }
+  [[ -f "$root/venv/bin/lpac" && ! -L "$root/venv/bin/lpac" ]] || return 1
   python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
     "$(docker image inspect "$image" --format '{{.Id}}')" \
-    "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" "$modules_contract" <<'PY'
+    "$(docker image inspect "$image" --format '{{.Size}}')" "$(tree_hash "$root/webui")" "$modules_contract" \
+    "$(sha256sum "$root/venv/bin/lpac" | awk '{print $1}')" "$(lpac_source_fingerprint "$source")" <<'PY' || return 1
 import json, sys
-path, sha, version, image, runtime_fp, base_fp, image_id, image_size, webui_hash, modules_json = sys.argv[1:]
+path, sha, version, image, runtime_fp, base_fp, image_id, image_size, webui_hash, modules_json, lpac_hash, lpac_fp = sys.argv[1:]
 modules = json.loads(modules_json)
 try:
     with open(path, encoding="utf-8") as stream:
@@ -776,6 +785,7 @@ expected = {
     "architecture": "amd64", "runtime_fp": runtime_fp, "base_fp": base_fp,
     "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
     "image_id": image_id, "webui_hash": webui_hash,
+    "lpac_sha256": lpac_hash, "lpac_source_fp": lpac_fp,
     "asterisk_modules": modules["count"], "asterisk_modules_sha256": modules["sha256"],
 }
 if any(value.get(key) != item for key, item in expected.items()):
@@ -799,6 +809,7 @@ if not str(value.get("asterisk", "")).startswith("Asterisk "):
 if not isinstance(value.get("asterisk_modules"), int) or value["asterisk_modules"] <= 20:
     raise SystemExit(1)
 PY
+  lpac_binary_valid "$root/venv/bin/lpac"
 }
 
 prepare_build() {
@@ -816,7 +827,7 @@ prepare_build() {
     warn "cached build identity check failed; rebuilding $sha"
   fi
   local temp="${build_root}.tmp.$$" runtime_fp base_fp image="mdd-sim-gateway/engine:$sha" version module_count asterisk_version
-  local image_id image_size webui_hash actual_modules modules_contract module_hash
+  local image_id image_size webui_hash actual_modules modules_contract module_hash lpac_hash lpac_fp
   [[ "$temp" == "$(dirname "$build_root")/"* ]] || die "unsafe build staging path"
   rm -rf -- "$temp"; install -d -m 0755 "$temp/venv" "$temp/webui"
 
@@ -824,6 +835,7 @@ prepare_build() {
   python3 -m venv --clear "$temp/venv"
   "$temp/venv/bin/pip" install --disable-pip-version-check --no-cache-dir -r "$source_dir/control/requirements.txt"
   "$temp/venv/bin/pip" check
+  build_lpac "$temp/venv/bin/lpac"
 
   info "building WebUI in fixed Node container $NODE_BUILD_IMAGE"
   docker run --rm --network bridge -v "$source_dir/webui:/src:ro" -v "$temp/webui:/out" \
@@ -867,10 +879,12 @@ prepare_build() {
   image_id=$(docker image inspect "$image" --format '{{.Id}}')
   image_size=$(docker image inspect "$image" --format '{{.Size}}')
   webui_hash=$(tree_hash "$temp/webui")
+  lpac_hash=$(sha256sum "$temp/venv/bin/lpac" | awk '{print $1}')
+  lpac_fp=$(lpac_source_fingerprint "$source_dir")
   python3 - "$temp/manifest.json" "$sha" "$version" "$image" "$runtime_fp" "$base_fp" \
-    "$asterisk_version" "$module_count" "$image_id" "$image_size" "$webui_hash" "$module_hash" <<'PY'
+    "$asterisk_version" "$module_count" "$image_id" "$image_size" "$webui_hash" "$module_hash" "$lpac_hash" "$lpac_fp" <<'PY'
 import datetime, json, os, sys
-path, sha, version, image, runtime_fp, base_fp, asterisk, modules, image_id, image_size, webui_hash, module_hash = sys.argv[1:]
+path, sha, version, image, runtime_fp, base_fp, asterisk, modules, image_id, image_size, webui_hash, module_hash, lpac_hash, lpac_fp = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as stream:
     json.dump({"source_commit": sha, "version": version, "image": image,
                "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
@@ -878,7 +892,7 @@ with open(path, "w", encoding="utf-8") as stream:
                "asterisk": asterisk.strip(), "asterisk_modules": int(modules),
                "asterisk_modules_sha256": module_hash,
                "image_id": image_id, "image_size": int(image_size),
-               "webui_hash": webui_hash,
+               "webui_hash": webui_hash, "lpac_sha256": lpac_hash, "lpac_source_fp": lpac_fp,
                "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
               stream, sort_keys=True, indent=2)
     stream.write("\n")
@@ -1177,7 +1191,6 @@ case "$action" in
     ensure_singbox
     ensure_xray
     ensure_vpcd
-    ensure_lpac
     scr_prime_gate
     cellular_gate
     build_root="$cache_dir/builds/$sha"

@@ -60,6 +60,44 @@ class DiagnosticTests(unittest.TestCase):
         self.assertNotIn('card_result', error.diagnostic())
         self.assertNotIn('private-reader', json.dumps(error.public_detail()))
 
+    def test_scoped_native_diagnostics_ignore_init_cleanup_and_private_payloads(self):
+        stderr = ("SW=6F00\nMDD_LPAC_DIAG begin=profile\n"
+                  "MDD_LPAC_DIAG stage=response_status sw=6985\n"
+                  "MDD_LPAC_DIAG stage=command_exchange\n"
+                  "private-card APDU=0123456789\nMDD_LPAC_DIAG end=profile\n"
+                  "SCardTransmit() failed: 8010000B (cleanup)\n")
+        error = lpa.LpaError('es10c_enable_profile', stage='profile enable', transport_detail=stderr)
+        data = error.diagnostic()
+        self.assertEqual(data['failure_stage'], 'response_status')
+        self.assertEqual(data['status_word'], '6985')
+        self.assertNotIn('pcsc_code', data)
+        self.assertEqual(data['category'], 'unknown_error')
+        self.assertNotIn('busy', error.user_message())
+        self.assertNotIn('card_result', data)
+        self.assertNotIn('private', json.dumps(error.public_detail()))
+
+    def test_native_parser_uses_closed_tokens_and_bounded_codes(self):
+        from control.app.lpa_diagnostics import profile_transport_diagnostic
+        for line in ('stage=private-stage', 'stage=response_status sw=698500',
+                     'card_result=999', 'card_result=-1', 'stage=response_tag private-token'):
+            self.assertEqual(profile_transport_diagnostic(
+                'MDD_LPAC_DIAG begin=profile\nMDD_LPAC_DIAG ' + line + '\n'), {})
+        self.assertEqual(profile_transport_diagnostic('MDD_LPAC_DIAG stage=response_tag\n'), {})
+        self.assertEqual(profile_transport_diagnostic(
+            'MDD_LPAC_DIAG begin=profile\nMDD_LPAC_DIAG stage=apdu_transport\n'
+            'SCardTransmit() failed: 80100016 (private-reader)\n'),
+            {'failure_stage': 'apdu_transport', 'pcsc_code': '80100016'})
+
+    def test_managed_helper_never_falls_back_to_old_shared_binary(self):
+        with patch.object(lpa.cfg, 'get_settings', return_value={}), \
+                patch.object(lpa.cfg.sys, 'prefix', '/fixture/generation/venv'), \
+                patch.object(lpa.cfg.sys, 'base_prefix', '/usr'):
+            self.assertEqual(lpa.lpac_bin(), '/fixture/generation/venv/bin/lpac')
+        with patch.object(lpa.cfg, 'get_settings', return_value={'esim': {'lpac_bin': '/custom/lpac'}}):
+            self.assertEqual(lpa.lpac_bin(), '/custom/lpac')
+        with patch.dict(lpa.os.environ, {'LIBEUICC_DEBUG_APDU': '1'}):
+            self.assertNotIn('LIBEUICC_DEBUG_APDU', lpa._env_for_reader('fixture-reader'))
+
 
 class LpacEnvelopeTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_profile_envelope_retains_reason_in_safe_journal(self):
@@ -117,7 +155,9 @@ class ProfileResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('error', self.status())
 
     async def test_uncertain_enable_keeps_its_original_card_diagnostic(self):
-        diagnostic = lpa.LpaError('es10c_enable_profile', detail='unknown').diagnostic()
+        diagnostic = lpa.LpaError('es10c_enable_profile', detail='unknown', transport_detail=(
+            'MDD_LPAC_DIAG begin=profile\nMDD_LPAC_DIAG stage=response_status sw=6985\n'
+            'MDD_LPAC_DIAG end=profile\n')).diagnostic()
         async def fail():
             raise main.HTTPException(409, {
                 'code': 'profile_enable_unconfirmed', 'diagnostic': diagnostic,

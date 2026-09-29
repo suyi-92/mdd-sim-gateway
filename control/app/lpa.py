@@ -51,6 +51,13 @@ class LpaError(Exception):
         for field in ("pcsc_code", "status_word"):
             if field in transport:
                 result.setdefault(field, transport[field])
+        if self.message in lpa_diagnostics.PROFILE_STEPS:
+            scoped = lpa_diagnostics.profile_transport_diagnostic(self.transport_detail)
+            if "MDD_LPAC_DIAG begin=profile\n" in self.transport_detail:
+                # Ignore unrelated init/cleanup codes when scoped evidence exists.
+                for field in ("pcsc_code", "status_word"):
+                    result.pop(field, None)
+            result.update(scoped)
         return result
 
     def public_detail(self) -> dict:
@@ -89,8 +96,18 @@ class LpaResult:
     progress: list[dict] = field(default_factory=list)
 
 
+def _classification_text(error: LpaError) -> str:
+    if error.message in lpa_diagnostics.PROFILE_STEPS:
+        scoped = lpa_diagnostics.profile_transport_text(error.transport_detail)
+        if scoped is not None:
+            detail = error.detail if isinstance(error.detail, str) else ""
+            reason = detail if detail.casefold() in lpa_diagnostics.PROFILE_REASONS else ""
+            return f"{error.message} {reason} {scoped}".casefold()
+    return f"{error.message} {error.detail} {error.transport_detail}".casefold()
+
+
 def _reader_busy_error(error: LpaError) -> bool:
-    detail = f"{error.message} {error.detail} {error.transport_detail}".lower()
+    detail = _classification_text(error)
     return any(value in detail for value in ("8010000b", "scard_e_sharing_violation", "sharing violation"))
 
 
@@ -104,7 +121,7 @@ def classify_lpa_error(error: BaseException) -> str:
         return error.category
     if _reader_busy_error(error):
         return "reader_busy"
-    text = f"{error.message} {error.detail} {error.transport_detail}".casefold()
+    text = _classification_text(error)
     if any(value in text for value in (
         "scard_e_no_smartcard", "scard_w_removed_card", "no smartcard",
         "no smart card", "card absent", "card removed", "card not present",
@@ -146,7 +163,7 @@ def lpac_bin() -> str:
     path = (settings.get("esim") or {}).get("lpac_bin") or ""
     if path:
         return path
-    return os.path.join(cfg.DATA_DIR, "lpac", "lpac")
+    return cfg.default_lpac_bin()
 
 
 def download_timeout() -> float:
@@ -168,6 +185,7 @@ def lpac_available() -> bool:
 
 def _env_for_reader(reader_name: str | None, aid: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("LIBEUICC_DEBUG_APDU", None)
     env["LPAC_APDU"] = "pcsc"
     env["LPAC_HTTP"] = "curl"
     # Clear any host-level overrides that would pick the wrong reader / ISD-R.
@@ -214,7 +232,7 @@ async def run_lpac(
     if not os.path.isfile(binary):
         raise LpaError(
             f"lpac binary not found at {binary}. "
-            "Build it with: sudo ./install.sh build-lpac"
+            "The active build is incomplete; repair it through the managed update."
         )
     if not os.access(binary, os.X_OK):
         raise LpaError(f"lpac binary is not executable: {binary}")

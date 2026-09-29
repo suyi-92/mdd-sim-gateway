@@ -57,7 +57,7 @@ try {
         const detail = { code: 'esim_operation_failed',
           message: "The card's profile policy does not allow this operation.",
           diagnostic: { operation: method === 'DELETE' ? 'profile delete' : 'profile enable',
-            step: method === 'DELETE' ? 'es10c_delete_profile' : 'es10c_enable_profile', lpac_code: -1, card_result: 3 } }
+            step: method === 'DELETE' ? 'es10c_delete_profile' : 'es10c_enable_profile', lpac_code: -1, card_result: 3, failure_stage: "response_status", status_word: "6985" } }
         operation = { state: 'failed', error: detail, updated_at: attempts + 100 }
         return route.fulfill({ status: 400, json: { detail } })
       }
@@ -73,6 +73,8 @@ try {
     const beforeRow = await row.boundingBox()
     await enable.click()
     await row.getByRole('status').filter({ hasText: '卡端结果：3' }).waitFor()
+    await row.getByRole('status').filter({ hasText: '卡返回异常状态' }).waitFor()
+    await row.getByRole('status').filter({ hasText: 'SW 6985' }).waitFor()
     const after = await enable.boundingBox()
     const afterRow = await row.boundingBox()
     // The reserved feedback line must not move the row's controls.

@@ -84,3 +84,40 @@ def diagnostic(message: str, detail, *, operation: str, code: int, category: str
     if match and match[1].startswith(("6", "9")):
         result["status_word"] = match[1]
     return result
+
+
+FAILURE_STAGES = {
+    "identifier_encoding", "request_encoding", "apdu_transport", "apdu_response",
+    "command_exchange", "response_status", "response_tag", "response_result",
+}
+
+def profile_transport_text(stderr: str) -> str | None:
+    """Exclude ignored initialization failures and subsequent channel cleanup."""
+    begin = "MDD_LPAC_DIAG begin=profile\n"
+    if begin not in stderr:
+        return None
+    return stderr.split(begin, 1)[1].split("MDD_LPAC_DIAG end=profile", 1)[0][:16384]
+
+
+def profile_transport_diagnostic(stderr: str) -> dict:
+    """Read only fixed tokens inside the pinned patch's profile exchange markers."""
+    scope = profile_transport_text(stderr)
+    if scope is None:
+        return {}
+    result = {}
+    for line in scope.splitlines():
+        match = re.fullmatch(r"MDD_LPAC_DIAG sw=([0-9A-F]{4})", line)
+        if match:
+            result["status_word"] = match[1]
+        match = re.fullmatch(r"MDD_LPAC_DIAG stage=([a-z_]+)(?: sw=([0-9A-F]{4}))?", line)
+        if match and match[1] in FAILURE_STAGES:
+            result.setdefault("failure_stage", match[1])
+            if match[2] and match[1] == "response_status":
+                result.setdefault("status_word", match[2])
+        match = re.fullmatch(r"MDD_LPAC_DIAG card_result=([0-9]{1,3})", line)
+        if match and 0 <= int(match[1]) <= 255:
+            result["card_result"] = int(match[1])
+        match = re.fullmatch(r"SCardTransmit\(\) failed: (8010[0-9A-F]{4}) \(.*\)", line)
+        if match:
+            result.setdefault("pcsc_code", match[1])
+    return result

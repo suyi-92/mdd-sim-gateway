@@ -1,0 +1,103 @@
+lpac 2.3.0: scoped, identity-free profile command diagnostics.
+No raw APDU, identifier, or reader name is emitted. Keep operation semantics unchanged.
+
+--- a/euicc/es10c.c
++++ b/euicc/es10c.c
+@@ -188,6 +188,8 @@
+
+     struct euicc_derutil_node tmpnode;
+
++    fprintf(stderr, "MDD_LPAC_DIAG begin=profile\n");
++
+     memset(&n_request, 0, sizeof(n_request));
+     memset(&n_choicer, 0, sizeof(n_choicer));
+     memset(&n_profileIdentifierChoice, 0, sizeof(n_profileIdentifierChoice));
+@@ -195,12 +197,14 @@
+
+     if (strlen(str_id) == 32) {
+         if ((id_len = euicc_hexutil_hex2bin(id, sizeof(id), str_id)) < 0) {
+-            return -1;
++            fprintf(stderr, "MDD_LPAC_DIAG stage=identifier_encoding\n");
++            goto err;
+         }
+         n_profileIdentifierChoice.tag = 0x4F;
+     } else {
+         if ((id_len = euicc_hexutil_gsmbcd2bin(id, sizeof(id), str_id, 10)) < 0) {
+-            return -1;
++            fprintf(stderr, "MDD_LPAC_DIAG stage=identifier_encoding\n");
++            goto err;
+         }
+         n_profileIdentifierChoice.tag = 0x5A;
+     }
+@@ -230,28 +234,36 @@
+
+     reqlen = sizeof(ctx->apdu._internal.request_buffer.body);
+     if (euicc_derutil_pack(ctx->apdu._internal.request_buffer.body, &reqlen, &n_request)) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=request_encoding\n");
+         goto err;
+     }
+
+     if (es10x_command(ctx, &respbuf, &resplen, ctx->apdu._internal.request_buffer.body, reqlen) < 0) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=command_exchange\n");
+         goto err;
+     }
+
+     if (euicc_derutil_unpack_find_tag(&tmpnode, n_request.tag, respbuf, resplen) < 0) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=response_tag\n");
+         goto err;
+     }
+
+     if (euicc_derutil_unpack_find_tag(&tmpnode, 0x80, tmpnode.value, tmpnode.length) < 0) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=response_result\n");
+         goto err;
+     }
+
+     fret = euicc_derutil_convert_bin2long(tmpnode.value, tmpnode.length);
++
++    if (fret >= 0 && fret <= 255)
++        fprintf(stderr, "MDD_LPAC_DIAG card_result=%d\n", fret);
+
+     goto exit;
+
+ err:
+     fret = -1;
+ exit:
++    fprintf(stderr, "MDD_LPAC_DIAG end=profile\n");
+     free(respbuf);
+     respbuf = NULL;
+     return fret;
+--- a/euicc/euicc.c
++++ b/euicc/euicc.c
+@@ -52,6 +52,7 @@
+             return 0;
+         }
+
++        fprintf(stderr, "MDD_LPAC_DIAG stage=response_status sw=%02X%02X\n", response.sw1, response.sw2);
+         return -1;
+     } while (1);
+ }
+--- a/euicc/interface.c
++++ b/euicc/interface.c
+@@ -61,15 +61,20 @@
+         euicc_apdu_request_print(request, request_len);
+     }
+
+-    if (in->transmit(ctx, &response->data, &response->length, (uint8_t *)request, request_len) < 0)
++    if (in->transmit(ctx, &response->data, &response->length, (uint8_t *)request, request_len) < 0) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=apdu_transport\n");
+         return -1;
++    }
+
+-    if (response->length < 2)
++    if (response->length < 2) {
++        fprintf(stderr, "MDD_LPAC_DIAG stage=apdu_response\n");
+         return -1;
++    }
+
+     response->sw1 = response->data[response->length - 2];
+     response->sw2 = response->data[response->length - 1];
+     response->length -= 2;
++    fprintf(stderr, "MDD_LPAC_DIAG sw=%02X%02X\n", response->sw1, response->sw2);
+
+     if (getenv("LIBEUICC_DEBUG_APDU")) {
+         euicc_apdu_response_print(response);

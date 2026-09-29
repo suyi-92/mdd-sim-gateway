@@ -16,8 +16,7 @@ index; a name filter (substring match, as upstream intended) applies on its own.
 
 --- a/driver/apdu/pcsc.c
 +++ b/driver/apdu/pcsc.c
-@@ -117,11 +117,13 @@
-     DWORD dwActiveProtocol;
+@@ -118,10 +118,12 @@
 
      const int id = getenv_or_default(ENV_DRV_IFID, (int)-1);
      if (id != -1 && id != index) {

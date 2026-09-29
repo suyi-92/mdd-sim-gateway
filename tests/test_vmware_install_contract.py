@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -443,12 +444,16 @@ validate_scr_prime_reader "$2"
 
     def test_lpac_build_gate_does_not_require_a_pcsc_reader(self):
         validator = shell_function(INSTALL, "lpac_binary_valid")
-        ensure = shell_function(INSTALL, "ensure_lpac")
+        ensure = INSTALL[INSTALL.index("build_lpac() ("):INSTALL.index("pcsc_scan_capture()")]
         self.assertIn("LPAC_APDU=stdio LPAC_HTTP=stdio", validator)
         self.assertIn('"$binary" driver list', validator)
         self.assertIn("'\"pcsc\"'", validator)
         self.assertIn("'\"curl\"'", validator)
-        self.assertIn('lpac_binary_valid "$destination/lpac" && return', ensure)
+        self.assertIn('lpac_binary_valid "$candidate"', ensure)
+        self.assertIn('build_lpac "$temp/venv/bin/lpac"', INSTALL)
+        self.assertIn('git -C "$source" archive "$LPAC_COMMIT"', ensure)
+        self.assertIn("--fuzz=0", ensure)
+        self.assertNotIn('rm -rf -- "$destination"', ensure)
         self.assertNotIn("driver apdu list", INSTALL)
 
     @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
@@ -468,6 +473,38 @@ printf '%s\\n' '{"LPAC_APDU":["pcsc","stdio"],"LPAC_HTTP":["curl","stdio"]}'
             subprocess.run(
                 ["bash", "-c", script,
                  "lpac-validator", str(binary)], check=True)
+
+    def test_generation_manifest_rejects_stale_or_changed_lpac(self):
+        verify = shell_function(INSTALL, "verify_prepared_build")
+        self.assertGreater(verify.index('lpac_binary_valid "$root/venv/bin/lpac"'),
+                           verify.index('if any(value.get(key) != item'))
+        self.assertIn('! -L "$root/venv/bin/lpac"', verify)
+        code = verify.split("<<'PY' || return 1\n", 1)[1].split("\nPY", 1)[0]
+        modules = {"count": 30, "sha256": "modules-digest"}
+        manifest = {
+            "source_commit": "revision", "version": "version", "image": "image",
+            "architecture": "amd64", "runtime_fp": "runtime", "base_fp": "base",
+            "source_repository": "https://github.com/suyi-92/mdd-sim-gateway",
+            "image_id": "image-digest", "image_size": 1000, "webui_hash": "web-digest",
+            "asterisk_modules": 30, "asterisk_modules_sha256": "modules-digest",
+            "asterisk": "Asterisk fixture", "lpac_sha256": "binary-digest",
+            "lpac_source_fp": "patch-digest",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'manifest.json'
+            arguments = [sys.executable, '-c', code, str(path), 'revision', 'version', 'image',
+                         'runtime', 'base', 'image-digest', '1000', 'web-digest',
+                         json.dumps(modules), 'binary-digest', 'patch-digest']
+            for field, replacement in [(None, None), ('lpac_sha256', None),
+                                       ('lpac_sha256', 'changed'), ('lpac_source_fp', 'old-patches')]:
+                document = dict(manifest)
+                if field and replacement is None:
+                    document.pop(field)
+                elif field:
+                    document[field] = replacement
+                path.write_text(json.dumps(document))
+                result = subprocess.run(arguments, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if field is None else 1, result.stderr)
 
     def test_networkmanager_policy_preserves_the_management_interface(self):
         self.assertIn("address-before.json", INSTALL)
@@ -644,7 +681,7 @@ class MddctlContractTests(unittest.TestCase):
 class VersionContractTests(unittest.TestCase):
     def test_vmware_version_suffix(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version, "1.9.4-vmware.45")
+        self.assertEqual(version, "1.9.4-vmware.46")
         for path in (ROOT / "webui/package.json", ROOT / "webui/package-lock.json"):
             self.assertIn(f'"version": "{version}"', path.read_text(encoding="utf-8"))
 
