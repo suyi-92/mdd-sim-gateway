@@ -427,7 +427,6 @@ function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast
       body.matching_id = matchingId.trim() || undefined
     }
     if (runningLine) {
-      if (!confirm(t('Downloading will briefly stop line {id} and end any current call. The gateway will attempt to restore the original line afterward. Continue?', { id: runningLine.id }))) return
       Object.assign(body, { resume_line_id: String(runningLine.id), expected_iccid: card?.iccid,
         expected_generation: card?.generation })
     }
@@ -818,10 +817,6 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     const current = () => owner === session.current && owner.mounted
     const title = profileDisplayName(p, t('Profile'))
     const target = seTarget(reader, se)
-    if (lineRunning && matchedInst) {
-      const ok = confirm(t('Switch to "{name}"? Running line {id} stops first; the line for the newly enabled profile starts again automatically.', { name: title, id: matchedInst.id }))
-      if (!ok) return
-    }
     setBusyOp('Enable')
     setProfileSwitch({ iccid: p.iccid, phase: 'switching' })
     setErr('')
@@ -894,20 +889,13 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     if (!reader || loading || busyOp || switchActive) return
     const body = { reader, expected_iccid: selectedCard?.iccid, expected_generation: selectedCard?.generation }
     if (lineRunning && matchedInst) {
-      const label = matchedInst.name
-        ? `${t('line')} ${matchedInst.id} (${matchedInst.name})`
-        : `${t('line')} ${matchedInst.id}`
-      const ok = confirm(
-        t('Reading the eSIM will briefly stop {line} and end any current call. The gateway will attempt to restore the original line afterward. Continue?', { line: label }),
-      )
-      if (!ok) return
       Object.assign(body, { resume_line_id: String(matchedInst.id),
         expected_iccid: selectedCard?.iccid, expected_generation: selectedCard?.generation })
     }
     setReadFeedback('')
     await loadAll(body)
     await refresh?.()
-  }, [reader, loading, busyOp, switchActive, lineRunning, matchedInst, selectedCard, loadAll, refresh, t])
+  }, [reader, loading, busyOp, switchActive, lineRunning, matchedInst, selectedCard, loadAll, refresh])
 
   const requestDownload = useCallback(async () => {
     if (!reader || busyOp || switchActive) return
@@ -1175,7 +1163,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
             <div>
               <div style={{ fontWeight: 700 }}>{t('VoWiFi running on this reader')}</div>
               <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>
-                {t('Local notes and cached profiles do not interrupt WiFi Calling. Reading or writing the card briefly stops the line; the gateway then attempts to restore it.')}
+                {t('Local notes and cached profiles do not interrupt WiFi Calling. Card operations briefly stop the line and end current calls; afterward the gateway restores the original line or starts the selected profile.')}
                 {matchedInst ? ` (${t('line')} ${matchedInst.id}${matchedInst.name ? ` · ${matchedInst.name}` : ''})` : ''}
               </div>
             </div>

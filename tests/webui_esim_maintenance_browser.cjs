@@ -10,8 +10,8 @@ fs.mkdirSync(output, { recursive: true })
 const reader = 'Fixture reader'
 const profile = { iccid: 'fixture-card', profileNickname: 'Card nickname', profileState: 'enabled', local_label: '' }
 const se = { id: 'default', eid: 'fixture-euicc', profiles: [profile], notifications: [] }
-let operation = null, operationReads = 0, flight = true, importFailure = false
-const writes = [], errors = []
+let operation = null, operationReads = 0, flight = true, importFailure = false, running = true
+const writes = [], errors = [], dialogs = []
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost')
   const json = (value, code = 200) => {
@@ -24,6 +24,13 @@ const server = http.createServer(async (request, response) => {
     if (request.method !== 'GET') {
       writes.push(url.pathname)
       const body = JSON.parse(raw || '{}')
+      if (url.pathname === '/api/instances/7/stop') return json({ ok: true })
+      if (url.pathname === '/api/esim/profiles/fixture-next/enable') {
+        assert.equal(body.reader, reader)
+        assert.equal(body.se_id, 'default')
+        se.profiles.forEach(item => { item.profileState = item.iccid === 'fixture-next' ? 'enabled' : 'disabled' })
+        return json({ ok: true, card: { identity_state: 'confirmed', iccid: 'fixture-next' } })
+      }
       if (url.pathname.endsWith('/label')) {
         assert.equal(body.eid, 'fixture-euicc'); assert.equal(body.se_id, 'default')
         profile.local_label = body.label
@@ -48,7 +55,7 @@ const server = http.createServer(async (request, response) => {
     const values = {
       '/api/auth/status': { configured: true, authenticated: true, csrf: 'fixture-only' },
       '/api/cards': { cards: [{ name: reader, index: 0, present: true, iccid: 'fixture-card', generation: 4, matched: '7', hardware_id: 'modem-fixture' }] },
-      '/api/instances': { instances: [{ id: '7', name: 'Fixture line', iccid: 'fixture-card', enabled: true, status: { state: 'OK' } }] },
+      '/api/instances': { instances: [{ id: '7', name: 'Fixture line', iccid: 'fixture-card', enabled: true, status: { state: running ? 'OK' : 'STOPPED' } }] },
       '/api/devices': { devices: [{ id: 'modem-fixture', device_type: 'modem', present: true,
         instance_id: '7', name: 'Fixture modem', sim: { present: true },
         cellular: flight ? null : { registration: 'searching', data_active: false },
@@ -80,7 +87,13 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     browser = await chromium.launch({ headless: true, ...(process.env.MDD_BROWSER_EXECUTABLE ? { executablePath: process.env.MDD_BROWSER_EXECUTABLE } : {}) })
     const page = await browser.newPage()
     page.on('pageerror', error => errors.push(error.message))
-    page.on('dialog', dialog => dialog.accept())
+    page.on('dialog', dialog => {
+      if (page.url().endsWith('/esim')) {
+        dialogs.push(dialog.message())
+        return dialog.dismiss()
+      }
+      return dialog.accept()
+    })
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 1000 })
       operation = null
@@ -103,6 +116,7 @@ server.on('upgrade', (_request, socket) => socket.destroy())
       await page.getByRole('button', { name: '读取', exact: true }).click()
       await page.getByText('已请求启动原线路，请在“设备”查看注册结果。', { exact: true }).waitFor()
       assert.deepEqual(writes, ['/api/esim/chip/read'], 'Server owns stop and recovery')
+      assert.deepEqual(dialogs, [], 'Reading must proceed without a browser confirmation')
       await page.screenshot({ path: path.join(output, `esim-${width}.png`), fullPage: true })
       await page.getByRole('button', { name: '本地备注', exact: true }).scrollIntoViewIfNeeded()
       await page.screenshot({ path: path.join(output, `esim-profile-${width}.png`), fullPage: true })
@@ -140,10 +154,25 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     await page.getByText('原线路恢复失败，请在“设备”检查 SIM 和注册状态。', { exact: true }).waitFor()
     assert.ok(operationReads >= 2, 'A temporarily mismatched generation must not stop recovery polling')
     assert.deepEqual(writes, ['/api/esim/download'])
+    assert.deepEqual(dialogs, [], 'Submitting download must not ask for repeated confirmation')
     await page.reload()
     await page.getByText('原线路恢复失败，请在“设备”检查 SIM 和注册状态。', { exact: true }).waitFor()
+    se.profiles.push({ iccid: 'fixture-next', profileNickname: 'Next fixture', profileState: 'disabled' })
+    await page.reload()
+    writes.length = 0
+    await page.getByRole('button', { name: '启用', exact: true }).click()
+    await page.getByText('配置文件切换完成，VoWiFi 线路已启动。', { exact: true }).waitFor()
+    assert.deepEqual(writes, ['/api/instances/7/stop', '/api/esim/profiles/fixture-next/enable'],
+      'One click must retain stop-before-switch ordering')
+    assert.deepEqual(dialogs, [], 'Switching must proceed without a browser confirmation')
+    running = false
+    await page.reload()
+    writes.length = 0
+    await page.getByRole('button', { name: '删除', exact: true }).first().click()
+    assert.equal(dialogs.length, 1, 'Deleting a profile must still require confirmation')
+    assert.deepEqual(writes, [], 'Cancelling deletion must not mutate the card')
     assert.deepEqual(errors, [])
-    console.log('PASS: local notes, read recovery, download cancellation, SMS availability, and 1440/900/390 layouts')
+    console.log('PASS: no repeated read/download/switch dialogs; deletion confirmation; stop/recovery; local notes; SMS availability; 1440/900/390 layouts')
   } finally {
     if (browser) await browser.close()
     await new Promise(resolve => server.close(resolve))
