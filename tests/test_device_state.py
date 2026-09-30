@@ -48,6 +48,14 @@ class DeviceStateTests(unittest.TestCase):
             "reason": "Finalizing the carrier identity",
         })
 
+    def test_native_card_faults_surface_the_reason_instead_of_initializing(self):
+        for state, reason in (("NO_CARD", "wrong reader"), ("PIN_PROBLEM", "PIN required")):
+            with self.subTest(state=state):
+                capability = device_state.native_vowifi_capability(
+                    True, True, {"state": state, "reason": reason})
+                self.assertEqual(capability["actual"], "degraded")
+                self.assertEqual(capability["reason"], reason)
+
     def test_invalid_status_presentation_cannot_invent_a_capability_state(self):
         self.assertEqual(device_state.vowifi_presentation({
             "presentation": {"actual": "private-state", "reason": "ignored"},

@@ -660,6 +660,7 @@ class Hub:
         self.hotplug_epochs: dict[str, int] = {}
         self.hotplug_pending: dict[str, dict] = {}
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
+        self.reader_binding_retry_at: dict[str, float] = {}
         self.esim_line_recoveries: set[str] = set()  # one post-switch starter per line
         self.device_rescan_applied = ""  # newest completed host rediscovery reconciled here
         # When each line last became healthy, so a failure can be attributed. A line that
@@ -1255,6 +1256,33 @@ async def _probe_inserted_card(name: str, idx: int, port: str | None):
     return retried
 
 
+def _native_wrong_card_binding(inst: dict) -> dict:
+    """Prove a misplaced Engine can move to this SIM's confirmed, idle native reader."""
+    iid = str(inst["id"])
+    pin = engine.read_run_json(iid, "pin_status.json") or {}
+    if (pin.get("state") != "WRONG_CARD" or not pin.get("reader")
+            or not pin.get("iccid") or pin["iccid"] == inst.get("iccid")):
+        return {}
+    binding = _live_native_binding_for_instance(inst)
+    if not binding or _live_modem_binding_for_instance(inst):
+        return {}
+    names = sim.list_readers()
+    index = binding["reader_index"]
+    port = binding["reader_port"]
+    if not port or usbreader.index_for_port(port) != index or index >= len(names):
+        return {}
+    name = names[index]
+    card_info = hub.cards.get(name) or {}
+    if (card_info.get("identity_state") != "confirmed"
+            or card_info.get("iccid") != inst.get("iccid")
+            or name == pin["reader"] or hub.lpa_busy.get(name)
+            or hub.lpa_busy.get(pin["reader"])
+            or (hub.reader_locks.get(name) and hub.reader_locks[name].locked())
+            or _find_running_by_reader(name)):
+        return {}
+    return {**binding, "name": name, "generation": card_info.get("generation")}
+
+
 async def _auto_start_hotplugged_line(iid: str) -> None:
     """Start one enabled matched line after reader enumeration settles.
 
@@ -1272,8 +1300,17 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
             if hub.hotplug_epochs.get(iid, 0) != epoch:
                 return
             inst = cfg.get_instance(iid)
-            if not inst or await asyncio.to_thread(engine.is_running, iid):
+            if not inst:
                 return
+            repair_container = None
+            if await asyncio.to_thread(engine.is_running, iid):
+                if (time.monotonic() < hub.reader_binding_retry_at.get(iid, 0)
+                        or not await asyncio.to_thread(_native_wrong_card_binding, inst)):
+                    return
+                runtime = await hub.runtime.get(iid, force=True)
+                repair_container = runtime.get("container_id")
+                if not runtime.get("running") or not repair_container:
+                    return
             cards = hub.cards_list()
             card_info = next((item for item in cards if item.get("present")
                               and str(item.get("iccid") or "") == str(inst.get("iccid") or "")), None)
@@ -1298,8 +1335,12 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
                     "pin_wrong", "pin_invalid", "pin_blocked", "pin_required"}:
                 return
             try:
+                options = {}
+                if repair_container:
+                    hub.reader_binding_retry_at[iid] = time.monotonic() + 60
+                    options["wrong_card_container_id"] = repair_container
                 await _start_instance(iid, health_reason="hotplug_start",
-                                      engine_reason="hotplug", automatic_epoch=epoch)
+                                      engine_reason="hotplug", automatic_epoch=epoch, **options)
             except HTTPException as exc:
                 if (isinstance(exc.detail, dict) and exc.detail.get("code") == "egress_unavailable"
                         ):
@@ -2724,6 +2765,10 @@ async def _poll_instance_status(inst: dict) -> None:
                   "detail": {"registration": "unknown"}, "retry": {"count": 0, "max": 0}}
         else:
             st = await status_mod.compute(inst, ami, runtime)
+        if (not update and st.get("reason_code") == "wrong_card"
+                and iid not in hub.hotplug_starts
+                and time.monotonic() >= hub.reader_binding_retry_at.get(iid, 0)):
+            asyncio.create_task(_auto_start_hotplugged_line(iid))
         registration = str((st.get("detail") or {}).get("registration") or "unknown")
         previous = hub.status_cache.get(iid)
         previous_sampled_at = hub.status_sampled_at.get(iid)
@@ -2827,8 +2872,12 @@ def _with_status_activity(iid: str, st: dict) -> dict:
         current = "The VoWiFi line is stopped"
         next_action = "Enable VoWiFi to start the line."
     elif state == "NO_CARD":
-        current = "Waiting for the SIM card"
-        next_action = "Insert the SIM card to continue automatically."
+        if st.get("reason_code") == "wrong_card":
+            current = status_mod.REASONS["wrong_card"]
+            next_action = "The line will recover when its SIM is confirmed in an available reader."
+        else:
+            current = "Waiting for the SIM card"
+            next_action = "Insert the SIM card to continue automatically."
     elif state == "PIN_PROBLEM":
         current = "Waiting for SIM PIN attention"
         next_action = "Verify the SIM PIN before automatic setup can continue."
@@ -7483,6 +7532,7 @@ async def _start_instance_locked(
     health_reason: str = "user_requested",
     engine_reason: str = "manual",
     automatic_epoch: int | None = None,
+    wrong_card_container_id: str | None = None,
 ):
     """Start (or restart) a line. Actively checks the SIM PIN state first: if the card
     requires a PIN and we have no valid saved one, the start is refused with a structured
@@ -7500,6 +7550,17 @@ async def _start_instance_locked(
 
     if automatic_epoch is not None and not automatic_current():
         raise HTTPException(409, {"code": "recovery_cancelled"})
+    repair_binding = None
+    if wrong_card_container_id:
+        runtime = await hub.runtime.get(iid, force=True)
+        repair_binding = await asyncio.to_thread(_native_wrong_card_binding, inst)
+        if (not runtime.get("running") or runtime.get("container_id") != wrong_card_container_id
+                or not repair_binding):
+            raise HTTPException(409, {"code": "recovery_cancelled"})
+        ami = await hub.ami_for(iid, runtime)
+        channels = await ami.active_channel_count() if ami else None
+        if channels or (channels is None and await asyncio.to_thread(engine.tunnel_installed, iid)):
+            raise HTTPException(409, {"code": "recovery_cancelled"})
     identity_snapshot = [(c.get("name"), c.get("generation"), c.get("iccid"))
                          for c in hub.cards_list() if c.get("present")
                          and c.get("iccid") == inst.get("iccid")]
@@ -7567,6 +7628,11 @@ async def _start_instance_locked(
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     if automatic_epoch is not None and not automatic_current():
         raise HTTPException(409, {"code": "recovery_cancelled"})
+    if wrong_card_container_id:
+        runtime = await hub.runtime.get(iid, force=True)
+        if (not runtime.get("running") or runtime.get("container_id") != wrong_card_container_id
+                or repair_binding != await asyncio.to_thread(_native_wrong_card_binding, inst)):
+            raise HTTPException(409, {"code": "recovery_cancelled"})
     cid = await asyncio.to_thread(
         _start_engine_checked, inst, settings, dev_mounts=dev, reason=engine_reason)
     asyncio.create_task(push_status(str(iid)))

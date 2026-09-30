@@ -73,6 +73,9 @@ def native_vowifi_capability(desired: bool, running: bool, line_status: dict | N
     raw = str((line_status or {}).get("state") or (line_status or {}).get("label") or "").lower()
     if raw in {"ok", "working", "registered"}:
         return {"desired": True, "actual": "on", "reason": ""}
+    if raw in {"no_card", "pin_problem"}:
+        return {"desired": True, "actual": "degraded",
+                "reason": str((line_status or {}).get("reason") or "VoWiFi requires SIM attention")}
     if raw in {"error", "failed", "stopped"}:
         return {"desired": True, "actual": "error",
                 "reason": str((line_status or {}).get("reason") or "VoWiFi failed")}

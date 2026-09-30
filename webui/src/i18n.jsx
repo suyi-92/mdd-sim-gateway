@@ -666,6 +666,8 @@ const zh = {
   'Automatic recovery will run if the connection is lost.': '连接中断时将自动执行恢复。',
   'The VoWiFi line is stopped': 'VoWiFi 线路已停止', 'Enable VoWiFi to start the line.': '开启 VoWiFi 后将启动线路。',
   'Waiting for the SIM card': '正在等待 SIM 卡', 'Insert the SIM card to continue automatically.': '插入 SIM 卡后将自动继续。',
+  'The line will recover when its SIM is confirmed in an available reader.': '确认本卡所在读卡器可用后，将自动恢复线路。',
+  'VoWiFi requires SIM attention': 'SIM 状态异常，请查看具体原因',
   'Waiting for SIM PIN attention': '正在等待处理 SIM PIN', 'Verify the SIM PIN before automatic setup can continue.': '验证 SIM PIN 后才能继续自动配置。',
   'Resolving the carrier ePDG gateway': '正在解析运营商 ePDG 网关', 'The backend will retry automatically.': '后台将自动重试。',
   'Establishing the secure ePDG tunnel': '正在建立安全的 ePDG 隧道',

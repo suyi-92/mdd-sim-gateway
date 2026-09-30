@@ -1,5 +1,6 @@
 """A migrated native reader must survive an unrelated modem's eSIM switch."""
 import copy
+import asyncio
 from bridge_identity_fixture import verified_bridge
 import json
 import tempfile
@@ -196,6 +197,156 @@ class NativeBindingPersistenceTests(unittest.TestCase):
                 self.assertEqual(loaded[key], original[key], key)
             config.upsert_instance({"id": "1", "enabled": False})
             self.assertFalse(any(key in config.get_instance("1") for key in CHANNELS))
+
+
+class RunningNativeBindingRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.inst = {"id": "native", "iccid": NATIVE, "enabled": True,
+                     "reader_index": 1, "reader_port": "3-4"}
+        self.card = {"name": "SCR target", "index": 1, "reader_port": "3-4",
+                     "iccid": NATIVE, "present": True, "identity_state": "confirmed",
+                     "generation": 2}
+        self.pin = {"state": "WRONG_CARD", "reader": "SCR other", "iccid": OLD}
+        self.runtime = {"running": True, "container_id": "old-container"}
+        for attr, value in (("cards", {"SCR target": self.card}), ("reader_locks", {}),
+                            ("instance_locks", {}), ("lpa_busy", {}), ("hotplug_starts", set()),
+                            ("hotplug_epochs", {}), ("hotplug_pending", {}),
+                            ("reader_binding_retry_at", {}), ("manual_stops", set()),
+                            ("health", {})):
+            self.enterContext(patch.object(main.hub, attr, value))
+        self.enterContext(patch.object(config, "get_instance", side_effect=lambda _: dict(self.inst)))
+        self.enterContext(patch.object(config, "list_instances", return_value=[self.inst]))
+        self.enterContext(patch.object(config, "get_settings", return_value={}))
+        self.enterContext(patch.object(main.sim, "list_readers", return_value=["SCR other", "SCR target"]))
+        self.port = self.enterContext(patch.object(main.usbreader, "index_for_port", return_value=1))
+        self.enterContext(patch.object(main.engine, "read_run_json", side_effect=lambda *_: dict(self.pin)))
+        self.enterContext(patch.object(main.engine, "is_running", return_value=True))
+        self.enterContext(patch.object(main, "_live_modem_binding_for_instance", return_value={}))
+        self.enterContext(patch.object(main, "_device_for_card", return_value=("device", "reader")))
+        self.enterContext(patch.object(main.hub, "cards_list", side_effect=lambda: list(main.hub.cards.values())))
+        self.runtime_get = self.enterContext(patch.object(main.hub.runtime, "get", new=AsyncMock(
+            side_effect=lambda *a, **k: dict(self.runtime))))
+        self.channels = AsyncMock(return_value=0)
+        self.enterContext(patch.object(main.hub, "ami_for", new=AsyncMock(
+            return_value=SimpleNamespace(active_channel_count=self.channels))))
+        self.tunnel = self.enterContext(patch.object(main.engine, "tunnel_installed", return_value=False))
+        self.enterContext(patch.object(main.hub, "broadcast", new=AsyncMock()))
+        self.enterContext(patch.object(main.hub, "drop_ami", new=AsyncMock()))
+        self.enterContext(patch.object(main, "push_status", new=AsyncMock()))
+        self.enterContext(patch.object(main, "_record_lifecycle"))
+
+    def test_running_wrong_card_has_unique_confirmed_idle_destination(self):
+        self.assertEqual(main._native_wrong_card_binding(self.inst), {
+            "reader_index": 1, "reader_port": "3-4", "name": "SCR target", "generation": 2})
+
+    def test_missing_pending_or_same_reader_evidence_never_rebinds(self):
+        for changes in ({"present": False}, {"identity_state": "pending"},
+                        {"identity_state": "failed"}, {"iccid": OLD}):
+            with self.subTest(changes=changes), patch.dict(self.card, changes):
+                self.assertFalse(main._native_wrong_card_binding(self.inst))
+        self.pin["reader"] = "SCR target"
+        self.assertFalse(main._native_wrong_card_binding(self.inst))
+
+    def test_healthy_line_and_unresolved_port_never_rebind(self):
+        self.pin["state"] = "PIN_DISABLED"
+        self.assertFalse(main._native_wrong_card_binding(self.inst))
+        self.pin["state"] = "WRONG_CARD"
+        self.port.return_value = None
+        self.assertFalse(main._native_wrong_card_binding(self.inst))
+
+    async def test_busy_or_owned_destination_never_rebinds(self):
+        with patch.dict(main.hub.lpa_busy, {"SCR target": True}):
+            self.assertFalse(main._native_wrong_card_binding(self.inst))
+        lock = main.hub.reader_lock("SCR target")
+        await lock.acquire()
+        self.assertFalse(main._native_wrong_card_binding(self.inst))
+        lock.release()
+        with patch.object(main, "_find_running_by_reader", return_value={"id": "sibling"}):
+            self.assertFalse(main._native_wrong_card_binding(self.inst))
+
+    def test_ambiguous_card_does_not_select_destination(self):
+        with patch.dict(main.hub.cards, {"SCR other": {**self.card, "name": "SCR other"}}):
+            with self.assertRaises(HTTPException):
+                main._native_wrong_card_binding(self.inst)
+
+    async def test_running_container_no_longer_suppresses_proven_recovery(self):
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "_start_instance", new=AsyncMock()) as start:
+            await main._auto_start_hotplugged_line("native")
+            await main._auto_start_hotplugged_line("native")
+        start.assert_awaited_once_with("native", health_reason="hotplug_start",
+            engine_reason="hotplug", automatic_epoch=0, wrong_card_container_id="old-container")
+
+    async def test_status_poll_recovers_without_another_usb_event(self):
+        status = {"state": "NO_CARD", "reason_code": "wrong_card", "reason": "wrong reader"}
+        with patch.object(main.status_mod, "compute", new=AsyncMock(return_value=status)), \
+                patch.object(main.ims_recovery, "hold", new=AsyncMock(return_value=False)), \
+                patch.object(main.stability, "sample"), \
+                patch.object(main, "_record_line_state", new=AsyncMock()), \
+                patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()) as recover, \
+                patch.object(main.hub, "status_cache", {}), \
+                patch.object(main.hub, "status_sampled_at", {}), \
+                patch.object(main.hub, "egress_updates", {}):
+            await main._poll_instance_status(self.inst)
+            await asyncio.sleep(0)
+            recover.assert_awaited_once_with("native")
+            self.assertEqual(main.hub.status_cache["native"]["reason_code"], "wrong_card")
+
+    async def test_pin_failure_never_reaches_engine_replacement(self):
+        with patch.object(main, "_preflight_pin", new=AsyncMock(return_value={
+                "ok": False, "code": "pin_required"})), \
+                patch.object(main, "_start_engine_checked") as start:
+            with self.assertRaises(HTTPException) as error:
+                await main._start_instance("native", automatic_epoch=0,
+                                           wrong_card_container_id="old-container")
+            self.assertEqual(error.exception.detail["code"], "pin_required")
+        start.assert_not_called()
+
+    async def test_actual_rebuild_keeps_identity_and_pin_preflight(self):
+        with patch.object(main, "_preflight_pin", new=AsyncMock(return_value={"ok": True})) as pin, \
+                patch.object(main, "_start_engine_checked", return_value="new-container") as start:
+            result = await main._start_instance("native", automatic_epoch=0,
+                                               wrong_card_container_id="old-container")
+        self.assertEqual(result["container"], "new-container")
+        pin.assert_awaited_once()
+        self.assertEqual(start.call_args.args[0]["reader_port"], "3-4")
+
+    async def test_manual_stop_or_new_container_cancels_before_pin(self):
+        for cause in ("stop", "generation"):
+            with self.subTest(cause=cause), \
+                    patch.object(main, "_preflight_pin", new=AsyncMock()) as pin:
+                main.hub.manual_stops.clear()
+                self.runtime["container_id"] = "old-container"
+                if cause == "stop":
+                    main.hub.manual_stops.add("native")
+                else:
+                    self.runtime["container_id"] = "new-container"
+                with self.assertRaises(HTTPException):
+                    await main._start_instance("native", automatic_epoch=0,
+                                               wrong_card_container_id="old-container")
+                pin.assert_not_awaited()
+
+    async def test_call_or_unknown_calls_on_connected_tunnel_wait(self):
+        for channels, tunnel in ((1, False), (None, True)):
+            with self.subTest(channels=channels), \
+                    patch.object(main, "_preflight_pin", new=AsyncMock()) as pin:
+                self.channels.return_value = channels
+                self.tunnel.return_value = tunnel
+                with self.assertRaises(HTTPException):
+                    await main._start_instance("native", automatic_epoch=0,
+                                               wrong_card_container_id="old-container")
+                pin.assert_not_awaited()
+
+    async def test_change_during_pin_preflight_cancels_rebuild(self):
+        async def preflight(*_):
+            self.card["generation"] += 1
+            return {"ok": True}
+        with patch.object(main, "_preflight_pin", new=AsyncMock(side_effect=preflight)), \
+                patch.object(main, "_start_engine_checked") as start:
+            with self.assertRaises(HTTPException):
+                await main._start_instance("native", automatic_epoch=0,
+                                           wrong_card_container_id="old-container")
+        start.assert_not_called()
 
 
 if __name__ == "__main__":
