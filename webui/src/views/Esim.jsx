@@ -6,6 +6,7 @@ import { isEsimRecoverySuperseded } from '../cellularPresentation.js'
 import { mergeNotificationSnapshot, newerNotificationStatus, notificationReaderFailureRecovered } from '../esimNotifications.js'
 import { boundedRead } from '../pollRequest.js'
 import { esimErrorMessage, profileOperationFeedback } from '../esimErrors.js'
+import { acceptDownloadEvent, canDismissDownload, dismissDownload, isDownloadDismissed, shouldAutoDismissDownload } from '../esimDownloadFeedback.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -577,7 +578,6 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
   const [err, setErr] = useState('')
   const [showDl, setShowDl] = useState(false)
   const [dl, setDl] = useState(null) // {step, event, metadata, error, done}
-  const [dismissedDownload, setDismissedDownload] = useState('')
   const [renameTarget, setRenameTarget] = useState(null) // { se, profile }
   const [readFeedback, setReadFeedback] = useState('')
   const [renameStatus, setRenameStatus] = useState(null)
@@ -666,7 +666,6 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     setCachedAt(0)
     setErr('')
     setDl(null)
-    setDismissedDownload('')
     setRenameTarget(null)
     setRenameStatus(null)
     setProfileSwitch(null)
@@ -692,8 +691,9 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           return
         }
         const restored = downloadFromOperation(operation, t)
-        if (restored && restored.operationId !== dismissedDownload) setDl(restored)
-        if (['running', 'cancelling'].includes(operation?.state) || operation?.line_recovery === 'recovering') {
+        if (restored && !isDownloadDismissed(restored.operationId)) setDl(restored)
+        if (['running', 'cancelling'].includes(operation?.state) || operation?.line_recovery === 'recovering'
+            || (restored?.done && !operation.line_recovery)) {
           timer = setTimeout(poll, 1000)
         }
       } catch {
@@ -702,7 +702,19 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     }
     void poll()
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [reader, identityKey, selectedCard?.generation, dl?.operationId, dismissedDownload, t])
+  }, [reader, identityKey, selectedCard?.generation, dl?.operationId, t])
+
+  const closeDownload = useCallback(() => {
+    setDl(current => dismissDownload(current) ? null : current)
+  }, [])
+  const autoDismissDownload = shouldAutoDismissDownload(dl)
+  useEffect(() => {
+    if (!pageVisible || !autoDismissDownload) return undefined
+    const timer = setTimeout(() => setDl(current => (
+      shouldAutoDismissDownload(current) && dismissDownload(current) ? null : current
+    )), 5000)
+    return () => clearTimeout(timer)
+  }, [pageVisible, autoDismissDownload, dl?.operationId])
 
   // Without a fresh read, show the gateway's persisted last read for this card (matched
   // server-side by the inserted card's ICCID) so switching profiles does not force a
@@ -967,14 +979,20 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       }
       if (msg.type !== 'esim_download') return
       if (reader && msg.reader && msg.reader !== reader) return
+      if (isDownloadDismissed(msg.operation_id)) return
+      const updateDownload = update => setDl(current => {
+        if (!acceptDownloadEvent(current, msg)) return current
+        const sameJob = current?.operationId === msg.operation_id ? current : null
+        return { ...update(sameJob), operationId: msg.operation_id }
+      })
       if (msg.event === 'started') {
-        setDl((current) => ({ ...(current || {}), operationId: msg.operation_id
+        updateDownload((current) => ({ ...(current || {}), operationId: msg.operation_id
           || current?.operationId, step: 'started', event: 'started', done: false }))
       } else if (msg.event === 'progress' || msg.event === 'preview') {
         // lpac emits cancel_session progress on failure — ignore non-pipeline steps so the bar
         // does not jump back to step 1 before the error event arrives.
         const known = resolveDownloadStep(msg.step)
-        setDl((d) => ({
+        updateDownload((d) => ({
           ...(d || {}),
           step: known || d?.step || 'started',
           event: msg.event,
@@ -982,7 +1000,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           done: false,
         }))
       } else if (msg.event === 'completed') {
-        setDl((d) => ({ ...(d || {}), step: 'completed', event: 'completed', done: true, result: msg.result }))
+        updateDownload((d) => ({ ...(d || {}), step: 'completed', event: 'completed', done: true, result: msg.result }))
         showToast?.(t('Profile downloaded'))
         // The backend still owns reader recovery. Refresh only its cache here.
         api.esimChipCached(reader).then(r => {
@@ -994,7 +1012,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       } else if (msg.event === 'error') {
         // Prefer lpac failing function name when it maps to a pipeline step; else keep last progress.
         const known = resolveDownloadStep(msg.step)
-        setDl((d) => ({
+        updateDownload((d) => ({
           ...(d || {}),
           step: known || resolveDownloadStep(d?.step) || d?.step || 'started',
           event: 'error',
@@ -1003,7 +1021,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
         }))
         showToast?.(msg.error || t('Download failed'))
       } else if (msg.event === 'cancelling') {
-        setDl((d) => ({ ...(d || {}), event: 'cancelling' }))
+        updateDownload((d) => ({ ...(d || {}), event: 'cancelling' }))
       }
     })
   }, [subscribe, reader, identityKey, selectedCard?.iccid, selectedCard?.generation, loadAll, refresh, showToast, t])
@@ -1200,11 +1218,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                   {t('Cancel')}
                 </button>
               )}
-              {(dl.done || dl.error) && (
-                <button className="btn btn-ghost" onClick={() => {
-                  setDismissedDownload(dl.operationId || '')
-                  setDl(null)
-                }}>{t('Dismiss')}</button>
+              {canDismissDownload(dl) && (
+                <button className="btn btn-ghost" onClick={closeDownload}>{t('Dismiss')}</button>
               )}
             </div>
           </div>
@@ -1537,7 +1552,6 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           active={pageVisible}
           onClose={() => setShowDl(false)}
           onStarted={operation => {
-            setDismissedDownload('')
             setDl(downloadFromOperation(operation, t)
               || { step: 'started', event: 'started', done: false })
           }}
