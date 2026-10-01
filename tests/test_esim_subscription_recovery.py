@@ -60,6 +60,26 @@ class SubscriptionRetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FailedOutcomeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_resolution_retains_the_original_command_diagnostic(self):
+        status = {'state': 'failed', 'updated_at': 10, 'error': {'diagnostic': {'step': 'es10c_enable_profile', 'status_word': '6F00'}}}
+        with patch.object(main, '_esim_cache_for_iccid', return_value={'ses': [{'profiles': [
+                {'iccid': 'target-card', 'operation_status': status}]}]}), \
+                patch.object(main, '_esim_cache_update_profile') as update:
+            await main._esim_profile_operation_resolved('target-card')
+        saved = update.call_args.kwargs['operation_status']
+        self.assertEqual(saved['state'], 'resolved')
+        self.assertEqual(saved['error'], status['error'])
+        self.assertEqual(saved['failed_at'], 10)
+        self.assertEqual(saved['resolution'], 'enabled_profile_verified')
+
+    async def test_enable_confirmation_does_not_resolve_an_unrelated_command_failure(self):
+        status = {'state': 'failed', 'error': {'diagnostic': {'step': 'es10c_delete_profile'}}}
+        with patch.object(main, '_esim_cache_for_iccid', return_value={'ses': [{'profiles': [
+                {'iccid': 'target-card', 'operation_status': status}]}]}), \
+                patch.object(main, '_esim_cache_update_profile') as update:
+            await main._esim_profile_operation_resolved('target-card')
+        update.assert_not_called()
+
     def setUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.store = esim_recovery.RecoveryStore(str(Path(directory) / 'tasks.json'))

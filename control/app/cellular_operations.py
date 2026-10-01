@@ -51,11 +51,13 @@ class NetworkOperations:
         self._record(key)["selection_reset"] = True
         return self.view(key)
 
-    def progress(self, key, operation_id, phase):
+    def progress(self, key, operation_id, phase, networks=None):
         operation = self._record(key).get("operation")
         if (self.active == key and operation and operation["id"] == operation_id
-                and phase in {"registering", "confirming", "restoring"}):
+                and phase in {"scanning", "registering", "confirming", "restoring"}):
             operation["phase"] = phase
+            if operation["action"] == "scan" and isinstance(networks, list):
+                self._record(key)["networks"] = copy.deepcopy(networks[:128])
 
     def deadline(self, key, operation_id):
         operation = self._record(key).get("operation")

@@ -46,6 +46,11 @@ class NetworkOperationTests(unittest.IsolatedAsyncioTestCase):
         reply = state.start(KEY, "scan", {}, worker)
         self.assertEqual(reply["operation"]["state"], "running")
         self.assertNotIn(KEY[2], json.dumps(reply))
+        state.progress(KEY, reply['operation']['id'], 'restoring', [NETWORK])
+        self.assertEqual(state.view(KEY)['networks'], [NETWORK])
+        self.assertEqual(state.view(KEY)['operation']['state'], 'running')
+        state.progress(KEY, 'old-operation', 'restoring', [])
+        self.assertEqual(state.view(KEY)['networks'], [NETWORK])
         with self.assertRaises(cellular_operations.OperationBusy):
             state.start(KEY, "apply", {}, worker)
         self.assertTrue(state.view(("other", "line", "card"))["blocked"])

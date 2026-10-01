@@ -7,6 +7,7 @@ import { mergeNotificationSnapshot, newerNotificationStatus, notificationReaderF
 import { boundedRead } from '../pollRequest.js'
 import { esimErrorMessage, profileOperationFeedback } from '../esimErrors.js'
 import { acceptDownloadEvent, canDismissDownload, dismissDownload, isDownloadDismissed, shouldAutoDismissDownload } from '../esimDownloadFeedback.js'
+import { canRetainEsimView, esimText } from '../esimViewState.js'
 import { useI18n } from '../i18n.jsx'
 
 const DOWNLOAD_STEPS = [
@@ -241,9 +242,9 @@ function StatePill({ state, pending = false, cached = false }) {
 
 /** Match sigmo: nickname takes priority, else profileName. */
 function profileDisplayName(p, fallback = 'Profile') {
-  const nick = (p.profileNickname || '').trim()
+  const nick = esimText(p.profileNickname).trim()
   if (nick) return nick
-  return (p.profileName || p.serviceProviderName || fallback).trim() || fallback
+  return (esimText(p.profileName) || esimText(p.serviceProviderName) || fallback).trim() || fallback
 }
 
 function RenameModal({ profile, runningLine, busy, error, onClose, onSave, local = false }) {
@@ -559,7 +560,25 @@ function isLineRunning(inst) {
   return !!(st && st !== 'STOPPED')
 }
 
-export default function Esim({ cards, devices = [], instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
+class EsimViewBoundary extends React.Component {
+  state = { failed: false }
+  static getDerivedStateFromError() { return { failed: true } }
+  render() {
+    if (!this.state.failed) return this.props.children
+    const { t } = this.props
+    return <div className="card" style={{ padding: 20 }} role="alert">
+      <p>{t('The eSIM view could not be displayed. Reloading this view will not repeat a download or profile switch.')}</p>
+      <button className="btn btn-primary" onClick={() => this.setState({ failed: false })}>{t('Reload view')}</button>
+    </div>
+  }
+}
+
+export default function Esim(props) {
+  const { t } = useI18n()
+  return <EsimViewBoundary t={t}><EsimView {...props}/></EsimViewBoundary>
+}
+
+function EsimView({ cards, devices = [], instances, refresh, subscribe, showToast, initialLoading, loadErrors, pageVisible = true }) {
   const { t } = useI18n()
   const present = useMemo(
     () => collapseEsimReaders(cards),
@@ -584,6 +603,15 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
   const renameBusy = useRef(false)
   const [busyOp, setBusyOp] = useState('')
   const [profileSwitch, setProfileSwitch] = useState(null) // { iccid, phase }
+  const viewOwner = useRef(null)
+  const switchRequest = useRef(null)
+  const [cachePending, setCachePending] = useState(false)
+  const [cacheRevision, setCacheRevision] = useState(0)
+  const liveCard = present.find(c => c.name === reader)
+  const retainedView = canRetainEsimView(viewOwner.current, reader, liveCard, devices)
+  const readerOptions = !liveCard && retainedView
+    ? [...present, { ...viewOwner.current.card, present: false, iccid: '', identity_state: 'pending' }]
+    : present
 
   // Background downloads and profile switches are server-owned and remain visible after
   // returning. A not-yet-submitted modal is only a local draft, so leaving the page closes it
@@ -597,15 +625,26 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
 
   useEffect(() => {
     if (!reader && present[0]) setReader(present[0].name)
-    if (reader && !present.find((c) => c.name === reader) && present[0]) setReader(present[0].name)
-  }, [present, reader])
+    if (reader && !present.find((c) => c.name === reader) && !retainedView && present[0]) setReader(present[0].name)
+  }, [present, reader, retainedView])
 
-  const selectedCard = present.find((c) => c.name === reader)
+  const selectedCard = liveCard
   const cardNow = useRef(null)
   cardNow.current = selectedCard
   const selectedDevice = devices.find((device) => (
-    String(device.id || '') === String(selectedCard?.hardware_id || '')
+    String(device.id || '') === String(selectedCard?.hardware_id || (retainedView && viewOwner.current?.hardwareId) || '')
   ))
+  const viewNow = useRef(null)
+  viewNow.current = { reader, card: selectedCard, devices }
+  const rememberView = useCallback((list) => {
+    const current = viewNow.current
+    const device = current.devices.find(item => item.id === current.card?.hardware_id)
+    if (list.length && current.card) viewOwner.current = {
+      reader: current.reader, card: current.card, hardwareId: device?.id,
+      hardwareGeneration: device?.hardware_generation,
+      profileIds: list.flatMap(se => (se.profiles || []).map(p => p.iccid)),
+    }
+  }, [])
   const identityKey = JSON.stringify([reader, selectedCard?.iccid,
     selectedCard?.generation])
   const session = useRef({ key: identityKey, serial: 0, mounted: true })
@@ -637,8 +676,11 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
   const deferredNotification = profiles.some(profile =>
     notificationReaderFailureRecovered(profile, selectedDevice, selectedCard))
   const hasEuicc = ses.some((se) => se.eid || se.chip || (se.profiles || []).length)
+  const downloadActive = !!dl && !dl.done && !dl.error
   const switchActive = ['switching', 'recovering', 'notifying', 'starting', 'retrying'].includes(profileSwitch?.phase)
     || dl?.lineRecovery === 'recovering'
+  const targetProfile = profiles.find(p => p.iccid === profileSwitch?.iccid)
+  const targetLabel = targetProfile ? esimText(targetProfile.local_label) || profileDisplayName(targetProfile) : ''
 
   useEffect(() => {
     if (switchActive && lineRunning && selectedCard?.iccid === profileSwitch?.iccid) {
@@ -659,17 +701,22 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
 
   useEffect(() => {
     setLoading(false)
-    setBusyOp('')
-    setSes([])
-    setMeta({ imei: '' })
+    if (!retainedView) {
+      setBusyOp('')
+      setSes([])
+      setMeta({ imei: '' })
+      setDl(null)
+      setProfileSwitch(null)
+      switchRequest.current = null
+      viewOwner.current = null
+    }
     setLoaded(false)
     setCachedAt(0)
     setErr('')
-    setDl(null)
     setRenameTarget(null)
     setRenameStatus(null)
-    setProfileSwitch(null)
-  }, [identityKey])
+    setCachePending(true)
+  }, [identityKey, selectedDevice?.hardware_generation])
 
   // Download jobs are owned by Control, not this page or WebSocket connection. Rehydrate the
   // safe snapshot after navigation/reload and poll while active so a missed WS completion is
@@ -720,17 +767,28 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
   // server-side by the inserted card's ICCID) so switching profiles does not force a
   // stop-line read first — and the cache works from any browser.
   useEffect(() => {
-    if (loaded || loading || ses.length || !reader) return
-    let cancelled = false
+    if (!pageVisible || loading || !reader || (loaded && !cachePending)) return
+    let cancelled = false, timer
     const owner = session.current
-    api.esimChipCached(reader).then((r) => {
-      if (cancelled || owner !== session.current || !owner.mounted || !r?.cached) return
-      setSes(r.ses || [])
-      setMeta({ imei: r.imei || '' })
-      setCachedAt((r.ts || 0) * 1000)
-    }).catch(() => {})
-    return () => { cancelled = true }
-  }, [loaded, loading, ses.length, reader, identityKey])
+    const poll = async () => {
+      try {
+        const r = await boundedRead(signal => api.esimChipCached(reader, undefined, signal))
+        if (cancelled || owner !== session.current || !owner.mounted) return
+        if (r?.cached && (r.generation == null || r.generation === cardNow.current?.generation)) {
+          const list = r.ses || []
+          rememberView(list)
+          setSes(list)
+          setMeta({ imei: r.imei || '' })
+          setCachedAt((r.ts || 0) * 1000)
+          setCachePending(false)
+          return
+        }
+      } catch { /* Reader recovery can temporarily make this cache unavailable. */ }
+      if (!cancelled && owner === session.current && owner.mounted) timer = setTimeout(poll, 2000)
+    }
+    void poll()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [pageVisible, loaded, loading, reader, identityKey, cacheRevision, rememberView])
 
   // A missed completion event must not preserve an old warning until navigation.
   // This endpoint reads only the server cache, never the reader or its ownership.
@@ -791,7 +849,9 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       if (!current()) return
       if (readBody) setReadFeedback(lineRecoveryFeedback(c.line_recovery, t))
       const list = c.ses || []
+      rememberView(list)
       setSes(list)
+      setCachePending(false)
       setMeta({ imei: c.imei || '' })
       const seErr = list.map((s) => s.error).filter(Boolean)
       setEmptyReason(seErr.some((m) => isNoCardError(m)) ? 'no-card' : 'not-euicc')
@@ -826,7 +886,11 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
    * view, so no fresh exclusive read is required. */
   const switchProfile = async (p, se) => {
     const owner = session.current
-    const current = () => owner === session.current && owner.mounted
+    const request = { reader, iccid: p.iccid }
+    switchRequest.current = request
+    const current = () => owner.mounted && session.current.mounted && switchRequest.current === request
+      && viewNow.current.reader === reader
+      && (owner === session.current || canRetainEsimView(viewOwner.current, reader, viewNow.current.card, viewNow.current.devices))
     const title = profileDisplayName(p, t('Profile'))
     const target = seTarget(reader, se)
     setBusyOp('Enable')
@@ -838,7 +902,6 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
       }
       if (owner !== session.current) return
       const res = await api.esimEnable(p.iccid, target)
-      await refresh?.()
       if (!current()) return
       // The confirmed WebSocket event normally updates this as soon as lpac succeeds. Keep
       // the response path as a fallback for a reconnecting browser.
@@ -894,11 +957,15 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
         }
       }).catch(() => {})
     }
-    if (current()) setBusyOp('')
+    if (current()) {
+      setBusyOp('')
+      setCacheRevision(value => value + 1)
+    }
+    await refresh?.()
   }
 
   const requestLoad = useCallback(async () => {
-    if (!reader || loading || busyOp || switchActive) return
+    if (!reader || loading || busyOp || switchActive || downloadActive) return
     const body = { reader, expected_iccid: selectedCard?.iccid, expected_generation: selectedCard?.generation }
     if (lineRunning && matchedInst) {
       Object.assign(body, { resume_line_id: String(matchedInst.id),
@@ -907,7 +974,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
     setReadFeedback('')
     await loadAll(body)
     await refresh?.()
-  }, [reader, loading, busyOp, switchActive, lineRunning, matchedInst, selectedCard, loadAll, refresh])
+  }, [reader, loading, busyOp, switchActive, downloadActive, lineRunning, matchedInst, selectedCard, loadAll, refresh])
 
   const requestDownload = useCallback(async () => {
     if (!reader || busyOp || switchActive) return
@@ -1140,7 +1207,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
 
   if (initialLoading && !present.length) return <p role="status">{t('Loading')}…</p>
   if (loadErrors?.cards && !present.length) return <p className="u-error">{t('Loading failed')}</p>
-  if (!present.length) {
+  if (!readerOptions.length) {
     return (
       <div className="card" style={{ padding: 24, color: 'var(--text-dim)' }}>
         {t('No SIM present. Insert an eUICC into a PC/SC reader to manage profiles.')}
@@ -1155,18 +1222,18 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           <span>{t('Reader')}</span>
           <select value={reader} disabled={!!busyOp || loading || switchActive || !!renameTarget}
             onChange={(e) => setReader(e.target.value)} style={{ minWidth: 220 }}>
-            {present.map((c) => (
+            {readerOptions.map((c) => (
               <option key={c.name} value={c.name}>
                 #{c.index} · {deviceTitle(c, c.index || 0, t)}{c.iccid ? ` · ${c.iccid}` : ''}
               </option>
             ))}
           </select>
         </label>
-        <button className="btn btn-ghost u-load-action" onClick={requestLoad} disabled={loading || !!busyOp || switchActive}>
+        <button className="btn btn-ghost u-load-action" onClick={requestLoad} disabled={!liveCard || loading || !!busyOp || switchActive || downloadActive}>
           {t(loading ? 'Loading…' : 'Load')}
         </button>
         <button className="btn btn-primary" onClick={requestDownload}
-          disabled={!status?.available || !hasEuicc || !!busyOp || switchActive
+          disabled={!liveCard || cachePending || !status?.available || !hasEuicc || !!busyOp || switchActive
             || ((cachedAt > 0 || !loaded) && ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state))
             || !!dl && !dl.done && !dl.error}
           title={!hasEuicc ? t('Read this eSIM once before downloading a new one.') : ''}>
@@ -1174,6 +1241,11 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
         </button>
         {status?.available && !hasEuicc && <span style={{ fontSize: 12, color: 'var(--text-mute)' }}>{t('Read this eSIM once before downloading a new one.')}</span>}
       </div>
+
+      {cachePending && <div role="status" className="u-esim-cache-feedback">
+        {t(profiles.length ? 'Refreshing SIM access; the previous profile list is shown until verification completes.'
+          : 'Profile list is temporarily unavailable. Retrying…')}
+      </div>}
 
       {lineRunning && (
         <div className="card" style={{ padding: 14, borderColor: '#f59e0b', background: 'color-mix(in srgb, #f59e0b 12%, var(--panel))' }}>
@@ -1226,8 +1298,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           <ProgressBar step={dl.step} done={dl.done} error={dl.error} />
           {dl.metadata && (
             <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-soft)' }}>
-              {t('Preview')}: {dl.metadata.profileName || dl.metadata.serviceProviderName || t('profile')}
-              {dl.metadata.iccid ? ` · ${dl.metadata.iccid}` : ''}
+              {t('Preview')}: {esimText(dl.metadata.profileName) || esimText(dl.metadata.serviceProviderName) || t('profile')}
+              {esimText(dl.metadata.iccid) ? ` · ${dl.metadata.iccid}` : ''}
             </div>
           )}
           {dl.error && <div style={{ marginTop: 10, color: '#ef4444', fontSize: 13 }}>{dl.error}</div>}
@@ -1321,7 +1393,8 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
           </div>
         )}
         <div className="u-esim-switch-feedback" role="status" aria-live="polite">
-          {profileSwitch?.phase === 'switching'
+          {targetLabel && <strong>{t(switchActive ? 'Switching to {name}' : 'Selected profile: {name}', { name: targetLabel })} · </strong>}
+          <span>{profileSwitch?.phase === 'switching'
             ? t('Enabling the eSIM profile…')
             : profileSwitch?.phase === 'recovering'
               ? t('Profile enabled; rebuilding the modem SIM bridge…')
@@ -1339,7 +1412,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                         ? t('Profile enabled; completing SIM and baseband initialization…')
                       : profileSwitch?.phase === 'error'
                         ? t('Profile switching needs attention; check its operation result.')
-                        : '\u00a0'}
+                        : '\u00a0'}</span>
         </div>
         {!profiles.length ? (
           <div style={{ color: 'var(--text-mute)', fontSize: 13 }}>
@@ -1374,11 +1447,12 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                       {seProfiles.map((p) => {
                         const profileEnabled = String(p.profileState || '').toLowerCase() === 'enabled'
                         const enabled = profileEnabled
-                        const profileActionsBlocked = loading || ((cachedAt > 0 || !loaded)
+                        const profileActionsBlocked = !liveCard || cachePending || loading || downloadActive || ((cachedAt > 0 || !loaded)
                           && ['pending', 'reading', 'failed'].includes(selectedCard?.identity_state))
                           || !['enabled', 'disabled'].includes(String(p.profileState || '').toLowerCase())
                         const target = seTarget(reader, se)
                         const title = profileDisplayName(p, t('Profile'))
+                        const switchingTarget = switchActive && profileSwitch?.iccid === p.iccid
                         const renameFeedback = renameStatus?.iccid === p.iccid && renameStatus?.seId === se.id
                           ? renameStatus : null
                         const notification = notificationReaderFailureRecovered(p, selectedDevice, selectedCard)
@@ -1391,12 +1465,13 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                           recoveryStatus, selectedDevice, p, selectedCard)
                         const recovery = recoverySuperseded ? '' : recoveryFeedback(recoveryStatus, t)
                         const operationError = profileOperationFeedback(p.operation_status, t)
-                        const feedback = renameFeedback?.message || operationError || recovery || notification
+                        const feedback = (switchingTarget ? t('Switching to {name}', { name: p.local_label || title }) : '')
+                          || renameFeedback?.message || operationError || recovery || notification
                         return (
-                          <div key={`${se.id}:${p.iccid}`} style={{
-                            border: `1px solid ${enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
+                          <div key={`${se.id}:${p.iccid}`} aria-busy={switchingTarget} data-switch-target={switchingTarget || undefined} style={{
+                            border: `1px solid ${switchingTarget ? 'var(--primary)' : enabled ? 'color-mix(in srgb, var(--primary) 35%, var(--border))' : 'var(--border)'}`,
                             borderRadius: 12, padding: '12px 14px',
-                            background: enabled ? 'color-mix(in srgb, var(--primary) 6%, var(--panel))' : 'transparent',
+                            background: switchingTarget ? 'color-mix(in srgb, var(--primary) 14%, var(--panel))' : enabled ? 'color-mix(in srgb, var(--primary) 6%, var(--panel))' : 'transparent',
                             display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 12,
                           }}>
                             <div style={{ minWidth: 0, flex: '1 1 140px' }}>
@@ -1409,7 +1484,7 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                                 </span>
                                 {p.local_label && <span style={{ flexShrink: 0, color: 'var(--text-mute)', fontSize: 11 }}>{t('Local note')}</span>}
                                 <StatePill state={p.profileState} cached={cachedAt > 0}
-                                  pending={profileSwitch?.iccid === p.iccid && profileSwitch?.phase === 'switching'} />
+                                  pending={switchingTarget} />
                               </div>
                               <div role={feedback ? 'status' : undefined} title={feedback || undefined} style={{
                                 marginTop: 4, fontSize: 12, color: !renameFeedback && (operationError || (recovery && ['failed', 'network_rejected'].includes(recoveryStatus?.state)) || (notification && p.notification_status?.state === 'failed')) ? 'var(--warning, #b45309)' : 'var(--text-mute)',
@@ -1420,11 +1495,11 @@ export default function Esim({ cards, devices = [], instances, refresh, subscrib
                                 {feedback || p.iccid}
                               </div>
                             </div>
-                            <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                            <div style={{ display: 'flex', gap: 6, minWidth: 0, maxWidth: '100%', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {!enabled && (
                                 <button className="btn btn-primary" disabled={!!busyOp || switchActive || profileActionsBlocked}
                                   onClick={() => switchProfile(p, se)}>
-                                  {t('Enable')}
+                                  {t(switchingTarget ? 'Switching…' : 'Enable')}
                                 </button>
                               )}
                               {enabled && (

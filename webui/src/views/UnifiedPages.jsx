@@ -362,7 +362,9 @@ function CellularNetworkControl({ device, refreshDevices, showToast, active = tr
   let feedback = ''
   if (report) {
     if (outcome) feedback = outcome.text
-    else if (busy) feedback = busy === 'scan' ? t('Scanning nearby networks. The modem may take several minutes.')
+    else if (busy) feedback = busy === 'scan' ? t(operation.phase === 'restoring'
+      ? 'Scan finished; restoring the previous network selection. Results are shown below.'
+      : 'Scanning nearby networks. The modem may take several minutes.')
       : cellularOperationProgress(operation, t)
     else if (operation.state === 'success') {
       feedback = t(networks.length ? 'Found {count} cellular networks.'

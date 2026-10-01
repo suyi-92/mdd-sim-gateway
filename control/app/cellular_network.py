@@ -217,7 +217,7 @@ def _scan_at(modem_path: str, runner, timeout: float) -> list[dict]:
     return parse_cops_output(_at_command(modem_path, "AT+COPS=?", runner, timeout))
 
 
-def _scan_quectel(modem_path: str, runner, timeout: float, sleeper, previous=None) -> list[dict]:
+def _scan_quectel(modem_path: str, runner, timeout: float, sleeper, previous=None, progress=None) -> list[dict]:
     # COPS scans can be rejected while this firmware remains registered, even with
     # no data bearer. Temporarily deregister only when the exact selection can be
     # restored. A non-numeric manual selection is never guessed from its name.
@@ -245,6 +245,8 @@ def _scan_quectel(modem_path: str, runner, timeout: float, sleeper, previous=Non
         networks = _scan_at(modem_path, runner, timeout)
     except CellularNetworkError as exc:
         scan_error = exc
+    if progress:
+        progress("restoring", networks)
     # Recovery is separate from the scan result; never discard real networks.
     selected = {"mode": "automatic" if automatic else "manual",
                 "operator_id": "" if automatic else manual[2]}
@@ -270,13 +272,15 @@ def _scan_quectel(modem_path: str, runner, timeout: float, sleeper, previous=Non
 
 
 def scan(modem_path: str, runner=subprocess.run,
-         timeout: float = SCAN_TIMEOUT_SECONDS, sleeper=time.sleep, previous=None) -> list[dict]:
+         timeout: float = SCAN_TIMEOUT_SECONDS, sleeper=time.sleep, previous=None, progress=None) -> list[dict]:
     if not MODEM_PATH_RE.fullmatch(str(modem_path or "")):
         raise CellularNetworkError("The cellular modem path is invalid.")
+    if progress:
+        progress("scanning", None)
     # Quectel QMI firmware can report a successful but empty NAS scan while its
     # AT scan returns real networks. Prefer the verified AT path for these modems.
     if _prefer_at_scan(modem_path, runner):
-        return _scan_quectel(modem_path, runner, timeout, sleeper, previous)
+        return _scan_quectel(modem_path, runner, timeout, sleeper, previous, progress)
     try:
         result = runner(
             ["mmcli", "-m", modem_path, "--3gpp-scan", f"--timeout={int(timeout)}"],
@@ -337,6 +341,12 @@ def _request_registration(modem_path: str, selection: dict, runner, timeout: flo
     else:
         error = _registration_error(_error(result, "failed")) if result.returncode else ""
     if use_at and error in {"", "network_timeout"}:
+        # MM may time out its 60-second waiter while the modem is still searching.
+        # If COPS proves the requested automatic mode, keep that search alive:
+        # deregistering here (and again on rollback) restarts roaming acquisition.
+        if (selection["mode"] == "automatic" and error == "network_timeout"
+                and _selection_is_applied(modem_path, selection, runner)):
+            return error
         # Synchronize MM's selection intent FIRST. Applying it after COPS can
         # overwrite the freshly selected AT mode using a stale QMI registration.
         # MM remains the only tty owner; no port, band or APN configuration changes.
@@ -449,6 +459,15 @@ def register(modem_path: str, *, mode: str, operator_id: str = "", previous: dic
         error = "operation_timeout"
     if progress:
         progress("restoring")
+    if (use_at and selected == restore and selected["mode"] == "automatic"
+            and _selection_is_applied(modem_path, selected, recovery_runner)):
+        # The previous setting is already applied. A second Register/COPS cycle
+        # cannot restore anything; it only discards the ongoing roaming search.
+        recovered = _wait_registration(modem_path, restore, recovery_runner, sleeper, settle_attempts)
+        if error in {"", "network_timeout", "operation_timeout", "not_registered"} and _is_registered(recovered, restore):
+            return {**selected, "registration": recovered}
+        raise CellularRegistrationError(error, {"state": "pending" if recovered["state"] in {
+            "searching", "idle", "registering"} else "failed", **restore, "registration": recovered})
     recovery_error = _request_registration(modem_path, restore, recovery_runner,
                                             min(timeout, 15), use_at=use_at)
     recovered = _wait_registration(modem_path, restore, recovery_runner, sleeper,

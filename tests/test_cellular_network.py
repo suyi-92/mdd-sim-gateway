@@ -12,6 +12,39 @@ MODEM = "/org/freedesktop/ModemManager1/Modem/7"
 
 
 class CellularNetworkCommandTests(unittest.TestCase):
+    def test_automatic_search_is_not_restarted_after_mm_waiter_times_out(self):
+        runner = Mock(return_value=self.reply(stderr='Network timeout', returncode=1))
+        with patch.object(cellular_network, '_registration_snapshot', return_value={'state': 'searching', 'operator_id': ''}), \
+                patch.object(cellular_network, '_selection_is_applied', return_value=True), \
+                patch.object(cellular_network, '_at_command') as command:
+            error = cellular_network._request_registration(MODEM, {'mode': 'automatic', 'operator_id': ''},
+                                                            runner, 120, use_at=True)
+        self.assertEqual(error, 'network_timeout')
+        command.assert_not_called()  # Do not issue COPS=2 and start roaming acquisition over.
+
+    def test_scan_publishes_networks_before_registration_recovery_finishes(self):
+        rows = [{"operator_id": "00101", "name": "Fixture", "status": "available", "access_technology": "lte"}]
+        progress = Mock()
+        def restore(*args, **kwargs):
+            progress.assert_called_once_with('restoring', rows)
+            return ''
+        with patch.object(cellular_network, '_at_command', return_value='+COPS: 0'), \
+                patch.object(cellular_network, '_scan_at', return_value=rows), \
+                patch.object(cellular_network, '_request_registration', side_effect=restore), \
+                patch.object(cellular_network, '_wait_registration', return_value={'state': 'roaming', 'operator_id': '00101'}), \
+                patch.object(cellular_network, '_selection_is_applied', return_value=True):
+            self.assertEqual(cellular_network._scan_quectel(MODEM, Mock(), 315, Mock(), progress=progress), rows)
+
+    def test_identical_automatic_restore_observes_search_without_a_second_registration(self):
+        with patch.object(cellular_network, '_prefer_at_scan', return_value=True), \
+                patch.object(cellular_network, '_request_registration', return_value='network_timeout') as request, \
+                patch.object(cellular_network, '_wait_registration', return_value={'state': 'searching', 'operator_id': ''}), \
+                patch.object(cellular_network, '_selection_is_applied', return_value=True):
+            with self.assertRaises(cellular_network.CellularRegistrationError) as caught:
+                cellular_network.register(MODEM, mode='automatic', runner=Mock())
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(caught.exception.detail['recovery']['state'], 'pending')
+
     @staticmethod
     def reply(stdout="", stderr="", returncode=0):
         return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
@@ -468,7 +501,7 @@ class CellularNetworkApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["networks"][0]["name"], "China Mobile")
         self.assertEqual(result["networks"][0]["name_zh"], "中国移动")
         self.assertEqual(result["networks"][0]["access_technology"], "lte")
-        scan.assert_called_once_with(MODEM, previous={"mode": "automatic", "operator_id": ""})
+        scan.assert_called_once_with(MODEM, progress=ANY, previous={"mode": "automatic", "operator_id": ""})
 
     async def test_manual_selection_persists_only_after_registration(self):
         line = {"id": "3", "iccid": "card-a"}

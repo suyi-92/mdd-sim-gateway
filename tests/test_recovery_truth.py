@@ -13,6 +13,21 @@ from host import mdd_orchestrator as host
 
 
 class CapabilityTruthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovering_bridge_does_not_fail_a_radio_toggle_before_actual_radio_arrives(self):
+        wanted = {'flight_mode': False, 'cellular_enabled': False, 'vowifi_enabled': False}
+        row = {'present': True, 'desired': wanted, 'actual': {'cellular_radio_enabled': False},
+               'cellular': {'data_active': False}, 'error': 'The SIM bridge keeps exiting (1 attempt(s))'}
+        def advance(_seconds):
+            row['actual']['cellular_radio_enabled'] = True
+        with patch.object(main.device_state, 'status', return_value={'devices': {'modem': row}}), \
+                patch.object(main.asyncio, 'sleep', new=AsyncMock(side_effect=advance)) as sleep:
+            await main._wait_for_device_request('modem', wanted, requested={'flight_mode': False})
+        sleep.assert_awaited_once()
+        row['bridge_recovery'] = {'state': 'failed', 'error_code': 'sim_access_failed_direct'}
+        with patch.object(main.device_state, 'status', return_value={'devices': {'modem': row}}):
+            with self.assertRaises(RuntimeError):
+                await main._wait_for_device_request('modem', wanted)
+
     async def test_saved_intent_and_settled_sim_failure_cannot_complete_rf_enable(self):
         wanted = {'flight_mode': False, 'cellular_enabled': False, 'vowifi_enabled': False}
         observed = {'devices': {'modem': {'present': True, 'desired': wanted,

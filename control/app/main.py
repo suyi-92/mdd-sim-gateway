@@ -4436,7 +4436,8 @@ async def _reconcile_failed_profile_outcomes() -> None:
                 or task.get("phase") != "profile_enable"
                 or task.get("error_code") not in {"profile_enable_failed", "profile_enable_unconfirmed"}
                 or task.get("outcome_result") == "different_profile"
-                or time.time() - float(task.get("outcome_checked_at") or 0) < 60):
+                or time.time() - float(task.get("outcome_checked_at") or 0)
+                    < (5 if int(task.get("outcome_checks") or 0) < 3 else 60)):
             continue
         device_id, iccid, reader = (str(task.get(key) or "") for key in ("device_id", "iccid", "reader"))
         def same_generation():
@@ -4503,6 +4504,7 @@ async def _reconcile_failed_profile_outcomes() -> None:
                 se_id=task.get("se_id") or "", se_aid=task.get("se_aid") or "",
                 resumed_from=task['id'])
             log.info("resumed failed eSIM enable after same-generation profile confirmation")
+            await _esim_profile_operation_resolved(iccid)
 
 
 async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> None:
@@ -4572,6 +4574,7 @@ async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> Non
             elif enabled == [iccid]:
                 await _update_esim_recovery(task_id, "profile_enabled", phase="profile_enabled",
                                            profile_confirmation_pending=False)
+                await _esim_profile_operation_resolved(iccid)
             else:
                 await _update_esim_recovery(task_id, "failed", phase="card_access",
                                            error_code="profile_enable_unconfirmed")
@@ -6292,8 +6295,15 @@ async def _scan_cellular_network(device_id: str):
     """Scan only the selected modem through MM, including its managed AT command path."""
     async with capability_lock:
         _observed, _inst, modem_path = _cellular_network_target(device_id)
+        key = _cellular_operation_key(device_id, _inst, _observed)
+        operation = network_operations.view(key).get("operation") or {}
+        loop = asyncio.get_running_loop()
+        def progress(phase, networks):
+            loop.call_soon_threadsafe(network_operations.progress, key, operation.get("id"),
+                                     phase, _display_cellular_networks(networks) if networks is not None else None)
         try:
             networks = await asyncio.to_thread(cellular_network.scan, modem_path,
+                progress=progress,
                 previous={"mode": _inst.get("cellular_network_mode") or "automatic",
                           "operator_id": _inst.get("cellular_operator_id") or ""})
         except cellular_network.CellularScanError as exc:
@@ -6446,7 +6456,12 @@ async def _wait_for_device_request(device_id: str, wanted: dict, timeout: float 
             if not current.get("present", True) or current.get("error") == "device is not connected":
                 await asyncio.sleep(.5)
                 continue
-            if current.get("error") or (latest.get("shared") or {}).get("error"):
+            # A bridge being respawned is a separate SIM-access observation, not
+            # proof that RF enable failed. Wait for the requested actual radio/data
+            # facts, while retaining terminal bridge and shared backend failures.
+            bridge_retry = (str(current.get("error") or "").startswith("The SIM bridge keeps exiting (")
+                            and not (current.get("bridge_recovery") or {}).get("error_code"))
+            if (current.get("error") and not bridge_retry) or (latest.get("shared") or {}).get("error"):
                 raise RuntimeError(current.get("error") or latest["shared"]["error"])
             actual = current.get("actual") or {}
             cellular = current.get("cellular") or {}
@@ -9448,6 +9463,22 @@ async def _esim_profile_operation_result(iccid: str, error: dict | None = None):
     except OSError as exc:
         # Persistence failure must neither hide the card result nor replay its write.
         log.warning("could not persist eSIM operation result error=%s", type(exc).__name__)
+
+
+async def _esim_profile_operation_resolved(iccid: str):
+    """Keep the failed command for audit, but record a later verified card outcome."""
+    entry = await asyncio.to_thread(_esim_cache_for_iccid, iccid)
+    for se in (entry or {}).get("ses") or []:
+        for profile in se.get("profiles") or []:
+            status = profile.get("operation_status") or {}
+            error = status.get("error") or {}
+            enable_error = (error.get("code") == "profile_enable_unconfirmed"
+                            or (error.get("diagnostic") or {}).get("step") == "es10c_enable_profile")
+            if profile.get("iccid") == iccid and status.get("state") == "failed" and enable_error:
+                await asyncio.to_thread(_esim_cache_update_profile, iccid,
+                    operation_status={**status, "state": "resolved", "resolved_at": time.time(),
+                                      "failed_at": status.get("updated_at"),
+                                      "resolution": "enabled_profile_verified", "updated_at": time.time()})
 
 
 @_esim_cache_transaction
