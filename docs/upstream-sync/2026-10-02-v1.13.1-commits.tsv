@@ -1,0 +1,368 @@
+4442d304654072808bea32f6b38b37021c939312	chore: sync the v1.9.4 release into develop
+ac48fe966584fa6cc00c8597cd3ca5c66202231d	Merge pull request #89 from MddIdd/chore/sync-v1.9.4-to-develop
+ea6192fd177773be3ea51dcb04a53058c0024267	fix(softphone): name a browser media failure instead of showing "Call ended"
+2140a53de2c3819332c0bdce7370505e2f2a847b	fix(softphone): place the call on silence instead of refusing it
+5794a3bb40994ebe7ca2b6249372fde87571745b	Merge pull request #91 from MddIdd/fix/softphone-microphone-preflight
+99223dc9edb10ebe31fd5cbd96af6cb68d41037d	chore(release): prepare v1.9.5
+919dced9aefbb003c2da3272d2c72a9b0617e745	Merge pull request #92 from MddIdd/release/v1.9.5
+9c9a57635ff86c39a5fd7cdb64363d7e6b4ff5f1	Merge pull request #93 from MddIdd/chore/sync-v1.9.5-to-develop
+62ebe9cc5782934cbafe689ed6c441f422191001	refactor(store): give every message a transport-independent identity
+76845b088714ba424214acf001869d71b73606ea	fix(sms): route VoWiFi deliveries through the shared message identity
+2b50bd942c974f4c302dd7e9047eb041aa802d6f	feat(modem): empty modem SMS storage as messages are imported
+57d1250abcf7008ab942d4e3bf55e4ce5f2a0efc	feat(mms): add a WAP Push and MMS encapsulation codec
+2c4cad15444776340aa603844472971375b03602	feat(mms): keep MMS notifications as pending MMS from both transports
+5b79b65b6d6b45099fe5c8e34e39b5cb943208d6	feat(mms): retrieve MMS from the carrier's MMSC
+c7f2b97efda088bb0838fea90595d28b2061e92f	feat(mms): send MMS through the MMSC
+c7f79796a2570a4fdc5064ab384602ecbaa877d6	fix(mms): leave a notification that expired before it was seen alone
+3227587c49c698c01461fa41efcdf8596168721f	refactor(mms): parse the provider database once per file version
+4002997c2ea29322d64479be9237bf35f5e7d886	feat(webui): show, download and send MMS in Messages
+261159776d2a44d1d9144f2273cdde52aba1090b	docs: describe MMS transport requirements and troubleshooting
+b6aa3859be6f41195edaa8895be8a4dd17459867	fix(mms): stop uploads over ModemManager from invalidating the modem
+48736ebef34aeb091907e90858b5c8997d68cccc	feat(mms): upload MMS through an AT port the gateway owns
+cc1be2fd64f378077e443e4f917eb99080f8b515	feat(install): release Quectel secondary AT ports for MMS; lock MMS per modem
+5ae231d2fce2891aafe1950b29fb45ce3e588c05	fix(store): scope message identity to the SIM and read timestamps zone-independently
+200d91d047035918b2969f7c0a940048e36ac28c	fix(store): make schema steps atomic and survive a rollback to an older version
+dd7dbf1f75cc43622d65683525c247def7f8b88b	fix(modem): keep modem SMS storage on upgraded installations
+63f7127d6fc210db97d0091bdf97c1b6935dd409	feat(webui): paste or drop pictures into the message box to send them as MMS
+202cec4c608966fa00a6a0b6a375b6eba68df070	fix(store): convert MMS notifications filed as non-text payloads
+384249f45a32b537a88410bb847bdebb02d0d769	fix(engine): record why the engine restarts, and stop the backoff creeping
+4705cbc2ede2389308109c13c03679b47861c0c6	fix(engine): make the P-CSCF apply mode settable per line
+3024b17bc7efc040e7711dfd662a04bda5e42f33	fix(control): record the first engine bounce after a manager restart
+d5cb44661be6ab446e64fd1cfca5e7dd85ee78dc	fix(engine): apply a new P-CSCF by cold-restarting Asterisk by default
+80a70b61aca75f807793c350e8df4c6d37b41e8c	fix(webui): name the two rekeys by what they renew, and say who renews at 0
+ca3ec4cb9ac224c49bb4071732163da97260f51a	fix(mms): never leave an MMS stuck in "downloading"
+13cd0f2410f87dc60e2d40619eee46be97774d64	fix(mms): aggregate delivery reports per recipient
+59c11e635c04776af87b605ecfc5b79c6f0ec199	fix(store): back up the history database before migrating it
+288435ad69f6e58ed1bcc8581632c2f2ece4fd58	fix(install): return the secondary AT port on uninstall, and test the rule lifecycle
+7c511ec50d8e40f38efef0f9ff850b330c298932	fix(store): reuse migration backups after failed starts
+623f06b2db372115776faadf78af016e24619fba	fix(install): tolerate missing release manifest
+2a04e5492f77d646c64285c604ca3f9cd7db0f10	Merge pull request #98 from MddIdd/fix/issue-94-install-no-manifest
+52e56131f58341097d7efdab720efc70525989ef	Merge branch 'develop' into feat/sms-mms-overhaul
+d182e87d361075116192a0162d78ed1cb712a496	feat(softphone): relay browser SIP-over-WebSocket through the control surface by line path
+01b21b200b22d281a8852104e9fbae00517ff215	feat(softphone): reach the engine by line path instead of a published WSS port
+db3db6719c3f417a429e1b4bcbe52319ca07f288	docs: describe the same-origin softphone WebSocket
+170b230425dc40c2cb8bf7d5538704581322fc31	test(softphone): drive the relay endpoint without starlette's TestClient
+b78648ce4fff52a3ba0e7bcaaf78a32ec42c7083	Merge pull request #95 from zhangsmallchi/feat/sms-mms-overhaul
+212f9e3c4e2eb881e207bc3acb66e13bbf7b7e2d	chore(release): prepare v1.10.0
+f52cb8bd042cc5e893290ce091fa55ed507ede13	chore(update): promote v1.9.5 channels
+82c8195b5c2c84e60e07c2a579aa291602bc6c50	Merge pull request #100 from MddIdd/release/v1.10.0
+6351dc6d725f983483b156a85ce20e97691069d0	Merge pull request #101 from MddIdd/chore/sync-v1.10.0-to-develop
+db46f7047d9e34b382a18fd8c7c5455b40ed7911	fix(engine): re-register after every tunnel rebuild, not only on a new P-CSCF
+7fe03c939a978bc15fca20ff3879c09641ba0a0c	Merge remote-tracking branch 'upstream/develop' into feat/softphone-ws-proxy
+fb4f996536e48d87b61d37bbe4620b7613970478	refactor(softphone): drop the settings the WSS listener left behind
+df9de724cefc22b9314ec8dbc26d36974eefc452	docs(config): say the retired "webrtc" port slot was only the WSS signalling port
+0260b7b8a6fd651efadcc68336b90ff90fe199ed	fix(engine): take the registration expiry from the carrier's own Contact
+dea490055a30689878134f7f220b78128cd22bbf	fix(engine): give the SIM time to answer, and retry when it still does not
+cb97f015450102b2b882f64915423738ca4afa71	fix(engine): claim the pending SIM response under the client state lock
+a64e7dfb9469f9d8c16c851554cffb130d2e62e1	Merge branch 'develop' into fix/engine-reconnect-evidence
+c2a6ce9bfb5497e206b402b7c6ec21d44303e57f	Merge pull request #96 from MddIdd/fix/engine-reconnect-evidence
+0c74fa37a8beea916308ca5c142d46380b38879f	Merge branch 'develop' into fix/volte-registration-expiry
+0c51d163e7f76198efc2ba9e412b26dd05e775f7	Merge pull request #105 from MddIdd/fix/volte-registration-expiry
+03b08eba249c1ae6c095bde3c7f686b47fbddf2b	Merge branch 'develop' into fix/volte-sim-timeout-retry
+c4d586b89207e48fd05a4ccf2989e5284558783c	Merge pull request #106 from MddIdd/fix/volte-sim-timeout-retry
+36b0b2792061e80a80909b6e67922104cf018c28	Merge branch 'develop' into fix/rekey-labels
+b54786b1674fb0253d736230798b2691bb950ef0	Merge pull request #97 from MddIdd/fix/rekey-labels
+fdbb8f654267358f0b7ae1bb18db1518509f4ba6	Merge branch 'develop' into feat/softphone-ws-proxy
+442b87ef0c98240387149989c608e7e1445558a4	Merge pull request #99 from zhangsmallchi/feat/softphone-ws-proxy
+4fdcde21dbbabfd5d1faa047189fb94d7e88c6cd	fix(softphone): close relay setup failures cleanly
+3de86a21e4aab53066b8975f072f8254d435c540	Merge pull request #107 from MddIdd/fix/softphone-ws-followup
+99fd908a3bd8441a202d6a0a768649b8dcd3bbe4	fix(engine): end the plain 'h' handlers with Hangup(), not Return()
+0df6d0d101356aca16a3fd7f37fcb6d306939344	feat(diagnostics): say which side ended a call, and carry Asterisk's warnings
+7aafc7809f1841a909d11fa8845a3abc81baf01e	Merge pull request #110 from MddIdd/fix/dialplan-h-return
+6d298aff1e01c71d794a22c8dbcb0d0a120a66f9	feat(webui): open conversations at the newest message
+473091b0863560d04bc88543d837717c03dbb8c7	fix(mms): build the SMIL with an XML library and give every part a unique reference
+3d916ce419ef25009de2a0a27374c330e63b9bf8	fix(mms): check the line's size limit against the packaged m-send-req
+5b39484757f1d05c5e80c8980ba631e5cd17ea6d	fix(mms): extract attachment naming helpers
+4c4873975a1fc312494a52122642f34e14c9e982	fix(mms): store parts under internal names and switch files only after commit
+38a39007d12e406539479d23b1ac5e734248aae3	fix(backup): keep MMS attachments with every copy of the message history
+500e88b4262208e0800883b7a50ef33207c2bbf9	fix(backup): report pre-existing missing MMS attachments
+b6acbf2d5ceace37aa41f7afdeb986f2b2829542	Merge pull request #111 from MddIdd/fix/mms-repair-only
+501f057f7c70dbdea84026d8f492aa28418e9fa6	release: prepare v1.11.0
+8d9a8308a5ffd7dae1a0d11b5f8e9ebeca27437a	Merge pull request #112 from MddIdd/release/v1.11.0
+916f200fad285cab43106e865973194a56ce7f50	Merge pull request #113 from MddIdd/main
+0c4cff4acc0a40efde02ff4b7585f3fe2c31c037	fix(mms): submit again when the modem cuts an upload short
+8583fe09147068ad992a78d7dda63f6c1dc5a014	fix(webui): show one pane at a time on a phone
+c6982e92d2fd009495761c98468c77a981ca6760	fix(webui): make a conversation row a button
+9ad6e4c20773d931ea7ac5881e195e60006e43c8	fix(webui): cache the page and the files it names differently
+1a7175ca19d4ca57fe083de673e41aa4c28f0611	feat(container): add full NAS container runtime
+6d4c9b787a6403c32755008450e073a4d4eab3ff	feat(lines): start a reader line when its IMEI completes the draft
+153bc50b8cf63151d2e7b02aaa88c625940c01b6	fix(container): harden updates and hardware supervision
+414f89de8dc595d7666df90caedd7c690fb0c86a	fix(container): cache Docker storage inventory
+924dd89d33aad7637f8b920723c6d8dd1fc17901	chore(release): prepare v1.12.0-rc1
+bf6ed878233f8550a1b3d5517d5d7269860264fa	Merge pull request #119 from MddIdd/feat/108-container-runtime
+a9871f8e0add80d6926a66bb73c207c5ee3d2115	fix(container): recover a stale QMI session during early host uptime
+ed28c4b14c5457cc6a000b06325f3cb08f8d2e49	Merge pull request #120 from MddIdd/release/v1.12.0-rc1
+9ec03eb0c5897ca5d606ef988ef4f392dedf6be5	Merge pull request #121 from MddIdd/main
+a6c3bbac5c690abf927f39b42e2bd826fd79cccc	perf(container): stop re-asking the same questions every pass
+f814a75b188b5517630b70495b1bab8c314e0bf5	Merge pull request #122 from MddIdd/perf/container-hot-paths
+22bf0ab7149ff388c3cfe5152aa0d0087751c2f1	fix(container): fetch the Engine image the deployment guide promises
+b26248670173722a8d6e593b45815ff8348bfc6d	fix(container): let Hardware recover a stale QMI session before Control starts
+864134629257823cf0228a63036679048252830d	Merge pull request #123 from MddIdd/fix/engine-image-fetch
+f3c6102c846a35b3b8b1e08efb086da0804880a3	Merge branch 'develop' into fix/hardware-cold-start
+64d1d3f1ad65e7c068172a1212ccf20c55a24ea0	Merge pull request #124 from MddIdd/fix/hardware-cold-start
+2bac37ed0d433d14f60cbf0e9a442fb79fcf0af4	chore(release): prepare v1.12.0-rc2
+19963dbb0a095d65f8ef5301b8ad3a7df62ad7ff	Merge pull request #125 from MddIdd/release/v1.12.0-rc2
+91259ae08ea2937592237f2f51af352e90bb5ad8	Merge pull request #126 from MddIdd/main
+291e602c075bf01a9e9a078dedae20eec7037acd	fix(container): run the update's disk probe instead of a second control plane
+4b2cbc6663969ec5c803a4036ec0a3aad1843231	fix(container): make the first real container update work end to end
+c030bee637991eb1d4eceb99c093606bbfb2c94b	feat(container): a one-shot rollback drill for release validation
+9f631570727880e0c00efc4465653cc6b031a8fd	Merge pull request #128 from MddIdd/fix/update-helper-entrypoint
+eceabd1528a6c6cd594b8c752d85cc15daef28c4	chore(release): prepare v1.12.0-rc3
+acabb53c5a4cc17b9284c25cf1e52c79b2c12a72	Merge pull request #129 from MddIdd/release/v1.12.0-rc3
+7df272fc11ec8d44c838f6ac1ec77c64d816c94d	Merge pull request #130 from MddIdd/main
+8e74547993b3ff02c698c740b61e4a50737bd440	docs: present the full-container deployment in the README
+9c48052d68876fca68d5045a75f975bb502cde38	Merge pull request #131 from MddIdd/docs/rc4-container-readme
+0fa633ab920feb3db7e543e6d898399c443ff0e3	chore(release): prepare v1.12.0-rc4
+65efb79f1aa4326f34915d52f4154b210b622b46	Merge pull request #132 from MddIdd/release/v1.12.0-rc4
+3291d47520ebc0ccca14fa3d2a5723bbc7c76e15	Merge pull request #133 from MddIdd/main
+23e25dcf8bae6cbf187e335f43bdcf70d5475634	fix(container): start in a data folder created in File Station
+37cbf4655a73b61420329ef9950b60c5ce2acc45	fix(webui): translate the draft line's IMEI hint
+6ce9f3e079fab09918f17ae32190c06962de725d	Merge pull request #135 from MddIdd/fix/data-dir-ownership
+0e14fc3afba17715d0fe7b4f95f6ea2473846c84	Merge branch 'develop' into fix/i18n-reasons
+7ca108a245b01f412e70aa21efd87b099d2e4218	fix(devices): tell the operator what a draft line is really waiting for
+c86ae5a1fb3162158b872aa32fe441d172d3b4cf	Merge pull request #136 from MddIdd/fix/i18n-reasons
+d02c489d2f9aba23923520de2cbab30714882913	Merge branch 'develop' into fix/draft-setup-guidance
+ad265b602741c0ecfb08791f31b93e3fec003da2	fix(devices,webui): read a draft's SIM again, and show an update until it lands
+f0adebebf1c95c315a713ccd71aaa2635d1eb122	Merge pull request #137 from MddIdd/fix/draft-setup-guidance
+fd7b46474ab17e58f36fac5d0e5292c70af023d8	Merge pull request #138 from MddIdd/fix/card-reread
+360f303f5a3e9ee3c1de5b7dd1f2c12ddfc404ad	chore(release): prepare v1.12.0-rc5
+0814d956b7dd4ae95e3a43b9cdfead4e9ccd10b1	Merge pull request #139 from MddIdd/release/v1.12.0-rc5
+18dd142ba1fae97893faac3f1e9995971185c7d0	Merge pull request #140 from MddIdd/main
+737903383d475b5f80413856cf3f56969522e097	fix(container): let Container Manager manage containers an update created
+80ddc80367f6eab7322cc7e6ea6b47282f8565b0	fix(lines): avoid engine restart on rename
+2b3ac854fed62e3471d3d6757b4559da34c1a3e5	Merge pull request #141 from MddIdd/fix/helper-compose-labels
+629bc151e95f3d9e2dd4c8c8492c59748c9a358c	Merge pull request #115 from MddIdd/fix/line-rename-runtime-fields
+4c9b1105a28c003411cc7f6b84a009eebd8a7a7a	chore: bring #115 (merged into main) back to develop
+b29f7b039e07391097d62ddddb2ccc63eb882200	Merge pull request #143 from MddIdd/sync/115-to-develop
+1a72b386aa54786535f2c9c4d663549ff2e55f15	chore(release): prepare v1.12.0-rc6
+c51a11c895fef5b55f769c2d9d90b71c3e39383e	Merge pull request #144 from MddIdd/release/v1.12.0-rc6
+57df66eb35b7ed491ab4aa423a1705938b549ccf	Merge pull request #145 from MddIdd/main
+3062e080e2eed588a75926ef945b7f0e901ea3ce	docs: full-container deployment is for any Linux Docker host, not only NAS
+55dfcb40bba77036dc57d2b04af5e824db499008	Merge pull request #146 from MddIdd/docs/container-not-nas-only
+78d9154579d7022e11eba1588b96e2ce2c699da7	feat(drivers): publish the DS1621+ modem driver pack, rebuilt reproducibly
+5eff37b4c4090e4d3bea4d8c31c3eeeac9ba1e11	Merge pull request #147 from MddIdd/feat/synology-driver-pack
+9d99d8b6ab9128926737696522e6d5a666152c11	chore(release): prepare v1.12.0-rc7
+4aac4c6f62c31a130aef0d4a8d8c4e9fdfa1736b	Merge pull request #148 from MddIdd/release/v1.12.0-rc7
+f1e52fc53e9bf95e75f13106a55b3798d30aaa60	Merge pull request #149 from MddIdd/main
+96453a94d84b14aa2098a697ccdaa0bca5d5efb8	fix(hardware): serve SIMs that grant a single logical channel
+775191c002bad7caff905b873003531ad0908240	feat: raise the SIM line limit from five to ten
+ae3bcdd0775f30c27ff01b6921a9310a1adb17fe	feat: tell 4G and VoWiFi apart, and know when a carrier offers no VoWiFi
+7d6429a1ef04216cf3bcc3a79737fb18a841b133	fix(webui): show the 4G badge on readers too, as not supported
+48337cb7dae0694cb4964c9c7901328e4eac4855	fix(webui): the line picker shows 4G and VoWiFi state, not VoWiFi alone
+267a3b20f3034bf75c491f428c30e4b525b638d5	feat: modem VoLTE/IMS switch, and explain SMS the network refused
+726f8e0dc551681c9e4a69494b5583f7602833ad	Merge pull request #150 from MddIdd/fix/modem-single-channel-sim
+843d575d75c9dd183d633c1196a1f57f1ceda713	Merge branch 'develop' into feat/max-sim-lines-10
+fbd0638bd0bdc08734f1daa219137baad3b17126	Merge pull request #151 from MddIdd/feat/max-sim-lines-10
+7d3fb51d9db23887d4d9e2e752d063463ac8925e	Merge branch 'develop' into feat/vowifi-carrier-support
+5785bdc32ecb7332b9ec6eeed21fcc8ca1207c38	Merge pull request #152 from MddIdd/feat/vowifi-carrier-support
+c9314f901d7f9989f5b4198d8bff274a4707c4b1	Merge remote-tracking branch 'origin/develop' into feat/modem-volte-ims
+a0e8a9f6d49dfd76aca22557f89bee70acec8e0f	Merge pull request #153 from MddIdd/feat/modem-volte-ims
+a4b1acc835aeebb8d04831c9fc4e39593a9c97fe	chore(release): prepare v1.12.0-rc8
+1d5e825edc10e9edfa8d7d2693e2df6077a917e0	Merge pull request #154 from MddIdd/release/v1.12.0-rc8
+60a074300e1f4108c0ab87254a98c3b85295f286	Merge pull request #155 from MddIdd/main
+358160b1ddbbe11b47168a93bfaac4803a51784d	fix(update): wait for a slow base container to exit before Compose replaces it
+c54d32968921cd904f3cb40cbf77a4c841f14383	fix(hardware): reset a modem ModemManager gave up on through its AT port
+18c27f6d63b0ed018e9e3a69e47823d3c13aadb2	feat: detect whether a modem can hand cellular call audio to the gateway
+e60051212486e7082597082aab6fed0ffecfdb94	Merge pull request #157 from MddIdd/fix/hardware-unclaimed-modem-reset
+bc33c4424847c70b6adeccdff713212215bb8868	Merge branch 'develop' into feat/modem-voice-audio-detect
+4e97b29c0355e68aab3ca2b1dc78fddfc43b7a0a	Merge pull request #158 from MddIdd/feat/modem-voice-audio-detect
+7e12eba43d131646b0d484b47d96a2319d0dfc08	perf: cut idle CPU on a Raspberry Pi from about one core to a quarter
+83a69bc377c6bba98c8d5e9767a93c540302a3f2	fix(perf): drop --start-interval, which Docker before 25 rejects at build time
+796ced4b104a89aa5361d2d0689aa758de893a64	Merge pull request #159 from MddIdd/perf/config-cache
+b7ab4de035f0f1f2faefded5f10a207c3debda72	Merge branch 'develop' into fix/update-stop-hung-container
+6b930e58f1d8689498e0eb001907c6e776972f97	Merge pull request #156 from MddIdd/fix/update-stop-hung-container
+0d3c106a61eec045f2dbb786aaea9acf5c91f88f	fix(mms): give up on an MMSC connection after 30 s, not the whole upload deadline
+63209e0eeff2e4442c0ccf0ae8e3bb2046a2bf6e	Merge remote-tracking branch 'origin/develop' into pr116
+d3c39dd847e5639237488784e0d2c4ecf2f78100	fix(webui): open a new message on a phone, and let back return to the list
+2083e249cd0008296bd3805ca0a128d425e87bc3	Merge pull request #116 from zhangsmallchi/fix/mms-send-retry
+4377736fee313e75576600a5a8b75a1e4814990c	Merge remote-tracking branch 'origin/develop' into pr117
+ac3a4952e829acbd9e65855cf73c10054b7aeca0	docs(changelog): Messages on a phone
+2ccd21c345d29da07be9fa411ce8a7eb4224efe9	Merge pull request #117 from zhangsmallchi/fix/webui-mobile-and-caching
+8384b22ce893276854f3e42e71713edc6adbbc16	chore(release): prepare v1.12.0-rc9
+12cb4e85772d3f671826a1fa9c7dfdd8d5958907	Merge pull request #160 from MddIdd/release/v1.12.0-rc9
+7db1e9c4db08d2b33b667d83f3f7faeda87923fd	Merge pull request #161 from MddIdd/main
+7a4620aada4e03e26ffe58a002662fca2503432d	fix: name container modems by model, and keep a stable reason for carriers without VoWiFi
+ebf2130e8037ddcc83968025bd16567301cf24d2	Merge pull request #163 from MddIdd/fix/container-modem-name-and-vowifi-text
+303994d06edd7e8e35a2a7704f394b8696778442	fix: a rename that also resaves the padded MNC or the live reader binding no longer restarts the line
+ed911f7b5b364ba09fbed72c72fa179a06e15fab	Merge pull request #164 from MddIdd/fix/rename-ignores-derived-fields
+fd2a055c4a51d44cf7001f7de5be8ed6549bd114	fix(host): keep the reader definitions readable by an unprivileged pcscd
+ed9855badbe6271d2e62319179e4c9cd9dbda812	Merge pull request #165 from MddIdd/fix/reader-conf-readable-by-pcscd
+17ced1f1b604010012dbe68b5130192506425ab9	chore(release): prepare v1.12.0-rc10
+e6cb04b26487bedd0d854198a568fa827d96eead	Merge pull request #166 from MddIdd/release/v1.12.0-rc10
+5402eb3a81afaa82eeb299a84991d15c83f8ca14	Merge pull request #167 from MddIdd/main
+be767e12dc410136fd959d9dc169ad1f8f73de84	fix(engine): start a line behind a country exit, where the Engine has no default route
+f5b91bbe1bf0d3b53e386ef28a62581d9f49a9f8	Merge pull request #168 from MddIdd/fix/swu-source-without-default-route
+a64261af036db7f66c2adfcd42c4abdf61969e6d	chore(release): prepare v1.12.0-rc11
+a062c3ba11177991d3e77918ffb6e4e754382b06	Merge pull request #169 from MddIdd/release/v1.12.0-rc11
+852ed2006c4d9f0872ac83102841d7f642612853	Merge pull request #170 from MddIdd/main
+8cdff7a858f5f06dcc0abaa16507927c3140bb32	fix(update): keep the image archives being downloaded out of the pre-update backup
+99c1578627a78fed65101a5469029684282c1f2f	Merge pull request #171 from MddIdd/fix/backup-skips-update-staging
+f151a1d89a436f1a6adf56febe34e9f47d09a7e8	release: prepare v1.12.0
+8e44fe1a7c250c12265c3616335e79fa0091e77f	Merge pull request #172 from MddIdd/release/v1.12.0
+af9e044f071ff9cdbffe50205605ab1d0cddb46f	Merge pull request #173 from MddIdd/main
+ac5032bfec840769985ceee4d2b36175b95c9593	docs: drop the release-candidate records
+cc37eb6d641250c3fd7f7548a3cf5325e4cd8468	Merge pull request #174 from MddIdd/docs/drop-rc-records
+37f7564b3746c058b0ff44482b903f5b5f25d75e	Merge pull request #175 from MddIdd/main
+604cc8b6530cc80ec0eb5edeb3bc41badc807b57	fix(egress): take the exit tuns back out of the host DNS
+0abfa08ef6815ea57852b0a556a40d3fbe40be96	Merge pull request #176 from MddIdd/fix/tun-steals-host-dns
+f6d4545e8349ea80b649d436e61b1909db1360dd	fix(engine): deliver engine events to Control in the container stack
+7b3443bbe9e55758ada66af4ab61ea47dac16cf7	feat(auth): one gate for API requests and WebSocket handshakes
+592c8abba2d393625b68b943093516b5c1e07481	feat(contacts): an address book, with vCard and CSV import and export
+a50d47bdaad3d06efd9bd99d495f2d6b29072a10	feat(webui): a contacts page, and names on messages and calls
+c8f4c731c8db7283370f991a2417a39d79c0f498	fix(contacts): read vCards the way phones actually write them
+42e785235ac6f79ba02b520ca455c3553a024283	fix(contacts): an import keeps two people on one number apart
+432bbc35ca5e95380c05fc83062095e9a71ba8c3	fix(contacts): read an import off the event loop, and refuse bad input with a 4xx
+a8cca5dbb12cc3318c4b1e6e599633f0ab3976ba	fix(contacts): an export cannot carry a formula or an extra property
+5db445d339e41b6925167234c0be3089148ab2e5	fix(webui): name the caller on the Calls page's own line
+e358a438244a69d08dee5862b42e0cb0fe194f2e	build(contacts): depend on phonenumberslite, shipped with the control image
+7f58c1069346f67e5d38e12ba7c9b2eb17ad9d8a	feat(contacts): match a national number on each line by that line's country
+7b4fd0def5c7ee070370ca9836b4a9af08271f37	fix(contacts): an import adds every entry, skipping only an exact copy
+bc0c6ef0533678998506a5abb3c7d85041f9b9fb	fix(contacts): keep every spelling of a number the owner wrote
+128e90d8300bdecfc432966c7bf60f7193f2cd7e	fix(auth): read the session cookie the way Starlette does
+8ed79418bbeae0bf7e84837ccd46b07446a17539	feat(webui): say why live updates stopped behind a proxy that hides the host
+e17785305bd3e4c90e501d5bbfd5cdde88d57ef7	Merge pull request #178 from zhangsmallchi/feat/control-gate
+dc376fb0584b581494e6d12de97d590ca24cf1ec	feat(notify): announce lines that stay offline, and their recovery
+ef012f29c3e7f2ad96b8837ca5a84eac041a313e	docs(proxy): tell nginx to pass $http_host, which keeps the port
+9354516e3da0315f02909a1c0b59b34ac57eaaee	Merge remote-tracking branch 'origin/develop' into feat/line-offline-notify
+0bcd36f7f9708ff12c8d28f8ee2dcffa7e54ef86	Merge pull request #180 from MddIdd/fix/nginx-http-host
+10d3c1aa14a2a3763aacb054df4440d2d147953e	Merge remote-tracking branch 'origin/develop' into feat/line-offline-notify
+89c77e5f78e7ffd9db49ccc0240b0bec85a13b34	Merge pull request #179 from MddIdd/feat/line-offline-notify
+427005ea5462f58bf2feee9cf690163410a1fb85	Merge branch 'develop' into fix/manager-url-container
+b11eabc84836c84c597b0f76a0bdf7efd9379117	Merge pull request #177 from MddIdd/fix/manager-url-container
+92c40d5d8468949cbcf30b94c7d2f877035ed091	Merge branch 'develop' into feat/contacts
+1ad08f34bfa2d7aaca31cb560444a1286666cc2a	fix(install): keep SWU_TUN_MTU on the docker-mode control container
+5d3dbc16bd6b6bb9522c48592877733c047fd439	refactor(auth): the gate dispatches on a table of credential sources
+e52feb1c322ab8c14a554733d12d4a1a36f57aea	Merge pull request #118 from zhangsmallchi/feat/contacts
+e8e919a70c89525f41f8992347b3c70b32f2ad23	feat(messages): record how far a conversation has been read
+556b6b9db02ed8ab52ab9fa3ef48df2013c294f0	Merge branch 'develop' into fix/docker-tun-mtu
+1a631c7289c9daa022fa684ca84b3de3b5c07fea	Merge pull request #182 from zhangsmallchi/fix/docker-tun-mtu
+265c1e33c7b64155046ad63fac635d3549d1ee59	fix(install): let SWU_TUN_MTU be cleared and keep it in a usable range
+540bf0ab315e39fcda69674f834c69ec099ae965	Merge pull request #185 from MddIdd/fix/tun-mtu-clear-and-range
+a1e8379533922cb2780725e45d4ac165488e9689	fix(orchestrator): recover a modem ModemManager has failed
+29d3292f4676073efd4877dd6b5e4702ae428c35	Merge pull request #184 from zhangsmallchi/fix/modem-failed-state
+d62447c8a11f57b184ea0e8c7dcc8dbf80a9b944	Merge branch 'develop' into refactor/credential-sources
+6bc2d23e7debf2b8ff16c102998c37e6c0897cbc	fix(orchestrator): spare flight-mode modems, and time failed-modem recovery monotonically
+024cc846a2515c4578a6d42b5be1ddb64ef4275b	Merge pull request #183 from zhangsmallchi/refactor/credential-sources
+81775a313f294b38a94afe8ba6993325b3f39f5b	Merge branch 'develop' into fix/modem-failed-recovery-followup
+c039c78efafbaf8d14a1505533f16cdeaa760594	Merge pull request #186 from MddIdd/fix/modem-failed-recovery-followup
+c34b17a387d035cf8b48584a8e2012f83e08d0ef	perf(messages): index a line's inbound messages for the unread count
+9f9409a0664234f1f34bd052fcbc4eb581c98ae1	fix(webui): a message is not read while the page is out of sight
+380a60e83da92d93131d7fadc9c22215e7fed757	Merge branch 'develop' into feat/message-read-state
+dfd2c7baf144150fe2a325b9930be43af2e7614b	Merge pull request #127 from zhangsmallchi/feat/message-read-state
+63810377a3261744cd4fee3b4ea6d10d19260702	feat(media): add the relay media mode, its network and TURN relay
+1b8a6801aedb8aa33c3ba1851902f9e7aba876a6	feat(engine): run a line on the media network in relay mode
+5daa3f38b131b2bd1d697d6a096df0f3df648141	feat(control): move running lines to the media mode and supervise the relay
+b2f111fb705b2446cea63124ca88aa8e5a40b012	feat(softphone): carry call media through the relay in relay mode
+3092f644826d3c1ef58dbe1ff44aaf1a1f53286d	feat(install): switch the media mode, and ship the relay image
+a225647e98faef1c95d56889ea841dd48d903403	docs: describe the two media modes and how to switch them
+208cb19609ef62637123a5774105663d27cd48c7	build(media): run the stock coturn alpine image, ship it as a Release asset
+8149a64eb0b5f8c95e0632bb47b63bfc5acb4c17	docs(media): mark relay mode untested on the container stack, and what it needs
+b78a8c3b041a36af2162011930546e12d50cd38e	fix(engine): never take the media address as the line's own
+478b80e6a3b2d6dac3a21eee795ddebb3d44651f	fix(control): a line that cannot move to the media mode no longer holds up the rest
+de018ef8bd93023324776ed46a210424daeb118d	fix(media): serialise the switch with supervision, and leave nothing behind
+4e7b423a00ee8d5a5921521c273d0beaaed4146d	fix(control): act on a media switch at the next pass, not the next check
+e03c3d152ae1f2d8eeed62b6b7f642e8f1cf6c80	fix(control): a line left relay-pending waits instead of rebuilding every pass
+e2e3361517b95f08dbd5825de4dea95a6c53238d	fix(media): stop checking for a leftover relay once direct mode is clean
+05a8dfb42b7f162c2b49e0c29e4587858692a105	feat(hardware): recognise the Quectel EC20 (05c6:9215) out of the box
+6d8ec456ffca711f31ce15f2d5835271f56fbb22	feat(hardware): find, test and add a modem the gateway does not know
+a49501bfd0239db5b4f9a61ce6f01a9fe110c577	docs(media): record what was tested on a container stack
+05d3f4e052a7df023fb53b6977b3adc63d0a516b	Merge pull request #181 from zhangsmallchi/feat/media-relay
+d205b4534cfc878d6da257320ca3f62f80848714	Merge branch 'develop' into feat/ec20-builtin-profile
+d8e4d3b5fc41c60217ea148943ebe7555b42a582	Merge remote-tracking branch 'origin/feat/ec20-builtin-profile' into feat/unknown-modem-onboarding
+e6d262f5304abbc78fd8a093d160433f2c467cff	fix(hardware): stop resetting a modem ModemManager can never claim
+6396bff260a583a54738d38ebad7675239f19021	Merge pull request #187 from MddIdd/feat/ec20-builtin-profile
+2ec44a315750f4d6571f5b59b94928ddb602ade4	Merge branch 'develop' into feat/unknown-modem-onboarding
+3971cab3a077499bb6a53bf7e70b50094bb73876	Merge pull request #188 from MddIdd/feat/unknown-modem-onboarding
+17adc1fbe368f5dcd68c71d07175fe19790d8710	Merge branch 'develop' into fix/container-unclaimed-reset-bound
+2b9ba4161a3ccb5111977d7b54b52b2edcd0e4b6	Merge pull request #191 from MddIdd/fix/container-unclaimed-reset-bound
+2f62ca507eac3b059cdbe720259d8759cd08ff1d	fix(control): forward RTP for lines behind an exit on the container stack
+48ef2c7962ab3e70446a986d4c0bdc2acda31a18	Merge pull request #192 from MddIdd/fix/container-socks-rtp-forward
+a9b0303c48c292ad12a40187350292bd824b8739	feat(auth): client apps sign in and get a revocable bearer token
+13854d0fa9c17f90279e86ffbfa743ffb8aa51e6	feat(auth): a client sees its lines' conversations, not the gateway's configuration
+7592abde9e11edf5db8cbca21877a62de7258c9d	feat(auth): revoking a sign-in closes its sockets, and the audit names who acted
+bdf3cda14a4b318ebf79b948609feb5707e3ba08	feat(webui): list signed-in apps under Security and sign them out
+be1ea2844da9310cdc361ac5e173b91dedb45234	feat(auth): a client shares the administrator's address book and read marks
+05ed5c54c386c2d1bc7e62e0a5bc72915396225d	fix(auth): address the review of client tokens
+55fbce4a5836ee328090b053c35f7c3e79227103	Merge pull request #194 from zhangsmallchi/feat/client-tokens
+4124b5c81a8f6392ba7428f0b0a629f2b90aef06	fix(engine): bind the softphone WebSocket on the Engine network (#195)
+315c23cc5c35116d7edd6030bcdc9be636a11445	Merge pull request #196 from MddIdd/fix/softphone-ws-engine-network
+70f80e074885f35e752af9eb7fafb07e55d23e8f	feat(mms): one attachment capability table, and check what a file really is
+f4b143d61cc87ad839ca1996a73fda53e09afbd9	feat(mms): convert and shrink attachments on the gateway to fit the line's limit
+3567756799b79f00a3a95d3c0c2a1563b9578ec3	feat(mms): keep attachments on the gateway while a message is composed
+c4d06130f074c7f0953cf8ba71caac59d919ff0b	feat(webui): upload MMS attachments as they are added and show what will be sent
+e80ad4835875900bcbf252d8893d9959a774ad8c	feat(mms): send several attachments as one MMS or one MMS each
+7490a98d78fa1a470c6b3eb8e4c30706fa035506	feat(webui): choose between one MMS and one MMS per attachment
+a3ea7e984335a1705da9a612599a2c43982c710f	docs(mms): describe attachment checks, gateway conversion, the size limit and backups
+3e630caa10ef4a4ef8a11f3012581e2c3ab5cc0b	fix(mms): do not read past the end of a video that stops short
+c8c74089e9726f9b39bd3c0ef950ed9704f4a347	fix(mms): hold a picture to the pixel limit instead of Pillow's warning
+486bb422a4d0355c12811623aef6d429fe7e6fc9	fix(mms): refuse more staged attachments than a line can hold
+3d59282971ef1e6bad0f82a822f21ab87f32c661	fix(mms): give the staging area a disk budget, not just a count
+e56a8af0ae3a3d582bc8dff2e74bb705d472127d	fix(mms): bound what one upload request may carry
+4b73067c9024ac03d23c5274eb65c595bd0625b6	fix(install): stop a reload that cannot install or import the dependencies
+6ef233209cb79c8ea3786b35bd6e6aa69952705d	docs(notice): record what the pillow-heif wheel brings with it
+1f69ce6040df7c6f2530fa29d6924c277565e074	build(mms): read HEIC with pi-heif, which has no encoder
+8bfbacd384fc2dc7f3c1b9fbf7cf516809172aa3	fix(mms): spool uploads under the data directory, not /tmp
+de018ab542c52f69bde489ab32228a73fcd31c6f	feat(auth): a client app may compose MMS the way the WebUI does
+05c0c313434bd0fb46d2edae3d9a4cd2a969b98e	perf(mms): decode a picture once, shrunk, and fit every target from that
+59d0b2c4cb284dbf10e1b7be550dbd04ce245bfa	feat(mms): decode pictures in worker processes, within a memory budget
+400a15969dcf87861009b369d7e5e653d7d49cad	fix(mms): read the memory limit under cgroup v1, as Synology DSM mounts it
+13b4fb18b3a136f36bb3d449cb9347ac65959893	Merge pull request #103 from zhangsmallchi/feat/mms-improvements
+8702acaa0be0a7bd9408aec91f79fea63cfebe90	fix(hardware): recognise a modem's data interface by DEVTYPE, not by its name
+eec4d0f9b4e409bdef3c774425718469515d0305	feat(media): fall back to iptables-legacy where the kernel has no nf_tables
+87300fa398ff9651f9d99178b2b5997e9f5236dd	Merge pull request #197 from MddIdd/fix/hardware-predictable-nic
+74b5ddb5b9a68ce67455eaa1fdf8fa37847c0ff6	Merge branch 'develop' into fix/container-rtp-iptables-legacy
+8a6e39d332e2885bd9b4425bf7cd50e901d50376	Merge pull request #198 from MddIdd/fix/container-rtp-iptables-legacy
+bdfe217b827b578c4bd753c118ec76b031c5e0c4	fix(voice): add request-URI parameters to outgoing calls; user=phone on T-Mobile US
+447cd924a27a3df007e5fdceb93697be83b17248	fix(engine): stop forwarding incoming SMS to the browser softphone
+f0e37be93c0550eb31ddf992d6a85fd959e2d3cc	Merge pull request #200 from MddIdd/fix/sms-no-softphone-forward
+431ae6d3dda2ec4cc624798f72504faaf34ff91a	Merge branch 'develop' into fix/tmobile-us-user-eq-phone
+81ae0d45158330bcc9f3421249ad3594aee99669	Merge pull request #199 from MddIdd/fix/tmobile-us-user-eq-phone
+1f2c0f0426274299c419506fdfd178600fb0b64e	chore(release): prepare v1.13.0-rc1
+28549091fe74995734eb19a5276622c50997d659	Merge pull request #201 from MddIdd/release/v1.13.0-rc1
+a0df61978c08f1287e037d8e9f1771fedb665bdb	Merge pull request #202 from MddIdd/chore/sync-v1.13.0-rc1-to-develop
+9e6f2f2a10826d93fcf34659c156939266beab2a	fix(update): size the container update's space check by the release, and prune old releases
+a9024db2ce19c9f7ed82b100a3eaead861463c41	fix(egress): copy the modules the orchestrator imports into the Egress image
+4096e5e268748a30cd51ccf4f52986c64d4a54b0	Merge pull request #204 from MddIdd/fix/egress-image-modem-probe
+94acf0d7277236889c4c1b1cd13a44f60a48b15c	Merge branch 'develop' into fix/container-update-disk-space
+2b7f16b3bfd953f3fd8ab97866b0acfe0057b930	Merge pull request #203 from MddIdd/fix/container-update-disk-space
+f7aca89c4a6f4b5e66dbc553e9c15d4028ebd528	chore(release): prepare v1.13.0-rc2
+1753579cfb9c7a17c59fb8f769a22c2dda5b472f	Merge pull request #205 from MddIdd/release/v1.13.0-rc2
+6f0158136361bca0bf74f186a980b11ec695762f	Merge pull request #206 from MddIdd/chore/sync-v1.13.0-rc2-to-develop
+53432e9c567089a15dff960818bb166d0f5c4365	fix(webui): show one ;user=phone setting on the line form
+9f930d975504fe8dd2c1de6c8f00144e44288e11	fix(media): read the firewall probe's output on Synology's Docker
+251d88ffb24e85c3b57000bb2238f1eb7055dd8a	feat(messages): mark a long SMS completed by a late part, and push it whole
+913fc57ae16347a91fd7157efd599c22867d367e	fix(control): rebind a card-reader line to the reader holding its SIM on every start
+aa6426c87c34f8c0c158ec2b68a8742d3e8be5fa	Merge pull request #209 from MddIdd/fix/media-probe-output-on-dsm
+2e5d19c266197aca095494b9070f36514d9942c5	Merge branch 'develop' into fix/reader-line-follows-its-sim
+f843c59c4429651da0b631fdf28c81942536d835	Merge pull request #211 from MddIdd/fix/reader-line-follows-its-sim
+8202118bb1b4ca88e237af98b54208c228542776	Merge branch 'develop' into fix/one-user-phone-setting
+227d10b34744c750f5d9e4c6456e2ef4ea5ee52e	Merge pull request #208 from MddIdd/fix/one-user-phone-setting
+6cc76379bd49941b725c5fd8f6eee1829f49d839	Merge branch 'develop' into fix/late-sms-completion
+bd794327a9e97acc3dca2ecf34c1e9c5fa6f911d	Merge pull request #210 from zhangsmallchi/fix/late-sms-completion
+0a6ab0db2e5df8eeed3f0cba876e5affa8699677	chore(release): prepare v1.13.0
+2eb46f7292f5e78ca0b2937ddab18e9711b5489d	docs(release): drop the sign-in-again limitation, which no longer holds
+caa17d57aef72f7b9bb657599105adefcf9b2455	Merge pull request #212 from MddIdd/release/v1.13.0
+7f8eb1184731d8b79ebfc822354191e2444af2fb	Merge pull request #213 from MddIdd/chore/sync-v1.13.0-to-develop
+ed3977ffecf06a5fa93f5d0fe706ef3e4d522dd1	docs: drop the v1.13.0 release-candidate notes
+b84f7ec6c1b11d25c6ce04060b8decfeb67a8091	Merge pull request #214 from MddIdd/docs/drop-v1.13-rc-records
+d0ec7c91f6e98dc3e1376a8ba76253aef378602e	chore(update): promote the main channel to 1.11.0
+71ea92728fb1aa4f22bb7a4e7794285c41cd9668	Merge pull request #216 from MddIdd/chore/promote-main-channel-1.11.0
+2f1b398dc02ce2d845b02fde1b0cdf58ee2e3988	Merge pull request #217 from MddIdd/chore/sync-policy-and-rc-cleanup-to-develop
+c02c30284f6349c40cbbdea610b74efadb1c0ad8	Fix UDP node test parser imports in control container
+724030b21b626c3b1839145b0bcdc6ab8f79c3a1	Merge pull request #218 from tinet-jutt/fix/udp-control-host-parser-import
+64c8106bf3dbdc75ebbe4f4c0f995b2a83b3d184	docs(changelog): move the #218 node-test fix under Unreleased
+94410e87fa5d1786b0ae6f0254f5734d38e582d3	Merge pull request #219 from MddIdd/docs/changelog-unreleased-218
+5f62cea86cdb3ac03d6490c87e852ae763379068	fix(vowifi): report a placeholder ePDG record (loopback-only answers) as unsupported
+9cd82839e4907bd71b3039583dd2185389d5751d	fix(esim): structured 409 (code + instance_id) when a running line blocks LPA
+0dc9e76631380043862612064d6cd412234f9563	fix(esim): close the LPA coroutine when the engine gate rejects the call
+dc12f04373f282527354b43d7d6e6c8b8cdfa1d8	Merge pull request #224 from Linwayne04/fix/esim-guard-coroutine-close
+ebb83bd1a8e2dd5172767ce88265eaaf3f8bf372	Merge branch 'develop' into fix/vowifi-epdg-placeholder-loopback
+e532c1fb90854eecf8616feebbf0d6b84871b982	Merge pull request #222 from Linwayne04/fix/vowifi-epdg-placeholder-loopback
+89ceb8ce57fff46c33402d2f6843ca34a05a25d6	Merge branch 'develop' into fix/esim-engine-running-409-structured
+f837d2aa533b1687e1018e1dcbee64c55842afa5	Merge pull request #223 from Linwayne04/fix/esim-engine-running-409-structured
+0e126bb72307f1c29855182d1666718c777712fa	fix(webui): keep SIM switching visible beside calls and messages
+6c4e9789ce9e1b49168c775a5ffa836c9ef56238	Merge pull request #226 from MddIdd/fix/sim-picker-sidebar
+cb1f0ab28de285b602959ce801a95473acd46afd	release: prepare v1.13.1 fixes for review
+3bf02ae24379a0c229f59337093fbc46a21dc12c	Merge pull request #227 from MddIdd/release/v1.13.1
+5108c37d0be2d7ec22a1d68af88e23f66ea2de08	chore(update): record v1.13.1 as the latest patch release
+5d5a1f8ee49cc306736e6c4cecdae301b8388119	Merge pull request #228 from MddIdd/chore/record-v1.13.1-release

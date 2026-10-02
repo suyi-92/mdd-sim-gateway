@@ -59,7 +59,10 @@ class UpdateRollbackTransactionTests(unittest.TestCase):
             run(["git", "clone", "--quiet", "--bare", str(fixture.repo), str(remote)])
             run(["git", "clone", "--quiet", str(remote), str(producer)])
             (producer / "tracked.txt").write_text("new generation\n", encoding="utf-8")
-            run(["git", "add", "tracked.txt"], cwd=producer)
+            (producer / "scripts").mkdir(exist_ok=True)
+            (producer / "scripts/mdd_mms_ports.sh").write_text(
+                (ROOT / "scripts/mdd_mms_ports.sh").read_text(), encoding="utf-8")
+            run(["git", "add", "tracked.txt", "scripts/mdd_mms_ports.sh"], cwd=producer)
             run(["git", "commit", "-m", "new generation"], cwd=producer)
             run(["git", "push", "origin", "vmware"], cwd=producer)
             new = run(["git", "rev-parse", "HEAD"], cwd=producer).stdout.strip()
@@ -92,6 +95,9 @@ info() {{ printf 'INFO:%s\\n' "$*" >&2; }}
 warn() {{ printf 'WARN:%s\\n' "$*" >&2; }}
 acquire_lock() {{ :; }}
 driver_reprobe_native() {{ :; }}
+have() {{ return 1; }}
+export MDD_UDEV_RULES_DIR={str(root / "udev-rules")!r}
+mkdir -p "$MDD_UDEV_RULES_DIR"
 image_path() {{
   local key
   key=$(printf '%s' "$1" | tr '/:' '__')
@@ -229,6 +235,8 @@ cmd_update --yes
             self.assertEqual((images / stable_key).read_text(encoding="ascii").strip(), old)
             self.assertEqual(data.read_text(encoding="ascii"), "old-data\n")
             self.assertEqual(runtime.read_text(encoding="ascii"), "old-running\n")
+            self.assertFalse((root / "udev-rules/78-mdd-mms-at-port.rules").exists(),
+                             "a failed upgrade must restore the previous absent MMS rule")
 
 
 if __name__ == "__main__":

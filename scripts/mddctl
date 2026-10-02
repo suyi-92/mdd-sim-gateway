@@ -35,6 +35,8 @@ Usage:
   mddctl reset-admin [--dry-run]
   mddctl export-backup --input PATH --output PATH.mddbackup
   mddctl import-backup --input PATH.mddbackup
+  mddctl media [status | direct | relay [--port N] [--public-host HOST]]
+  mddctl mms-port install | remove
   mddctl driver status | install | restore
   mddctl uninstall [--purge]
 EOF
@@ -104,6 +106,7 @@ UPDATE_SNAPSHOT=""
 UPDATE_PREVIOUS_IMAGE=""
 UPDATE_WORKTREE_ACTIVE=0
 UPDATE_TRANSACTION_ARMED=0
+UPDATE_MMS_RULE_BACKUP=""
 
 command=${1:-}
 [[ -n "$command" ]] || { usage; exit 2; }
@@ -814,6 +817,66 @@ cmd_driver() {
   esac
 }
 
+media_cli() {
+  ( cd "$INSTALL_DIR/control" && env -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY \
+      -u DOCKER_CERT_PATH -u DOCKER_API_VERSION DOCKER_HOST=unix:///var/run/docker.sock \
+      MDD_DATA="$DATA_DIR" MDD_HOST_DATA="$DATA_DIR" MDD_REPO_DIR="$INSTALL_DIR" \
+      MDD_ENGINE_IMAGE="$ENGINE_STABLE_IMAGE" "$INSTALL_DIR/.venv/bin/python" -m app.media "$@" )
+}
+
+cmd_media() {
+  local sub=${1:-status}
+  (($# == 0)) || shift
+  case "$sub" in status|direct|relay) ;; *) die "usage: mddctl media [status|direct|relay]" ;; esac
+  acquire_lock
+  validate_managed_checkout
+  validate_active_generation
+  service_is_active "$CONTROL_UNIT" || die "the native Control service must be running"
+  media_cli "$sub" "$@" || return 1
+  if [[ "$sub" == relay ]]; then
+    info "allow the configured relay port in both TCP and UDP through your firewall/router"
+  fi
+}
+
+cmd_mms_port() {
+  local sub=${1:-} backup armed=0
+  [[ $# -eq 1 && ( "$sub" == install || "$sub" == remove ) ]] || die "usage: mddctl mms-port install|remove"
+  acquire_lock
+  validate_managed_checkout
+  validate_active_generation
+  source "$INSTALL_DIR/scripts/mdd_mms_ports.sh"
+  install -d -m 0700 "$CACHE_DIR/update"
+  backup="$CACHE_DIR/update/mms-port-before-$$"
+  snapshot_mms_at_port_rule "$backup" || die "could not snapshot the existing MMS rule"
+  remember_run_state
+  mms_port_cleanup() {
+    local code=${1:-1}
+    trap - EXIT HUP INT TERM
+    if ((armed)); then
+      if ! restore_mms_at_port_rule "$backup"; then
+        warn "MMS rule rollback failed; services remain stopped"
+        exit "$code"
+      fi
+      restore_run_state || warn "could not restore the previous service state after MMS rollback"
+    fi
+    exit "$code"
+  }
+  trap 'mms_port_cleanup $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  armed=1
+  stop_runtime
+  if [[ "$sub" == install ]]; then
+    ensure_mms_at_port_rule || die "could not apply the MMS AT-port rule"
+  else
+    remove_mms_at_port_rule || die "could not remove the MMS AT-port rule"
+  fi
+  restore_run_state || die "could not restore the previous service state after the MMS rule change"
+  armed=0
+  trap - EXIT HUP INT TERM
+}
+
 cmd_update() {
   local no_cache=0 dry_run=0 assume_yes=0
   while (($#)); do case "$1" in --no-cache) no_cache=1 ;; --dry-run) dry_run=1 ;; --yes|-y) assume_yes=1 ;; *) die "unknown update option: $1" ;; esac; shift; done
@@ -830,6 +893,7 @@ cmd_update() {
   UPDATE_PREVIOUS_IMAGE=""
   UPDATE_WORKTREE_ACTIVE=0
   UPDATE_TRANSACTION_ARMED=0
+  UPDATE_MMS_RULE_BACKUP=""
   if ((dry_run)); then info "update preflight passed for $old; no fetch or build performed"; return; fi
   git -C "$INSTALL_DIR" fetch --prune origin "$BRANCH"
   new=$(git -C "$INSTALL_DIR" rev-parse "origin/$BRANCH")
@@ -904,6 +968,12 @@ cmd_update() {
           rollback_failed=1
         fi
       fi
+      if [[ -n "$UPDATE_MMS_RULE_BACKUP" ]]; then
+        if ! restore_mms_at_port_rule "$UPDATE_MMS_RULE_BACKUP"; then
+          warn "rollback could not restore the previous MMS AT-port rule"
+          rollback_failed=1
+        fi
+      fi
       if ((rollback_failed == 0)); then
         if ! restore_run_state; then
           warn "rollback could not restore the previous service run state"
@@ -941,6 +1011,7 @@ cmd_update() {
   bash "$worktree/install.sh" "${args[@]}"
   (cd "$worktree" && "$build/venv/bin/python" -m unittest discover -s tests -p 'test_*.py')
   (driver_reprobe_native)
+  source "$worktree/scripts/mdd_mms_ports.sh"
 
   snapshot="$BACKUP_DIR/pre-update-$old-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
   UPDATE_SNAPSHOT=$snapshot
@@ -949,6 +1020,10 @@ cmd_update() {
   previous_image="mdd-sim-gateway/engine:previous-$old"
   UPDATE_PREVIOUS_IMAGE=$previous_image
   UPDATE_TRANSACTION_ARMED=1
+  local mms_rule_backup="$CACHE_DIR/update/mms-rule-$new"
+  snapshot_mms_at_port_rule "$mms_rule_backup" || die "could not snapshot the MMS AT-port rule"
+  UPDATE_MMS_RULE_BACKUP=$mms_rule_backup
+  ensure_mms_at_port_rule || die "could not apply the MMS AT-port rule"
   docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1 && docker tag "$ENGINE_STABLE_IMAGE" "$previous_image"
 
   git -C "$INSTALL_DIR" merge --ff-only "origin/$BRANCH"
@@ -980,6 +1055,8 @@ cmd_uninstall() {
   fi
   if [[ -f "$STATE_DIR/scr-prime-driver.json" ]]; then driver_restore_internal; fi
   stop_runtime
+  source "$INSTALL_DIR/scripts/mdd_mms_ports.sh"
+  remove_mms_at_port_rule
   systemctl disable "$CONTROL_UNIT" "$ORCHESTRATOR_UNIT" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$CONTROL_UNIT" "/etc/systemd/system/$ORCHESTRATOR_UNIT"
   rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
@@ -1003,6 +1080,9 @@ cmd_uninstall() {
   output=$(managed_containers) || die "could not list managed Engine containers during uninstall"
   [[ -z "$output" ]] || mapfile -t ids <<< "$output"
   ((${#ids[@]} == 0)) || docker rm -f "${ids[@]}" >/dev/null
+  if [[ -f "$INSTALL_DIR/control/app/media.py" ]]; then
+    media_cli direct --wait 0 || die "could not clean up the managed media relay"
+  fi
   output=$(docker image ls --format '{{.Repository}}:{{.Tag}}') || die "could not list Docker images during uninstall"
   output=$(grep '^mdd-sim-gateway/engine:' <<< "$output" || true)
   [[ -z "$output" ]] || mapfile -t images <<< "$output"
@@ -1036,6 +1116,8 @@ case "$command" in
   reset-admin) cmd_reset_admin "$@" ;;
   export-backup) cmd_transfer_backup export "$@" ;;
   import-backup) cmd_transfer_backup import "$@" ;;
+  media) cmd_media "$@" ;;
+  mms-port) cmd_mms_port "$@" ;;
   driver) cmd_driver "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   -h|--help|help) usage ;;

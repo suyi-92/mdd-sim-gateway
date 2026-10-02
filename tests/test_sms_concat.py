@@ -178,8 +178,8 @@ class StaleSegmentTests(TempStore):
         stale = store.take_stale_sms_segments(timeout=180, now=5000)
         self.assertEqual([g["concat_ref"] for g in stale], [1])
         self.assertEqual(stale[0], {"instance": "7", "peer": "888", "concat_ref": 1,
-                                    "total": 3, "first_ts": 1000, "seqs": [1],
-                                    "bodies": ["old"]})
+                                    "total": 3, "first_ts": 1000, "sent_ts": None,
+                                    "seqs": [1], "bodies": ["old"]})
         self.assertEqual(self._buffered(), 1, "the fresh group stays buffered")
 
     def test_sweep_ages_a_group_by_its_first_part_not_its_last(self):
@@ -297,6 +297,124 @@ class InboundEventTests(unittest.IsolatedAsyncioTestCase, TempStore):
                               ts=group["first_ts"])
         self.assertEqual(self._stored(),
                          [{"peer": "888", "body": CTEXCEL[0] + main.SMS_GAP_MARK + CTEXCEL[2]}])
+
+    async def test_redelivered_text_and_modem_copy_are_not_shown_twice(self):
+        # SMS-DELIVER from 447700900123 with TP-SCTS 26-03-14 15:09:26 +02:00.
+        tpdu = "040c91447700091032" + "0000" + "62304151906280" + "01" + "41"
+        event = _event("7", "+447700900123", "A", ("", "", ""))
+        event["args"] += ["0", "0", "", tpdu]
+        first = await main.api_engine_event(event)
+        again = await main.api_engine_event(event)
+        self.assertNotIn("duplicate", first)
+        self.assertTrue(again.get("duplicate"))
+        with store._conn() as c:
+            ts = c.execute("SELECT ts FROM messages").fetchone()[0]
+        self.assertEqual(ts, 1773493766)
+        self.assertIsNone(store.ingest_message("7", "in", "07700900123", "A",
+                                               transport="cellular", sent_ts=1773493766))
+        self.assertEqual(self.push.call_count, 1)
+
+    async def test_parts_carry_the_first_parts_network_time(self):
+        store.add_sms_segment("7", "888", 4, 2, 2, "b", sent_ts=2_010)
+        group = store.add_sms_segment("7", "888", 4, 2, 1, "a", sent_ts=2_000, with_meta=True)
+        self.assertEqual(group, {"bodies": ["a", "b"], "sent_ts": 2_000})
+
+
+class LateCompletionTests(unittest.IsolatedAsyncioTestCase, TempStore):
+    """A text shown incomplete, then made whole by its late parts (#193).
+
+    It stays where the reader saw it, with its time and its read state, and says it was
+    completed. VMware updates the existing row without sending a second notification.
+    """
+
+    def setUp(self):
+        TempStore.setUp(self)
+        self.broadcast = AsyncMock()
+        self.push = Mock()
+        for target, attr, new in ((main.hub, "broadcast", self.broadcast),
+                                  (main, "_dispatch_push", self.push)):
+            p = patch.object(target, attr, new)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _published_incomplete(self, seqs, total, ref=77):
+        """What the reaper leaves behind: the partial text stored, and its group remembered."""
+        bodies = [CTEXCEL[n - 1] for n in seqs]
+        rec = store.add_message("7", "in", "888", main._join_sms_parts(bodies, seqs, total))
+        store.remember_partial_sms_group("7", "888", ref, total, rec["id"], seqs, bodies)
+        return rec
+
+    def _row(self, mid):
+        with store._conn() as c:
+            return dict(c.execute("SELECT body, ts, completed_ts FROM messages WHERE id=?",
+                                  (mid,)).fetchone())
+
+    async def test_the_last_part_completes_the_message_in_place_without_duplicate_push(self):
+        rec = self._published_incomplete([1, 2], 3)
+        before = self._row(rec["id"])
+        self.assertIsNone(before["completed_ts"])
+
+        result = await main.api_engine_event(_event("7", "888", CTEXCEL[2], (77, 3, 3)))
+        self.assertEqual(result["merged"], "3/3")
+        after = self._row(rec["id"])
+        self.assertEqual(after["body"], "".join(CTEXCEL))
+        self.assertEqual(after["ts"], before["ts"])                 # it keeps its place
+        self.assertIsNotNone(after["completed_ts"])
+        # The page learns it from the broadcast record, and a page loaded later from the row.
+        self.assertEqual(self.broadcast.await_args[0][0]["message"]["completed_ts"],
+                         after["completed_ts"])
+        self.assertEqual(store.list_messages("7", "888")[0]["completed_ts"],
+                         after["completed_ts"])
+        self.push.assert_not_called()
+
+    async def test_a_part_that_leaves_it_incomplete_updates_it_without_a_push(self):
+        rec = self._published_incomplete([1], 3)
+        await main.api_engine_event(_event("7", "888", CTEXCEL[2], (77, 3, 3)))
+        self.assertIsNone(self._row(rec["id"])["completed_ts"])
+        self.assertIn(main.SMS_GAP_MARK, self._row(rec["id"])["body"])
+        self.assertEqual(self.broadcast.await_count, 1)
+        self.push.assert_not_called()
+        # A repeat changes nothing; completion keeps the VMware no-duplicate-push contract.
+        await main.api_engine_event(_event("7", "888", CTEXCEL[2], (77, 3, 3)))
+        await main.api_engine_event(_event("7", "888", CTEXCEL[1], (77, 3, 2)))
+        self.push.assert_not_called()
+        self.assertIsNotNone(self._row(rec["id"])["completed_ts"])
+
+    async def test_completing_a_message_already_read_leaves_it_read(self):
+        rec = self._published_incomplete([1, 2], 3)
+        store.mark_thread_read(store.ADMIN_OWNER, "7", "888")
+        await main.api_engine_event(_event("7", "888", CTEXCEL[2], (77, 3, 3)))
+        self.assertEqual(store.unread_counts(store.ADMIN_OWNER, "7"), {})
+        self.assertIsNotNone(self._row(rec["id"])["completed_ts"])
+
+    def test_a_database_from_before_the_mark_gains_the_column(self):
+        with store._conn() as c:
+            c.execute("ALTER TABLE messages DROP COLUMN completed_ts")
+            c.execute("PRAGMA user_version="
+                      f"{store._MIGRATIONS.index(store._migration_completed_ts)}")
+        store.init()
+        with store._conn() as c:
+            columns = {row[1] for row in c.execute("PRAGMA table_info(messages)")}
+            version = c.execute("PRAGMA user_version").fetchone()[0]
+        self.assertIn("completed_ts", columns)
+        self.assertEqual(version, len(store._MIGRATIONS))
+
+
+class DeliverTimestampTests(unittest.TestCase):
+    def test_scts_with_positive_zone(self):
+        # 26-03-14 15:09:26, zone 8 quarter hours east.
+        tpdu = "4404812143000462304151906280"
+        self.assertEqual(main.sms_pdu.deliver_timestamp(tpdu), 1773493766)
+
+    def test_negative_zone_and_malformed_input(self):
+        # 26-01-02 03:04:05, zone 0x8A: the low nibble 0xA is the sign bit plus a tens digit of 2,
+        # = sign + 2 tens, high nibble 8 -> 28 quarter hours west (-07:00).
+        tpdu = "0003a121f300006210203040508a"
+        self.assertEqual(main.sms_pdu.deliver_timestamp(tpdu), 1767323045 + 7 * 3600)
+        self.assertIsNone(main.sms_pdu.deliver_timestamp(""))
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("zz"))
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("0103a121f3"))   # SMS-SUBMIT
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("0003a121f30000621320"))
 
 
 if __name__ == "__main__":

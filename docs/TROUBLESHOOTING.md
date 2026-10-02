@@ -1,5 +1,44 @@
 # VMware 故障排查
 
+## 1.13.1 新增能力排查
+
+### 软电话与中继
+
+浏览器信令已改为经过 WebUI 的同源 HTTPS/WSS。若显示“实时更新和软电话已停用”，
+先核对反向代理 Host（保留端口）、Upgrade/Connection 和可信代理设置，不再尝试逐一信任
+Engine 的 WSS 证书。`sudo mddctl media status` 区分 direct/relay 与中继健康；relay 下
+检查指定端口是否同时允许 TCP/UDP、外部主机/端口映射是否正确。中继失败不等同于 SIM
+鉴权或 IMS 注册失败，须分别核对。
+
+隧道已连接而 IMS REGISTER 反复无响应时，可在已经排除 SIM/出口故障后核对分片路径。
+需要降低 MTU 时，用 `sudo systemctl edit mdd-sim-gateway-control` 在 `[Service]` 下设置
+`Environment=SWU_TUN_MTU=1280`（允许 1280–1500），然后在维护窗口通过 `mddctl restart`
+重新启动线路；drop-in 在更新时保留。该参数不是所有注册失败的通用修复。
+
+### 彩信（MMS）
+
+1. 确认线路具有受支持的蜂窝模块、运营商 MMS 权限与正确的 APN/MMSC；普通 PC/SC reader
+   没有蜂窝能力。彩信设置按线路配置，不能用其他线路的成功代替当前线路验收。
+2. Quectel 上传需要独占 secondary AT 口。旧管理入口升级后若尚未配置，使用安装说明中的
+   `sudo mddctl mms-port install`，不要手动抢占 primary AT 或关闭 ModemManager。只有一个 AT
+   口的模块不会被该规则匹配；是否支持仍取决于模块型号/固件。
+3. “发送结果未知”表示完整请求可能已经送达 MMSC 而响应未确认。不要自动反复重发，以免重复
+   收费或重复送达。明确在上传完成前中断的情况由有界重试处理；过期通知会单独标记。
+4. 附件按实际内容校验。常见可发送格式为 JPEG/GIF/PNG、AMR/AMR-WB/MP3/AAC、兼容的
+   3GP/MP4、纯文本和 vCard 2.1/3.0；WebP/BMP/HEIC/HEIF/AVIF 图片在网关转换为 JPEG。
+   HEVC 视频、vCard 4.0、内容不符或损坏文件会拒绝；实际格式表以彩信设置接口为准。
+5. 大小限额针对最终完整彩信报文。图片按线路限额压缩，多个附件共用一条彩信上限；选择
+   “每张单独发送”会形成多条独立彩信。视频和音频不自动压缩。图片元数据会去除，照片旋转
+   会规范化。大 HEIC 图片解码仍可能占用较多内存，转换进程预算不足时会排队或明确拒绝。
+6. 新构建在切换服务前实际导入 Pillow/pi-heif；导入失败应修复完整构建依赖后重新更新，
+   不要略过检查。需要控制转换资源时，可在 Control 的 systemd drop-in 设置
+   `MDD_MMS_CONVERT_WORKERS` 和 `MDD_MMS_CONVERT_MEMORY`（MB）。
+7. 临时草稿在 `mms-staging/`，超过阈值的上传暂存在 `uploads/`；发送后的附件在 `mms/`。
+   使用受管备份/恢复同时保留数据库与附件，不手工用单个数据库覆盖运行目录。
+
+以下历史版本记录解释既有 VMware 行为；其中旧 WSS 端口排查仅适用于旧版本/旧 Engine。
+
+
 `1.9.4-vmware.52` 区分 eSIM 下载、配置启用、桥接恢复和漫游注册。
 下载成功后启用返回 `6F00` 或 PC/SC 暂不可用，不能据此推断下载失败或配置被删除；须继续核对
 同一 USB 代次的目标配置实读结果。页面会保留待核实的列表、重试只读缓存，并突出显示本次切换
@@ -819,7 +858,7 @@ Engine；如果日志仍显示 Fake-IP，检查 sing-box/Xray 出口状态和 DN
 浏览器 SDP 会过滤 Fake-IP ICE candidate。双向音频仍失败时检查：
 
 - 浏览器麦克风授权；
-- WSS 8089/8099；
+- 当前版本 WebUI 同源 WSS（旧版 Engine 才检查 8089/8099）；
 - 对应 RTP UDP 小范围；
 - VM 桥接地址是否与 Control 的 advertise address 一致；
 - 是否有 VPN/安全软件改写浏览器路由。

@@ -168,7 +168,7 @@ class PageRhythmTests(unittest.TestCase):
 
     def test_calls_messages_keepalive_and_logs_have_narrow_layout_contracts(self):
         self.assertIn('className="u-call-layout"', SOFTPHONE)
-        self.assertIn('className="u-messages-layout"', MESSAGES)
+        self.assertIn('u-messages-layout u-messages-split', MESSAGES)
         self.assertIn('className="u-keepalive-grid"', KEEPALIVE)
         self.assertIn('className="u-log-toolbar"', LOGS)
         self.assertIn("@media(max-width:760px)", CSS)
@@ -254,7 +254,7 @@ class PageRhythmTests(unittest.TestCase):
         self.assertIn("access_technology", CELLULAR_PRESENTATION)
         self.assertIn("No data bearer", CELLULAR_PRESENTATION)
         self.assertIn("d.cellular.packet_service === 'attached'", UNIFIED)
-        self.assertIn("registeredCellular\n      || capabilityDetail(kind, c, device, t)", UNIFIED)
+        self.assertIn("registeredCellular\n      || (unsupportedReason ? t(unsupportedReason) : capabilityDetail(kind, c, device, t))", UNIFIED)
 
     def test_cellular_network_selection_is_scanned_confirmed_and_responsive(self):
         self.assertIn("cellularNetworkState.start(device.id, 'scan')", UNIFIED)

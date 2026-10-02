@@ -11,9 +11,9 @@ import { communicationLineDetails } from '../simLineDetails.js'
 // selected-line state so switching a messaging line cannot tear down an active phone session.
 //
 // Only lines whose physical reader is currently PRESENT are listed — a provisioned line
-// whose reader/card is unplugged is dropped from the dropdown (its config stays under SIM
+// whose reader/card is unplugged is dropped from the list (its config stays under SIM
 // Config and it reappears when the reader returns).
-export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false, showToast }) {
+export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, unreadLines = {}, label = 'Active SIM / line', showDetails = false, showToast }) {
   const { t, language } = useI18n()
   const selectedHardware = useRef('')
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
@@ -37,12 +37,32 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
       || i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
   }
   const numberTail = (i) => String(i.msisdn || '').replace(/\D/g, '').slice(-4)
+  // Calls and texts can go over 4G or VoWiFi, so a line's state is both paths. Showing only
+  // the VoWiFi line status called a SIM with working 4G "Stopped".
+  const statusText = (i) => {
+    const device = devices.find((d) => String(d.instance_id || '') === String(i.id))
+    const caps = device?.capabilities || {}
+    const parts = []
+    const cellular = caps.cellular?.actual
+    if (device && device.device_type !== 'reader' && cellular && cellular !== 'unsupported') {
+      const registered = ['home', 'roaming', 'registered'].includes(String(device.cellular?.registration || '').toLowerCase())
+        && !caps.flight?.desired && caps.flight?.actual === 'off'
+      parts.push(cellular === 'off' && registered ? t('Cellular network registered')
+        : `${t('Cellular data (4G)')} ${t(`cap.${cellular}`)}`)
+    }
+    const vowifi = caps.vowifi || {}
+    if (vowifi.actual === 'off' && vowifi.support?.status === 'unsupported') parts.push(`VoWiFi ${t('cap.unsupported')}`)
+    else if (vowifi.actual === 'off' && vowifi.desired === false) parts.push(t('VoWiFi is off'))
+    else if (i.status?.presentation?.label || i.status?.label) parts.push(`VoWiFi ${t(i.status?.presentation?.label || i.status.label)}`)
+    else if (vowifi.actual) parts.push(`VoWiFi ${t(`cap.${vowifi.actual}`)}`)
+    return parts.join(' · ')
+  }
 
   // Calls/Messages own their useful default: choose the first live line here instead of in
   // App, where a global default could leak an unrelated line into a device's SIM tab.
   const id = selected?.id
   useEffect(() => {
-    if (!id || !live.some((i) => i.id === id)) {
+    if (!id || !live.some((i) => String(i.id) === String(id))) {
       const replacement = live.find(i => deviceFor(i)?.id === selectedHardware.current)
       setSelected(replacement?.id || live[0]?.id || null)
     } else {
@@ -67,13 +87,9 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
           const c = sourceFor(i)
           const physical = deviceFor(i) || c
           const tail = numberTail(i)
-          const statusLabel = i.status?.state === 'STOPPED' && physical.device_type === 'modem'
-            && physical.capabilities?.vowifi?.desired === false
-            ? ['home', 'roaming', 'registered'].includes(physical.cellular?.registration)
-              ? 'Cellular network registered' : 'VoWiFi is off'
-            : i.status?.presentation?.label || i.status?.label
-          const st = statusLabel ? ` — ${t(statusLabel)}` : ''
-          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
+          const status = statusText(i)
+          const st = status ? ` — ${status}` : ''
+          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}{unreadLines[i.id] ? ` · ${t('Unread messages')} (${unreadLines[i.id]})` : ''}</option>
         })}
       </select>
       {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}

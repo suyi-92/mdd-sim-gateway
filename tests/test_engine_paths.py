@@ -8,7 +8,17 @@ import unittest
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
+
+
+def _docker_errors():
+    """Mirror docker-py's hierarchy: ImageNotFound is a subclass of NotFound there, so a
+    stub that makes them unrelated would hide a handler catching the wrong one."""
+    not_found = type("NotFound", (Exception,), {})
+    return SimpleNamespace(
+        NotFound=not_found,
+        ImageNotFound=type("ImageNotFound", (not_found,), {}),
+    )
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +66,7 @@ class EnginePathTests(unittest.TestCase):
     def engine_module():
         fake_docker = SimpleNamespace(
             from_env=lambda: None,
-            errors=SimpleNamespace(NotFound=type("NotFound", (Exception,), {})),
+            errors=_docker_errors(),
         )
         with patch.dict(sys.modules, {"docker": fake_docker}):
             sys.modules.pop("control.app.engine", None)
@@ -151,11 +161,13 @@ class EnginePathTests(unittest.TestCase):
         self.assertEqual(bindings["5038/tcp"], ("127.0.0.1", 5038))
         self.assertEqual(captured["volumes"]["/etc/localtime"],
                          {"bind": "/etc/localtime", "mode": "ro"})
-        # Only authenticated WebRTC and RTP stay reachable; standalone SIP is not published.
-        for exposed in ("8089/tcp", "10000/udp"):
-            self.assertNotIsInstance(bindings[exposed], tuple)
-        self.assertNotIn("5060/udp", bindings)
-        self.assertNotIn("5061/tcp", bindings)
+        # Only RTP stays reachable; no SIP listener is published, including the softphone's
+        # WebSocket, which the control surface relays over the docker bridge.
+        self.assertNotIsInstance(bindings["10000/udp"], tuple)
+        for private in ("8088/tcp", "8089/tcp", "5060/udp", "5061/tcp"):
+            self.assertNotIn(private, bindings)
+        self.assertFalse(any(v.get("bind", "").startswith("/etc/asterisk/certificate")
+                             for v in captured["volumes"].values()))
 
     def test_default_engine_has_no_host_ami_mapping_and_uses_configured_rtp_span(self):
         engine = self.engine_module()
@@ -186,6 +198,14 @@ class EnginePathTests(unittest.TestCase):
         self.assertEqual(len([key for key in bindings if key.endswith("/udp")]), 12)
         self.assertIn("10011/udp", bindings)
         self.assertNotIn("10012/udp", bindings)
+        self.assertEqual(captured["sysctls"], {
+            "net.ipv6.conf.all.accept_ra": "0",
+            "net.ipv6.conf.default.accept_ra": "0",
+            "net.ipv6.conf.all.autoconf": "0",
+            "net.ipv6.conf.default.autoconf": "0",
+            "net.ipv6.conf.all.use_tempaddr": "0",
+            "net.ipv6.conf.default.use_tempaddr": "0",
+        })
 
     def test_proxied_engine_pins_epdg_to_the_real_routed_address(self):
         engine = self.engine_module()

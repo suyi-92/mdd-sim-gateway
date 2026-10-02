@@ -30,6 +30,11 @@ import urllib.request
 from pathlib import Path
 
 try:
+    from host import modem_probe
+except ImportError:  # run as host/mdd_orchestrator.py, with host/ itself on the path
+    import modem_probe
+
+try:
     import serial
 except ImportError:  # pragma: no cover - host installer provides pyserial
     serial = None
@@ -38,6 +43,13 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
+
+
+def load_yaml_text(text: str) -> dict:
+    """Parse with libyaml when PyYAML has it: the same safe schema, far less CPU. The country
+    egress re-reads a subscription of hundreds of nodes every few seconds."""
+    loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return yaml.load(text, Loader=loader) or {}
 
 # 0x8C7B (35963) is vpcd's own default port, which the distribution package hands to its
 # "Virtual PCD" reader. Two pcscd readers cannot listen on one port, so sharing that base
@@ -809,6 +821,9 @@ class Orchestrator:
         self.backup_operation_request_path = self.root / "backup-operation-request.json"
         self.device_rescan_request_path = self.root / "device-rescan-request.json"
         self.device_rescan_status_path = self.root / "device-rescan-status.json"
+        # USB devices that look like a modem but match no model, and operator-requested tests.
+        self.usb_candidates = modem_probe.CandidateScanner(self.root / "usb-candidates.json")
+        self.modem_probes = modem_probe.ProbeRequests(self.root)
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -968,6 +983,9 @@ class Orchestrator:
                 migrated_bridge_terminal = True
         if migrated_bridge_terminal:
             self._persist_bridge_terminal()
+        # device id -> ModemManager's failed verdict for this physical USB generation.
+        # Cleared once ModemManager reports any other state; no blind firmware reset.
+        self._modem_failed: dict[str, dict] = {}
         # Whether this gateway is configured VoWiFi-only (hardware.modem_backend = serial).
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
@@ -1664,7 +1682,7 @@ class Orchestrator:
                 None, "", "ready", "failed", "cancelled", "waiting_flight_mode"}
             recovery_failed = cellular_recovery.get("state") == "failed"
             device_transitioning = bool(not recovery_failed and (
-                transitioning or (not degraded and
+                transitioning or (not degraded and device_id not in self._modem_failed and
                 present and (target_data_active != observed_data_active or
                              (not sim_missing and backend_active
                               and radio_enabled is not None and
@@ -1808,6 +1826,37 @@ class Orchestrator:
         retries and reports a terminal SIM-access failure instead of issuing a blind reset.
         """
         time.sleep(2)
+
+    def recover_failed_modem(self, modem: dict, reason: str, wanted: bool = True) -> None:
+        """Report an MM failure without changing an unverified modem's physical generation.
+
+        A USB profile (including EC25-compatible VID/PID) proves neither the firmware's
+        reset contract nor ownership of its QMI clients. Upstream's unconditional CFUN
+        reboot can interrupt a working VoWiFi bridge and invalidate an eSIM recovery.
+        The existing per-device, per-generation UIM recovery remains responsible for
+        profile switches; other failed modems require an explicit operator recovery.
+        """
+        device_id = modem["id"]
+        generation = str(modem.get("usb_generation") or "")
+        record = self._modem_failed.get(device_id)
+        if not record or record.get("usb_generation") != generation:
+            record = {"reason": reason, "since": time.monotonic(),
+                      "usb_generation": generation, "resets": 0, "rebooted": 0}
+            self._modem_failed[device_id] = record
+        record["reason"] = reason
+
+    def forget_absent_modem_failures(self, live_ids: set) -> None:
+        self._modem_failed = {device_id: value for device_id, value
+                              in self._modem_failed.items() if device_id in live_ids}
+
+    def modem_failure(self, device_id: str) -> dict:
+        """Read-only diagnostic: no automatic reset is claimed without a safe contract."""
+        record = self._modem_failed.get(device_id)
+        if not record:
+            return {}
+        return {"reason": record["reason"], "resettable": False,
+                "resets": 0, "rebooted": 0, "exhausted": False,
+                "recovery_blocked": "unverified_reset_contract"}
 
     def _bridge_stderr_path(self, hwid: str):
         # Since 1.3.10 this carries the bridge's stdout too: its activity lines used to go
@@ -2067,8 +2116,10 @@ class Orchestrator:
                 "metadata_age_seconds": max(0, now - updated_at) if updated_at else None,
                 "imei_valid": len(imei) == 15,
                 "iccid_valid": iccid.startswith("89") and 19 <= len(iccid) <= 22,
-                "channels_ready": (metadata.get("channel_status") == "ready"
-                                   and requested > 0 and allocated == requested),
+                # Every requested slot is served, on its own channel or a shared one.
+                "channels_ready": (metadata.get("channel_status") == "ready" and requested > 0
+                                   and allocated > 0 and nonnegative_int(
+                                       metadata.get("slots_served", allocated)) == requested),
             }
 
         atomic_json(self.host_diagnostics_path, {
@@ -2333,9 +2384,10 @@ class Orchestrator:
         text = detail.stdout or ""
         power = self._kv(text, "modem.generic.power-state").lower()
         state = self._kv(text, "modem.generic.state").lower()
-        failed_reason = self._kv(text, "modem.generic.state-failed-reason").lower()
-        if failed_reason in {"--", "unknown", "none", "n/a"}:
-            failed_reason = ""
+        failed_reason = (self._kv(text, "modem.generic.state-failed-reason").lower()
+                         if state == "failed" else "")
+        if state == "failed" and failed_reason in {"", "--", "none", "n/a"}:
+            failed_reason = "unknown"
         primary = self._kv(text, "modem.generic.primary-port")
         ports = re.findall(r"modem\.generic\.ports\.value\[\d+\]\s*:\s*([^ ]+) \(([^)]+)\)", text)
         network_port = next((name for name, kind in ports if kind == "net"), "")
@@ -2511,7 +2563,10 @@ class Orchestrator:
         registration = snapshot.get("registration")
         if registration not in {"home", "roaming", "registered"}:
             return
-        if time.monotonic() - self.data_attempt_at.get(device_id, 0) < 45:
+        # `None` means "never attempted"; a 0 default would compare against a monotonic clock
+        # that starts near zero at boot and hold back the first dial for 45 seconds of uptime.
+        last_attempt = self.data_attempt_at.get(device_id)
+        if last_attempt is not None and time.monotonic() - last_attempt < 45:
             return
         self.data_attempt_at[device_id] = time.monotonic()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
@@ -2925,7 +2980,18 @@ class Orchestrator:
                 self.cellular_states[device_id] = snapshot
                 observed = snapshot.get("radio_enabled") if snapshot.get("available") else None
                 if observed is not None:
+                    # A failed/new MM generation still carries current RF evidence. Publish
+                    # it before the failed-state early return can leave an old radio-on bit.
                     self.radio_states[device_id] = bool(observed)
+                if snapshot.get("state") == "failed":
+                    # Enabling a failed modem only ever answers "Wrong state". Report it
+                    # without resetting unverified firmware; VoWiFi remains available.
+                    self.recover_failed_modem(modem, snapshot.get("failed_reason") or "unknown",
+                                              wanted=radio_enabled)
+                    snapshot["failure"] = self.modem_failure(device_id)
+                    self.cellular_states[device_id] = snapshot
+                    continue
+                self._modem_failed.pop(device_id, None)
                 if snapshot.get("failed_reason") == "sim-missing":
                     # There is no radio action that can repair an absent card. Retrying
                     # --enable every reconcile only floods the journal and, before the
@@ -2980,7 +3046,7 @@ class Orchestrator:
     def reconcile_timezone(self):
         """Apply the validated WebUI timezone to the host without changing its hostname."""
         try:
-            document = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+            document = load_yaml_text((self.data / "config.yaml").read_text())
             timezone = str((document.get("settings") or {}).get("timezone") or "").strip()
         except Exception:
             return
@@ -3023,7 +3089,18 @@ class Orchestrator:
                     raise
         if yaml is None:
             raise RuntimeError("PyYAML is required for subscription mode")
-        return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
+        # The cache only changes on a refresh (every refresh_minutes), but this runs on every
+        # reconcile pass. Keep the parsed document until the file changes; hand out a copy so
+        # the proxy builders can never edit the cached one.
+        stat = cache.stat()
+        key = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        parsed = getattr(self, "_subscription_docs", None)
+        if parsed is None:
+            parsed = self._subscription_docs = {}
+        entry = parsed.get(str(cache))
+        if entry is None or entry[0] != key:
+            entry = parsed[str(cache)] = (key, load_yaml_text(cache.read_text(encoding="utf-8")))
+        return deepcopy(entry[1])
 
     def resolve_proxy_server(self, server: str, *, cache_key: str = "",
                              revision: str = "") -> str:
@@ -4213,6 +4290,21 @@ class Orchestrator:
                  "it collides with this gateway's per-modem virtual readers")
         return True
 
+    @staticmethod
+    def reader_config_unreadable(config_path: Path) -> bool:
+        """Whether an unprivileged pcscd would be unable to read the reader definitions.
+
+        This service runs with UMask=0077, so a freshly created definition file is 0600
+        root. pcscd running as root never noticed; distributions whose pcscd.service drops
+        to its own user (Ubuntu 26.04) silently skip the file and no modem reader appears.
+        Files written by earlier releases keep that mode, and their content already matches,
+        so the mode has to be checked on its own for an upgrade to repair them.
+        """
+        try:
+            return (config_path.stat().st_mode & 0o044) != 0o044
+        except OSError:
+            return False
+
     def reconcile_hardware(self, desired: dict, desired_devices: dict,
                            through_modemmanager=False) -> dict:
         hardware = (desired.get("hardware") or {})
@@ -4242,6 +4334,7 @@ class Orchestrator:
         if retained_terminal != self._bridge_terminal:
             self._bridge_terminal = retained_terminal
             self._persist_bridge_terminal()
+        self.forget_absent_modem_failures(live_ids)
         old = read_json(self.hw_state_path).get("assignments") or {}
         ports = [BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(VPCD_PORT_SLOTS)]
         # A port saved by a release that started at vpcd's own default is migrated here:
@@ -4276,10 +4369,12 @@ class Orchestrator:
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
         distro_disabled = self.disable_distro_vpcd_reader(config_path)
-        if reader_config != self.last_reader_config or distro_disabled:
+        unreadable = self.reader_config_unreadable(config_path)
+        if reader_config != self.last_reader_config or distro_disabled or unreadable:
             if not self.dry_run:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 config_path.write_text(reader_config, encoding="utf-8")
+                os.chmod(config_path, 0o644)
                 if legacy_present:
                     legacy_config.unlink(missing_ok=True)
                 (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")
@@ -4396,7 +4491,7 @@ class Orchestrator:
             # hardware lives beside proxy in settings; desired v1 publishers may omit it.
             if not desired.get("hardware"):
                 try:
-                    conf = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+                    conf = load_yaml_text((self.data / "config.yaml").read_text())
                     desired["hardware"] = (conf.get("settings") or {}).get("hardware") or {}
                 except Exception:
                     pass
@@ -4405,6 +4500,7 @@ class Orchestrator:
                                     or "auto") == "serial"
             device_rescan = self.process_device_rescan_request()
             discovered = self.usb_modems(desired.get("hardware") or {})
+            self.reconcile_usb_candidates(desired.get("hardware") or {})
             self.migrate_device_ids(discovered)
             desired_devices, _migrated = self.desired_devices(discovered)
             present_ids = {modem["id"] for modem in discovered}
@@ -4496,12 +4592,29 @@ class Orchestrator:
             self._sleep_for_work(IDLE_INTERVAL_SECONDS if idle else self.interval,
                                  observed_inputs=cycle_inputs)
 
+    def reconcile_usb_candidates(self, hardware: dict):
+        """Publish unrecognised modem-like USB devices and run any test the operator asked for.
+
+        Tests run here, before bridges are reconciled, and only on request: sending AT to a
+        serial port nobody identified is never done on the gateway's own initiative.
+        """
+        if self.dry_run:
+            return
+        known = {(str(p.get("vid", "")).lower(), str(p.get("pid", "")).lower())
+                 for p in hardware.get("modem_profiles") or [] if isinstance(p, dict)}
+        try:
+            candidates = self.usb_candidates.scan(known, run)
+            self.modem_probes.process(candidates, log=self.log)
+        except Exception as exc:  # never let discovery of extras stop the known modems
+            self.log(f"USB candidate scan failed: {exc}")
+
     def _input_mtimes(self) -> tuple:
         """Cheap change detector for the documents an operator action writes."""
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
-                     self.bridge_restart_request_dir, self.exit_test_request_dir,
+                     self.bridge_restart_request_dir, self.modem_probes.request_dir,
+                     self.exit_test_request_dir,
                      self.backup_operation_request_path,
                      self.device_rescan_request_path,
                      self.root / "service-restart-request.json"):

@@ -242,7 +242,9 @@ class ImsHomeDomainPrivacyTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_cached_line_status", return_value={}), \
                 patch.object(main, "_reader_index_for_instance", return_value=None), \
                 patch.object(main, "_reader_port_for_instance", return_value=""):
-            response = await main.api_instances()
+            from starlette.requests import Request
+            request = Request({"type": "http", "state": {"principal": main.gate.Principal("admin")}})
+            response = await main.api_instances(request)
         self.assertNotIn("ims_home_domain", response["instances"][0])
 
 

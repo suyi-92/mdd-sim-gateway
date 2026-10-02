@@ -44,6 +44,7 @@ if kind == "runtime":
         b"engine/pin_keeper.py",
         b"engine/ami_usim.py",
         b"engine/swu_ike.py",
+        b"engine/outer_transport.py",
         b"engine/log_capture.py",
         b"engine/stability_log.py",
         b"engine/asterisk_supervisor.py",

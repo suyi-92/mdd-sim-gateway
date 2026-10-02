@@ -48,6 +48,8 @@ def _excluded_directory(root: Path, path: Path) -> bool:
     """
     relative = path.relative_to(root).parts
     return path.name in EXCLUDED_DIRECTORIES or (
+        len(relative) == 1 and relative[0] in {"mms-staging", "uploads"}
+    ) or (
         len(relative) == 3 and relative[0] == "instances" and relative[2] == "run"
     )
 

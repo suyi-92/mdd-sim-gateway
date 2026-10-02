@@ -3,6 +3,51 @@
 本文只描述 `vmware` 分支。它不支持 WSL/usbipd、ARM64、Docker Control、GitHub Release
 资产或云端编译。
 
+## 1.13.1 首次升级与新增能力
+
+从旧 VMware 版首次升级到本轮，使用普通用户终端运行最新入口的更新命令：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) update --yes
+```
+
+仍需先完成适用的 VM 快照和维护窗口准备。入口下载完整源码后调用新版受管事务，不使用
+`install` 绕过更新。新增 MMS secondary AT 规则在备份并停线之后应用，失败时恢复原规则、
+原代码/产物/数据和服务状态。新装自动配置该规则；它只匹配 ModemManager 已标记为 secondary
+的 Quectel AT 口，不占用 primary AT、QMI/MBIM 或单 AT 口设备。
+
+若已经通过旧 `mddctl update` 升级完成，旧入口不会执行新增规则步骤，可在维护窗口运行
+`sudo mddctl mms-port install`。此命令核验当前代、保存旧规则、停线后更新，并恢复此前服务状态；
+`sudo mddctl mms-port remove` 可显式撤销。规则未改变时不会重复重启 ModemManager。
+
+Control 的 Pillow、pi-heif 和 websockets 均按 requirements 固定版本安装；新构建与缓存构建
+在激活前都实际导入依赖。仅 `pip check` 成功不代表 HEIC 等原生解码库可用。
+
+### 浏览器软电话与媒体
+
+软电话信令经过 WebUI 同一 HTTPS/WSS 入口，不必再为每条线路单独开放浏览器 WSS 端口。
+反向代理需保留原始 Host（含非默认端口）及 WebSocket Upgrade/Connection 头；若改写 Host，
+需在应用设置中配置可信反向代理并传递 X-Forwarded-Host。
+
+```bash
+sudo mddctl media status
+sudo mddctl media direct
+sudo mddctl media relay --port 8478
+```
+
+默认 direct 模式仍使用各线路 RTP 端口。可选 relay 使用固定摘要的官方 coturn 镜像，
+只发布一个 TCP/UDP 端口，按需要可加 `--public-host HOST --public-port N` 指定外部映射。
+模式切换会依次重建运行线路并重新注册；启用前会检查内部媒体网络、Engine 防火墙与 STUN。
+失败不改模式。防火墙或路由器须显式放行 relay 的 TCP 和 UDP；HTTP 反代不能转发这些媒体包。
+`mddctl` 使用本机 Docker socket，不继承远程或 rootless context，不下载项目 Release 资产。
+实际双向音频与各 VM 内核支持须单独验收。
+
+### MMS 备份
+
+受管 `mddctl backup` 在停止写入方后保存数据库和 `mms/` 下附件；恢复走原有归档安全校验
+与回滚事务。编写中的 `mms-staging/` 和临时 `uploads/` 不进入备份；已经缺失的附件不能
+凭备份重新生成。不要只恢复数据库而遗失对应附件。
+
 ## 1. 固定部署模型
 
 ```text

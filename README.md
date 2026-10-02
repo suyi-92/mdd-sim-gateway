@@ -13,6 +13,16 @@
   <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
 
+## 1.13.1 VMware 融合版
+
+保留原生 Control/WebUI、VMware USB 与网络保护、最多 13 条默认线路（可配置 1–32）、
+eSIM 恢复和本机源码构建。在此基础上融合通讯录、MMS 彩信与图片处理、浏览器同源软电话连接、
+可选 TURN 媒体中继，以及后续运营商和模块修复。具体融合范围与未验证事项见
+[上游同步记录](docs/upstream-sync/README.md)。
+
+从旧 VMware 版首次升级到本轮时，使用最新 bootstrap 的 `update`，让新增的 MMS 端口规则
+与源码、数据和服务一起进入更新事务；步骤见 [安装说明](docs/INSTALL.md)。
+
 ## 先安装、后接设备（推荐）
 
 **设备不是基础安装的前提。** `--require-scr-prime` 和 `--require-cellular` 只是“本次安装
@@ -57,7 +67,7 @@ Quectel 热发现后仍需在 WebUI 建线；SCR Prime 后插时运行一次 `su
 放行。
 
 `vmware` 分支面向 Windows x86_64 宿主机上的 VMware Workstation。Control 与 WebUI
-在 Linux 客户机中由 systemd 原生运行；只有每条 SIM 的 Engine 使用 rootful Docker。
+在 Linux 客户机中由 systemd 原生运行；每条 SIM 的 Engine 使用 rootful Docker；可选 relay 模式另运行固定摘要的官方 coturn 容器。
 项目不使用 GitHub Actions、GitHub Release 自动更新、预编译 Control/Engine/WebUI 资产或
 Git LFS 交付包。首次安装和后续更新都在客户机本地从当前源码构建。
 

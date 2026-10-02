@@ -285,7 +285,7 @@ class StabilityReportTests(unittest.TestCase):
 
 class ClientEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_schema_limits_and_session_csrf_protection(self):
-        from control.app import main, auth
+        from control.app import main, auth, gate
         from starlette.requests import Request
         from starlette.responses import Response
         from fastapi import HTTPException
@@ -294,19 +294,27 @@ class ClientEndpointTests(unittest.IsolatedAsyncioTestCase):
         def request(body, headers=()):
             return Request({"type": "http", "method": "POST", "scheme": "https",
                             "path": "/api/diagnostics/client-events", "query_string": b"",
-                            "headers": list(headers)},
+                            "headers": [(b"cookie", f"{auth.SESSION_COOKIE}=fixture-session".encode()),
+                                        *headers]},
                            AsyncMock(return_value={"type": "http.request", "body": body}))
 
-        call_next = AsyncMock(return_value=Response())
+        async def authenticate(req):
+            messages = []
+            async def application(scope, receive, send):
+                await Response()(scope, receive, send)
+            async def send(message):
+                messages.append(message)
+            with patch.object(auth, "configured", return_value=True):
+                await gate.Gate(application)(req.scope, req.receive, send)
+            return next(message["status"] for message in messages
+                        if message["type"] == "http.response.start")
+
         with patch.object(auth, "session", return_value=None):
-            response = await main.require_admin_session(request(b"{}"), call_next)
-            self.assertEqual(response.status_code, 401)
+            self.assertEqual(await authenticate(request(b"{}")), 401)
         with patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
-            response = await main.require_admin_session(request(b"{}"), call_next)
-            self.assertEqual(response.status_code, 403)
-            response = await main.require_admin_session(
-                request(b"{}", [(b"x-mdd-csrf-token", b"fixture-csrf")]), call_next)
-            self.assertEqual(response.status_code, 200)
+            self.assertEqual(await authenticate(request(b"{}")), 403)
+            self.assertEqual(await authenticate(request(
+                b"{}", [(b"x-mdd-csrf-token", b"fixture-csrf")])), 200)
         item = {"scope": "devices", "outcome": "timeout", "status_code": 0,
                 "elapsed_ms": 15000, "client_epoch": 1000, "sequence": 1}
         with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", directory):

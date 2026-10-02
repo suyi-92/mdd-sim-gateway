@@ -21,6 +21,9 @@ from scripts import mdd_admin, mdd_archive
 
 
 class ApiClient:
+    def __init__(self, cookie=""):
+        self.cookie = cookie
+
     """Exercise the real ASGI middleware without adding HTTP client dependencies."""
     def request(self, method, path, content=b"", headers=None):
         async def invoke():
@@ -42,7 +45,9 @@ class ApiClient:
                     result["body"].extend(message.get("body", b""))
                     if not message.get("more_body", False):
                         finished.set()
-            values = {"content-length": str(len(content)), **(headers or {})}
+            values = {"content-length": str(len(content)),
+                      **({"cookie": f"{auth.SESSION_COOKIE}={self.cookie}"} if self.cookie else {}),
+                      **(headers or {})}
             scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
                      "http_version": "1.1", "scheme": "https", "method": method,
                      "path": path, "raw_path": path.encode(), "query_string": b"",
@@ -322,8 +327,9 @@ class TransferApiTests(RecoveryFixture):
 
     def test_authenticated_round_trip_requires_csrf_and_cleans_download_staging(self):
         self.archive()
-        client = ApiClient()
-        with patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
+        client = ApiClient(cookie="fixture-session")
+        with patch.object(auth, "configured", return_value=True), \
+                patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
             exported = client.get("/api/system/backups/fixture.tar.gz/export")
             self.assertEqual(exported.status_code, 200)
             self.assertEqual(exported.headers["cache-control"], "no-store")

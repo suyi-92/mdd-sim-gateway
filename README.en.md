@@ -12,6 +12,15 @@
   <a href="docs/upstream-sync/README.md">Upstream integration (Chinese)</a>
 </p>
 
+## VMware integration of 1.13.1
+
+This edition retains native Control/WebUI, VMware USB and routing protections, local source
+builds and the configurable 1–32 line limit (default 13). It integrates contacts, MMS and picture
+conversion, same-origin browser softphone connections, optional TURN media relay, and subsequent
+carrier/modem fixes. See the [integration records](docs/upstream-sync/README.md) for scope and
+verification limits. Use the latest bootstrap **update** for the first upgrade from the older
+VMware edition so that the MMS port rule participates in the update transaction.
+
 ## Install first, attach hardware later
 
 **Hardware is not required for the base installation.** `--require-scr-prime` and
@@ -31,30 +40,23 @@ After attaching both devices to the guest:
 
 1. Pass SCR Prime and the **complete Quectel USB composite device** through in VMware Workstation,
    and insert a SIM in SCR Prime. Passing only Windows COM ports is insufficient.
-2. Rerun the idempotent installer with both hardware gates:
-
-   ```bash
-   bash <(wget -qO- https://raw.githubusercontent.com/suyi-92/mdd-sim-gateway/vmware/bootstrap.sh) install --require-scr-prime --require-cellular
-   ```
-
-   The same commit reuses its verified local build and Docker cache. SCR Prime is checked against
-   the distribution driver first; when required, CCID with patch 03 only is installed automatically,
-   followed by ATR and physical unplug/replug validation. The cellular gate waits up to about 90
-   seconds for `mmcli -L` to expose a modem.
-3. Follow the SCR Prime unplug/replug prompts, then run `sudo mddctl doctor`.
+2. Run `sudo mddctl driver install` to probe SCR Prime and, only if needed, transactionally
+   install the fixed CCID driver with patch 03. An absent card is a warning; insert a card and
+   confirm its ATR with `pcsc_scan` before using the reader. Do not rerun the full installer just
+   to install a driver after attaching a reader.
+3. Check unplug/replug recovery, then run `sudo mddctl doctor`. ModemManager discovers Quectel
+   devices separately; create the cellular line in the WebUI after discovery.
 4. Open `https://<reserved-VM-address>:8443`. Create SCR Prime as a **PC/SC, VoWiFi-only** line.
    Create Quectel as a **modem, 4G + VoWiFi** line and enter the SIM's APN/4G settings so
    NetworkManager can create its GSM profile, bearer, and IP.
 
-When attaching only one device, rerun with only its corresponding `--require-scr-prime` or
-`--require-cellular` gate. Quectel is normally hot-detected but still needs a WebUI line. SCR Prime
-should be revalidated because its real `04d9:c001` presence is the evidence needed to decide whether
-the CCID patch is required. If the guest firewall is active, add `--configure-firewall` to that
-acceptance run or apply the exact printed ports manually.
+Quectel is normally hot-detected but still needs a WebUI line. For a newly attached SCR Prime,
+use `mddctl driver install` and then verify PC/SC, ATR and reconnect recovery. If the guest
+firewall is active, allow the exact ports printed by the original installer.
 
 The `vmware` branch targets VMware Workstation on an x86_64 Windows host. Control and WebUI run
-natively in the guest under systemd; Docker is rootful and is used only for per-SIM Engine
-containers. The project does not use GitHub Actions, GitHub Release updates, prebuilt project
+natively in the guest under systemd; rootful Docker runs per-SIM Engine containers and, when
+relay media is enabled, an optional official coturn image pinned by digest. The project does not use GitHub Actions, GitHub Release updates, prebuilt project
 archives, or Git LFS delivery assets. Installation and updates build the checkout locally.
 
 ## Supported topology

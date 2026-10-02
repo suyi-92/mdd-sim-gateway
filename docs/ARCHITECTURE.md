@@ -30,7 +30,8 @@ x86_64 Linux guest
 ```
 
 Control 永远在客户机本机运行，不存在 Docker Control 分支。Engine 需要独立网络命名空间、
-TUN、NET_ADMIN、Asterisk 和每线路端口，因此继续使用容器。
+TUN、NET_ADMIN、Asterisk 和每线路端口，因此继续使用容器。可选媒体 relay 模式额外使用
+固定版本的官方 coturn 容器，通过 `sudo mddctl media relay|direct|status` 管理。默认仍为 direct。
 
 ## 数据与构建
 
@@ -64,7 +65,7 @@ AID。PIN keeper、IKE/EAP-AKA 和 SIP/IMS-AKA 共用该选择逻辑，避免三
 桥接 vNIC 是管理平面默认路由。NetworkManager 只新增或保留蜂窝管理，不接管原本由其他
 backend 管理的桥接网卡。蜂窝 bearer 是设备能力，不应替换管理默认路由。
 
-每条 Engine 使用独立的 WebRTC 与小范围 RTP block。分配器同时探测 TCP 和 UDP 真实占用，
+浏览器软电话通过同源 `/api/instances/<id>/softphone/ws` WebSocket 连接；每条 Engine 使用独立的小范围 RTP block。分配器同时探测 TCP 和 UDP 真实占用，
 避免 Docker 创建后才发现冲突。国家出口按 SIM 国家建立独立 TUN，UDP 健康失败时该线路
 fail-closed，不退回错误国家的默认网络。
 

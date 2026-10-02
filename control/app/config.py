@@ -24,12 +24,26 @@ import yaml
 DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
 _lock = threading.RLock()
+# libyaml parses config.yaml an order of magnitude faster than the pure-Python loader. Same
+# safe schema; fall back where PyYAML was built without it.
+_SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+# (path, inode, size, mtime_ns) of the file behind the cached load(), and the merged result.
+# Every settings read, line lookup and device listing used to parse the whole file again:
+# on a Raspberry Pi with the device page open that was ~70 % of Control's CPU.
+_loaded: tuple | None = None
 
 # Operator-controlled product boundary. The Web UI exposes the configured value, while this
 # source-level range prevents a typo or malformed client from creating an unbounded workload.
 MIN_SIM_LINE_LIMIT = 1
 DEFAULT_SIM_LINE_LIMIT = 13
 MAX_SIM_LINE_LIMIT = 32
+# Values added by the instances API for display only. They may ride back on a complete WebUI
+# form, but they are not part of the desired line configuration and must never reach config.yaml.
+# Keep this list shared with the save/restart diff so removing pollution written by an older
+# release does not itself look like an operational edit and rebuild a running line.
+RUNTIME_ONLY_INSTANCE_FIELDS = frozenset({
+    "status", "has_pin", "proxy_country_effective", "sip_carrier_defaults",
+})
 
 # SIP User-Agent a line presents to the IMS core. The product identifies itself honestly by
 # default; a line may override it because some carriers gate IMS registration on a User-Agent
@@ -91,6 +105,9 @@ DEFAULTS = {
         "debug": {"asterisk": False, "charon": False, "pcap": False, "ami": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
         "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
+        # Minutes an enabled line may stay off the network before the line_offline notification
+        # is sent. Short outages are the retry policy's job; this is for the ones it is losing.
+        "line_offline_notify_minutes": 10,
         # Proactive IKEv2 SA rekey. IKEv2 does NOT negotiate SA lifetime on the wire (RFC 7296
         # dropped it), so rekey timing is local policy (3GPP TS 24.302 clause 7.2.2C: use a
         # configured value, else an implementation value). We rekey the CHILD (ESP) SA every
@@ -105,12 +122,10 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
-        # A carrier MMS notification reaches the SMS channel as a WAP Push: no readable text
-        # and a binary WSP payload. The gateway never retrieves MMS, so the object can neither
-        # be shown nor forwarded, and nothing else consumes it -- it holds modem/SIM SMS
-        # storage until that storage is full and no new SMS can be received. Delete it once
-        # recognised. Set false to keep the raw objects for troubleshooting.
-        "drop_mms_wap_push": True,
+        # What happens to an SMS object on the modem/SIM once its message is in the database:
+        # "delete" (default), "when_full" or "keep". Deliberately absent from these defaults:
+        # an unset key defers to MDD_CELLULAR_SMS_STORAGE, so a deployment can choose the
+        # policy from its service environment; a value saved here takes precedence.
         # Voicemail defaults. Off unless asked for: recording a caller is the operator's
         # decision. Per-line overrides live in the line's sip.* block, like ring_timeout.
         "vm_enabled": False,
@@ -148,6 +163,10 @@ DEFAULTS = {
             "vpcd_slots": 3,
             "modem_profiles": [
                 {"name": "DJI/Quectel cellular modem", "vid": "2c7c", "pid": "0125",
+                 "at_interface": 2},
+                # The original EC20 enumerates under Qualcomm's vendor id with the same
+                # interface layout as the EC25 (0 DM, 1 NMEA, 2 AT, 3 PPP, 4 QMI).
+                {"name": "Quectel EC20", "vid": "05c6", "pid": "9215",
                  "at_interface": 2},
             ],
         },
@@ -241,10 +260,15 @@ def internal_event_token() -> str:
         save(data)
         return token
 
-# Port block allocation per instance index (avoids collisions across SIMs)
-PORT_BASE = {"sip_udp": 5060, "sip_tls": 5061, "webrtc": 8089, "ami": 5038,
-             "rtp_start": 10000, "rtp_end": 11000}
-PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "webrtc": 10, "ami": 10,
+# Port block allocation per instance index (avoids collisions across SIMs).
+# A block saved by an older version may also carry "webrtc". Despite the name, that was only
+# the browser softphone's WSS *signalling* port (8089, 8099, ...). Signalling now reaches the
+# engine through the control surface relay (softphone_ws), so the key is ignored. WebRTC
+# *media* (ICE, DTLS-SRTP) is unaffected and still uses the rtp_start..rtp_span range below.
+PORT_BASE = {"sip_udp": 5060, "sip_tls": 5061, "ami": 5038,
+             "rtp_start": int(os.environ.get("MDD_RTP_BASE", "10000")),
+             "rtp_end": int(os.environ.get("MDD_RTP_BASE", "10000")) + 1000}
+PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "ami": 10,
                "rtp_start": 2000, "rtp_end": 2000}
 
 
@@ -254,15 +278,17 @@ def _host_lan_ipv4() -> str:
     in-dialog requests (BYE) back to the published host port instead of the unroutable
     docker-bridge container IP. Uses a UDP connect (no traffic sent) to learn the source
     address the kernel would pick for outbound; returns "" if it can't be determined."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = None
     try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("1.1.1.1", 80))
         ip = s.getsockname()[0]
         return ip if ip and not ip.startswith("127.") else ""
     except Exception:
         return ""
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
 
 def ims_realm(mcc: str, mnc: str) -> str:
@@ -333,11 +359,41 @@ def _ensure():
     os.chmod(CONFIG_PATH, 0o600)
 
 
+def _file_key() -> tuple:
+    st = os.stat(CONFIG_PATH)
+    return (CONFIG_PATH, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def merged_modem_profiles(saved) -> list[dict]:
+    """The saved modem profiles plus every built-in model they do not already cover.
+
+    The first start writes the defaults to config.yaml, and the saved ``hardware`` block
+    then replaces the defaults wholesale, so a model added to the built-in list in a later
+    release never reached an existing install. A saved entry for the same vid/pid still
+    wins, which keeps an operator's own interface or name for that model.
+    """
+    profiles = [dict(item) for item in (saved if isinstance(saved, list) else [])
+                if isinstance(item, dict)]
+    known = {(str(item.get("vid", "")).lower(), str(item.get("pid", "")).lower())
+             for item in profiles}
+    for item in DEFAULTS["settings"]["hardware"]["modem_profiles"]:
+        if (item["vid"], item["pid"]) not in known:
+            profiles.append(dict(item))
+    return profiles
+
+
 def load() -> dict:
+    """The merged configuration. Callers get their own copy and may mutate it freely."""
+    global _loaded
     with _lock:
         _ensure()
+        # Taken before reading: a write that lands in between changes the key, so the next
+        # call parses again instead of serving the older content under the newer key.
+        file_key = _file_key()
+        if _loaded is not None and _loaded[0] == file_key:
+            return deepcopy(_loaded[1])
         with open(CONFIG_PATH) as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f, Loader=_SafeLoader) or {}
         # merge defaults (shallow for settings)
         out = deepcopy(DEFAULTS)
         out["settings"].update(data.get("settings", {}))
@@ -454,6 +510,8 @@ def load() -> dict:
             candidate = data.get("settings", {}).get(key, {}) or {}
             saved = candidate if isinstance(candidate, dict) else {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
+        out["settings"]["hardware"]["modem_profiles"] = merged_modem_profiles(
+            out["settings"]["hardware"].get("modem_profiles"))
         # Proxy profiles were introduced after the original single-subscription/country-form
         # layout.  Expose a lossless v2 view immediately, but do not rewrite config.yaml until
         # the operator next saves Settings.
@@ -531,6 +589,7 @@ def load() -> dict:
             # the product never provisions standalone SIP accounts.
             (inst.setdefault("sip", {}))["external"] = []
         out["internal"] = data.get("internal", {})
+        _loaded = (file_key, deepcopy(out))
         return out
 
 
@@ -543,7 +602,9 @@ def esim_settings() -> dict:
 
 
 def save(data: dict):
+    global _loaded
     with _lock:
+        _loaded = None
         _private_dir(DATA_DIR)
         tmp = CONFIG_PATH + ".tmp"
         with _private_text_writer(tmp) as f:
@@ -619,8 +680,8 @@ def rtp_span(block: dict) -> int:
 
 
 def _block_ports(block: dict) -> set[int]:
-    """Every host port a port-block occupies: the 4 fixed services + the RTP span."""
-    used = {block["sip_udp"], block["sip_tls"], block["webrtc"], block["ami"]}
+    """Every host port a port-block occupies: the 3 fixed services + the RTP span."""
+    used = {block["sip_udp"], block["sip_tls"], block["ami"]}
     used |= set(range(block["rtp_start"], block["rtp_start"] + rtp_span(block)))
     return used
 
@@ -670,7 +731,7 @@ def _block_free(block: dict, reserved: set[int]) -> bool:
     bp = _block_ports(block)
     if bp & reserved:
         return False
-    for port in (block["sip_udp"], block["sip_tls"], block["webrtc"], block["ami"]):
+    for port in (block["sip_udp"], block["sip_tls"], block["ami"]):
         if not _host_port_free(port):
             return False
     # New blocks expose only 12 RTP ports. Legacy saved blocks can expose 60, but a bounded bind
@@ -719,13 +780,13 @@ def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None
         if sip_udp in clash or block["sip_tls"] in clash:
             raise ValueError(f"port {sip_udp} is already used by another line. "
                              f"Choose a different port or use Automatic.")
-        # A derived service/RTP port (WebRTC/control/RTP) overlaps a neighbouring line's
+        # A derived service/RTP port (control/RTP) overlaps a neighbouring line's
         # block. Tell the user what to avoid without exposing internal port math.
         raise ValueError(f"port {sip_udp} overlaps another line's port range "
                          f"(conflict at {min(clash)}). Try a port at least 10 away, or "
                          f"use Automatic.")
     for port, name in ((block["sip_udp"], "SIP/UDP"), (block["sip_tls"], "SIP/TLS"),
-                       (block["webrtc"], "WebRTC"), (block["ami"], "control")):
+                       (block["ami"], "control")):
         if not _host_port_free(port):
             raise ValueError(f"port {port} ({name}) is already in use on the host. "
                              f"Choose a different port or use Automatic.")
@@ -805,9 +866,11 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
                             clear_modem_readers: bool = False) -> dict:
     data = load()
     iid = str(inst["id"])
-    # Runtime-only fields sometimes ride along on the instance object (the API returns
-    # instances with a computed `status` and `has_pin`); never persist them to config.
-    inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
+    # Runtime-only fields sometimes ride along on the instance object returned by the API;
+    # never persist them to config. `proxy_country_effective` is particularly important here:
+    # it is computed from MCC/default routing and feeding it back used to make a display-name
+    # edit look operational, unnecessarily rebuilding the running engine.
+    inst = {k: v for k, v in inst.items() if k not in RUNTIME_ONLY_INSTANCE_FIELDS}
     existing = data["instances"].get(iid, {})
     limit = sim_line_limit(data["settings"])
     if not existing and len(data["instances"]) >= limit:
@@ -861,6 +924,10 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
         # an ordinary partial save must still preserve the three modem channel bindings.
         for field in ("pin_reader", "swu_reader", "ami_reader"):
             merged.pop(field, None)
+    # Self-heal documents polluted by an older release. The restart diff also ignores these
+    # keys, so this cleanup remains metadata-only when the operator merely renames a line.
+    for key in RUNTIME_ONLY_INSTANCE_FIELDS:
+        merged.pop(key, None)
     # Production Asterisk debug can expose complete SIP messages and subscriber identities.
     # Diagnostic SIP logging is enabled briefly at runtime by the dedicated number-learning
     # flow instead; it must never be persisted on a line.
@@ -877,6 +944,8 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
     # were hand-edited rather than saved through here.
     if "user_agent" in sip:
         sip["user_agent"] = sanitize_user_agent(sip.get("user_agent"))
+    if "invite_uri_params" in sip:
+        sip["invite_uri_params"] = sanitize_uri_params(sip.get("invite_uri_params"))
     wr = sip.setdefault("webrtc", {})
     wr.setdefault("username", "webrtc")
     if not wr.get("password"):
@@ -985,6 +1054,23 @@ def sanitize_user_agent(value: str) -> str:
     return " ".join(cleaned.split())[:MAX_USER_AGENT_LEN].strip()
 
 
+MAX_URI_PARAMS_LEN = 128
+_URI_PARAM = re.compile(r"[A-Za-z0-9._~+%:-]+(?:=[A-Za-z0-9._~+%:-]+)?")
+
+
+def sanitize_uri_params(value: str) -> str:
+    """Return ';'-separated SIP URI parameters for an outgoing call, or ''.
+
+    The text lands inside the dialplan's Dial() argument, so it may hold only what a URI
+    parameter is made of: no ',' or '&' (Dial separators), no '$', '[' or '(' (dialplan
+    expressions), no whitespace. A part that does not look like name or name=value is dropped
+    rather than guessed at. A leading ';' is optional. Mirrored by engine/render.py.
+    """
+    parts = [part.strip() for part in str(value or "").split(";")]
+    kept = [part for part in parts if part and _URI_PARAM.fullmatch(part)]
+    return ";".join(kept)[:MAX_URI_PARAMS_LEN].rstrip(";")
+
+
 def imeisv_from_imei(imei: str, imeisv: str = "", svn: str = "00") -> str:
     """Return a 16-digit IMEISV.
 
@@ -1071,7 +1157,22 @@ CARRIER_SIP_PROFILES = {
     "234-10": {  # O2 UK and MVNOs such as giffgaff
         "pani_country": "GB",
         "access_type": "wlan1",
+        # Calls need ;user=phone (the TAS answers 487 without it). The endpoint-wide switch
+        # also puts it on SMS, which has worked here, so it stays; the call-only parameter
+        # is what the line form shows.
         "user_eq_phone": True,
+        "invite_uri_params_enable": True,
+        "invite_uri_params": "user=phone",
+    },
+    # T-Mobile US and MVNOs on its IMS core, such as Ultra Mobile. Its MGCF answers an INVITE
+    # to a US number with 500 "CC_IMS_TRY_NEXT_MGCF_FAIL" unless the request URI carries
+    # ;user=phone; the number itself may keep its + (tested on a live 310-240 line: +1 and 1
+    # forms both fail without it and both connect with it; an international +86 call connects
+    # either way). Only the INVITE gets it, so SMS is sent exactly as before. No PANI identity:
+    # none has been characterised for this network (#114).
+    "310-240": {
+        "invite_uri_params_enable": True,
+        "invite_uri_params": "user=phone",
     },
 }
 
@@ -1131,6 +1232,9 @@ def carrier_home_local_voice_codes(mcc: str, mnc: str,
                 value.casefold() for value in rule["spns"]}:
             return tuple(rule.get("home_local_voice_codes") or ())
     return ()
+# What a carrier profile may set besides a PANI identity, and the kind of each value.
+CARRIER_SIP_FLAGS = ("user_eq_phone", "invite_uri_params_enable")
+CARRIER_SIP_TEXT = ("invite_uri_params",)
 
 
 def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "",
@@ -1155,17 +1259,19 @@ def carrier_sip_defaults(mcc: str, mnc: str, identity: str = "",
                         if key in CARRIER_SIP_PROFILES), None)
     if not profile:
         return {}
-    seed = str(identity or keys[0]).strip()
-    node = bytearray(hashlib.sha256(("mdd-pani:" + seed).encode("utf-8")).digest()[:6])
-    node[0] = (node[0] | 0x02) & 0xFE  # locally administered, never multicast
-    node_id = "".join("%02x" % value for value in node)
-    country = profile["pani_country"]
-    return {
-        "pani": (r'IEEE-802.11\; i-wlan-node-id="%s"\;country=%s'
-                 % (node_id, country)),
-        "access_type": profile["access_type"],
-        "user_eq_phone": bool(profile["user_eq_phone"]),
-    }
+    defaults = {key: bool(profile[key]) for key in CARRIER_SIP_FLAGS if key in profile}
+    defaults.update({key: str(profile[key]) for key in CARRIER_SIP_TEXT if key in profile})
+    # A PANI identity is derived only for a carrier whose country and access type have been
+    # characterised; inventing one for the rest would present a location nobody asked for.
+    if "pani_country" in profile:
+        seed = str(identity or keys[0]).strip()
+        node = bytearray(hashlib.sha256(("mdd-pani:" + seed).encode("utf-8")).digest()[:6])
+        node[0] = (node[0] | 0x02) & 0xFE  # locally administered, never multicast
+        node_id = "".join("%02x" % value for value in node)
+        defaults["pani"] = (r'IEEE-802.11\; i-wlan-node-id="%s"\;country=%s'
+                            % (node_id, profile["pani_country"]))
+        defaults["access_type"] = profile["access_type"]
+    return defaults
 
 
 def merge_carrier_sip_defaults(mcc: str, mnc: str, identity: str,
@@ -1204,8 +1310,44 @@ def cp_mode_order_for(mcc: str, mnc: str) -> str:
     return ",".join(order)
 
 
+def _engine_manager_url(settings: dict) -> str:
+    """Where engine notify.py POSTs events (SMS, calls, tunnel state).
+
+    Explicit setting wins; else MDD_MANAGER_URL env (the installer sets this to the PUBLISHED
+    host port when the control plane runs in a bridge-networked container with a different
+    host port); else the default assumes a 1:1 host.docker.internal:<http_port> mapping.
+
+    In the container stack the Engine sits on an internal network with no route to the host,
+    so only the Control's own MDD_MANAGER_URL is reachable. A saved setting carried over from a
+    native install (host.docker.internal) would make every event time out while notify.py
+    swallows the error: inbound SMS reached the Engine but never the web UI."""
+    env_url = os.environ.get("MDD_MANAGER_URL")
+    if os.environ.get("MDD_CONTAINER_STACK") == "1" and env_url:
+        return env_url
+    return (settings.get("manager_url")
+            or env_url
+            or f"https://host.docker.internal:{settings.get('http_port', 10443)}")
+
+
 def render_instance_json(inst: dict, settings: dict) -> dict:
     """Convert a stored instance into the engine /config/instance.json contract."""
+    rendered = _render_instance_json(inst, settings)
+    # Relay media mode (media.engine_attachment, one-run copy like "epdg"): every engine uses
+    # the same RTP range on its own media address, so the line's own block is not used, and
+    # stays saved for a return to direct mode. Absent in direct mode.
+    relay = inst.get("media")
+    if relay:
+        rendered["media"] = dict(relay)
+        rendered["rtp_start"] = relay["rtp_start"]
+        rendered["rtp_end"] = relay["rtp_end"]
+    # The Engine network the control surface relays the softphone over (engine.start, one-run
+    # copy). Absent outside the container stack.
+    if inst.get("engine_subnet"):
+        rendered["engine_subnet"] = inst["engine_subnet"]
+    return rendered
+
+
+def _render_instance_json(inst: dict, settings: dict) -> dict:
     ports = inst.get("ports", _alloc_ports(inst.get("index", 0)))
     sip = merge_carrier_sip_defaults(
         inst.get("mcc", ""), inst.get("mnc", ""),
@@ -1258,15 +1400,13 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "msisdn": inst.get("msisdn", ""),
         "smsc": inst.get("smsc", ""),
         "pcscf": inst.get("pcscf", ""),
+        # Usually blank so the Engine derives the carrier ePDG hostname.  In an
+        # isolated country-egress run Control resolves that hostname first and
+        # writes the one-run IPv4 peer here because the Engine has no public DNS.
+        "epdg": inst.get("epdg", ""),
         "ami_user": inst.get("ami_user", "vowifi"),
         "ami_secret": ami_secret,
-        # Where engine notify.py POSTs events. Explicit setting wins; else MDD_MANAGER_URL
-        # env (the installer sets this to the PUBLISHED host port when the control plane runs
-        # in a bridge-networked container with a non-8443 port map); else the default assumes
-        # a 1:1 host.docker.internal:<http_port> mapping.
-        "manager_url": settings.get("manager_url")
-                       or os.environ.get("MDD_MANAGER_URL")
-                       or f"https://host.docker.internal:{settings.get('http_port', 8443)}",
+        "manager_url": _engine_manager_url(settings),
         "manager_event_token": internal_event_token(),
         "domain": settings.get("tls", {}).get("domain", ""),
         "rtp_start": ports["rtp_start"],
@@ -1276,7 +1416,6 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # rtp_end to the published span rather than the (larger) block-allocation rtp_end.
         "rtp_end": min(ports["rtp_end"], ports["rtp_start"] + rtp_span(ports) - 1),
         "sip": {
-            "listen_addr": sip.get("listen_addr", "0.0.0.0"),
             "external": [],
             "advertise_address": advertise_address(settings),
             # ICE host-candidate mappings require an IP literal even when PJSIP itself uses
@@ -1310,13 +1449,16 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             # realm; the latter remains a safe first-registration fallback until Control learns
             # the P-Associated-URI and rebuilds this one line.
             "home_phone_context": home_phone_context,
+            # URI parameters added to the request URI of an outgoing call only (INVITE, not
+            # SMS), for carriers that route a call only with them (T-Mobile US: user=phone).
+            "invite_uri_params": (sanitize_uri_params(sip.get("invite_uri_params"))
+                                  if sip.get("invite_uri_params_enable") else ""),
             "pani": sip.get("pani", ""),
             "access_type": sip.get("access_type", ""),
             "webrtc": {
                 "enable": bool(webrtc.get("enable", True)),
                 "username": webrtc.get("username", "webrtc"),
                 "password": webrtc_password,
-                "port": 8089,
             },
         },
         # Defence in depth for instance.json files rendered from old or imported configs.

@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 
 # vcgencmd get_throttled bits (Raspberry Pi firmware). The low nibble is "right now", the
@@ -41,6 +42,11 @@ DISK_CRITICAL_PERCENT = float(os.environ.get("MDD_DISK_CRITICAL_PERCENT", "96"))
 # signal is the paging RATE, not how much swap is occupied: pages parked there since boot and
 # never touched again cost nothing, and alerting on occupancy fires on a perfectly healthy box.
 SWAP_PAGES_PER_SECOND = float(os.environ.get("MDD_SWAP_PAGES_PER_SECOND", "50"))
+DOCKER_STORAGE_CACHE_SECONDS = float(
+    os.environ.get("MDD_DOCKER_STORAGE_CACHE_SECONDS", "21600"))
+_docker_storage_cache: dict = {}
+_docker_storage_cached_at = 0.0
+_docker_storage_lock = threading.Lock()
 # The Pi throttles at 80°C, and a loaded board sits in the seventies quite normally. A
 # threshold inside the ordinary operating range just flaps across it all day.
 TEMPERATURE_WARN_C = float(os.environ.get("MDD_TEMPERATURE_WARN_C", "80"))
@@ -215,7 +221,7 @@ def _project_paths(data_dir: str) -> list[str]:
     return paths
 
 
-def _docker_storage() -> dict:
+def _docker_storage(*, refresh: bool = False) -> dict:
     """MDD image/container usage plus separately identified shared builder cache.
 
     Image ``Size`` values are virtual sizes and repeat shared layers. Docker's aggregate usage
@@ -224,94 +230,110 @@ def _docker_storage() -> dict:
     use Docker's own conservative-prune estimate rather than treating every ``InUse=false``
     record as deletable.
     """
-    try:
-        import docker
-        client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=10)
-    except Exception:
-        return {}
-    try:
-        report = client.df()
-    except Exception:
-        return {}
-    finally:
+    global _docker_storage_cache, _docker_storage_cached_at
+    now = time.monotonic()
+    if (not refresh and _docker_storage_cache
+            and now - _docker_storage_cached_at < DOCKER_STORAGE_CACHE_SECONDS):
+        return dict(_docker_storage_cache)
+    # A DSM daemon may spend over a minute walking xattrs for one df() call. Serialise callers
+    # and cache the result so the 60-second host health poll cannot keep dockerd permanently busy.
+    with _docker_storage_lock:
+        now = time.monotonic()
+        if (not refresh and _docker_storage_cache
+                and now - _docker_storage_cached_at < DOCKER_STORAGE_CACHE_SECONDS):
+            return dict(_docker_storage_cache)
         try:
-            client.close()
+            import docker
+            client = docker.from_env(environment={"DOCKER_HOST": "unix:///var/run/docker.sock"}, timeout=10)
         except Exception:
-            pass
+            return dict(_docker_storage_cache)
+        try:
+            report = client.df()
+        except Exception:
+            return dict(_docker_storage_cache)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
-    repositories = ("mdd-sim-gateway/engine:",)
-    image_bytes, image_ids = 0, set()
-    for item in report.get("Images") or []:
-        image_id = str(item.get("Id") or item.get("ID") or "")
-        labels = item.get("Labels") or {}
-        labels = labels if isinstance(labels, dict) else {}
-        tags = [str(tag) for tag in (item.get("RepoTags") or []) if tag]
-        managed = labels.get("io.mdd-sim-gateway.managed") == "true" or any(
-            tag.startswith(repositories) for tag in tags)
-        if managed and image_id not in image_ids:
-            image_ids.add(image_id)
-            image_bytes += max(0, int(item.get("Size") or 0))
+        repositories = ("mdd-sim-gateway/engine:",)
+        image_bytes, image_ids = 0, set()
+        for item in report.get("Images") or []:
+            image_id = str(item.get("Id") or item.get("ID") or "")
+            labels = item.get("Labels") or {}
+            labels = labels if isinstance(labels, dict) else {}
+            tags = [str(tag) for tag in (item.get("RepoTags") or []) if tag]
+            managed = labels.get("io.mdd-sim-gateway.managed") == "true" or any(
+                tag.startswith(repositories) for tag in tags)
+            if managed and image_id not in image_ids:
+                image_ids.add(image_id)
+                image_bytes += max(0, int(item.get("Size") or 0))
 
-    writable_bytes, container_ids = 0, set()
-    for item in report.get("Containers") or []:
-        container_id = str(item.get("Id") or item.get("ID") or "")
-        labels = item.get("Labels") or {}
-        labels = labels if isinstance(labels, dict) else {}
-        image = str(item.get("Image") or "")
-        managed = labels.get("io.mdd-sim-gateway.managed") == "true" or image.startswith(
-            repositories)
-        if managed and container_id not in container_ids:
-            container_ids.add(container_id)
-            writable_bytes += max(0, int(item.get("SizeRw") or 0))
+        writable_bytes, container_ids = 0, set()
+        for item in report.get("Containers") or []:
+            container_id = str(item.get("Id") or item.get("ID") or "")
+            labels = item.get("Labels") or {}
+            labels = labels if isinstance(labels, dict) else {}
+            image = str(item.get("Image") or "")
+            managed = labels.get("io.mdd-sim-gateway.managed") == "true" or image.startswith(
+                repositories)
+            if managed and container_id not in container_ids:
+                container_ids.add(container_id)
+                writable_bytes += max(0, int(item.get("SizeRw") or 0))
 
-    image_usage = report.get("ImageUsage") or {}
-    image_items = image_usage.get("Items") or report.get("Images") or []
-    all_image_ids = {str(item.get("Id") or item.get("ID") or "")
-                     for item in image_items if item.get("Id") or item.get("ID")}
-    all_images_are_mdd = bool(all_image_ids) and all_image_ids == image_ids
-    current_tags = {"mdd-sim-gateway/engine:latest"}
-    old_image_count, protected_unused = 0, False
-    for item in image_items:
-        image_id = str(item.get("Id") or item.get("ID") or "")
-        if image_id not in image_ids or int(item.get("Containers") or 0) != 0:
-            continue
-        tags = {str(tag) for tag in (item.get("RepoTags") or []) if tag}
-        if tags & current_tags:
-            protected_unused = True
+        image_usage = report.get("ImageUsage") or {}
+        image_items = image_usage.get("Items") or report.get("Images") or []
+        all_image_ids = {str(item.get("Id") or item.get("ID") or "")
+                         for item in image_items if item.get("Id") or item.get("ID")}
+        all_images_are_mdd = bool(all_image_ids) and all_image_ids == image_ids
+        current_tags = {"mdd-sim-gateway/engine:latest"}
+        old_image_count, protected_unused = 0, False
+        for item in image_items:
+            image_id = str(item.get("Id") or item.get("ID") or "")
+            if image_id not in image_ids or int(item.get("Containers") or 0) != 0:
+                continue
+            tags = {str(tag) for tag in (item.get("RepoTags") or []) if tag}
+            if tags & current_tags:
+                protected_unused = True
+            else:
+                old_image_count += 1
+        layer_bytes = max(0, int(image_usage.get("TotalSize")
+                                 or report.get("LayersSize") or 0))
+        image_reclaimable = max(0, int(image_usage.get("Reclaimable") or 0))
+        old_image_reclaimable = (image_reclaimable
+                                 if all_images_are_mdd and not protected_unused else None)
+
+        cache = report.get("BuildCache") or []
+        cache_usage = report.get("BuildCacheUsage") or {}
+        cache_bytes = max(0, int(cache_usage.get("TotalSize")
+                                 or sum(max(0, int(item.get("Size") or 0)) for item in cache)))
+        if "Reclaimable" in cache_usage:
+            cache_reclaimable = max(0, int(cache_usage.get("Reclaimable") or 0))
         else:
-            old_image_count += 1
-    layer_bytes = max(0, int(image_usage.get("TotalSize")
-                             or report.get("LayersSize") or 0))
-    image_reclaimable = max(0, int(image_usage.get("Reclaimable") or 0))
-    old_image_reclaimable = (image_reclaimable
-                             if all_images_are_mdd and not protected_unused else None)
-
-    cache = report.get("BuildCache") or []
-    cache_usage = report.get("BuildCacheUsage") or {}
-    cache_bytes = max(0, int(cache_usage.get("TotalSize")
-                             or sum(max(0, int(item.get("Size") or 0)) for item in cache)))
-    if "Reclaimable" in cache_usage:
-        cache_reclaimable = max(0, int(cache_usage.get("Reclaimable") or 0))
-    else:
-        # Older daemons do not publish the aggregate. Shared records are parents of reusable
-        # cache and survive the default prune; unshared, unused records are the safe estimate.
-        cache_reclaimable = sum(max(0, int(item.get("Size") or 0)) for item in cache
-                                if not item.get("InUse") and not item.get("Shared"))
-    return {"docker_images_bytes": image_bytes,
-            "docker_image_layers_bytes": layer_bytes,
-            "docker_image_reclaimable_bytes": image_reclaimable,
-            "docker_images_all_managed": all_images_are_mdd,
-            "mdd_old_image_count": old_image_count,
-            "mdd_old_images_reclaimable_bytes": old_image_reclaimable,
-            "container_writable_bytes": writable_bytes,
-            "build_cache_bytes": cache_bytes,
-            "build_cache_reclaimable_bytes": cache_reclaimable}
+            # Older daemons do not publish the aggregate. Shared records are parents of reusable
+            # cache and survive the default prune; unshared, unused records are the safe estimate.
+            cache_reclaimable = sum(max(0, int(item.get("Size") or 0)) for item in cache
+                                    if not item.get("InUse") and not item.get("Shared"))
+        result = {"docker_images_bytes": image_bytes,
+                  "docker_image_layers_bytes": layer_bytes,
+                  "docker_image_reclaimable_bytes": image_reclaimable,
+                  "docker_images_all_managed": all_images_are_mdd,
+                  "mdd_old_image_count": old_image_count,
+                  "mdd_old_images_reclaimable_bytes": old_image_reclaimable,
+                  "container_writable_bytes": writable_bytes,
+                  "build_cache_bytes": cache_bytes,
+                  "build_cache_reclaimable_bytes": cache_reclaimable}
+        _docker_storage_cache = dict(result)
+        _docker_storage_cached_at = time.monotonic()
+        return result
 
 
-def project_storage(data_dir: str) -> dict:
+def project_storage(data_dir: str, *, include_docker_storage: bool = True) -> dict:
     files = sum(_path_usage_bytes(path) for path in _project_paths(data_dir))
     result = {"files_bytes": files}
-    result.update(_docker_storage())
+    if include_docker_storage:
+        result.update(_docker_storage())
     image_storage = (result.get("docker_image_layers_bytes", 0)
                      if result.get("docker_images_all_managed")
                      else result.get("docker_images_bytes", 0))
@@ -418,7 +440,7 @@ def usb_devices() -> list[str]:
     return names
 
 
-def collect(data_dir: str = "/") -> dict:
+def collect(data_dir: str = "/", *, include_docker_storage: bool = True) -> dict:
     """One host snapshot. Cheap enough to record on every line failure."""
     snapshot = {
         "ts": int(time.time()),
@@ -429,7 +451,8 @@ def collect(data_dir: str = "/") -> dict:
         "load": load(),
         "memory": memory(),
         "disk": disk(data_dir),
-        "project_storage": project_storage(data_dir),
+        "project_storage": project_storage(
+            data_dir, include_docker_storage=include_docker_storage),
         "network": network(),
     }
     for key, value in (("throttling", throttling()),

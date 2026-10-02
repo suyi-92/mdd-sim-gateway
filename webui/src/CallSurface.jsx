@@ -48,6 +48,7 @@ export function DtmfKeypad({ value, onTone, t }) {
 
 export default function CallSurface({
   call,
+  callerName = '',
   line,
   duration = '00:00',
   muted = false,
@@ -85,9 +86,11 @@ export default function CallSurface({
 
       <div className="u-call-identity">
         <div className="u-call-avatar" aria-hidden="true">☎</div>
-        <div className="u-call-number mono">{call.number ? formatPhoneNumberDisplay(call.number) : t('Unknown')}</div>
+        <div className={`u-call-number${callerName ? '' : ' mono'}`}>{callerName || (call.number ? formatPhoneNumberDisplay(call.number) : t('Unknown'))}</div>
+        {callerName && <div className="mono">{formatPhoneNumberDisplay(call.number)}</div>}
         <div className="u-call-line">{line || t('VoWiFi line')}</div>
         {state === 'active' && <div className="u-call-duration mono">{duration}</div>}
+        {call.listenOnly && state !== 'ended' && <div role="status" style={{ fontSize: 12, color: '#f59e0b', marginTop: 6 }}>{t('Listen only · the other side cannot hear you')}</div>}
       </div>
 
       {state === 'active' && canDtmf && keypad && (
@@ -110,8 +113,8 @@ export default function CallSurface({
         )}
         {state === 'active' && (
           <>
-            <ActionButton icon={muted ? '🔇' : '🎙'} label={t(muted ? 'Unmute' : 'Mute')}
-              tone="primary" active={muted} onClick={onToggleMute} />
+            <ActionButton icon={call.listenOnly ? '🚫' : muted ? '🔇' : '🎙'} label={t(call.listenOnly ? 'No mic' : muted ? 'Unmute' : 'Mute')}
+              tone="primary" active={muted} disabled={Boolean(call.listenOnly)} onClick={onToggleMute} />
             {canDtmf && <ActionButton icon="⌨" label={t('Keypad')} tone="violet"
               active={keypad} onClick={onToggleKeypad} />}
             {subtitles?.available && <ActionButton icon="文" label={subtitleButtonLabel(subtitles, t)}

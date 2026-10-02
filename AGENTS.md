@@ -7,8 +7,8 @@
 
 - `vmware` 是面向 VMware Workstation Linux 客户机的部署分支。
 - 正式支持范围为 x86_64 的 Ubuntu 24.04/26.04 和 Debian 12/13。
-- Control 与 WebUI 使用本机 Python venv + systemd；只有每条 SIM 的 Engine 使用
-  rootful Docker。
+- Control 与 WebUI 使用本机 Python venv + systemd；每条 SIM 的 Engine 使用
+  rootful Docker。可选媒体 relay 模式额外运行固定版本的官方 coturn 容器；不引入 Docker Control。
 - 首次安装和更新均在客户机本地从源码构建，不依赖 GitHub Actions、GitHub Release、
   预编译项目归档、Git LFS 资产或 Docker Control。
 - 开始工作前阅读 `README.md`；安装、开发和排障分别以 `docs/INSTALL.md`、

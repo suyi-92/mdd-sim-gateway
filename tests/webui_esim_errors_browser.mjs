@@ -40,19 +40,26 @@ try {
     const page = await browser.newPage({ viewport: { width, height: 1000 } })
     await page.addInitScript(() => localStorage.setItem('mdd-language', 'zh'))
     const errors = []; page.on('pageerror', e => errors.push(e.message))
-    let operation = null, method = '', attempts = 0
+    let operation = null, method = '', attempts = 0, guardMode = '', guardAttempts = 0, stopCalls = 0
     const payload = () => ({ ok: true, cached: true, ts: 100, ses: [{
       id: 'default', eid: 'fixture-euicc', profiles: [
         { iccid: 'card-active', profileNickname: 'Active profile', profileState: 'enabled' },
         { iccid: 'card-target', profileNickname: 'Target profile', profileState: 'disabled', operation_status: operation },
       ],
     }] })
-    await page.route('**/api/**', route => {
+    await page.route('**/api/**', async route => {
       const url = new URL(route.request().url())
       if (url.pathname === '/api/esim/status') return route.fulfill({ json: { available: true } })
       if (url.pathname === '/api/esim/download/operation') return route.fulfill({ json: { operation: null } })
-      if (url.pathname === '/api/esim/chip/cached' || url.pathname === '/api/esim/chip') return route.fulfill({ json: payload() })
+      if (url.pathname === '/api/esim/chip/cached' || url.pathname === '/api/esim/chip' || url.pathname === '/api/esim/chip/read') return route.fulfill({ json: payload() })
+      if (url.pathname === '/api/instances/guard-line/stop') {
+        stopCalls++
+        if (guardMode === 'changed') { await page.evaluate(() => window.bumpGeneration()); await page.waitForTimeout(100) }
+        return route.fulfill({ json: { ok: true } })
+      }
+      if (url.pathname === '/api/instances') return route.fulfill({ json: { instances: [] } })
       if (url.pathname.startsWith('/api/esim/profiles/')) {
+        if (guardMode && ++guardAttempts === 1) return route.fulfill({ status: 409, json: { detail: { code: 'engine_running', instance_id: 'guard-line' } } })
         attempts++; method = route.request().method()
         const detail = { code: 'esim_operation_failed',
           message: "The card's profile policy does not allow this operation.",
@@ -97,9 +104,23 @@ try {
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
     assert.deepEqual(errors, [])
     await page.screenshot({ path: path.join(output, `${width}.png`), fullPage: true })
+    if (width === 1440) {
+      for (const mode of ['same', 'changed']) {
+        guardMode = mode; guardAttempts = 0; stopCalls = 0
+        await page.reload()
+        await page.getByRole('button', { name: '读取', exact: true }).click()
+        page.once('dialog', dialog => dialog.accept())
+        const stopped = page.waitForResponse(response => new URL(response.url()).pathname === '/api/instances')
+        await row.getByRole('button', { name: '启用', exact: true }).click()
+        await stopped
+        await page.waitForTimeout(150)
+        assert.equal(stopCalls, 1)
+        assert.equal(guardAttempts, mode === 'same' ? 2 : 1, '409 retry must be bounded and remain on the same card generation')
+      }
+    }
     await page.close()
   }
-  console.log('eSIM error persistence and fixed row feedback passed at 1440/900/390px')
+  console.log('eSIM 409 same-card retry/fence, error persistence and fixed row feedback passed at 1440/900/390px')
 } finally {
   await browser?.close()
   await server.close()

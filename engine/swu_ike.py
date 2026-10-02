@@ -20,6 +20,8 @@ import hashlib
 import ipaddress
 from stability_log import ike_event as stability_event
 
+from outer_transport import proxy_udp_socket
+
 # Python 3.14 changed POSIX multiprocessing's default from fork to forkserver.  The SWu data
 # plane workers intentionally inherit the live IKE/crypto state; serialising that state is both
 # unnecessary and impossible (cryptography's DHParameterNumbers is not picklable).  Keep the
@@ -159,6 +161,7 @@ SWU_IFACE = os.environ.get("SWU_IFACE", "ipsec0")          # tun device name (pj
 SWU_NOTIFY = os.environ.get("SWU_NOTIFY", "/usr/local/bin/notify.py")
 SWU_ASSIGN_IPV6_GLOBAL = os.environ.get("SWU_ASSIGN_IPV6_GLOBAL", "1") not in ("0", "", "no")
 SWU_WRITE_RESOLV = os.environ.get("SWU_WRITE_RESOLV", "0") not in ("0", "", "no")
+SWU_EGRESS_PROXY = os.environ.get("SWU_EGRESS_PROXY", "").strip()
 
 # --- Data-plane MTU / fragmentation handling -------------------------------------------------
 # The userspace ESP dataplane reads inner IP packets off the tun (ipsec0), wraps each in
@@ -245,13 +248,15 @@ def swu_notify(event, arg=None):
         pass
 
 
-def swu_apply_pcscf(addr):
+def swu_apply_pcscf(addr, tunnel_rebuilt=False):
     """Queue a process replacement; never hot-reload native IMS/IPsec objects.
 
-    A new SWu process requests fresh IMS even when the peer reuses its P-CSCF:
+    Every full attach requests fresh IMS even when the peer reuses its P-CSCF:
     the inner address and security associations may have changed independently.
+    The supervisor consumes initial tickets when rendering before its first start;
+    later requests replace only a confirmed idle Asterisk process.
     """
-    if not addr or globals().get("_pcscf_requested") == addr:
+    if not addr or (not tunnel_rebuilt and globals().get("_pcscf_requested") == addr):
         return
     try:
         from asterisk_supervisor import request_restart
@@ -262,7 +267,6 @@ def swu_apply_pcscf(addr):
         swu_log("P-CSCF/session changed; queued supervised IMS process replacement")
     except Exception:
         swu_log("P-CSCF restart request failed; retaining unapplied state for retry")
-
 
 
 '''
@@ -323,7 +327,7 @@ NONE = 0
 SA =      33
 KE =      34
 IDI =     35
-IDR =     36 
+IDR =     36
 CERT =    37
 CERTREQ = 38
 AUTH =    39
@@ -347,7 +351,7 @@ INFORMATIONAL =   37
 RESERVED = 0
 IKE = 1
 AH =  2
-ESP = 3   
+ESP = 3
 
 #Transform Type Values
 ENCR = 1
@@ -511,7 +515,7 @@ TS_UNACCEPTABLE                         =    38
 INVALID_SELECTORS                       =    39
 TEMPORARY_FAILURE                       =    43
 CHILD_SA_NOT_FOUND                      =    44
-# from 24.302                                        
+# from 24.302
 PDN_CONNECTION_REJECTION                =  8192
 MAX_CONNECTION_REACHED                  =  8193
 SEMANTIC_ERROR_IN_THE_TFT_OPERATION     =  8241
@@ -533,8 +537,8 @@ UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED = 11055
 INITIAL_CONTACT                         = 16384
 SET_WINDOW_SIZE                         = 16385
 ADDITIONAL_TS_POSSIBLE                  = 16386
-IPCOMP_SUPPORTED                        = 16387      
-NAT_DETECTION_SOURCE_IP                 = 16388      
+IPCOMP_SUPPORTED                        = 16387
+NAT_DETECTION_SOURCE_IP                 = 16388
 NAT_DETECTION_DESTINATION_IP            = 16389
 COOKIE                                  = 16390
 USE_TRANSPORT_MODE                      = 16391
@@ -546,7 +550,7 @@ NON_FIRST_FRAGMENTS_ALSO                = 16395
 IKEV2_FRAGMENTATION_SUPPORTED           = 16430      # RFC 7383 status notify (IKE fragmentation)
 
 EAP_ONLY_AUTHENTICATION                 = 16417
-# from 24.302                                        
+# from 24.302
 REACTIVATION_REQUESTED_CAUSE            = 40961
 BACKOFF_TIMER                           = 41041
 PDN_TYPE_IPv4_ONLY_ALLOWED              = 41050
@@ -883,30 +887,33 @@ class swu():
         self.mcc = str(mcc).zfill(3) if mcc else mcc
         self.mnc = str(mnc).zfill(3) if mnc else mnc
         self.imsi = imsi
-        
+
         self.netns_name = netns
-        
+        self.egress_proxy = SWU_EGRESS_PROXY
+        # SOCKS5 UDP carries an IPv4 destination as RSV/FRAG/ATYP/DST.ADDR/DST.PORT.
+        self.proxy_udp_overhead = 10 if self.egress_proxy else 0
+
         self.set_variables()
         self.set_udp() # default
         self.create_socket(self.client_address)
         self.create_socket_nat(self.client_address_nat)
-        self.create_socket_esp(self.client_address_esp)        
+        self.create_socket_esp(self.client_address_esp)
         self.userplane_mode = ESP_PROTOCOL
-        
+
         self.sk_ENCR_NULL_pad_length = 0 #[0 or 1 byte] SK payload is not definied in RFC for IKEv2. Some vendors don't use pad length byte, others use.
 
-        
+
     def set_variables(self):
         self.port = DEFAULT_IKE_PORT
         self.port_nat = DEFAULT_IKE_NAT_TRAVERSAL_PORT
         self.client_address = (self.source_address,self.port)
-        self.client_address_nat = (self.source_address,self.port_nat) 
-        self.client_address_esp = (self.source_address,0)         
+        self.client_address_nat = (self.source_address,self.port_nat)
+        self.client_address_esp = (self.source_address,0)
         self.timeout = DEFAULT_TIMEOUT_UDP
         self.state = 0
         self.server_address = (self.epdg_address, self.port)
         self.server_address_nat = (self.epdg_address, self.port_nat)
-        self.server_address_esp = (self.epdg_address, 0)        
+        self.server_address_esp = (self.epdg_address, 0)
         self.message_id_request = 0
         self.message_id_responses = 0
 
@@ -1067,7 +1074,7 @@ class swu():
         else:
             idr_value = self.apn
         self.set_identification(IDR, ID_FQDN, idr_value)
-        
+
         self.ike_decoded_header = {}
         self.decodable_payloads = [
             SA,
@@ -1087,7 +1094,7 @@ class swu():
             CP,
             EAP
         ]
-      
+
         self.iana_diffie_hellman = {
             MODP_768_bit:   768,
             MODP_1024_bit: 1024,
@@ -1096,17 +1103,17 @@ class swu():
             MODP_3072_bit: 3072,
             MODP_4096_bit: 4096,
             MODP_6144_bit: 6144,
-            MODP_8192_bit: 8192 
+            MODP_8192_bit: 8192
         }
         self.prf_function = {
             PRF_HMAC_MD5 :        hashes.MD5(),
-            PRF_HMAC_SHA1 :       hashes.SHA1(),    
+            PRF_HMAC_SHA1 :       hashes.SHA1(),
             #PRF_HMAC_TIGER :        3
             #PRF_AES128_XCBC :       4
             PRF_HMAC_SHA2_256 :   hashes.SHA256(),
             PRF_HMAC_SHA2_384 :   hashes.SHA384(),
             PRF_HMAC_SHA2_512 :   hashes.SHA512()
-            #PRF_AES128_CMAC :       8 
+            #PRF_AES128_CMAC :       8
         }
         self.prf_key_len_bytes = {
             PRF_HMAC_MD5 :          16,
@@ -1117,9 +1124,9 @@ class swu():
             PRF_HMAC_SHA2_384 :     48,
             PRF_HMAC_SHA2_512 :     64,
             PRF_AES128_CMAC :       16,
-            
+
         }
-        self.integ_function = {        
+        self.integ_function = {
             NONE :                      None,
             AUTH_HMAC_MD5_96 :	        hashes.MD5(),
             AUTH_HMAC_SHA1_96 :         hashes.SHA1(),
@@ -1134,9 +1141,9 @@ class swu():
             #AUTH_AES_256_GMAC :        32,
             AUTH_HMAC_SHA2_256_128 :   hashes.SHA256(),
             AUTH_HMAC_SHA2_384_192 :   hashes.SHA384(),
-            AUTH_HMAC_SHA2_512_256 :   hashes.SHA512()            
-        }        
-        self.integ_key_len_bytes = {        
+            AUTH_HMAC_SHA2_512_256 :   hashes.SHA512()
+        }
+        self.integ_key_len_bytes = {
             NONE :                      0,
             AUTH_HMAC_MD5_96 :	        16,
             AUTH_HMAC_SHA1_96 :         20,
@@ -1151,9 +1158,9 @@ class swu():
             #AUTH_AES_256_GMAC :        32,
             AUTH_HMAC_SHA2_256_128 :   32,
             AUTH_HMAC_SHA2_384_192 :   48,
-            AUTH_HMAC_SHA2_512_256 :   64        
+            AUTH_HMAC_SHA2_512_256 :   64
         }
-        self.integ_key_truncated_len_bytes = {        
+        self.integ_key_truncated_len_bytes = {
             NONE :                      0,
             AUTH_HMAC_MD5_96 :	        12,
             AUTH_HMAC_SHA1_96 :         12,
@@ -1168,10 +1175,10 @@ class swu():
             #AUTH_AES_256_GMAC :        32?,
             AUTH_HMAC_SHA2_256_128 :   16,
             AUTH_HMAC_SHA2_384_192 :   24,
-            AUTH_HMAC_SHA2_512_256 :   32        
-        }        
+            AUTH_HMAC_SHA2_512_256 :   32
+        }
         self.configuration_payload_len_bytes = {
-        
+
             INTERNAL_IP4_ADDRESS	                : 4,
             INTERNAL_IP4_NETMASK	                : 4,
             INTERNAL_IP4_DNS	                    : 4,
@@ -1194,7 +1201,7 @@ class swu():
             EXTERNAL_SOURCE_IP4_NAT_INFO            : 6,
             TIMEOUT_PERIOD_FOR_LIVENESS_CHECK	    : 4,
             INTERNAL_DNS_DOMAIN	                    : None,
-            INTERNAL_DNSSEC_TA                      : None      
+            INTERNAL_DNSSEC_TA                      : None
         }
         self.errors = {
             OK :                            'OK',
@@ -1202,21 +1209,21 @@ class swu():
             REPEAT_STATE :                  'REPEAT_STATE',
             DECODING_ERROR :                'DECODING_ERROR',
             MANDATORY_INFORMATION_MISSING : 'MANDATORY_INFORMATION_MISSING',
-            OTHER_ERROR :                   'OTHER_ERROR'    
+            OTHER_ERROR :                   'OTHER_ERROR'
         }
 
 
-    def return_integrity_algorithm_name(self):        
+    def return_integrity_algorithm_name(self):
         integ_alg = {
             AUTH_HMAC_MD5_96 : "HMAC_MD5_96 [RFC2403]",
             AUTH_HMAC_SHA1_96 : "HMAC_SHA1_96 [RFC2404]",
-            AUTH_HMAC_SHA2_256_128 : "HMAC_SHA2_256_128 [RFC4868]", 
+            AUTH_HMAC_SHA2_256_128 : "HMAC_SHA2_256_128 [RFC4868]",
             AUTH_HMAC_SHA2_384_192 : "HMAC_SHA2_384_192 [RFC4868]",
             AUTH_HMAC_SHA2_512_256 : "HMAC_SHA2_512_256 [RFC4868]",
             NONE : "NONE [RFC4306]"
         }
         return integ_alg.get(self.negotiated_integrity_algorithm,'UNKNOWN')
-    
+
     def return_encryption_algorithm_name(self):
         encr_alg = ''
         key_size = self.negotiated_encryption_algorithm_key_size
@@ -1227,18 +1234,18 @@ class swu():
         elif self.negotiated_encryption_algorithm == ENCR_NULL:
             encr_alg = "NULL [RFC2410]"
         return encr_alg
-    
+
     def return_integrity_algorithm_child_name(self):
         integ_alg = {
             AUTH_HMAC_MD5_96 : "HMAC-MD5-96 [RFC2403]",
             AUTH_HMAC_SHA1_96 : "HMAC-SHA-1-96 [RFC2404]",
-            AUTH_HMAC_SHA2_256_128 : "HMAC-SHA-256-128 [RFC4868]", 
+            AUTH_HMAC_SHA2_256_128 : "HMAC-SHA-256-128 [RFC4868]",
             AUTH_HMAC_SHA2_384_192 : "HMAC-SHA-384-192 [RFC4868]",
             AUTH_HMAC_SHA2_512_256 : "HMAC-SHA-512-256 [RFC4868]",
             NONE : "NULL"
         }
-        return integ_alg.get(self.negotiated_integrity_algorithm_child,'UNKNOWN')        
-    
+        return integ_alg.get(self.negotiated_integrity_algorithm_child,'UNKNOWN')
+
     def return_encryption_algorithm_child_name(self):
         encr_alg = ''
         if self.negotiated_encryption_algorithm_child == ENCR_AES_CBC:
@@ -1248,11 +1255,11 @@ class swu():
         elif self.negotiated_encryption_algorithm_child == ENCR_AES_GCM_12:
             encr_alg = "AES-GCM [RFC4106]"
         elif self.negotiated_encryption_algorithm_child == ENCR_AES_GCM_16:
-            encr_alg = "AES-GCM [RFC4106]"            
+            encr_alg = "AES-GCM [RFC4106]"
         elif self.negotiated_encryption_algorithm_child == ENCR_NULL:
             encr_alg = "NULL"
-        return encr_alg    
-    
+        return encr_alg
+
     def print_ikev2_decryption_table(self):
         # Never persist traffic-decryption keys. Support bundles include this process's log.
         return
@@ -1261,39 +1268,57 @@ class swu():
         return
 
 
-       
+
     def set_timeout(self,value):
         self.timeout = value
-        
+
     def set_udp(self):
         self.socket_type = UDP
 
     def create_socket(self,client_address):
-        
+
         if self.socket_type == UDP:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket = proxy_udp_socket(
+                    self.egress_proxy, self.server_address,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket.bind(client_address)
         self.socket.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket)
 
 
     def create_socket_nat(self,client_address):
-        
+
         if self.socket_type == UDP:
-            self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket_nat = proxy_udp_socket(
+                    self.egress_proxy, self.server_address_nat,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket_nat.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket_nat.bind(client_address)
         self.socket_nat.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket_nat)
 
     def create_socket_esp(self,client_address):
-        self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
-        self.socket_esp.bind(client_address)    
+        if self.egress_proxy:
+            # SOCKS5 has no raw-IP transport.  Keep a selectable, unreachable local socket
+            # for the existing worker loop; every real packet is forced to UDP/4500 below.
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket_esp.bind(("127.0.0.1", 0))
+        else:
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
+            self.socket_esp.bind(client_address)
         self._enable_outer_pmtud(self.socket_esp)
 
     def _enable_outer_pmtud(self, sock):
@@ -1311,7 +1336,7 @@ class swu():
             sock.setsockopt(socket.IPPROTO_IP, ip_mtu_discover, ip_pmtudisc_do)
         except Exception as e:
             swu_log("could not set IP_PMTUDISC_DO on outer socket: %r" % e)
-        
+
     def set_server(self,address):
         self.server_address = (address,self.port)
 
@@ -1428,45 +1453,45 @@ class swu():
 
 
     def return_flags(self,value): #works with value or tuple
-        
+
         if type(value) is int:
             rvi = (value//8)%8
             return (rvi // 4, (rvi//2)%2, rvi%2)
         else: #is a tuple with (r,v,i)
             return 32*value[0]+16*value[1]+8*value[2]
-            
-            
-            
+
+
+
     def dh_create_private_key_and_public_bytes(self,key_size):
         prime = {
              768: 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF,
-            1024: 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF,                 
+            1024: 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF,
             1536: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca237327ffffffffffffffff,
             2048: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aacaa68ffffffffffffffff,
             3072: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a93ad2caffffffffffffffff,
             4096: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c934063199ffffffffffffffff,
             6144: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dcc4024ffffffffffffffff,
-            8192: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dbe115974a3926f12fee5e438777cb6a932df8cd8bec4d073b931ba3bc832b68d9dd300741fa7bf8afc47ed2576f6936ba424663aab639c5ae4f5683423b4742bf1c978238f16cbe39d652de3fdb8befc848ad922222e04a4037c0713eb57a81a23f0c73473fc646cea306b4bcbc8862f8385ddfa9d4b7fa2c087e879683303ed5bdd3a062b3cf5b3a278a66d2a13f83f44f82ddf310ee074ab6a364597e899a0255dc164f31cc50846851df9ab48195ded7ea1b1d510bd7ee74d73faf36bc31ecfa268359046f4eb879f924009438b481c6cd7889a002ed5ee382bc9190da6fc026e479558e4475677e9aa9e3050e2765694dfc81f56e880b96e7160c980dd98edd3dfffffffffffffffff            
-        }    
-        g = 2        
+            8192: 0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dbe115974a3926f12fee5e438777cb6a932df8cd8bec4d073b931ba3bc832b68d9dd300741fa7bf8afc47ed2576f6936ba424663aab639c5ae4f5683423b4742bf1c978238f16cbe39d652de3fdb8befc848ad922222e04a4037c0713eb57a81a23f0c73473fc646cea306b4bcbc8862f8385ddfa9d4b7fa2c087e879683303ed5bdd3a062b3cf5b3a278a66d2a13f83f44f82ddf310ee074ab6a364597e899a0255dc164f31cc50846851df9ab48195ded7ea1b1d510bd7ee74d73faf36bc31ecfa268359046f4eb879f924009438b481c6cd7889a002ed5ee382bc9190da6fc026e479558e4475677e9aa9e3050e2765694dfc81f56e880b96e7160c980dd98edd3dfffffffffffffffff
+        }
+        g = 2
         self.pn = dh.DHParameterNumbers(prime.get(key_size),g)
         parameters = self.pn.parameters()
         self.dh_private_key = parameters.generate_private_key()
         self.dh_public_key_bytes = self.dh_private_key.public_key().public_numbers().y.to_bytes(key_size//8,'big')
-        
-        
+
+
     def dh_calculate_shared_key(self,peer_public_key_bytes):
         peer_public_numbers = dh.DHPublicNumbers(int.from_bytes(peer_public_key_bytes, byteorder='big'), self.pn)
         peer_public_key = peer_public_numbers.public_key()
         self.dh_shared_key = self.dh_private_key.exchange(peer_public_key)
-        
-        
-        
+
+
+
     def get_identity(self):
             imsi = return_imsi(self.com_port)
             self.imsi = imsi
             self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
-    
+
     def encode_eap_at_identity(self, identity):
         """ Returns the EAP AT Identity as bytes """
         # 4 bytes -> header (type, at_len, identity_len)
@@ -1482,58 +1507,58 @@ class swu():
                 + identity.encode("utf-8")
                 + pad * b'\x00')
         return eap_at_identity
-        
+
     def eap_keys_calculation(self,ck, ik):
         identity = self.identification_initiator[1].encode('utf-8') #idi value
         digest = hashes.Hash(hashes.SHA1())
         digest.update(identity + ik + ck)
         MK = digest.finalize()
-        
+
         result = b''
         xval = MK
         modulus = pow(2,160)
-        
+
         for i in range(4):
             w0 = sha1_dss(xval)
             xval = ((int.from_bytes(xval,'big') + int.from_bytes(w0, 'big') + 1 ) % modulus).to_bytes(20,'big')
             w1 = sha1_dss(xval)
             xval = ((int.from_bytes(xval,'big') + int.from_bytes(w1, 'big') + 1 ) % modulus).to_bytes(20,'big')
-            
+
             result += w0 + w1
 
-        # return     
+        # return
         return result[0:16],result[16:32],result[32:96],result[96:160],MK
-        
-        
+
+
     def eap_keys_calculation_fast_reauth(self,counter, nonce_s):
         identity = self.identification_initiator[1].encode('utf-8') #idi value
         digest = hashes.Hash(hashes.SHA1())
         digest.update(identity + struct.pack('!H',counter) + nonce_s + self.MK)
         XKEY = digest.finalize()
-        
+
         result = b''
         xval = XKEY
         modulus = pow(2,160)
-        
+
         for i in range(4):
             w0 = sha1_dss(xval)
             xval = ((int.from_bytes(xval,'big') + int.from_bytes(w0, 'big') + 1 ) % modulus).to_bytes(20,'big')
             w1 = sha1_dss(xval)
             xval = ((int.from_bytes(xval,'big') + int.from_bytes(w1, 'big') + 1 ) % modulus).to_bytes(20,'big')
-            
+
             result += w0 + w1
 
-        # return     
-        return result[0:64],result[64:128],XKEY        
-        
+        # return
+        return result[0:64],result[64:128],XKEY
+
     def build_eap_aka_response(self, eap_identifier, res):
         """
         Build EAP-AKA Response payload with proper length calculation and padding.
-        
+
         Args:
             eap_identifier: EAP packet identifier
             res: RES value (4-16 bytes according to 3GPP standard)
-            
+
         Returns:
             Complete EAP-AKA response payload with proper length and padding
         """
@@ -1541,7 +1566,7 @@ class swu():
         res_len = len(res)
         if res_len < 4 or res_len > 16:
             raise ValueError(f"RES length must be between 4-16 bytes, got {res_len}")
-        
+
         # EAP-AKA fixed parts
         eap_code = bytes([2])  # Response
         eap_id = bytes([eap_identifier])
@@ -1549,63 +1574,63 @@ class swu():
         eap_aka_header = fromHex('1701000003')  # EAP-AKA Challenge Response header
         eap_res_bit_len = struct.pack('!H', res_len * 8)
         at_mac_header = fromHex('0b050000')  # AT_MAC attribute header (16 bytes follow)
-        
+
         # Calculate payload length before MAC
         # Structure: Code(1) + ID(1) + Length(2) + EAP-AKA Header(8) + RES(var) + AT_MAC(20)
         base_length = 1 + 1 + 2 + len(eap_aka_header) + 3 + res_len + len(at_mac_header) + 16
-        
+
         # EAP-AKA payloads must be multiples of 4 bytes - add padding if needed
         padding_needed = (4 - (base_length % 4)) % 4
         eap_res_4bytes_len = struct.pack('!B', (res_len + padding_needed) // 4 + 1)
         padding = bytes(padding_needed)
-        
+
         # Final length including padding
         total_length = base_length + padding_needed
-        
+
         # Build length field (2 bytes, big endian)
         length_bytes = struct.pack('!H', total_length)
-        
+
         # Construct payload without MAC (MAC placeholder is 16 zero bytes)
-        eap_payload_response = (eap_code + 
-                              eap_id + 
-                              length_bytes + 
-                              eap_aka_header + 
-                              eap_res_4bytes_len + 
-                              eap_res_bit_len + 
-                              res + 
+        eap_payload_response = (eap_code +
+                              eap_id +
+                              length_bytes +
+                              eap_aka_header +
+                              eap_res_4bytes_len +
+                              eap_res_bit_len +
+                              res +
                               padding +  # Add padding after RES if needed
-                              at_mac_header + 
+                              at_mac_header +
                               bytes(16))  # MAC placeholder
-        
+
         return eap_payload_response
-        
+
 #######################################################################################################################
 #######################################################################################################################
 ################                            D E C O D E     F U N C T I O N S                          ################
 #######################################################################################################################
 #######################################################################################################################
 
-        
+
     def decode_header(self, data):
         try:
-        #if True:        
+        #if True:
             self.ike_decoded_header['initiator_spi'] = data[0:8]
             self.ike_decoded_header['responder_spi'] = data[8:16]
             self.ike_decoded_header['next_payload'] = data[16]
             self.ike_decoded_header['major_version'] = data[17] // 16
-            self.ike_decoded_header['minor_version'] = data[17] % 16        
+            self.ike_decoded_header['minor_version'] = data[17] % 16
             self.ike_decoded_header['exchange_type'] = data[18]
-            self.ike_decoded_header['flags'] = self.return_flags(data[19])        
+            self.ike_decoded_header['flags'] = self.return_flags(data[19])
             self.ike_decoded_header['message_id'] = struct.unpack("!I",data[20:24])[0]
             self.ike_decoded_header['length'] =  struct.unpack("!I", data[24:28])[0]  #header + payloads
-            
-            
+
+
             if self.ike_spi_responder == (0).to_bytes(8,'big') and self.ike_spi_initiator == self.ike_decoded_header['initiator_spi'] :
                 self.ike_spi_responder = self.ike_decoded_header['responder_spi']
                 self.ike_decoded_header_ok = True
                 self.old_ike_message_received = False
                 return
-                
+
             if self.ike_spi_initiator == self.ike_decoded_header['initiator_spi'] and self.ike_spi_responder == self.ike_decoded_header['responder_spi']:
                 self.ike_decoded_header_ok = True
                 self.old_ike_message_received = False
@@ -1615,7 +1640,7 @@ class swu():
                 self.ike_decoded_header_ok = True
                 self.old_ike_message_received = True
                 return
-                
+
             self.ike_decoded_header_ok = False
             return
         except:
@@ -1627,34 +1652,34 @@ class swu():
         ike_decoded_payload_header['next_payload'] = data[position]
         ike_decoded_payload_header['C'] = data[position+1] // 128
         ike_decoded_payload_header['length'] =  struct.unpack("!H", data[position+2:position+4])[0]
-        ike_decoded_payload_header['data'] = data[position+4:position+ike_decoded_payload_header['length']]      
-        
+        ike_decoded_payload_header['data'] = data[position+4:position+ike_decoded_payload_header['length']]
+
         #to be used for SK decryption
         self.current_next_payload = ike_decoded_payload_header['next_payload']
-        
+
         if payload_type in self.decodable_payloads:
             ike_decoded_payload_header['decoded'] = [payload_type, self.decode_payload_type(payload_type, ike_decoded_payload_header['data'])]
         else:
             ike_decoded_payload_header['decoded'] = [payload_type, None]
-        
-        position += ike_decoded_payload_header['length']
-        return position, ike_decoded_payload_header['decoded'], ike_decoded_payload_header['next_payload'] 
 
-    
+        position += ike_decoded_payload_header['length']
+        return position, ike_decoded_payload_header['decoded'], ike_decoded_payload_header['next_payload']
+
+
     def decode_payload(self, data, next_payload, position=28): #by default it uses position 28 for normal
-        
+
         decoded_payload = []
         while position < len(data):
-            
+
             position, payload_decoded, next_payload = self.decode_generic_payload_header(data, position, next_payload)
             decoded_payload.append(payload_decoded)
-        
+
         return (True, decoded_payload)
-         
+
     def decode_ike(self, data):
         self.current_packet_received = data
-        
-        try:        
+
+        try:
         #if True:
             self.decode_header(data)
             if self.ike_decoded_header_ok == False:
@@ -1695,40 +1720,40 @@ class swu():
             TSR:     self.decode_payload_type_tsi_tsr  ,
             SK:      self.decode_payload_type_sk  ,
             CP:      self.decode_payload_type_cp  ,
-            EAP:     self.decode_payload_type_eap  
+            EAP:     self.decode_payload_type_eap
         }
-        func = payload_type.get(type, self.unsupported_payload_type)     
+        func = payload_type.get(type, self.unsupported_payload_type)
         return func(data)
 
 
     def decode_payload_type_sa(self, data):
         spi = b''
         if data[5]!= 0:
-            spi = data[8:8+data[6]]            
+            spi = data[8:8+data[6]]
         return [data[4],data[5],spi] # proposal number, protocol_id, spi
-        
+
     def decode_payload_type_ke(self, data):
         return [struct.unpack("!H", data[0:2])[0], data[4:]] # diffie-hellman group, key
-        
-        
+
+
     def decode_payload_type_idi(self, data):
         return [data[0],data[4:]]
-        
+
     def decode_payload_type_idr(self, data):
         return [data[0],data[4:]]
-        
+
     def decode_payload_type_cert(self, data):
         return [data[0],data[1:]]
-        
+
     def decode_payload_type_certreq(self, data):
         return [data[0],data[1:]]
-        
+
     def decode_payload_type_auth(self, data):
         return [data[0],data[4:]]
-    
+
     def decode_payload_type_ninr(self, data):
         return [data]  # nounce_received
-        
+
     def decode_payload_type_n(self, data):
         spi = b''
         notification_data = b''
@@ -1775,21 +1800,21 @@ class swu():
         except Exception:
             pass
         return [data[0],struct.unpack("!H", data[2:4])[0],spi,notification_data] # protocol_id, notify_message_type, spi, notification_data
-        
+
     def decode_payload_type_d(self, data):
         spi = b''
         spi_list = []
         num_of_spi = 0
         if data[1]!= 0: #spi present
-            num_of_spi = struct.unpack("!H", data[2:4])[0]            
+            num_of_spi = struct.unpack("!H", data[2:4])[0]
             for i in range(num_of_spi):
                 spi_list.append(data[4+i*data[1]:4+(i+1)*data[1]])
-            
+
         return [data[0],num_of_spi, spi_list] # [protocol_id, number of spi, [spi1, spi2, ... spi n]]
-            
+
     def decode_payload_type_v(self, data):
         return [data]
-        
+
     def decode_payload_type_tsi_tsr(self, data):
         num_of_ts = data[0]
         ts_list = []
@@ -1801,21 +1826,21 @@ class swu():
             if ts_type == TS_IPV4_ADDR_RANGE:
                 starting_address = socket.inet_ntop(socket.AF_INET,data[position+8:position+12])
                 ending_address = socket.inet_ntop(socket.AF_INET,data[position+12:position+16])
-                position += 16                  
+                position += 16
             elif ts_type == TS_IPV6_ADDR_RANGE:
                 starting_address = socket.inet_ntop(socket.AF_INET6,data[position+8:position+24])
-                ending_address = socket.inet_ntop(socket.AF_INET6,data[position+24:position+40])                
+                ending_address = socket.inet_ntop(socket.AF_INET6,data[position+24:position+40])
                 position += 40
-        
-            ts_list.append((ts_type,protocol_id,start_port,end_port,starting_address,ending_address))     
+
+            ts_list.append((ts_type,protocol_id,start_port,end_port,starting_address,ending_address))
         return [num_of_ts,ts_list]
-       
-       
-       
-       
-    ######### CIPHERED PAYLOAD ######  
-    ######### CIPHERED PAYLOAD ######  
-    ######### CIPHERED PAYLOAD ######      
+
+
+
+
+    ######### CIPHERED PAYLOAD ######
+    ######### CIPHERED PAYLOAD ######
+    ######### CIPHERED PAYLOAD ######
     def _decrypt_sk_body(self, data):
         """Decrypt + strip padding from the encrypted body of an SK (or an SKF fragment) payload,
         returning the plaintext IKE bytes. Factored out so RFC 7383 fragment reassembly reuses the
@@ -1946,11 +1971,11 @@ class swu():
                 attribute_list.append((attribute_type,attribute_value))
             position += length + 4
         return [cfg_type,attribute_list]
-        
+
     def decode_payload_type_eap(self, data):
         code = data[0] #1- request, 2-response, 3-success, 4-failure
         identifier = data[1]
-        if code in (EAP_SUCCESS,EAP_FAILURE): 
+        if code in (EAP_SUCCESS,EAP_FAILURE):
             return [code,identifier]
         elif code in (EAP_REQUEST,EAP_RESPONSE):
             if data[4] == EAP_AKA:
@@ -1962,7 +1987,7 @@ class swu():
 
     def unsupported_payload_type(self, data):
         return None
-        
+
 
     def decode_eap_attributes(self, data):
         eap_aka_decoded = []
@@ -1973,36 +1998,36 @@ class swu():
                 eap_aka_decoded.append((attribute,struct.unpack("!H", data[position+2:position+4])[0]))
             elif attribute in (AT_IDENTITY,AT_RES,AT_NEXT_PSEUDONYM,AT_NEXT_REAUTH_ID):
                 eap_aka_decoded.append((attribute,data[position+4:position+4+struct.unpack("!H", data[position+2:position+4])[0]]))
-            elif attribute in (AT_RAND,AT_AUTN,AT_IV,AT_MAC,AT_NONCE_S):                
+            elif attribute in (AT_RAND,AT_AUTN,AT_IV,AT_MAC,AT_NONCE_S):
                 eap_aka_decoded.append((attribute,data[position+4:position+20]))
-            elif attribute in (AT_AUTS,):                
+            elif attribute in (AT_AUTS,):
                 eap_aka_decoded.append((attribute,data[position+2:position+16]))
-            elif attribute in (AT_CHECKCODE,):               
-                if data[position+1] == 0:            
+            elif attribute in (AT_CHECKCODE,):
+                if data[position+1] == 0:
                     eap_aka_decoded.append((attribute,struct.unpack("!H", data[position+2:position+4])[0]))
                 else:
                     eap_aka_decoded.append((attribute,data[position+4:position+24]))
-            
+
             elif attribute in (AT_ENCR_DATA,):
                 eap_aka_decoded.append((attribute,data[position+4:position+4*data[position+1]]))
 
             elif attribute in (AT_PADDING,):
                 eap_aka_decoded.append((attribute,data[position+2:position+4*data[position+1]]))
-            
+
             position += data[position+1]*4
         return eap_aka_decoded
-        
+
 #######################################################################################################################
 #######################################################################################################################
 ################                           E N C O D E     F U N C T I O N S                           ################
 #######################################################################################################################
 #######################################################################################################################
-        
+
     def set_sa_list(self,sa_list):
-        self.sa_list = sa_list    
+        self.sa_list = sa_list
 
     def set_sa_list_child(self,sa_list):
-        self.sa_list_child = sa_list   
+        self.sa_list_child = sa_list
 
     def set_ts_list(self,type, ts_list):
         if type == TSI: self.ts_list_initiator = ts_list
@@ -2051,76 +2076,76 @@ class swu():
         header += bytes([major_version*16+minor_version])
         header += bytes([exchange_type])
         header += bytes([self.return_flags(flags)])
-        header += struct.pack("!I",message_id)  
-        header += struct.pack("!I",length)  
+        header += struct.pack("!I",message_id)
+        header += struct.pack("!I",length)
         return header
-        
+
 
     def encode_generic_payload_header(self,next_payload,c,data):
         payload = b''
         payload += bytes([next_payload])
         payload += bytes([c*128])
-        payload += struct.pack("!H",len(data)+4)  
+        payload += struct.pack("!H",len(data)+4)
         payload += data
         return payload
-        
-        
+
+
     def encode_payload_type_sa(self, sa_list):
         payload_sa = b''
         proposal_list = []
         self.sa_spi_list = []
         m = 0
-        
+
         proposal = 1
         for i in sa_list:
             transform_list = []
-            
+
             protocol_id = i[0][0]
             spi_size = i[0][1]
             spi_bytes = self.return_random_bytes(spi_size)
             self.sa_spi_list.append(spi_bytes)
 
             for m in range(1,len(i)): #transform_list
-                
+
                 transform_type = i[m][0]
                 transform_id = i[m][1]
-                if len(i[m])==3: #attributes 
+                if len(i[m])==3: #attributes
                     attribute_type = i[m][2][0][0]
                     attribute_format = i[m][2][0][1]
                     attribute_value = i[m][2][1]
                     if attribute_format == 0: #TLV: Value in bytes format
-                        attribute_bytes = struct.pack("!H",attribute_type) 
-                        attribute_bytes += struct.pack("!H",len(attribute_value)) 
+                        attribute_bytes = struct.pack("!H",attribute_type)
+                        attribute_bytes += struct.pack("!H",len(attribute_value))
                         attribute_bytes += attribute_value
                     else: # TV
-                        attribute_bytes = struct.pack("!H",32768+attribute_type) 
+                        attribute_bytes = struct.pack("!H",32768+attribute_type)
                         attribute_bytes += struct.pack("!H",attribute_value)
                 else:
-                    attribute_bytes = b''                
-                
-                
+                    attribute_bytes = b''
+
+
                 if proposal == 1 and transform_type == D_H and protocol_id == IKE:
-                    self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(transform_id))   
-                    self.dh_group_num = transform_id       
-     
-                
+                    self.dh_create_private_key_and_public_bytes(self.iana_diffie_hellman.get(transform_id))
+                    self.dh_group_num = transform_id
+
+
                 last = 3
                 if m == len(i)-1: last = 0 # last transform
-                    
+
                 transform_bytes = bytes([last]) + b'\x00\x00\x00' + bytes([transform_type]) + b'\x00' + struct.pack("!H",transform_id) + attribute_bytes
                 transform_bytes = bytearray(transform_bytes)
                 transform_bytes[2:4] = struct.pack("!H",len(transform_bytes))
 
                 transform_list.append(transform_bytes)
-                           
+
             last = 2
             if proposal == len(sa_list): last = 0 #last proposal
-            
-            proposal_bytes = bytes([last]) + b'\x00\x00\x00' + bytes([proposal]) + bytes([protocol_id]) + bytes([spi_size]) + bytes([m]) + spi_bytes + b''.join(transform_list)            
-                
+
+            proposal_bytes = bytes([last]) + b'\x00\x00\x00' + bytes([proposal]) + bytes([protocol_id]) + bytes([spi_size]) + bytes([m]) + spi_bytes + b''.join(transform_list)
+
             proposal_bytes = bytearray(proposal_bytes)
             proposal_bytes[2:4] = struct.pack("!H",len(proposal_bytes))
-            
+
             proposal_list.append(proposal_bytes)
 
 
@@ -2131,13 +2156,13 @@ class swu():
 
 
 
-    def encode_payload_type_ke(self):        
+    def encode_payload_type_ke(self):
         payload_ke = struct.pack("!H",self.dh_group_num) + b'\x00\x00' + self.dh_public_key_bytes
         return payload_ke
 
 
     def encode_payload_type_ninr(self, lowest = 0):
-        if lowest == 0:    
+        if lowest == 0:
             payload_ninr = self.return_random_bytes(16)
         elif lowest == -1:
             payload_ninr = b'\x00'*8 + self.return_random_bytes(8)
@@ -2152,13 +2177,13 @@ class swu():
 
     def encode_payload_type_tsr(self):
         return self.encode_payload_type_ts(TSR)
-        
+
     def encode_payload_type_ts(self,type):
         if type == TSI: ts_list = self.ts_list_initiator
         if type == TSR: ts_list = self.ts_list_responder
-        
+
         payload_ts = bytes([len(ts_list)]) + b'\x00\x00\x00'
-        
+
         for i in ts_list:
             ts_type = bytes([i[0]])
             ip_protocol = bytes([i[1]])
@@ -2173,17 +2198,17 @@ class swu():
                 starting_address = socket.inet_pton(socket.AF_INET6,i[4])
                 ending_address = socket.inet_pton(socket.AF_INET6,i[5])
             payload_ts += ts_type + ip_protocol + length + start_port + end_port + starting_address + ending_address
-        
+
         return payload_ts
-        
+
     def encode_payload_type_cp(self):
-    
+
         payload_cp = bytes([self.cp_list[0]]) + b'\x00\x00\x00'
         for i in self.cp_list[1:]:
             if len(i) == 1: #no value
                 payload_cp += struct.pack("!H",i[0]) + b'\x00\x00'
             else:
-                length = self.configuration_payload_len_bytes.get(i[0])              
+                length = self.configuration_payload_len_bytes.get(i[0])
                 if length == 4: #ip address
                     value = socket.inet_pton(socket.AF_INET,i[1])
                     payload_cp += struct.pack("!H",i[0]) + struct.pack("!H",4) + value
@@ -2200,36 +2225,36 @@ class swu():
                     payload_cp += struct.pack("!H",i[0]) + struct.pack("!H",len(i[1])) + i[1]
 
         return payload_cp
-        
+
     def encode_payload_type_idi(self):
         return self.encode_payload_type_id(IDI)
 
     def encode_payload_type_idr(self):
         return self.encode_payload_type_id(IDR)
-        
+
     def encode_payload_type_id(self,type): #id
         if type == IDI: (id_type,value) = self.identification_initiator
         if type == IDR: (id_type,value) = self.identification_responder
-        if id_type in (ID_FQDN, ID_RFC822_ADDR): 
+        if id_type in (ID_FQDN, ID_RFC822_ADDR):
             value = value.encode('utf-8')
         elif id_type == ID_IPV4_ADDR:
             value = socket.inet_pton(socket.AF_INET,value)
         elif id_type == ID_IPV6_ADDR:
             value = socket.inet_pton(socket.AF_INET6,value)
-        #else binary, so use value as is.    
+        #else binary, so use value as is.
         payload_id = bytes([id_type]) + b'\x00\x00\x00' + value
 
         return payload_id
- 
- 
- 
-    def encode_payload_type_eap(self): 
+
+
+
+    def encode_payload_type_eap(self):
         return self.eap_payload_response
 
-    def encode_payload_type_auth(self,auth_method): 
+    def encode_payload_type_auth(self,auth_method):
         return bytes([auth_method]) + b'\x00'*3 + self.AUTH_payload
- 
-    def encode_payload_type_d(self, protocol, spi_list = b''): 
+
+    def encode_payload_type_d(self, protocol, spi_list = b''):
         if protocol == IKE:
             return bytes([IKE]) + b'\x00\x00\x00'
         elif protocol == ESP:
@@ -2375,12 +2400,12 @@ class swu():
         swu_log("IKEv2 outbound fragmentation: %d plaintext bytes -> %d SKF fragments (chunk=%d)" %
                 (len(plaintext_body), total, chunk))
         return packets
-        
-        
-        
-        
-        
-        
+
+
+
+
+
+
 
 #######################################################################################################################
 #######################################################################################################################
@@ -2403,8 +2428,8 @@ class swu():
 
         Without this, every reply the container sources from its docker-bridge address (SWU_SOURCE,
         e.g. 172.17.0.3) — DNS lookups AND, crucially, the SYN-ACK/return traffic of any published
-        port (the WebRTC WSS softphone on 8089, the manager AMI) — matches a /1 route
-        and is sent into the ePDG, which drops it. Symptom: a LAN client's TCP to the mapped WSS port
+        port or bridge peer (the softphone WS relay, the manager AMI) — matches a /1 route
+        and is sent into the ePDG, which drops it. Symptom: a LAN client's TCP to a mapped port
         never completes its handshake (SYN in on eth0, SYN-ACK out on ipsec0, lost), so the softphone
         can't connect; and container DNS times out (40s).
 
@@ -2548,7 +2573,7 @@ class swu():
 
     def _inner_mtu_from(self, outer_mtu):
         """Largest inner IP packet whose ESP encapsulation fits one outer datagram of outer_mtu."""
-        m = outer_mtu - self._esp_overhead() - SWU_MTU_MARGIN
+        m = outer_mtu - self._esp_overhead() - self.proxy_udp_overhead - SWU_MTU_MARGIN
         return m if m >= 68 else 68
 
     def _compute_and_apply_tun_mtu(self):
@@ -2768,17 +2793,21 @@ class swu():
             self.exec_in_netns("ip addr add " + self.ip_address_list[0] + "/32 dev " + self.tun_device)
             #set host route, only  required if no netns
             if not self.netns_name:
-                if self.default_gateway is None:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.get_default_gateway_linux()[0])
+                # Behind a country exit the Engine sits on an internal network with no default
+                # route: IKE and ESP reach the ePDG through the SOCKS proxy on that network's own
+                # subnet, which the /1 tunnel routes below never cover, so there is nothing to pin.
+                gateway = self.default_gateway or (self.get_default_gateway_linux() or [None])[0]
+                if gateway:
+                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + gateway)
                 else:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
+                    swu_log("no default route (proxied egress): ePDG host route not needed")
 
             # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two /1
             # routes below make the tunnel the default route for ALL IPv4. That blackholes every
             # packet the container sources from its docker-bridge address (SWU_SOURCE): DNS lookups
             # (-> 40s timeouts, delaying the IMS SMS RP-ACK past its correlation window so the SMSC
             # 488s it and re-pushes the same SM forever) AND the return traffic of any published port
-            # (the WebRTC WSS softphone, AMI) — a LAN client's SYN-ACK goes out ipsec0
+            # (the softphone WS relay, AMI) — a LAN client's SYN-ACK goes out ipsec0
             # and is lost, so the softphone can never connect. Fix both at once with SOURCE-based
             # policy routing: traffic sourced from the container's LAN address goes out the LAN link,
             # while IMS traffic (sourced from the tunnel INNER address) still uses the /1 tunnel
@@ -2790,7 +2819,7 @@ class swu():
 
             self.exec_in_netns("route add -net 0.0.0.0/1 gw " + self.ip_address_list[0])
             self.exec_in_netns("route add -net 128.0.0.0/1 gw " + self.ip_address_list[0])
-        
+
         if self.ipv6_address_list != []:
             ipv6_address_prefix = ':'.join(self.ipv6_address_list[0].split(':')[0:4])
             ipv6_address_identifier = 'fe80::' + ':'.join(self.ipv6_address_list[0].split(':')[4:8])
@@ -2832,19 +2861,19 @@ class swu():
             # callback + ePDG FQDN resolution. Netns mode still writes its own per-ns resolv.
             if self.netns_name:
                 self.add_dir() #create directory for namespace if it doesn't exist
-                
+
                 with open("/etc/netns/%s/resolv.conf" % self.netns_name, "w") as file_obj:
                     for i in self.dns_address_list:
                         file_obj.write("nameserver %s\n" % i)
                     for i in self.dnsv6_address_list:
                         file_obj.write("nameserver %s\n" % i)
             else:
-                subprocess.call("cp /etc/resolv.conf /etc/resolv.backup.conf", shell=True)  
-                subprocess.call("echo > /etc/resolv.conf", shell=True) 
+                subprocess.call("cp /etc/resolv.conf /etc/resolv.backup.conf", shell=True)
+                subprocess.call("echo > /etc/resolv.conf", shell=True)
                 for i in self.dns_address_list:
-                    subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)  
+                    subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)
                 for i in self.dnsv6_address_list:
-                    subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)            
+                    subprocess.call("echo 'nameserver " + i +"' >> /etc/resolv.conf", shell=True)
 
         # VoWiFi engine addition: size ipsec0 to the outer path now that the inner address family
         # (v4/v6) and the CHILD-SA cipher are both known, so the encapsulation worker (forked next
@@ -2884,7 +2913,14 @@ class swu():
         host_mask = ((1 << host_bits) - 1) if host_bits > 0 else 0
         addr_int = int(network.network_address) | (iid & host_mask)
         return (str(ipaddress.IPv6Address(addr_int)), plen)
-     
+
+    def seconds_since_connect(self):
+        """How long the current tunnel has been up, or -1 if it never reached CONNECTED."""
+        started = getattr(self, "_connected_at", None)
+        if not started:
+            return -1
+        return max(0, int(time.time() - started))
+
     def delete_routes(self):
         if self.netns_name:
             subprocess.call("ip netns del %s" % self.netns_name, shell=True)
@@ -2901,18 +2937,20 @@ class swu():
             os.close(self.tunnel)
             if self.dns_address_list != []:
                 subprocess.call("cp /etc/resolv.backup.conf /etc/resolv.conf", shell=True)
-      
+
 
     def get_default_source_address(self):
-    
-        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+        gateway = get_default_gateway_linux()
+        if not gateway:
+            return None
+        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
         output = str(proc.stdout.read())
         if 'addr:' in output:
             addr = output.split('addr:')[1].split()[0]
         else:
             addr = output.split('inet ')[1].split()[0]
         return addr
-    
+
     def get_default_gateway_linux(self):
         """Read the default gateway directly from /proc."""
         with open("/proc/net/route") as fh:
@@ -2920,7 +2958,7 @@ class swu():
                 fields = line.strip().split()
                 if fields[1] != '00000000' or not int(fields[3], 16) & 2:
                     continue
-    
+
                 return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16))), fields[0]
 
 
@@ -2929,7 +2967,7 @@ class swu():
         IFF_TUN   = 0x0001
         IFF_TAP   = 0x0002
         IFF_NO_PI = 0x1000 # No Packet Information - to avoid 4 extra bytes
-    
+
         TUNMODE = IFF_TUN | IFF_NO_PI
         MODE = 0
         DEBUG = 0
@@ -2958,74 +2996,74 @@ class swu():
             packet_type = 41
         else:
             return None
-        
+
         if encr_alg in (ENCR_AES_CBC,):
             vector = self.return_random_bytes(16)
             data_to_encrypt = packet
-            
+
             res = 16 - (len(data_to_encrypt) % 16)
             if res>1:
                 data_to_encrypt += self.esp_padding(res-2) + bytes([res-2]) + bytes([packet_type])
             else:
                 data_to_encrypt += self.esp_padding(14+res) + bytes([14+res]) + bytes([packet_type])
-                   
+
             cipher = Cipher(algorithms.AES(encr_key), modes.CBC(vector))
-            encryptor = cipher.encryptor()          
+            encryptor = cipher.encryptor()
             cipher_data = encryptor.update(data_to_encrypt) + encryptor.finalize()
-                      
-            new_ike_packet = spi_resp + struct.pack("!I",sqn) + vector + cipher_data         
-            
-            if hash_size != 0:          
-                hash = self.integ_function.get(integ_alg) 
+
+            new_ike_packet = spi_resp + struct.pack("!I",sqn) + vector + cipher_data
+
+            if hash_size != 0:
+                hash = self.integ_function.get(integ_alg)
                 h = hmac.HMAC(integ_key,hash)
                 h.update(new_ike_packet)
-                hash = h.finalize()[0:hash_size]         
+                hash = h.finalize()[0:hash_size]
             else:
                 hash = b''
-                
+
             return new_ike_packet + hash
 
         elif encr_alg in (ENCR_AES_GCM_8, ENCR_AES_GCM_12, ENCR_AES_GCM_16):
-            
+
             if encr_alg == ENCR_AES_GCM_8: mac_length = 8
             if encr_alg == ENCR_AES_GCM_12: mac_length = 12
-            if encr_alg == ENCR_AES_GCM_16: mac_length = 16        
-        
-            aad = spi_resp + struct.pack("!I",sqn) 
+            if encr_alg == ENCR_AES_GCM_16: mac_length = 16
+
+            aad = spi_resp + struct.pack("!I",sqn)
             vector = self.return_random_bytes(8)
-          
+
             data_to_encrypt = packet
-            
-            res = (len(data_to_encrypt)+2) % 4            
+
+            res = (len(data_to_encrypt)+2) % 4
             if res== 0:
-                data_to_encrypt += bytes([res]) + bytes([packet_type])                
+                data_to_encrypt += bytes([res]) + bytes([packet_type])
             else:
-                data_to_encrypt += self.esp_padding(4-res) + bytes([4-res]) + bytes([packet_type])                  
-                        
+                data_to_encrypt += self.esp_padding(4-res) + bytes([4-res]) + bytes([packet_type])
+
             cipher = AES.new(encr_key[:-4], AES.MODE_GCM, nonce=encr_key[-4:] + vector, mac_len=mac_length)
             cipher.update(aad)
-            
+
             cipher_data, tag = cipher.encrypt_and_digest(data_to_encrypt)
-                                           
+
             new_ike_packet = spi_resp + struct.pack("!I",sqn) + vector + cipher_data + tag
-          
+
             return new_ike_packet
 
         elif encr_alg in (ENCR_NULL,):
-            
+
             new_ike_packet = spi_resp + struct.pack("!I",sqn) + packet + bytes([0]) + bytes([packet_type])
-            
-            if hash_size !=0:            
-                hash = self.integ_function.get(integ_alg) 
+
+            if hash_size !=0:
+                hash = self.integ_function.get(integ_alg)
                 h = hmac.HMAC(integ_key,hash)
                 h.update(new_ike_packet)
-                hash = h.finalize()[0:hash_size]         
+                hash = h.finalize()[0:hash_size]
             else:
                 hash = b''
-                
-            return new_ike_packet + hash            
- 
-        
+
+            return new_ike_packet + hash
+
+
         return None
 
     def _prepare_egress(self, packet):
@@ -3084,7 +3122,7 @@ class swu():
         cur = getattr(self, "inner_mtu", 0) or (SWU_TUN_MTU_ENV or 1400)
         new_inner = None
         if outer:
-            candidate = outer - overhead - SWU_MTU_MARGIN
+            candidate = outer - overhead - self.proxy_udp_overhead - SWU_MTU_MARGIN
             if candidate < cur:
                 new_inner = candidate
         if new_inner is None:
@@ -3236,7 +3274,7 @@ class swu():
                                                        integ_alg, integ_key, spi_resp, sqn)
 
                 elif sock == pipe_ike:
-                    pipe_packet = pipe_ike.recv()                     
+                    pipe_packet = pipe_ike.recv()
                     decode_list = self.decode_inter_process_protocol(pipe_packet)
                     if decode_list[0] == INTER_PROCESS_DELETE_SA:
                         sys.exit()
@@ -3245,37 +3283,37 @@ class swu():
                             if i[0] == INTER_PROCESS_IE_ENCR_ALG: encr_alg = i[1]
                             if i[0] == INTER_PROCESS_IE_INTEG_ALG: integ_alg = i[1]
                             if i[0] == INTER_PROCESS_IE_ENCR_KEY: encr_key = i[1]
-                            if i[0] == INTER_PROCESS_IE_INTEG_KEY: integ_key = i[1]                            
+                            if i[0] == INTER_PROCESS_IE_INTEG_KEY: integ_key = i[1]
                             if i[0] == INTER_PROCESS_IE_SPI_RESP: spi_resp = i[1]
                     elif decode_list[0] == INTER_PROCESS_IKE and decode_list[1][0] == INTER_PROCESS_IE_IKE_MESSAGE: #not used for now. check 4 bytes zero if nat transversal
-                        ike_message = decode_list[1][1]                    
+                        ike_message = decode_list[1][1]
                         self.socket_nat.sendto(ike_message, self.server_address_nat)
-        
+
         return 0
-    
-    
+
+
     def decapsulate_ipsec(self,args, parent_pid=None):
 
         if parent_pid is not None:
             prepare_ipsec_worker(parent_pid, "decoder")
-        
+
         pipe_ike = args[0]
-                
+
         socket_list = [self.socket_nat, pipe_ike, self.socket_esp]
         encr_alg = None
         integ_alg = None
-        
+
         while True:
             read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [])
             for sock in read_sockets:
                 if sock == self.socket_nat:
                     packet, address = self.socket_nat.recvfrom(4096)
-                    
+
                     if encr_alg is not None:
                         if packet[0:4] == b'\x00\x00\x00\x00': #is ike message
                             inter_process_list_ike_message = [INTER_PROCESS_IKE,[(INTER_PROCESS_IE_IKE_MESSAGE, packet)]]
                             pipe_ike.send(self.encode_inter_process_protocol(inter_process_list_ike_message))
-                            
+
                         elif packet[0:4] == spi_init:
 
                             if encr_alg is not None:
@@ -3296,10 +3334,10 @@ class swu():
 
                                     os.write(self.tunnel,decrypted_packet)
                                     self._note_esp_activity(pipe_ike)
-                        
-               
+
+
                 elif sock == pipe_ike:
-                    pipe_packet = pipe_ike.recv()                     
+                    pipe_packet = pipe_ike.recv()
                     decode_list = self.decode_inter_process_protocol(pipe_packet)
                     if decode_list[0] == INTER_PROCESS_DELETE_SA:
                         sys.exit()
@@ -3308,49 +3346,49 @@ class swu():
                             if i[0] == INTER_PROCESS_IE_ENCR_ALG: encr_alg = i[1]
                             if i[0] == INTER_PROCESS_IE_INTEG_ALG: integ_alg = i[1]
                             if i[0] == INTER_PROCESS_IE_ENCR_KEY: encr_key = i[1]
-                            if i[0] == INTER_PROCESS_IE_INTEG_KEY: integ_key = i[1]                            
+                            if i[0] == INTER_PROCESS_IE_INTEG_KEY: integ_key = i[1]
                             if i[0] == INTER_PROCESS_IE_SPI_INIT: spi_init = i[1]
 
 
         return 0
 
-    def decapsulate_esp_packet(self,packet,encr_alg,encr_key,integ_alg,integ_key):       
-    
+    def decapsulate_esp_packet(self,packet,encr_alg,encr_key,integ_alg,integ_key):
+
         if encr_alg in (ENCR_AES_CBC,):
             vector = packet[8:24]
             hash_size = self.integ_key_truncated_len_bytes.get(integ_alg)
             hash_data = packet[-hash_size:]
-        
+
             encrypted_data = packet[24:len(packet)-hash_size]
-        
-            cipher = Cipher(algorithms.AES(encr_key), modes.CBC(vector))            
+
+            cipher = Cipher(algorithms.AES(encr_key), modes.CBC(vector))
             decryptor = cipher.decryptor()
-            
+
             uncipher_data = decryptor.update(encrypted_data) + decryptor.finalize()
             padding_length = uncipher_data[-2]
             uncipher_packet = uncipher_data[0:-padding_length-2]
 
             return uncipher_packet
-            
+
         elif encr_alg in (ENCR_AES_GCM_8, ENCR_AES_GCM_12, ENCR_AES_GCM_16):
             if encr_alg == ENCR_AES_GCM_8: mac_length = 8
             if encr_alg == ENCR_AES_GCM_12: mac_length = 12
             if encr_alg == ENCR_AES_GCM_16: mac_length = 16
-            
-            aad = packet[0:8]            
+
+            aad = packet[0:8]
             cipher = AES.new(encr_key[:-4], AES.MODE_GCM, nonce=encr_key[-4:] + packet[8:16],mac_len=mac_length)
             cipher.update(aad)
 
-            uncipher_data = cipher.decrypt_and_verify(packet[16:-mac_length],packet[-mac_length:])                      
+            uncipher_data = cipher.decrypt_and_verify(packet[16:-mac_length],packet[-mac_length:])
             padding_length = uncipher_data[-2]
-            uncipher_packet = uncipher_data[0:-padding_length-2]                               
-                     
+            uncipher_packet = uncipher_data[0:-padding_length-2]
+
             return uncipher_packet
 
         elif encr_alg in (ENCR_NULL,):
             hash_size = self.integ_key_truncated_len_bytes.get(integ_alg)
             hash_data = packet[-hash_size:]
-        
+
             uncipher_data = packet[8:len(packet)-hash_size]
             padding_length = uncipher_data[-2]
             uncipher_packet = uncipher_data[0:-padding_length-2]
@@ -3358,7 +3396,7 @@ class swu():
             return uncipher_packet
 
         return None
-        
+
     def decode_inter_process_protocol(self,packet):
         try:
             ie_list = []
@@ -3368,27 +3406,27 @@ class swu():
                 if packet[position+1] == 0 and packet[position+2] == 1:
                     ie_list.append((packet[position], packet[position+3]))
                 else:
-                    ie_list.append((packet[position], packet[position+3:position+3+packet[position+1]*256+packet[position+2]])) 
+                    ie_list.append((packet[position], packet[position+3:position+3+packet[position+1]*256+packet[position+2]]))
                 position += 3+packet[position+1]*256+packet[position+2]
             return [message, ie_list]
         except:
-            return [None,None]   
+            return [None,None]
 
 
 
     def encode_inter_process_protocol(self,message):
         packet = b''
-        for i in message[1]: 
+        for i in message[1]:
             if type(i[1]) is int:
                 packet += bytes([i[0]]) + b'\x00\x01' + bytes([i[1]])
             else:
                 packet += bytes([i[0]]) + struct.pack("!H",len(i[1])) + i[1]
-                
-        packet = bytes([message[0]]) + struct.pack("!H",len(packet)) + packet        
+
+        packet = bytes([message[0]]) + struct.pack("!H",len(packet)) + packet
         return packet
-       
-       
-       
+
+
+
 #### AUX FUNCTIONS RELATED TO STATES OR MESSAGES
 
     def get_eap_aka_attribute_value(self,list,id):
@@ -3405,89 +3443,89 @@ class swu():
     def set_sa_negotiated(self,num):
         sa_negotiated = self.sa_list[num-1]
         self.sa_list_negotiated = [self.sa_list[num-1]]
-        
+
         #default values
         self.negotiated_integrity_algorithm = NONE
         self.negotiated_encryption_algorithm = ENCR_NULL
-        self.negotiated_encryption_algorithm_key_size = 0        
-          
+        self.negotiated_encryption_algorithm_key_size = 0
+
         for i in sa_negotiated[1:]:
-            if i[0] == ENCR: 
+            if i[0] == ENCR:
                 self.negotiated_encryption_algorithm = i[1]
-                if self.negotiated_encryption_algorithm != ENCR_NULL: 
+                if self.negotiated_encryption_algorithm != ENCR_NULL:
                     self.negotiated_encryption_algorithm_key_size = i[2][1]
             if i[0] == PRF: self.negotiated_prf = i[1]
-            if i[0] == INTEG: self.negotiated_integrity_algorithm = i[1]            
-            if i[0] == D_H: self.negotiated_diffie_hellman_group = i[1]            
-   
-    def remove_sa_from_list(self,accepted_dh_group): 
+            if i[0] == INTEG: self.negotiated_integrity_algorithm = i[1]
+            if i[0] == D_H: self.negotiated_diffie_hellman_group = i[1]
+
+    def remove_sa_from_list(self,accepted_dh_group):
         new_sa_list = []
         for p in self.sa_list:
             for i in p:
-                if i[0] == D_H and i[1] == accepted_dh_group:  
+                if i[0] == D_H and i[1] == accepted_dh_group:
                     new_sa_list.append(p)
-                    break              
+                    break
         self.sa_list = new_sa_list
-        
+
 
     def set_sa_negotiated_child(self,num):
         sa_negotiated = self.sa_list_child[num-1]
         self.spi_init_child = self.sa_spi_list[num-1]
         self.sa_list_negotiated_child = [self.sa_list_child[num-1]]
-        
+
         #default values
         self.negotiated_integrity_algorithm_child = NONE
         self.negotiated_encryption_algorithm_child = ENCR_NULL
         self.negotiated_encryption_algorithm_key_size_child = 0
-        
+
         for i in sa_negotiated[1:]:
-            if i[0] == ENCR: 
+            if i[0] == ENCR:
                 self.negotiated_encryption_algorithm_child = i[1]
-                if self.negotiated_encryption_algorithm_child != ENCR_NULL:                
+                if self.negotiated_encryption_algorithm_child != ENCR_NULL:
                     self.negotiated_encryption_algorithm_key_size_child = i[2][1]
             if i[0] == ESN: self.negotiated_esn_child = i[1]
-            if i[0] == INTEG: self.negotiated_integrity_algorithm_child = i[1]            
-            if i[0] == D_H: self.negotiated_diffie_hellman_group_child = i[1]            
-   
+            if i[0] == INTEG: self.negotiated_integrity_algorithm_child = i[1]
+            if i[0] == D_H: self.negotiated_diffie_hellman_group_child = i[1]
+
     def generate_keying_material_child(self):
-        
+
         STREAM = self.nounce + self.nounce_received
-        
-        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm_child) 
+
+        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm_child)
         ENCR_KEY_SIZE = self.negotiated_encryption_algorithm_key_size_child//8
-        
+
         #exception for GCM since we need extra 4 bytes for SALT
         if self.negotiated_encryption_algorithm_child in (ENCR_AES_GCM_8, ENCR_AES_GCM_12, ENCR_AES_GCM_16):
-            ENCR_KEY_SIZE += 4    
-        
+            ENCR_KEY_SIZE += 4
+
         KEY_LENGHT_TOTAL = 2*AUTH_KEY_SIZE + 2*ENCR_KEY_SIZE
         KEYMAT = self.prf_plus(self.negotiated_prf,self.SK_D,STREAM,KEY_LENGHT_TOTAL)
-        
+
         self.SK_IPSEC_EI = KEYMAT[0:ENCR_KEY_SIZE]
         self.SK_IPSEC_AI = KEYMAT[ENCR_KEY_SIZE:ENCR_KEY_SIZE+AUTH_KEY_SIZE]
         self.SK_IPSEC_ER = KEYMAT[ENCR_KEY_SIZE+AUTH_KEY_SIZE:2*ENCR_KEY_SIZE+AUTH_KEY_SIZE]
         self.SK_IPSEC_AR = KEYMAT[2*ENCR_KEY_SIZE+AUTH_KEY_SIZE:2*ENCR_KEY_SIZE+2*AUTH_KEY_SIZE]
-               
-        
+
+
         self.print_esp_sa()
-        
+
     def generate_keying_material(self):
 
-        hash = self.prf_function.get(self.negotiated_prf) 
+        hash = self.prf_function.get(self.negotiated_prf)
         h = hmac.HMAC(self.nounce + self.nounce_received,hash)
         h.update(self.dh_shared_key)
-        SKEYSEED = h.finalize() 
-        
+        SKEYSEED = h.finalize()
+
         STREAM = self.nounce + self.nounce_received + self.ike_spi_initiator + self.ike_spi_responder
-        
+
         PRF_KEY_SIZE = self.prf_key_len_bytes.get(self.negotiated_prf)
-        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm) 
+        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm)
         ENCR_KEY_SIZE = self.negotiated_encryption_algorithm_key_size//8
-        
+
         KEY_LENGHT_TOTAL = 3*PRF_KEY_SIZE + 2*AUTH_KEY_SIZE + 2*ENCR_KEY_SIZE
 
         KEY_STREAM = self.prf_plus(self.negotiated_prf,SKEYSEED,STREAM,KEY_LENGHT_TOTAL)
-        
+
         self.SK_D  = KEY_STREAM[0:PRF_KEY_SIZE]
         self.SK_AI = KEY_STREAM[PRF_KEY_SIZE:PRF_KEY_SIZE+AUTH_KEY_SIZE]
         self.SK_AR = KEY_STREAM[PRF_KEY_SIZE+AUTH_KEY_SIZE:PRF_KEY_SIZE+2*AUTH_KEY_SIZE]
@@ -3497,10 +3535,10 @@ class swu():
         self.SK_PR = KEY_STREAM[2*PRF_KEY_SIZE+2*AUTH_KEY_SIZE+2*ENCR_KEY_SIZE:3*PRF_KEY_SIZE+2*AUTH_KEY_SIZE+2*ENCR_KEY_SIZE]
 
         self.print_ikev2_decryption_table()
-        
+
     def generate_new_ike_keying_material(self):
-        
-        self.SK_D_old  = self.SK_D 
+
+        self.SK_D_old  = self.SK_D
         self.SK_AI_old = self.SK_AI
         self.SK_AR_old = self.SK_AR
         self.SK_EI_old = self.SK_EI
@@ -3508,31 +3546,31 @@ class swu():
         self.SK_PI_old = self.SK_PI
         self.SK_PR_old = self.SK_PR
 
-        hash = self.prf_function.get(self.negotiated_prf) 
+        hash = self.prf_function.get(self.negotiated_prf)
         h = hmac.HMAC(self.SK_D,hash)
         h.update(self.dh_shared_key + self.nounce + self.nounce_received)
-        SKEYSEED = h.finalize() 
-        
-        STREAM = self.nounce + self.nounce_received + self.ike_spi_initiator + self.ike_spi_responder    
-        
+        SKEYSEED = h.finalize()
+
+        STREAM = self.nounce + self.nounce_received + self.ike_spi_initiator + self.ike_spi_responder
+
         PRF_KEY_SIZE = self.prf_key_len_bytes.get(self.negotiated_prf)
-        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm) 
+        AUTH_KEY_SIZE = self.integ_key_len_bytes.get(self.negotiated_integrity_algorithm)
         ENCR_KEY_SIZE = self.negotiated_encryption_algorithm_key_size//8
-        
+
         KEY_LENGHT_TOTAL = PRF_KEY_SIZE + 2*AUTH_KEY_SIZE + 2*ENCR_KEY_SIZE
 
         KEY_STREAM = self.prf_plus(self.negotiated_prf,SKEYSEED,STREAM,KEY_LENGHT_TOTAL)
-        
+
         self.SK_D  = KEY_STREAM[0:PRF_KEY_SIZE]
         self.SK_AI = KEY_STREAM[PRF_KEY_SIZE:PRF_KEY_SIZE+AUTH_KEY_SIZE]
         self.SK_AR = KEY_STREAM[PRF_KEY_SIZE+AUTH_KEY_SIZE:PRF_KEY_SIZE+2*AUTH_KEY_SIZE]
         self.SK_EI = KEY_STREAM[PRF_KEY_SIZE+2*AUTH_KEY_SIZE:PRF_KEY_SIZE+2*AUTH_KEY_SIZE+ENCR_KEY_SIZE]
         self.SK_ER = KEY_STREAM[PRF_KEY_SIZE+2*AUTH_KEY_SIZE+ENCR_KEY_SIZE:PRF_KEY_SIZE+2*AUTH_KEY_SIZE+2*ENCR_KEY_SIZE]
-   
+
         self.print_ikev2_decryption_table()
-        
+
     def prf_plus(self,algorithm,key,stream,size):
-        hash = self.prf_function.get(algorithm)  
+        hash = self.prf_function.get(algorithm)
         t = b''
         t_total = b''
         iter = 1
@@ -3542,14 +3580,14 @@ class swu():
             t = h.finalize()
             t_total += t
             iter += 1
-    
+
         return t_total[0:size]
- 
+
 
     def sha1_nat_source(self,print_info=True):
         digest = hashes.Hash(hashes.SHA1())
         if self.userplane_mode == ESP_PROTOCOL:
-            digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.source_address) + struct.pack('!H',self.port))    
+            digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.source_address) + struct.pack('!H',self.port))
         else: #NAT_TRAVERSAL
             digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.source_address) + struct.pack('!H',self.port_nat))
         hash = digest.finalize()
@@ -3559,14 +3597,14 @@ class swu():
     def sha1_nat_destination(self, print_info=True):
         digest = hashes.Hash(hashes.SHA1())
         if self.userplane_mode == ESP_PROTOCOL:
-            digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.epdg_address) + struct.pack('!H',self.port))    
+            digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.epdg_address) + struct.pack('!H',self.port))
         else: #NAT_TRAVERSAL
             digest.update(self.ike_spi_initiator + self.ike_spi_responder + socket.inet_pton(socket.AF_INET,self.epdg_address) + struct.pack('!H',self.port_nat))
         hash = digest.finalize()
         if print_info == True: print('NAT DESTINATION',toHex(hash))
         return hash
 
- 
+
 #### MESSAGES ####
 
     def create_IKE_SA_INIT(self, same_spi = False, cookie = False):
@@ -3578,8 +3616,8 @@ class swu():
             payload = b''
         else:
             header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, N, 2, 0, IKE_SA_INIT, (0,0,1), self.message_id_request)
-            payload = self.encode_generic_payload_header(SA,0,self.encode_payload_type_n(RESERVED,b'',COOKIE,self.cookie_received_bytes)) 
-            
+            payload = self.encode_generic_payload_header(SA,0,self.encode_payload_type_n(RESERVED,b'',COOKIE,self.cookie_received_bytes))
+
         payload += self.encode_generic_payload_header(KE,0,self.encode_payload_type_sa(self.sa_list))
 
         payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())
@@ -3611,10 +3649,10 @@ class swu():
     def create_IKE_AUTH(self):
         header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, IDI, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)
         payload = self.encode_generic_payload_header(IDR,0,self.encode_payload_type_idi())
-        payload += self.encode_generic_payload_header(CP,0,self.encode_payload_type_idr())        
-        payload += self.encode_generic_payload_header(SA,0,self.encode_payload_type_cp())   
-        payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_sa(self.sa_list_child))         
-        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())          
+        payload += self.encode_generic_payload_header(CP,0,self.encode_payload_type_idr())
+        payload += self.encode_generic_payload_header(SA,0,self.encode_payload_type_cp())
+        payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_sa(self.sa_list_child))
+        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())
         payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_tsr())
         # VoWiFi engine addition: INITIAL_CONTACT tells the ePDG this is a fresh attach so it
         # deletes any older IKE SA it still holds for this subscriber (e.g. after a hard kill),
@@ -3629,9 +3667,9 @@ class swu():
         if os.environ.get("SWU_PCSCF_RESELECTION_SUPPORT", "0") not in ("0", "", "no"):
             payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_n(RESERVED,b'',P_CSCF_RESELECTION_SUPPORT))
         payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',EAP_ONLY_AUTHENTICATION))
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)     
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
 
     def create_IKE_AUTH_EAP_IDENTITY(self):
@@ -3666,17 +3704,17 @@ class swu():
 
         encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
-        
+
 
     def answer_INFORMATIONAL_delete(self):
-        if self.old_ike_message_received == True:    
-            header = self.encode_header(self.ike_spi_initiator_old, self.ike_spi_responder_old, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])        
-        else:           
-            header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])        
-        
-        packet = self.set_ike_packet_length(header)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
+        if self.old_ike_message_received == True:
+            header = self.encode_header(self.ike_spi_initiator_old, self.ike_spi_responder_old, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+        else:
+            header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, NONE, 2, 0, INFORMATIONAL, (1,0,1), self.ike_decoded_header['message_id'])
+
+        packet = self.set_ike_packet_length(header)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
 
     def answer_INFORMATIONAL_delete_CHILD(self,protocol,spi_list = b''):
@@ -3981,16 +4019,16 @@ class swu():
 
 
     def answer_CREATE_CHILD_SA(self):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])        
-       
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])
+
         payload = self.encode_generic_payload_header(KE,0,self.encode_payload_type_sa(self.sa_list_create_child_sa))
-        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())  
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_ninr())          
-        packet = self.set_ike_packet_length(header+payload)   
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
-        return encrypted_and_integrity_packet        
+        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_ninr())
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
+        return encrypted_and_integrity_packet
 
 
     def answer_NOTIFY_NO_PROPOSAL_CHOSEN(self):
@@ -4039,16 +4077,16 @@ class swu():
 
 
     def create_CREATE_CHILD_SA(self, lowest = 0):
-       
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (0,0,1), self.message_id_request)        
-        
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (0,0,1), self.message_id_request)
+
         payload = self.encode_generic_payload_header(KE,0,self.encode_payload_type_sa(self.sa_list_create_child_sa))
-        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())  
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_ninr(lowest))          
-        packet = self.set_ike_packet_length(header+payload)   
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
-        return encrypted_and_integrity_packet   
+        payload += self.encode_generic_payload_header(NINR,0,self.encode_payload_type_ke())
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_ninr(lowest))
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
+        return encrypted_and_integrity_packet
 
 
     def create_CREATE_CHILD_SA_CHILD(self,lowest = 0):
@@ -4169,19 +4207,19 @@ class swu():
         self.print_esp_sa()
 
     def answer_CREATE_CHILD_SA_CHILD(self,lowest = 0):
-        
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])        
-        
-        payload = self.encode_generic_payload_header(NINR,0,self.encode_payload_type_sa(self.sa_list_create_child_sa_child)) 
-        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr(lowest))          
+
+        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, SA, 2, 0, CREATE_CHILD_SA, (1,0,1), self.ike_decoded_header['message_id'])
+
+        payload = self.encode_generic_payload_header(NINR,0,self.encode_payload_type_sa(self.sa_list_create_child_sa_child))
+        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_ninr(lowest))
         payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_n(ESP,self.spi_init_child,REKEY_SA))
-        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())          
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_tsr())   
-        
-        packet = self.set_ike_packet_length(header+payload)   
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
-        return encrypted_and_integrity_packet  
+        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())
+        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_tsr())
+
+        packet = self.set_ike_packet_length(header+payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
+        return encrypted_and_integrity_packet
 
 
 
@@ -4189,7 +4227,7 @@ class swu():
 
     def state_1(self, retry = False, cookie = False): #Send IKE_SA_INIT and process answer
         self.message_id_request = 0
-        
+
         packet = self.create_IKE_SA_INIT(retry, cookie)
 
         self.AUTH_SA_INIT_packet = packet #needed for AUTH Payload in state 4
@@ -4199,13 +4237,13 @@ class swu():
         if not self._send_request_await_response(packet):
             return TIMEOUT,'TIMEOUT'
 
-        
+
         if self.ike_decoded_header['exchange_type'] == IKE_SA_INIT:
-            print('received IKE_SA_INIT')        
+            print('received IKE_SA_INIT')
             for i in self.decoded_payload:
                 if i[0] == NINR:
                     self.nounce_received = i[1][0]
-                
+
                 elif i[0] == SA:
                     proposal = i[1][0]
                     protocol_id = i[1][1]
@@ -4213,11 +4251,11 @@ class swu():
                         self.set_sa_negotiated(proposal)
                     else:
                         return MANDATORY_INFORMATION_MISSING,'MANDATORY_INFORMATION_MISSING'
-                
+
                 elif i[0] == KE:
                     dh_peer_public_key_bytes = i[1][1]
                     self.dh_calculate_shared_key(dh_peer_public_key_bytes)
-                
+
                 elif i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     if i[1][1] == INVALID_KE_PAYLOAD:
                         accepted_dh_group = struct.unpack("!H", i[1][3])[0]
@@ -4227,12 +4265,12 @@ class swu():
                         self.log_notify_error(i[1][1], "IKE_SA_INIT")
                         self.note_reject(i[1][1], self.decoded_payload)
                         return OTHER_ERROR,str(i[1][1])
-                        
+
                     elif i[1][1] == COOKIE:
                         self.cookie = True
                         self.cookie_received_bytes = i[1][3]
                         return REPEAT_STATE_COOKIE, 'REPEAT SA_INIT WITH COOKIE'
-                        
+
                     elif i[1][1] == NAT_DETECTION_DESTINATION_IP:
                         received_nat_detection_destination = i[1][3]
                         print('NAT DESTINATION RECEIVED',toHex(received_nat_detection_destination))
@@ -4240,7 +4278,7 @@ class swu():
                         print('NAT DESTINATION CALCULATED',toHex(calculated_nat_detection_destination))
                         if received_nat_detection_destination != calculated_nat_detection_destination:
                             self.userplane_mode = NAT_TRAVERSAL
-                        
+
                     elif i[1][1] == NAT_DETECTION_SOURCE_IP:
                         received_nat_detection_source = i[1][3]
                         print('NAT SOURCE RECEIVED',toHex(received_nat_detection_source))
@@ -4255,10 +4293,14 @@ class swu():
                         # SKF fragments and reassemble them (see decode_ike).
                         self.peer_supports_fragmentation = True
                         swu_log("ePDG supports IKEv2 fragmentation (RFC 7383)")
-                        
+
             self.generate_keying_material()
-            
-            
+            if self.egress_proxy:
+                # The relay necessarily changes the outer source address.  Force RFC 3948
+                # encapsulation even if a non-conforming peer omitted NAT detection payloads.
+                self.userplane_mode = NAT_TRAVERSAL
+
+
             return OK,''
         else:
             return DECODING_ERROR,'DECODING_ERROR'
@@ -4278,9 +4320,9 @@ class swu():
         eap_received = False
         eap_payload_seen = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
-            print('received IKE_AUTH (1)')             
+            print('received IKE_AUTH (1)')
             for i in self.decoded_payload[0][1]:
-                
+
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     if i[1][1] == DEVICE_IDENTITY:
                         self.device_identity_requested = True
@@ -4325,23 +4367,23 @@ class swu():
                         return REPEAT_STATE, 'EAP IDENTITY REQUESTED'
                     if eap_code == EAP_REQUEST and eap_type == EAP_AKA:
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
-                            
+
                             eap_received = True
-                            
+
                             RAND = self.get_eap_aka_attribute_value(i[1][4],AT_RAND)
                             AUTN = self.get_eap_aka_attribute_value(i[1][4],AT_AUTN)
                             MAC = self.get_eap_aka_attribute_value(i[1][4],AT_MAC)
-                            
+
                             VECTOR =  self.get_eap_aka_attribute_value(i[1][4],AT_IV)
                             ENCR_DATA =  self.get_eap_aka_attribute_value(i[1][4],AT_ENCR_DATA)
-                           
+
                             self.eap_identifier = i[1][1]
-                                                     
+
                             if (RAND is not None and AUTN is not None) or (VECTOR is not None and ENCR_DATA is not None):
                                 if RAND is not None and AUTN is not None:
                                     self.current_counter = None
                                     res,ck,ik = return_res_ck_ik(self.com_port,toHex(RAND),toHex(AUTN))
-                                        
+
                                     if res is not None and ck is None and ik is None:
                                         # RES is AUTS returned by the USIM after a sequence error.
                                         auts, res = res, None
@@ -4366,8 +4408,8 @@ class swu():
                                         h.update(eap_payload_response)
                                         hash = h.finalize()[0:16]
                                         self.eap_payload_response = eap_payload_response[:-16] + hash
-                                    
-                                if VECTOR is not None and ENCR_DATA is not None:                                
+
+                                if VECTOR is not None and ENCR_DATA is not None:
                                     cipher = Cipher(algorithms.AES(self.KENCR), modes.CBC(VECTOR))
                                     decryptor = cipher.decryptor()
                                     uncipher_data = decryptor.update(ENCR_DATA) + decryptor.finalize()
@@ -4375,16 +4417,16 @@ class swu():
                                     NEXT_REAUTH_ID = self.get_eap_aka_attribute_value(eap_attributes,AT_NEXT_REAUTH_ID)
                                     COUNTER = self.get_eap_aka_attribute_value(eap_attributes,AT_COUNTER)
                                     NONCE_S = self.get_eap_aka_attribute_value(eap_attributes,AT_NONCE_S)
-                                    
-                                    
-                                    
-                                    if NEXT_REAUTH_ID is not None: 
+
+
+
+                                    if NEXT_REAUTH_ID is not None:
                                         self.next_reauth_id = NEXT_REAUTH_ID.decode('utf-8')
                                     else:
-                                        #should use permanent identity next 
+                                        #should use permanent identity next
                                         self.next_reauth_id = None
-                                        
-                                        
+
+
                                     if COUNTER is not None and NONCE_S is not None:
                                         ERROR = False
                                         if self.current_counter is None:
@@ -4392,18 +4434,18 @@ class swu():
                                         else:
                                             if COUNTER > self.current_counter:
                                                 self.current_counter = COUNTER
-                                                
+
                                             else:
                                                 #error: include AT_COUNTER_TOO_SMALL
                                                 ERROR = True
-                                                
-                                                                            
+
+
                                         #XKEY' = SHA1(Identity|counter|NONCE_S| MK)
                                         self.MSK, self.EMSK, self.XKEY = self.eap_keys_calculation_fast_reauth(COUNTER, NONCE_S)
-                                        
+
                                         vector = self.return_random_bytes(16)
                                         at_iv = bytes([AT_IV]) + fromHex('050000') + vector
-                                        
+
                                         if ERROR == False:
                                             at_padding = bytes([AT_PADDING]) + fromHex('0300000000000000000000')
                                             at_counter = bytes([AT_COUNTER]) + b'\x01' + struct.pack('!H',COUNTER)
@@ -4411,28 +4453,28 @@ class swu():
                                         else:
                                             at_padding = bytes([AT_PADDING]) + fromHex('02000000000000')
                                             at_counter = bytes([AT_COUNTER]) + b'\x01' + struct.pack('!H',COUNTER)
-                                            at_counter_too_small = bytes([AT_COUNTER_TOO_SMALL]) + b'\x01\x00\x00' 
-                                            
-                                        cipher = Cipher(algorithms.AES(self.KENCR), modes.CBC(vector)) 
-                                        encryptor = cipher.encryptor()          
-                                        cipher_data = encryptor.update(at_counter + at_counter_too_small + at_padding) + encryptor.finalize()                                        
-                                        
+                                            at_counter_too_small = bytes([AT_COUNTER_TOO_SMALL]) + b'\x01\x00\x00'
+
+                                        cipher = Cipher(algorithms.AES(self.KENCR), modes.CBC(vector))
+                                        encryptor = cipher.encryptor()
+                                        cipher_data = encryptor.update(at_counter + at_counter_too_small + at_padding) + encryptor.finalize()
+
                                         at_encr_data = bytes([AT_ENCR_DATA]) + fromHex('050000') + cipher_data
                                         length = struct.pack('!H',len(at_iv)+len(at_encr_data)+28)
-                                        
+
                                         eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + length + fromHex('170d0000') + at_iv + at_encr_data + fromHex('0b050000' + 16*'00')
-   
+
                                         h = hmac.HMAC(self.KAUT,hashes.SHA1())
                                         h.update(eap_payload_response + NONCE_S)
-                                        hash = h.finalize()[0:16]  
+                                        hash = h.finalize()[0:16]
                                         self.eap_payload_response = eap_payload_response[:-16] + hash
-                                    
+
                             else:
                                 return OTHER_ERROR,'NO RAND/AUTN IN EAP'
-                        
+
                         elif i[1][3] in (AKA_Identity,):
-                            
-                      
+
+
                             if any(attribute and attribute[0] in (
                                     AT_ANY_ID_REQ, AT_FULLAUTH_ID_REQ,
                                     AT_PERMANENT_ID_REQ, AT_IDENTITY)
@@ -4457,7 +4499,7 @@ class swu():
 
 
             if eap_received == True:
-                return OK,''               
+                return OK,''
             else:
                 detail = ('UNSUPPORTED EAP REQUEST RECEIVED' if eap_payload_seen
                           else 'NO EAP PAYLOAD RECEIVED')
@@ -4465,8 +4507,8 @@ class swu():
                 self.reject_reason_code = "no_eap_challenge"
                 self.reject_reason_policy = "backoff"
                 return MANDATORY_INFORMATION_MISSING,detail
-            
-        
+
+
     def state_3(self):
         self.message_id_request += 1
         packet = self.create_IKE_AUTH_2()
@@ -4475,13 +4517,13 @@ class swu():
         if not self._send_request_await_response(packet):
             return TIMEOUT,'TIMEOUT'
 
-        
+
         eap_received = False
         eap_payload_seen = False
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
-            print('received IKE_AUTH (2)')              
+            print('received IKE_AUTH (2)')
             for i in self.decoded_payload[0][1]:
-                
+
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     if i[1][1]<16384: #error
                         self.log_notify_error(i[1][1], "IKE_AUTH")
@@ -4505,33 +4547,33 @@ class swu():
                         return REPEAT_STATE, 'EAP IDENTITY REQUESTED'
                     eap_received = True
                     if eap_code == EAP_SUCCESS:
-                    
-                        hash = self.prf_function.get(self.negotiated_prf) 
+
+                        hash = self.prf_function.get(self.negotiated_prf)
                         h = hmac.HMAC(self.SK_PI,hash)
                         h.update(bytes([self.identification_initiator[0]]) + b'\x00'*3 + self.identification_initiator[1].encode('utf-8'))
-                        hash_result = h.finalize() 
+                        hash_result = h.finalize()
                         self.AUTH_SA_INIT_packet += self.nounce_received + hash_result
-                        
+
                         keypad = b'Key Pad for IKEv2'
                         h = hmac.HMAC(self.MSK,hash)
                         h.update(keypad)
-                        hash_result = h.finalize() 
+                        hash_result = h.finalize()
                         h = hmac.HMAC(hash_result,hash)
                         h.update(self.AUTH_SA_INIT_packet)
-                        self.AUTH_payload = h.finalize()                        
-                        
+                        self.AUTH_payload = h.finalize()
+
                     elif eap_code == EAP_REQUEST and eap_type == EAP_AKA:
                         if i[1][3] in (AKA_Challenge,):
-                            
+
                             RAND = self.get_eap_aka_attribute_value(i[1][4],AT_RAND)
                             AUTN = self.get_eap_aka_attribute_value(i[1][4],AT_AUTN)
                             MAC = self.get_eap_aka_attribute_value(i[1][4],AT_MAC)
-                            
+
                             VECTOR =  self.get_eap_aka_attribute_value(i[1][4],AT_IV)
                             ENCR_DATA =  self.get_eap_aka_attribute_value(i[1][4],AT_ENCR_DATA)
-                           
+
                             self.eap_identifier = i[1][1]
-                                                     
+
                             if (RAND is not None and AUTN is not None) or (VECTOR is not None and ENCR_DATA is not None):
                                 if RAND is not None and AUTN is not None:
                                     self.current_counter = None
@@ -4544,53 +4586,53 @@ class swu():
 
                                     self.RES, CK, IK = fromHex(res), fromHex(ck), fromHex(ik)
                                     self.KENCR, self.KAUT, self.MSK, self.EMSK, self.MK = self.eap_keys_calculation(CK,IK)
-                                    
+
                                     # Calculate dynamic EAP payload with proper padding
                                     eap_payload_response = self.build_eap_aka_response(self.eap_identifier, self.RES)
-                                    
+
                                     h = hmac.HMAC(self.KAUT,hashes.SHA1())
                                     h.update(eap_payload_response)
-                                    hash = h.finalize()[0:16]  
+                                    hash = h.finalize()[0:16]
                                     self.eap_payload_response = eap_payload_response[:-16] + hash
-                                
-                                if VECTOR is not None and ENCR_DATA is not None:                                
+
+                                if VECTOR is not None and ENCR_DATA is not None:
                                     cipher = Cipher(algorithms.AES(self.KENCR), modes.CBC(VECTOR))
                                     decryptor = cipher.decryptor()
                                     uncipher_data = decryptor.update(ENCR_DATA) + decryptor.finalize()
                                     eap_attributes = self.decode_eap_attributes(uncipher_data)
                                     NEXT_REAUTH_ID = self.get_eap_aka_attribute_value(eap_attributes,AT_NEXT_REAUTH_ID)
 
-                                    if NEXT_REAUTH_ID is not None: 
+                                    if NEXT_REAUTH_ID is not None:
                                         self.next_reauth_id = NEXT_REAUTH_ID.decode('utf-8')
                                     else:
-                                        #should use permanent identity next 
+                                        #should use permanent identity next
                                         self.next_reauth_id = None
 
 
-                                
+
                                 return REPEAT_STATE,'NEW AKA_Challenge'
 
 
                         elif i[1][3] in (AKA_Notification,):
                             self.eap_identifier = i[1][1]
-                            
+
                             NOTIFICATION = self.get_eap_aka_attribute_value(i[1][4],AT_NOTIFICATION)
-                            
+
                             if NOTIFICATION < 32768: #error
                                 print('EAP AT_NOTIFICATION with ERROR ' + str(NOTIFICATION))
-                                self.eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('0008170c0000') 
+                                self.eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('0008170c0000')
                                 return REPEAT_STATE, 'General_Failure'
-                     
+
                     elif eap_code == EAP_FAILURE:
-                        return OTHER_ERROR,'EAP FAILURE'                     
-                     
-                     
+                        return OTHER_ERROR,'EAP FAILURE'
+
+
                     else:
                         #check error
                         return MANDATORY_INFORMATION_MISSING,'NO RAND/AUTN IN EAP'
 
             if eap_received == True:
-                return OK,''               
+                return OK,''
             else:
                 detail = ('UNSUPPORTED EAP REQUEST RECEIVED' if eap_payload_seen
                           else 'NO EAP PAYLOAD RECEIVED')
@@ -4598,7 +4640,7 @@ class swu():
                 self.reject_reason_code = "no_eap_challenge"
                 self.reject_reason_policy = "backoff"
                 return MANDATORY_INFORMATION_MISSING,detail
-        
+
 
 
     def state_4(self):
@@ -4610,9 +4652,9 @@ class swu():
             return TIMEOUT,'TIMEOUT'
 
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
-            print('received IKE_AUTH (3)')             
+            print('received IKE_AUTH (3)')
             for i in self.decoded_payload[0][1]:
-                
+
                 if i[0] == N:    #protocol_id, notify_message_type, spi, notification_data
                     ntype = i[1][1]
                     if ntype<16384: #error
@@ -4630,13 +4672,13 @@ class swu():
                         swu_log("IKE_AUTH status: BACKOFF_TIMER = %s" % txt)
 
                 elif i[0] == CP:
-                    
+
                     if i[1][0] == CFG_REPLY:
                         self.ip_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP4_ADDRESS)
                         self.dns_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP4_DNS)
                         self.pcscf_address_list = self.get_cp_attribute_value(i[1][1],P_CSCF_IP4_ADDRESS)
                         self.ipv6_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP6_ADDRESS)
-                        self.dnsv6_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP6_DNS) 
+                        self.dnsv6_address_list = self.get_cp_attribute_value(i[1][1],INTERNAL_IP6_DNS)
                         self.pcscfv6_address_list = self.get_cp_attribute_value(i[1][1],P_CSCF_IP6_ADDRESS)
                         # P0-1: INTERNAL_IP6_SUBNET assigns the inner IPv6 as prefix+prefix_len
                         # (decoded as (type, prefix_str, prefix_len)); keep the length so
@@ -4663,8 +4705,8 @@ class swu():
                             return OTHER_ERROR,'NO IP ADDRESS (IPV4 or IPV6)'
                     else:
                         #check error
-                        return OTHER_ERROR,'NO CP REPLY'                     
-                        
+                        return OTHER_ERROR,'NO CP REPLY'
+
                 elif i[0] == SA:
                     proposal = i[1][0]
                     protocol_id = i[1][1]
@@ -4675,26 +4717,26 @@ class swu():
                         return MANDATORY_INFORMATION_MISSING,'MANDATORY_INFORMATION_MISSING'
 
             self.generate_keying_material_child()
-            return OK,''               
+            return OK,''
 
 
     def state_delete(self,initiator,kill = True):
         if initiator == True:
-            
+
             #if kill == True: #reauth scenario without delete (comment this line, and uncomment the next one)
-            if True:        
+            if True:
                 self.message_id_request += 1
                 packet = self.create_INFORMATIONAL_delete(IKE)
                 self.send_data(packet)
                 print('sending INFORMATIONAL (delete IKE)')
-                
+
             self.ike_to_ipsec_encoder.send(bytes([INTER_PROCESS_DELETE_SA]))
-            self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA])) 
-            self.delete_routes()   
+            self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
+            self.delete_routes()
             if kill == True:
                 exit(1)
 
-        
+
         else:
             # Scan the request: is there a DELETE payload, and is REACTIVATION_REQUESTED_CAUSE
             # present? (TS 24.302 clause 7.2.4.2: a DELETE carrying REACTIVATION_REQUESTED_CAUSE
@@ -4727,6 +4769,15 @@ class swu():
                         self.send_data(packet)
                         print('answering INFORMATIONAL (DELETE IKE)')
                         if self.old_ike_message_received == False:
+                            # The ePDG, not us, ended this tunnel. That distinction is the whole
+                            # story behind the periodic outages (one carrier tears down on a
+                            # ~24h timer regardless of how recently the SA was rekeyed), and it
+                            # was previously only visible by reading the archived IKE log by
+                            # hand. Record it as an event so the timeline shows who hung up.
+                            swu_log("ePDG tore down the tunnel (peer-initiated DELETE IKE) "
+                                    "after %ds" % self.seconds_since_connect())
+                            swu_notify("tunnel_deleted_by_peer",
+                                       str(self.seconds_since_connect()))
                             self.ike_to_ipsec_encoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                             self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                             self.delete_routes()
@@ -4767,8 +4818,8 @@ class swu():
                                     self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                                     self.delete_routes()
                                     exit(1)
-                        
-                        
+
+
     def state_epdg_create_sa(self):
         """P2-1: handle an ePDG-INITIATED CREATE_CHILD_SA request. Classify it (TS 24.302 / RFC
         7296) and respond with the correct, unambiguous message instead of the old 'reply
@@ -4917,7 +4968,7 @@ class swu():
         return True
 
 
-  
+
 
 
     def state_ue_create_sa(self,lowest = 0): #IKEv2 REKEY
@@ -5001,7 +5052,7 @@ class swu():
             return False
         self._create_child_response_handled = True
         return True
-                
+
     def state_epdg_create_sa_response(self):
         isIKE = False
         isESP = False
@@ -5108,10 +5159,10 @@ class swu():
                 stability_event("child_rekey_rejected", notify_code=INVALID_SYNTAX,
                                 mode=getattr(self, "_rekey_request_mode", "pfs"))
                 return
-            print('received CREATE_CHILD_SA response IPSEC')                
-            self.message_id_request += 1    
+            print('received CREATE_CHILD_SA response IPSEC')
+            self.message_id_request += 1
             self.spi_init_child_old = self.spi_init_child
-            self.spi_resp_child_old = self.spi_resp_child            
+            self.spi_resp_child_old = self.spi_resp_child
             packet = self.create_INFORMATIONAL_delete(ESP,self.spi_init_child_old)
 
             self.spi_init_child = self.sa_spi_list[0] #only one proposal was made
@@ -5131,10 +5182,10 @@ class swu():
                     (INTER_PROCESS_IE_ENCR_KEY, self.SK_IPSEC_EI),
                     (INTER_PROCESS_IE_INTEG_ALG, self.negotiated_integrity_algorithm_child),
                     (INTER_PROCESS_IE_INTEG_KEY, self.SK_IPSEC_AI),
-                    (INTER_PROCESS_IE_SPI_RESP, self.spi_resp_child)         
+                    (INTER_PROCESS_IE_SPI_RESP, self.spi_resp_child)
                 ]
             ]
-            
+
             inter_process_list_start_decoder = [
                 INTER_PROCESS_UPDATE_SA,
                 [
@@ -5142,13 +5193,13 @@ class swu():
                     (INTER_PROCESS_IE_ENCR_KEY, self.SK_IPSEC_ER),
                     (INTER_PROCESS_IE_INTEG_ALG, self.negotiated_integrity_algorithm_child),
                     (INTER_PROCESS_IE_INTEG_KEY, self.SK_IPSEC_AR),
-                    (INTER_PROCESS_IE_SPI_INIT, self.spi_init_child)         
+                    (INTER_PROCESS_IE_SPI_INIT, self.spi_init_child)
                 ]
             ]
-                        
+
             self.ike_to_ipsec_encoder.send(self.encode_inter_process_protocol(inter_process_list_start_encoder))
-            self.ike_to_ipsec_decoder.send(self.encode_inter_process_protocol(inter_process_list_start_decoder))            
-            
+            self.ike_to_ipsec_decoder.send(self.encode_inter_process_protocol(inter_process_list_start_decoder))
+
             #send request
             self.send_data(packet)
             print('sending INFORMATIONAL (DELETE IPSEC old)')
@@ -5169,13 +5220,13 @@ class swu():
 
     def state_connected(self):
         #set udp 4500 socket (self.socket_nat)
-     
+
         self.set_routes()
-    
+
         #set ipsec tunnel handlers
         self.ike_to_ipsec_encoder, self.ipsec_encoder_to_ike = multiprocessing.Pipe()
         self.ike_to_ipsec_decoder, self.ipsec_decoder_to_ike = multiprocessing.Pipe()
-           
+
         worker_parent_pid = os.getpid()
         ipsec_input_worker = multiprocessing.Process(
             target=self.encapsulate_ipsec,
@@ -5185,7 +5236,7 @@ class swu():
             target=self.decapsulate_ipsec,
             args=([self.ipsec_decoder_to_ike], worker_parent_pid))
         ipsec_output_worker.start()
-        
+
         inter_process_list_start_encoder = [
             INTER_PROCESS_CREATE_SA,
             [
@@ -5193,7 +5244,7 @@ class swu():
                 (INTER_PROCESS_IE_ENCR_KEY, self.SK_IPSEC_EI),
                 (INTER_PROCESS_IE_INTEG_ALG, self.negotiated_integrity_algorithm_child),
                 (INTER_PROCESS_IE_INTEG_KEY, self.SK_IPSEC_AI),
-                (INTER_PROCESS_IE_SPI_RESP, self.spi_resp_child)         
+                (INTER_PROCESS_IE_SPI_RESP, self.spi_resp_child)
             ]
         ]
 
@@ -5204,10 +5255,10 @@ class swu():
                 (INTER_PROCESS_IE_ENCR_KEY, self.SK_IPSEC_ER),
                 (INTER_PROCESS_IE_INTEG_ALG, self.negotiated_integrity_algorithm_child),
                 (INTER_PROCESS_IE_INTEG_KEY, self.SK_IPSEC_AR),
-                (INTER_PROCESS_IE_SPI_INIT, self.spi_init_child)         
+                (INTER_PROCESS_IE_SPI_INIT, self.spi_init_child)
             ]
         ]
-             
+
         self.ike_to_ipsec_encoder.send(self.encode_inter_process_protocol(inter_process_list_start_encoder))
         self.ike_to_ipsec_decoder.send(self.encode_inter_process_protocol(inter_process_list_start_decoder))
 
@@ -5218,15 +5269,19 @@ class swu():
         inner = (self.ipv6_address_list[0] if self.ipv6_address_list
                  else (self.ip_address_list[0] if self.ip_address_list else ""))
         swu_write_pcscf(pcscf)
+        # Stamped so a later teardown can report how long this tunnel actually lasted. The
+        # carrier-side lifetimes only became legible once the durations were in the log next to
+        # who initiated the teardown.
+        self._connected_at = time.time()
         swu_write_status("CONNECTED", inner_ip=inner, pcscf=pcscf, iface=self.tun_device)
         swu_log("tunnel CONNECTED inner=%s pcscf=%s iface=%s" % (inner, pcscf, self.tun_device))
         swu_notify("tunnel_up")
         if pcscf:
             swu_notify("pcscf", pcscf)
-            # Keep pjsip's P-CSCF (identify/resolve/register) in sync when the ePDG assigns a
-            # different P-CSCF on reconnect/reauth. No-op on first bring-up (entrypoint seeds
-            # pcscf.applied after its own initial render, before Asterisk starts).
-            swu_apply_pcscf(pcscf)
+            # A full attach means a new inner address, so Asterisk must re-register from it
+            # whether or not the P-CSCF changed. The supervisor renders this ticket before
+            # its first start, or performs a guarded process replacement after reconnect.
+            swu_apply_pcscf(pcscf, tunnel_rebuilt=True)
 
         # Headless control channel replaces interactive stdin. Open a FIFO O_RDWR so select()
         # never sees EOF (a plain stdin/EOF would busy-spin). The manager/entrypoint can echo
@@ -5303,10 +5358,10 @@ class swu():
             read_sockets, write_sockets, error_sockets = select.select(socket_list, [], [], _timeout)
 
             for sock in read_sockets:
-     
+
                 if sock == self.socket:
 
-                        
+
                     packet, server_address = self.socket.recvfrom(2000)
                     if server_address[0] == self.server_address[0]: #check server IP address. source port could be different than 500 or 4500, if it's a request reponse must be sent to the same port
 
@@ -5332,14 +5387,14 @@ class swu():
                                 if self._accept_create_child_response(
                                         self.ike_decoded_header['message_id']):
                                     self.state_epdg_create_sa_response()
-                            
-                            
-                        
+
+
+
                         if self.old_ike_message_received == True:
-                            self.old_ike_message_received = False                                
-                            
-                   
-                                    
+                            self.old_ike_message_received = False
+
+
+
 
                 elif sock == self.ike_to_ipsec_decoder:
                     pipe_packet = self.ike_to_ipsec_decoder.recv()
@@ -5350,7 +5405,7 @@ class swu():
                     elif decode_list[0] == INTER_PROCESS_IKE:
 
                         packet = decode_list[1][0][1]
-                        
+
                         #if received via pipe it was sent to port udp 4500 (exclude 4 initial bytes)
                         self.decode_ike(packet[4:])
 
@@ -5371,7 +5426,7 @@ class swu():
                                 if self._accept_create_child_response(
                                         self.ike_decoded_header['message_id']):
                                     self.state_epdg_create_sa_response()
-                        
+
                         if self.old_ike_message_received == True:
                             self.old_ike_message_received = False
 
@@ -5410,8 +5465,8 @@ class swu():
             self._ike_rekey_tick()
 
 
-                        
-    
+
+
 
     def _note_liveness_rx(self):
         """G4: record that a cryptographically-protected IKE message arrived from the ePDG — the SA
@@ -5999,8 +6054,8 @@ class swu():
             break
 
         exit(1)
-           
-        
+
+
 
 #######################################################################################################################
 #######################################################################################################################
@@ -6020,12 +6075,17 @@ def get_default_gateway_linux():
             fields = line.strip().split()
             if fields[1] != '00000000' or not int(fields[3], 16) & 2:
                 continue
-           
+
             return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16))), fields[0]
 
 def get_default_source_address():
-
-    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+    # Evaluated eagerly as the -s default, even when -s is given. A container Engine behind a
+    # country exit sits on an internal Docker network with no default route, and this used to
+    # raise TypeError before the entrypoint's -s could apply, so the line never started.
+    gateway = get_default_gateway_linux()
+    if not gateway:
+        return None
+    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
     output = str(proc.stdout.read())
     if 'addr:' in output:
         addr = output.split('addr:')[1].split()[0]
@@ -6038,10 +6098,10 @@ def toHex(value): # bytes hex string
 
 def fromHex(value): # hex string to bytes
     return unhexlify(value)
-    
+
 
 def sha1_dss(data):  #for MSK
-#based on code from https://codereview.stackexchange.com/questions/37648/python-implementation-of-sha1    
+#based on code from https://codereview.stackexchange.com/questions/37648/python-implementation-of-sha1
 
     h0 = 0x67452301
     h1 = 0xEFCDAB89
@@ -6054,8 +6114,8 @@ def sha1_dss(data):  #for MSK
 
     #special padding. data always 160 bits (20 bytes, so 44 bytes left to 64Bytes block)
     padding = 44*b'\x00'
-    padded_data = data + padding 
-    
+    padded_data = data + padding
+
     thunks = [padded_data[i:i+64] for i in range(0, len(padded_data), 64)]
     for thunk in thunks:
         w = list(struct.unpack('>16L', thunk)) + [0] * 64
@@ -6073,7 +6133,7 @@ def sha1_dss(data):  #for MSK
                 f = b ^ c ^ d
                 k = 0x6ED9EBA1
             elif 40 <= i < 60:
-                f = (b & c) | (b & d) | (c & d) 
+                f = (b & c) | (b & d) | (c & d)
                 k = 0x8F1BBCDC
             elif 60 <= i < 80:
                 f = b ^ c ^ d
@@ -6106,7 +6166,7 @@ def return_imsi(serial_interface_or_reader_index):
             except:
                 print('Unable to access serial port/smartcard reader/server; using test identity')
                 return DEFAULT_IMSI
-        
+
 def return_res_ck_ik(serial_interface_or_reader_index, rand, autn):
     """Run AKA only in the physical SIM/eSIM.
 
@@ -6132,12 +6192,12 @@ def return_res_ck_ik(serial_interface_or_reader_index, rand, autn):
 def get_imsi(serial_interface):
 
     imsi = None
-    
+
     ser = serial.Serial(serial_interface,38400, timeout=0.5,xonxoff=True, rtscts=True, dsrdtr=True, exclusive =True)
 
     CLI = []
     CLI.append('AT+CIMI\r\n')
-    
+
     a = time.time()
     for i in range(len(CLI)):
         ser.write(CLI[i].encode())
@@ -6145,16 +6205,16 @@ def get_imsi(serial_interface):
 
         while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
             buffer +=  ser.read().decode("utf-8")
-            
+
             if time.time()-a > 0.5:
                 ser.write(CLI[i].encode())
                 a = time.time() +1
-            
-        if i==0:    
+
+        if i==0:
             for m in buffer.split('\r\n'):
                 if len(m) == 15:
                     imsi = m
-         
+
     ser.close()
     return imsi
 
@@ -6163,11 +6223,11 @@ def get_res_ck_ik(serial_interface, rand, autn):
     res = None
     ck = None
     ik = None
-    
+
     ser = serial.Serial(serial_interface,38400, timeout=0.5,xonxoff=True, rtscts=True, dsrdtr=True, exclusive =True)
 
     CLI = []
-   
+
     #CLI.append('AT+CRSM=178,12032,1,4,0\r\n')
     CLI.append('AT+CSIM=14,"00A40000023F00"\r\n')
     CLI.append('AT+CSIM=14,"00A40000022F00"\r\n')
@@ -6178,38 +6238,38 @@ def get_res_ck_ik(serial_interface, rand, autn):
     for i in CLI:
         ser.write(i.encode())
         buffer = ''
-    
+
         while "OK" not in buffer and "ERROR" not in buffer:
             buffer +=  ser.read().decode("utf-8")
-        
+
             if time.time()-a > 0.5:
                 ser.write(i.encode())
 
                 a = time.time() + 1
-                
+
     for i in buffer.split('"'):
         if len(i)==4:
             if i[0:2] == '61':
                 len_result = i[-2:]
-    
+
     LAST_CLI = 'AT+CSIM=10,"00C00000' + len_result + '\"\r\n'
     ser.write(LAST_CLI.encode())
     buffer = ''
-    
+
     while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
         buffer +=  ser.read().decode("utf-8")
-        
+
     for result in buffer.split('"'):
         if len(result) > 10:
-        
+
 
             res = result[4:20]
             ck = result[22:54]
             ik = result[56:88]
-    
-    ser.close()    
+
+    ser.close()
     return res, ck, ik
-    
+
 
 #reader functions
 def bcd(chars):
@@ -6309,13 +6369,13 @@ def read_imsi(reader_index):
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect(disposition=SCARD_LEAVE_CARD)
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))     
+    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))
     data, sw1, sw2 = connection.transmit(toBytes('00A40000027F20'))
     data, sw1, sw2 = connection.transmit(toBytes('00A40000026F07'))
-    data, sw1, sw2 = connection.transmit(toBytes('00B0000009'))  
+    data, sw1, sw2 = connection.transmit(toBytes('00B0000009'))
     result = toHexString(data).replace(" ","")
     imsi = bcd(result)[-15:]
-    
+
     return imsi
 
 def read_res_ck_ik(reader_index, rand, autn):
@@ -6325,16 +6385,16 @@ def read_res_ck_ik(reader_index, rand, autn):
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect(disposition=SCARD_LEAVE_CARD)
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))    
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000022F00')) 
+    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))
+    data, sw1, sw2 = connection.transmit(toBytes('00A40000022F00'))
     data, sw1, sw2 = connection.transmit(toBytes('00A4040010A0000000871002FF44FFFF8901010100'))
-    data, sw1, sw2 = connection.transmit(toBytes('008800812210' + rand.upper() + '10' + autn.upper()))   
+    data, sw1, sw2 = connection.transmit(toBytes('008800812210' + rand.upper() + '10' + autn.upper()))
     if sw1 == 97:
-        data, sw1, sw2 = connection.transmit(toBytes('00C00000') + [sw2])         
+        data, sw1, sw2 = connection.transmit(toBytes('00C00000') + [sw2])
         result = toHexString(data).replace(" ", "")
         res = result[4:20]
         ck = result[22:54]
-        ik = result[56:88]          
+        ik = result[56:88]
 
     return res, ck, ik
 
@@ -6342,7 +6402,7 @@ def read_res_ck_ik(reader_index, rand, autn):
 def read_imsi_2(reader_index): #prepared for AUTS
     a = USIM(int(reader_index))
     return a.get_imsi()
-    
+
 def read_res_ck_ik_2(reader_index,rand,autn):
     # PIN handling (VoWiFi engine addition): if USIM_PIN is set, we MUST VERIFY CHV1 before
     # AUTHENTICATE or PIN-enabled cards (e.g. Telus) return 0x6982. VERIFY + AUTHENTICATE must
@@ -6581,7 +6641,7 @@ def https_res_ck_ik(server, rand, autn):
 
 
 
-#################################################################################################################    
+#################################################################################################################
 #####
 #####   SA Structure:
 #####   ------------
@@ -6597,7 +6657,7 @@ def https_res_ck_ik(server, rand, autn):
 #################################################################################################################
 
 
-#################################################################################################################    
+#################################################################################################################
 #####
 #####   TS Structure:
 #####   ------------
@@ -6609,7 +6669,7 @@ def https_res_ck_ik(server, rand, autn):
 #################################################################################################################
 
 
-#################################################################################################################    
+#################################################################################################################
 #####
 #####   CP Structure:
 #####   ------------
@@ -6697,15 +6757,15 @@ def main():
     ]
 
 
-    parser = OptionParser()    
+    parser = OptionParser()
     parser.add_option("-m", "--modem", dest="modem", default=DEFAULT_COM, help="modem port (i.e. COMX, or /dev/ttyUSBX), smartcard reader index (0, 1, 2, ...), or server for https")
     parser.add_option("-s", "--source", dest="source_addr",default=get_default_source_address(),help="IP address of source interface used for IKE/IPSEC")
-    parser.add_option("-d", "--dest", dest="destination_addr",default=DEFAULT_SERVER,help="ip address or fqdn of ePDG") 
-    parser.add_option("-a", "--apn", dest="apn", default=DEFAULT_APN, help="APN to use")    
-    parser.add_option("-g", "--gateway_ip_address", dest="gateway_ip_address", help="gateway IP address")    
-    parser.add_option("-I", "--imsi", dest="imsi",default=DEFAULT_IMSI,help="IMSI") 
-    parser.add_option("-M", "--mcc", dest="mcc",default=DEFAULT_MCC,help="MCC of ePDG (3 digits)") 
-    parser.add_option("-N", "--mnc", dest="mnc",default=DEFAULT_MNC,help="MNC of ePDG (3 digits)")   
+    parser.add_option("-d", "--dest", dest="destination_addr",default=DEFAULT_SERVER,help="ip address or fqdn of ePDG")
+    parser.add_option("-a", "--apn", dest="apn", default=DEFAULT_APN, help="APN to use")
+    parser.add_option("-g", "--gateway_ip_address", dest="gateway_ip_address", help="gateway IP address")
+    parser.add_option("-I", "--imsi", dest="imsi",default=DEFAULT_IMSI,help="IMSI")
+    parser.add_option("-M", "--mcc", dest="mcc",default=DEFAULT_MCC,help="MCC of ePDG (3 digits)")
+    parser.add_option("-N", "--mnc", dest="mnc",default=DEFAULT_MNC,help="MNC of ePDG (3 digits)")
 
     parser.add_option("-n", "--netns", dest="netns", help="Name of network namespace for tun device")
     parser.add_option("-E", "--imei", dest="imei", default="",
@@ -6748,6 +6808,8 @@ def main():
                              iccid=_foreign, expected=_want_iccid)
             exit(1)
 
+    if not options.source_addr:
+        parser.error("no IKE source address: pass -s, the host has no default route to derive one")
     a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.netns)
 
     if options.imsi == DEFAULT_IMSI: a.get_identity()
@@ -6796,9 +6858,9 @@ def main():
                 _extra["backoff"] = a.reject_backoff_seconds
         swu_write_status("DOWN", **_extra)
         swu_notify("tunnel_down")
-    
-    
-    
+
+
+
 if __name__ == "__main__":
     main()
-    
+

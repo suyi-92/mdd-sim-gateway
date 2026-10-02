@@ -1,0 +1,1048 @@
+import json
+import asyncio
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from control.app import cellular_sms, main, store
+
+TEST_EPOCH = "a" * 64
+MODEM = "/org/freedesktop/ModemManager1/Modem/0"
+SIM = "/org/freedesktop/ModemManager1/SIM/0"
+SMS = "/org/freedesktop/ModemManager1/SMS/7"
+LINE = [{"id": "3", "iccid": "card-a"}]
+
+
+class Result:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def is_create_call(args, modem_path=None):
+    prefix = [
+        "busctl", "--system", "call", "org.freedesktop.ModemManager1",
+        modem_path, "org.freedesktop.ModemManager1.Modem.Messaging", "Create",
+    ]
+    return len(args) >= len(prefix) and args[:len(prefix)] == prefix
+
+
+class MemoryTracker:
+    """Small successful durable-tracker stand-in for command-focused tests."""
+
+    def __init__(self, *, bind=True, reserve_error=None):
+        self.bound = bind
+        self.reserve_error = reserve_error
+        self.calls = []
+
+    def reserve_local_modem_sms(self, instance, iccid, content_hash, daemon_epoch,
+                                recipient, body):
+        self.calls.append(("reserve", instance, iccid, content_hash, daemon_epoch,
+                           recipient, body))
+        if self.reserve_error:
+            raise self.reserve_error
+        return 1
+
+    def bind_local_modem_sms(self, reservation_id, daemon_epoch, modem_path, sms_path):
+        self.calls.append(("bind", reservation_id, daemon_epoch, modem_path, sms_path))
+        return self.bound
+
+    def cancel_local_modem_sms(self, reservation_id):
+        self.calls.append(("cancel", reservation_id))
+
+
+def wap_push_sms() -> dict:
+    """A carrier MMS notification as ModemManager reports it: no text, binary WSP payload."""
+    payload = b"\x23\x06\x24" + b"application/vnd.wap.mms-message" + b"\x00"
+    return {
+        "content": {"number": "+447700900999", "text": "--",
+                    "data": " ".join(f"{byte:02X}" for byte in payload)},
+        "properties": {"pdu-type": "deliver", "state": "received",
+                       "timestamp": "2026-09-12T09:00:00+08:00"},
+    }
+
+
+def sms_runner(detail: list, *, calls=None, delete_returncode: int = 0):
+    """One modem holding one SMS object whose detail JSON can be swapped between polls."""
+    def runner(args, **_kwargs):
+        if calls is not None:
+            calls.append(tuple(args))
+        if args == ["mmcli", "-L"]:
+            return Result(MODEM)
+        if args == ["mmcli", "-m", MODEM, "--output-json"]:
+            return Result(json.dumps({"modem": {"generic": {"sim": SIM}}}))
+        if args == ["mmcli", "-i", SIM, "--output-json"]:
+            return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+        if args == ["mmcli", "-m", MODEM, "--messaging-list-sms", "--output-json"]:
+            return Result(json.dumps({"modem.messaging.sms": [SMS]}))
+        if args == ["mmcli", "-s", SMS, "--output-json"]:
+            return Result(json.dumps({"sms": detail[0]}))
+        if args == ["mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"]:
+            return Result(returncode=delete_returncode)
+        return Result(returncode=1)
+    return runner
+
+
+class CellularSmsTests(unittest.TestCase):
+    def setUp(self):
+        with cellular_sms._local_sms_lock:
+            cellular_sms._local_sms_paths.clear()
+
+    def send(self, *args, **kwargs):
+        kwargs.setdefault("local_sms_tracker", MemoryTracker())
+        kwargs.setdefault("epoch_getter", lambda: TEST_EPOCH)
+        return cellular_sms.send(*args, **kwargs)
+
+    def test_received_sms_is_mapped_to_instance_by_case_insensitive_iccid(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+        sms = "/org/freedesktop/ModemManager1/SMS/7"
+        responses = {
+            ("mmcli", "-L"): Result(modem),
+            ("mmcli", "-m", modem, "--output-json"): Result(json.dumps({
+                "modem": {"generic": {"sim": sim}}})),
+            ("mmcli", "-i", sim, "--output-json"): Result(json.dumps({
+                "sim": {"properties": {"iccid": "card-a"}}})),
+            ("mmcli", "-m", modem, "--messaging-list-sms", "--output-json"): Result(
+                json.dumps({"modem.messaging.sms": [sms]})),
+            ("mmcli", "-s", sms, "--output-json"): Result(json.dumps({"sms": {
+                "content": {"number": "+44123", "text": "hello"},
+                "properties": {"pdu-type": "deliver", "timestamp": "2026-08-03T00:00:00+08:00"},
+            }})),
+        }
+
+        def runner(args, **_kwargs):
+            return responses.get(tuple(args), Result(returncode=1))
+
+        rows = cellular_sms.discover([{"id": "3", "iccid": "CARD-A"}], runner=runner)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["instance"], "3")
+        self.assertEqual(rows[0]["direction"], "in")
+        self.assertEqual(rows[0]["transport"], "cellular")
+
+    def test_unknown_sim_and_empty_body_are_ignored(self):
+        self.assertEqual(cellular_sms.discover([], runner=lambda *_a, **_k: Result()), [])
+
+    def test_scanner_caches_topology_and_sms_details_but_keeps_listing_live(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+        sms = "/org/freedesktop/ModemManager1/SMS/7"
+        calls = []
+        responses = {
+            ("mmcli", "-L"): Result(modem),
+            ("mmcli", "-m", modem, "--output-json"): Result(json.dumps({
+                "modem": {"generic": {"sim": sim}}})),
+            ("mmcli", "-i", sim, "--output-json"): Result(json.dumps({
+                "sim": {"properties": {"iccid": "card-a"}}})),
+            ("mmcli", "-m", modem, "--messaging-list-sms", "--output-json"): Result(
+                json.dumps({"modem.messaging.sms": [sms]})),
+            ("mmcli", "-s", sms, "--output-json"): Result(json.dumps({"sms": {
+                "content": {"number": "+44123", "text": "hello"},
+                "properties": {"pdu-type": "deliver", "timestamp": "2026-08-03T00:00:00+08:00"},
+            }})),
+        }
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            return responses.get(tuple(args), Result(returncode=1))
+
+        now = [10.0]
+        scanner = cellular_sms.Scanner(runner, clock=lambda: now[0])
+        first = scanner.discover([{"id": "3", "iccid": "card-a"}])
+        now[0] += 5
+        second = scanner.discover([{"id": "3", "iccid": "card-a"}])
+
+        self.assertEqual(first, second)
+        self.assertEqual(calls.count(("mmcli", "-L")), 1)
+        self.assertEqual(calls.count(("mmcli", "-m", modem, "--output-json")), 1)
+        self.assertEqual(calls.count(("mmcli", "-i", sim, "--output-json")), 1)
+        self.assertEqual(calls.count(("mmcli", "-s", sms, "--output-json")), 1)
+        self.assertEqual(calls.count(
+            ("mmcli", "-m", modem, "--messaging-list-sms", "--output-json")), 2)
+
+    def test_scanner_refreshes_stable_objects_after_ttl(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args[:3] == ["mmcli", "-m", modem] and "--messaging-list-sms" not in args:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args[:3] == ["mmcli", "-i", sim]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+            if "--messaging-list-sms" in args:
+                return Result(json.dumps({"modem.messaging.sms": []}))
+            return Result(returncode=1)
+
+        now = [10.0]
+        scanner = cellular_sms.Scanner(runner, topology_ttl=60, clock=lambda: now[0])
+        scanner.discover([{"id": "3", "iccid": "card-a"}])
+        now[0] = 71.0
+        scanner.discover([{"id": "3", "iccid": "card-a"}])
+        self.assertEqual(calls.count(("mmcli", "-L")), 2)
+
+    def test_scanner_never_prunes_after_failed_or_malformed_listing(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+
+        class Tracker:
+            def __init__(self):
+                self.prunes = []
+
+            def prune_local_modem_sms(self, *args):
+                self.prunes.append(args)
+
+        listing = [{}]
+
+        def runner(args, **_kwargs):
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+            if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
+                return Result(json.dumps(listing[0]))
+            return Result(returncode=1)
+
+        tracker = Tracker()
+        scanner = cellular_sms.Scanner(
+            runner, local_sms_tracker=tracker, epoch_getter=lambda: TEST_EPOCH)
+        scanner.discover([{"id": "3", "iccid": "card-a"}])
+        listing[0] = {"modem.messaging.sms": ["not-an-object-path"]}
+        scanner.discover([{"id": "3", "iccid": "card-a"}])
+        self.assertEqual(tracker.prunes, [])
+
+    def test_incomplete_multipart_sms_is_never_imported_as_its_mmcli_placeholder(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        runner = sms_runner(detail)
+        now = [10.0]
+        scanner = cellular_sms.Scanner(runner, clock=lambda: now[0])
+
+        self.assertEqual(scanner.discover(LINE), [])
+        # A ModemManager build that reports no state must not import the placeholder either.
+        detail[0]["properties"].pop("state")
+        now[0] += 1
+        self.assertEqual(scanner.discover(LINE), [])
+
+        detail[0] = {
+            "content": {"number": "+44123", "text": "part one and part two"},
+            "properties": {"pdu-type": "deliver", "state": "received",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }
+        now[0] += 1
+        rows = scanner.discover(LINE)
+        self.assertEqual([row["body"] for row in rows], ["part one and part two"])
+
+    def test_stale_incomplete_inbound_sms_is_deleted_after_one_day(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        received_at = cellular_sms._timestamp(detail[0]["properties"]["timestamp"])
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: TEST_EPOCH,
+            wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS)
+
+        self.assertEqual(scanner.poll(LINE, lambda record: record), [])
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_recent_incomplete_sms_is_preserved_for_assembly(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        received_at = cellular_sms._timestamp(detail[0]["properties"]["timestamp"])
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: TEST_EPOCH,
+            wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS - 1)
+
+        self.assertEqual(scanner.poll(LINE, lambda record: record), [])
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_preserved_record_delete_requires_same_modemmanager_generation(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "hello"},
+            "properties": {"pdu-type": "deliver", "state": "received",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        epoch = [TEST_EPOCH]
+        scanner = cellular_sms.Scanner(
+            sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
+            epoch_getter=lambda: epoch[0])
+        record = scanner.discover(LINE)[0]
+        epoch[0] = "b" * 64
+
+        self.assertFalse(scanner.delete_preserved(record))
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        epoch[0] = TEST_EPOCH
+        self.assertTrue(scanner.delete_preserved(record))
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_mms_push_is_read_without_deleting_and_handed_to_durable_ingest(self):
+        calls = []
+        scanner = cellular_sms.Scanner(sms_runner([wap_push_sms()], calls=calls),
+                                       epoch_getter=lambda: TEST_EPOCH)
+        rows = scanner.discover(LINE)
+        self.assertEqual(len(rows), 1)
+        self.assertIn(b"application/vnd.wap.mms-message", rows[0]["data"])
+        self.assertFalse(any("--messaging-delete-sms=" in " ".join(c) for c in calls))
+        stored = scanner.poll(LINE, lambda record: {"id": 1, **record})
+        self.assertEqual(len(stored), 1)
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_mms_push_stays_on_modem_when_ingest_fails(self):
+        calls = []
+        scanner = cellular_sms.Scanner(sms_runner([wap_push_sms()], calls=calls),
+                                       epoch_getter=lambda: TEST_EPOCH)
+        def fail(_record):
+            raise OSError("database unavailable")
+        self.assertEqual(scanner.poll(LINE, fail), [])
+        self.assertFalse(any("--messaging-delete-sms=" in " ".join(c) for c in calls))
+
+    def test_keep_policy_preserves_mms_notification(self):
+        calls = []
+        scanner = cellular_sms.Scanner(sms_runner([wap_push_sms()], calls=calls),
+                                       epoch_getter=lambda: TEST_EPOCH)
+        self.assertEqual(len(scanner.poll(LINE, lambda record: record, policy="keep")), 1)
+        self.assertFalse(any("--messaging-delete-sms=" in " ".join(c) for c in calls))
+
+    def test_undeletable_mms_push_stops_retrying_after_its_attempt_budget(self):
+        calls = []
+        scanner = cellular_sms.Scanner(sms_runner([wap_push_sms()], calls=calls, delete_returncode=1),
+                                       epoch_getter=lambda: TEST_EPOCH)
+        for _ in range(6):
+            scanner.poll(LINE, lambda record: record)
+        attempts = sum("--messaging-delete-sms=" in " ".join(c) for c in calls)
+        self.assertEqual(attempts, cellular_sms._DELETE_ATTEMPTS)
+
+    def test_sms_binary_payload_decoding_tolerates_mmcli_renderings(self):
+        self.assertEqual(cellular_sms._sms_data("23 06 24"), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data("230624"), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data([35, 6, 36]), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data("--"), b"")
+        self.assertEqual(cellular_sms._sms_data(None), b"")
+        self.assertEqual(cellular_sms._sms_data("23 06 2"), b"")
+
+    def test_send_matches_case_insensitive_iccid_and_passes_typed_dbus_text(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/2"
+        sim = "/org/freedesktop/ModemManager1/SIM/2"
+        sms = "/org/freedesktop/ModemManager1/SMS/41"
+        body = "BAL, it's safe; $(touch never)"
+        calls, captured = [], {}
+
+        def runner(args, **kwargs):
+            calls.append(tuple(args))
+            self.assertIsInstance(args, list)
+            self.assertNotIn("shell", kwargs)
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-b"}}}))
+            if args == ["mmcli", "-m", modem, "--messaging-status", "--output-json"]:
+                return Result(json.dumps({"modem": {"messaging": {
+                    "supported-storages": ["me"]}}}))
+            if is_create_call(args, modem):
+                captured["body"] = args[-1]
+                captured["properties"] = args[7:-1]
+                return Result(f'o "{sms}"\n')
+            if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
+                return Result("{}")
+            return Result(returncode=1)
+
+        result = self.send(
+            [{"id": "3", "iccid": "CARD-B"}], "3", "6700", body, runner=runner)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["modem_path"], modem)
+        self.assertEqual(result["sms_path"], sms)
+        self.assertEqual(result["transport"], "cellular")
+        self.assertEqual(captured["body"], body)
+        self.assertEqual(captured["properties"],
+                         ["a{sv}", "2", "number", "s", "6700", "text", "s"])
+        self.assertFalse(any(any(arg.startswith("--messaging-create-sms") for arg in call)
+                             for call in calls))
+
+    def test_scanner_suppresses_sms_object_created_by_send(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/3"
+        sim = "/org/freedesktop/ModemManager1/SIM/3"
+        sms = "/org/freedesktop/ModemManager1/SMS/42"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-c"}}}))
+            if args == ["mmcli", "-m", modem, "--messaging-status", "--output-json"]:
+                return Result("{}")
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
+            if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
+                return Result("{}")
+            if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
+                return Result(json.dumps({"modem.messaging.sms": [sms]}))
+            if args == ["mmcli", "-s", sms, "--output-json"]:
+                return Result(json.dumps({"sms": {
+                    "content": {"number": "888", "text": "BAL"},
+                    "properties": {"pdu-type": "submit"},
+                }}))
+            return Result(returncode=1)
+
+        instances = [{"id": "4", "iccid": "card-c"}]
+        self.assertTrue(self.send(instances, "4", "888", "BAL", runner=runner)["ok"])
+        tracker = Mock()
+        tracker.is_local_modem_sms.return_value = True
+        self.assertEqual(cellular_sms.Scanner(
+            runner, local_sms_tracker=tracker, epoch_getter=lambda: TEST_EPOCH).discover(instances), [])
+        self.assertIn(("mmcli", "-s", sms, "--output-json"), calls)  # verify content, not path alone
+
+    def test_invalid_created_sms_path_is_never_sent(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/4"
+        sim = "/org/freedesktop/ModemManager1/SIM/4"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-d"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            if is_create_call(args, modem):
+                return Result('o "/tmp/not-an-sms"\n')
+            return Result(returncode=1)
+
+        result = self.send(
+            [{"id": "5", "iccid": "card-d"}], "5", "+44123", "hello", runner=runner)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "create")
+        self.assertIsNone(result["sms_path"])
+        self.assertFalse(any("--send" in call for call in calls))
+
+    def test_send_timeout_is_unknown_and_not_retried(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/5"
+        sim = "/org/freedesktop/ModemManager1/SIM/5"
+        sms = "/org/freedesktop/ModemManager1/SMS/43"
+        send_calls = []
+
+        def runner(args, **kwargs):
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-e"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
+            if "--send" in args:
+                send_calls.append(tuple(args))
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return Result(returncode=1)
+
+        result = self.send(
+            [{"id": "6", "iccid": "card-e"}], "6", "6700", "DATA", runner=runner)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unknown")
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(result["sms_path"], sms)
+        self.assertEqual(len(send_calls), 1)
+
+    def test_lookup_timeout_and_invalid_recipient_are_structured(self):
+        def timeout_runner(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+        timeout = self.send(
+            [{"id": "7", "iccid": "card-f"}], "7", "6700", "DATA",
+            runner=timeout_runner)
+        self.assertFalse(timeout["ok"])
+        self.assertEqual(timeout["status"], "unavailable")
+        self.assertEqual(timeout["stage"], "lookup")
+
+        called = []
+        invalid = self.send(
+            [{"id": "7", "iccid": "card-f"}], "7", "6700; reboot", "DATA",
+            runner=lambda *args, **kwargs: called.append((args, kwargs)))
+        self.assertFalse(invalid["ok"])
+        self.assertEqual(invalid["stage"], "validate")
+        self.assertEqual(called, [])
+
+    def test_send_is_refused_before_create_when_durable_reservation_fails(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/6"
+        sim = "/org/freedesktop/ModemManager1/SIM/6"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-g"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            return Result(returncode=1)
+
+        tracker = MemoryTracker(reserve_error=OSError("read only"))
+        result = cellular_sms.send(
+            [{"id": "8", "iccid": "card-g"}], "8", "6700", "DATA", runner=runner,
+            local_sms_tracker=tracker, epoch_getter=lambda: TEST_EPOCH)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "track")
+        self.assertFalse(any(is_create_call(list(call), modem) for call in calls))
+        self.assertFalse(any("--send" in call for call in calls))
+
+    def test_send_is_refused_when_created_path_cannot_be_durably_bound(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/7"
+        sim = "/org/freedesktop/ModemManager1/SIM/7"
+        sms = "/org/freedesktop/ModemManager1/SMS/47"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-h"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
+            return Result(returncode=1)
+
+        result = cellular_sms.send(
+            [{"id": "9", "iccid": "card-h"}], "9", "888", "BAL", runner=runner,
+            local_sms_tracker=MemoryTracker(bind=False),
+            epoch_getter=lambda: TEST_EPOCH)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "track")
+        self.assertEqual(result["sms_path"], sms)
+        self.assertFalse(any("--send" in call for call in calls))
+
+    def test_create_timeout_keeps_the_reservation_for_later_scanner_claim(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/9"
+        sim = "/org/freedesktop/ModemManager1/SIM/9"
+        tracker = MemoryTracker()
+
+        def runner(args, **kwargs):
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-j"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            if is_create_call(args, modem):
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return Result(returncode=1)
+
+        result = cellular_sms.send(
+            [{"id": "11", "iccid": "card-j"}], "11", "6700", "DATA",
+            runner=runner, local_sms_tracker=tracker,
+            epoch_getter=lambda: TEST_EPOCH)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "create")
+        self.assertIsNotNone(result.get("_reservation_id"))
+        self.assertFalse(any(call[0] == "cancel" for call in tracker.calls))
+
+    def test_pending_durable_reservation_is_claimed_and_keeps_its_history_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                digest = cellular_sms._content_hash("6700", "DATA")
+                reservation = store.reserve_local_modem_sms(
+                    "11", "card-j", digest, TEST_EPOCH, "6700", "DATA")
+                self.assertTrue(store.is_local_modem_sms(
+                    TEST_EPOCH, "card-j", "/org/freedesktop/ModemManager1/Modem/9",
+                    "/org/freedesktop/ModemManager1/SMS/49", digest))
+                message = store.local_modem_sms_message(reservation)
+                self.assertEqual(message["status"], "pending")
+                self.assertEqual(message["transport"], "cellular")
+                with sqlite3.connect(db_path) as connection:
+                    bound = connection.execute(
+                        "SELECT sms_path FROM local_modem_sms WHERE id=?", (reservation,)
+                    ).fetchone()[0]
+                self.assertEqual(bound, "/org/freedesktop/ModemManager1/SMS/49")
+                store.init()  # simulated process restart
+                interrupted = store.local_modem_sms_message(reservation)
+                self.assertEqual(interrupted["status"], "unknown")
+                self.assertIn("delivery is unknown", interrupted["error"])
+
+    def test_cancelled_reservation_keeps_history_but_cannot_claim_an_sms_object(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                digest = cellular_sms._content_hash("888", "BAL")
+                reservation = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                store.cancel_local_modem_sms(reservation)
+
+                message = store.local_modem_sms_message(reservation)
+                self.assertIsNotNone(message)
+                self.assertEqual(message["peer"], "888")
+                self.assertFalse(store.is_local_modem_sms(
+                    TEST_EPOCH, "card-g", "/org/freedesktop/ModemManager1/Modem/7",
+                    "/org/freedesktop/ModemManager1/SMS/47", digest))
+
+    def test_old_or_timestamp_mismatched_reservation_cannot_claim_external_sms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                digest = cellular_sms._content_hash("888", "BAL")
+                reservation = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                with sqlite3.connect(db_path) as connection:
+                    created_ts = connection.execute(
+                        "SELECT created_ts FROM local_modem_sms WHERE id=?", (reservation,)
+                    ).fetchone()[0]
+
+                # A real object timestamp that is far from the reservation cannot match.
+                self.assertFalse(store.is_local_modem_sms(
+                    TEST_EPOCH, "card-g", "/org/freedesktop/ModemManager1/Modem/7",
+                    "/org/freedesktop/ModemManager1/SMS/47", digest,
+                    created_ts + store.LOCAL_MODEM_SMS_CLAIM_SECONDS + 1))
+
+                # With no object timestamp, an old create timeout is no longer eligible.
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE local_modem_sms SET created_ts=? WHERE id=?",
+                        (created_ts - store.LOCAL_MODEM_SMS_CLAIM_SECONDS - 1, reservation))
+                self.assertFalse(store.is_local_modem_sms(
+                    TEST_EPOCH, "card-g", "/org/freedesktop/ModemManager1/Modem/7",
+                    "/org/freedesktop/ModemManager1/SMS/47", digest))
+
+    def test_scanner_claim_then_sender_bind_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                modem = "/org/freedesktop/ModemManager1/Modem/7"
+                sms = "/org/freedesktop/ModemManager1/SMS/47"
+                digest = cellular_sms._content_hash("888", "BAL")
+                reservation = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                self.assertTrue(store.is_local_modem_sms(
+                    TEST_EPOCH, "card-g", modem, sms, digest))
+                self.assertTrue(store.bind_local_modem_sms(
+                    reservation, TEST_EPOCH, modem, sms))
+                self.assertFalse(store.bind_local_modem_sms(
+                    reservation, TEST_EPOCH, modem,
+                    "/org/freedesktop/ModemManager1/SMS/99"))
+
+    def test_prune_removes_only_stale_nonlive_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                digest = cellular_sms._content_hash("888", "BAL")
+                live = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                stale = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                cancelled = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                unbound = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                other_modem = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                self.assertTrue(store.bind_local_modem_sms(
+                    live, TEST_EPOCH, "/org/freedesktop/ModemManager1/Modem/7",
+                    "/org/freedesktop/ModemManager1/SMS/1"))
+                self.assertTrue(store.bind_local_modem_sms(
+                    stale, TEST_EPOCH, "/org/freedesktop/ModemManager1/Modem/7",
+                    "/org/freedesktop/ModemManager1/SMS/2"))
+                self.assertTrue(store.bind_local_modem_sms(
+                    other_modem, TEST_EPOCH, "/org/freedesktop/ModemManager1/Modem/8",
+                    "/org/freedesktop/ModemManager1/SMS/3"))
+                store.cancel_local_modem_sms(cancelled)
+                fresh_cancelled = store.reserve_local_modem_sms(
+                    "7", "card-g", digest, TEST_EPOCH, "888", "BAL")
+                store.cancel_local_modem_sms(fresh_cancelled)
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE local_modem_sms SET created_ts=created_ts-? WHERE id<>?",
+                        (store.LOCAL_MODEM_SMS_RETENTION_SECONDS + 1, fresh_cancelled))
+                    connection.execute(
+                        "UPDATE local_modem_sms SET bound_ts=bound_ts-? "
+                        "WHERE bound_ts IS NOT NULL",
+                        (store.LOCAL_MODEM_SMS_RETENTION_SECONDS + 1,))
+
+                removed = store.prune_local_modem_sms(
+                    TEST_EPOCH, "card-g", "/org/freedesktop/ModemManager1/Modem/7",
+                    {"/org/freedesktop/ModemManager1/SMS/1"})
+                self.assertEqual(removed, 3)
+                with sqlite3.connect(db_path) as connection:
+                    remaining = connection.execute(
+                        "SELECT id FROM local_modem_sms ORDER BY id").fetchall()
+                self.assertEqual(remaining, [(live,), (other_modem,), (fresh_cancelled,)])
+
+    def test_durable_marker_survives_scanner_restart_and_allows_path_reuse(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/8"
+        sim = "/org/freedesktop/ModemManager1/SIM/8"
+        sms = "/org/freedesktop/ModemManager1/SMS/48"
+        current_text = ["BAL"]
+        current_epoch = [TEST_EPOCH]
+
+        def runner(args, **_kwargs):
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-i"}}}))
+            if "--messaging-status" in args:
+                return Result("{}")
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
+            if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
+                return Result("{}")
+            if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
+                return Result(json.dumps({"modem.messaging.sms": [sms]}))
+            if args == ["mmcli", "-s", sms, "--output-json"]:
+                return Result(json.dumps({"sms": {
+                    "content": {"number": "6700", "text": current_text[0]},
+                    "properties": {"pdu-type": "submit"},
+                }}))
+            return Result(returncode=1)
+
+        instances = [{"id": "10", "iccid": "card-i"}]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.multiple(store, DATA_DIR=str(root),
+                                DB_PATH=str(root / "mdd-sim-gateway.sqlite"),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                result = cellular_sms.send(
+                    instances, "10", "6700", "BAL", runner=runner,
+                    local_sms_tracker=store, epoch_getter=lambda: current_epoch[0])
+                self.assertTrue(result["ok"])
+
+                # Clear every process-local hint and construct a new scanner: only SQLite can
+                # identify the still-live ModemManager submit object after this simulated restart.
+                with cellular_sms._local_sms_lock:
+                    cellular_sms._local_sms_paths.clear()
+                restarted = cellular_sms.Scanner(
+                    runner, local_sms_tracker=store, epoch_getter=lambda: current_epoch[0])
+                self.assertEqual(restarted.discover(instances), [])
+                cleanup = restarted.discover(instances, include_local_cleanup=True)
+                self.assertEqual(len(cleanup), 1)
+                self.assertTrue(cleanup[0]["_local_only"])
+                self.assertFalse(store.local_modem_sms_is_preserved(
+                    "10", "card-i", TEST_EPOCH, modem, sms,
+                    cellular_sms._content_hash("6700", "BAL")))
+                message = store.local_modem_sms_message(result["_reservation_id"])
+                store.set_message_status(message["id"], "sent", None)
+                self.assertTrue(store.local_modem_sms_is_preserved(
+                    "10", "card-i", TEST_EPOCH, modem, sms,
+                    cellular_sms._content_hash("6700", "BAL")))
+
+                # Reusing the same numeric object path for different content remains importable.
+                with cellular_sms._local_sms_lock:
+                    cellular_sms._local_sms_paths.clear()
+                current_text[0] = "MANUAL"
+                reused = cellular_sms.Scanner(
+                    runner, local_sms_tracker=store,
+                    epoch_getter=lambda: current_epoch[0]).discover(instances)
+                self.assertEqual(len(reused), 1)
+                self.assertEqual(reused[0]["body"], "MANUAL")
+                self.assertEqual(reused[0]["direction"], "out")
+
+                # The same external object identity after a daemon restart receives a distinct
+                # import fingerprint even when ModemManager supplies no timestamp.
+                current_epoch[0] = "b" * 64
+                same_after_restart = cellular_sms.Scanner(
+                    runner, local_sms_tracker=store,
+                    epoch_getter=lambda: current_epoch[0]).discover(instances)
+                self.assertEqual(len(same_after_restart), 1)
+                self.assertNotEqual(
+                    reused[0]["fingerprint"], same_after_restart[0]["fingerprint"])
+
+                # A new ModemManager D-Bus owner may reuse both the numeric path and content.
+                # The old marker must not hide that new object.
+                current_text[0] = "BAL"
+                after_daemon_restart = cellular_sms.Scanner(
+                    runner, local_sms_tracker=store,
+                    epoch_getter=lambda: current_epoch[0]).discover(instances)
+                self.assertEqual(len(after_daemon_restart), 1)
+                self.assertEqual(after_daemon_restart[0]["body"], "BAL")
+
+    def test_modemmanager_epoch_combines_boot_and_unique_dbus_owner(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return Result('s ":1.14"\n')
+
+        first = cellular_sms._modemmanager_epoch(
+            runner, boot_id_reader=lambda: "12345678-1234-1234-1234-123456789abc")
+        second = cellular_sms._modemmanager_epoch(
+            lambda *_a, **_k: Result('s ":1.15"\n'),
+            boot_id_reader=lambda: "12345678-1234-1234-1234-123456789abc")
+
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+        self.assertEqual(calls[0][0][0], "busctl")
+        self.assertEqual(calls[0][1]["timeout"], 3)
+
+
+class CellularSmsReimportStoreTests(unittest.TestCase):
+    def test_legacy_import_table_gains_message_binding_before_cleanup_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE message_imports (fingerprint TEXT PRIMARY KEY, "
+                    "instance TEXT NOT NULL, imported_ts INTEGER NOT NULL)")
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                with sqlite3.connect(db_path) as connection:
+                    columns = {row[1] for row in connection.execute(
+                        "PRAGMA table_info(legacy_message_imports)")}
+                    indexes = {row[1] for row in connection.execute(
+                        "PRAGMA index_list(legacy_message_imports)")}
+                    triggers = {row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger'")}
+                self.assertIn("message_id", columns)
+                self.assertIn("idx_legacy_message_imports_message", indexes)
+                self.assertIn("legacy_message_import_message_deleted", triggers)
+
+    def test_empty_history_can_atomically_restore_retained_cellular_sms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                store.clear_messages("3")
+                records = [
+                    {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                     "peer": "+15550001", "body": "old", "ts": 1,
+                     "transport": "cellular"},
+                    {"fingerprint": "b" * 64, "instance": "3", "direction": "in",
+                     "peer": "+15550002", "body": "new", "ts": 2,
+                     "transport": "cellular"},
+                ]
+                restored = store.reimport_cellular_messages("3", records)
+                self.assertEqual(len(restored), 2)
+                with sqlite3.connect(db_path) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM messages WHERE instance='3'").fetchone()[0], 2)
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM legacy_message_imports WHERE instance='3'").fetchone()[0], 2)
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM legacy_message_imports "
+                        "WHERE instance='3' AND message_id IS NOT NULL").fetchone()[0], 2)
+                self.assertTrue(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+
+    def test_visible_history_blocks_reimport_without_changing_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "visible", 1, "cellular")
+                result = store.reimport_cellular_messages("3", [])
+                self.assertIsNone(result)
+                with sqlite3.connect(db_path) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM legacy_message_imports WHERE instance='3'").fetchone()[0], 1)
+
+    def test_deleted_history_is_not_eligible_for_automatic_modem_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                store.clear_messages("3")
+                self.assertFalse(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+                with sqlite3.connect(db_path) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT message_id FROM legacy_message_imports "
+                        "WHERE fingerprint=?", ("a" * 64,)).fetchone()[0])
+
+    def test_legacy_marker_claims_only_one_unambiguous_visible_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "mdd-sim-gateway.sqlite"
+            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(db_path),
+                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
+                store.init()
+                store.add_imported_message("a" * 64, "3", "in", "+15550001",
+                                           "old", 1, "cellular")
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE legacy_message_imports SET message_id=NULL WHERE fingerprint=?",
+                        ("a" * 64,))
+                    connection.commit()
+                self.assertTrue(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+                with sqlite3.connect(db_path) as connection:
+                    connection.execute(
+                        "UPDATE legacy_message_imports SET message_id=NULL WHERE fingerprint=?",
+                        ("a" * 64,))
+                    connection.execute(
+                        "INSERT INTO messages(instance,direction,peer,body,status,ts,transport) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        ("3", "in", "+15550001", "old", "ok", 1, "cellular"))
+                    connection.commit()
+                self.assertFalse(store.imported_cellular_message_is_preserved(
+                    "a" * 64, "3", "in", "+15550001", "old", 1, "cellular"))
+
+
+class CellularSmsPublishTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_local_send_releases_object_without_duplicate_import(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "out",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular", "_local_only": True,
+                "_modem_iccid": "card-a", "_modem_path": MODEM,
+                "_sms_path": SMS, "_daemon_epoch": TEST_EPOCH}
+        scanner = Mock()
+        with patch.object(main.store, "local_modem_sms_is_preserved",
+                          return_value=True) as preserved, \
+                patch.object(main.store, "add_imported_message") as add, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            imported = await main._publish_cellular_sms([item], scanner)
+        self.assertEqual(imported, 0)
+        preserved.assert_called_once_with(
+            "3", "card-a", TEST_EPOCH, MODEM, SMS,
+            cellular_sms._content_hash("+15550001", "hello"))
+        add.assert_not_called()
+        broadcast.assert_not_awaited()
+        scanner.delete_preserved.assert_called_once_with(item)
+
+    async def test_fresh_durable_import_releases_its_modem_copy(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular", "_modem_path": MODEM,
+                "_sms_path": SMS, "_daemon_epoch": TEST_EPOCH}
+        record = {"id": 7, "instance": "3", "direction": "in",
+                  "peer": "+15550001", "body": "hello", "status": "ok",
+                  "error": None, "ts": 1, "transport": "cellular"}
+        scanner = Mock()
+        scanner.delete_preserved.return_value = True
+        with patch.object(main.store, "add_imported_message", return_value=record), \
+                patch.object(main.store, "imported_cellular_message_is_preserved",
+                             return_value=True) as preserved, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            imported = await main._publish_cellular_sms([item], scanner, notify=False)
+        self.assertEqual(imported, 1)
+        broadcast.assert_awaited_once()
+        preserved.assert_called_once_with(
+            "a" * 64, "3", "in", "+15550001", "hello", 1, "cellular")
+        scanner.delete_preserved.assert_called_once_with(item)
+
+    async def test_existing_marker_retries_cleanup_only_with_visible_copy(self):
+        item = {"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                "peer": "+15550001", "body": "hello", "ts": 1,
+                "transport": "cellular"}
+        scanner = Mock()
+        with patch.object(main.store, "add_imported_message", return_value=None), \
+                patch.object(main.store, "imported_cellular_message_is_preserved",
+                             side_effect=[True, False]), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+            self.assertEqual(
+                await main._publish_cellular_sms([item], scanner, notify=False), 0)
+            self.assertEqual(
+                await main._publish_cellular_sms([item], scanner, notify=False), 0)
+        broadcast.assert_not_awaited()
+        scanner.delete_preserved.assert_called_once_with(item)
+
+
+class CellularSmsReimportApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reimport_requires_exact_line_confirmation(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.api_messages_reimport_cellular("3", {"confirm_id": "2"})
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_reimport_is_scoped_and_does_not_send_old_message_notifications(self):
+        inst = {"id": "3", "iccid": "card-a", "imsi": "00101"}
+        discovered = [{"fingerprint": "a" * 64, "instance": "3", "direction": "in",
+                       "peer": "+15550001", "body": "retained", "ts": 1,
+                       "transport": "cellular"}]
+        restored = [{"id": 7, **{key: value for key, value in discovered[0].items()
+                                  if key != "fingerprint"}, "status": "ok", "error": None}]
+        scanner = Mock()
+        scanner.discover.return_value = discovered
+        with patch.object(main.cfg, "get_instance", return_value=inst), \
+                patch.object(main.cfg, "list_instances", return_value=[inst]), \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main.cellular_sms, "modem_for_instance",
+                             return_value=(MODEM, None)), \
+                patch.object(main.cellular_sms, "Scanner", return_value=scanner), \
+                patch.object(main.store, "reimport_cellular_messages",
+                             return_value=restored) as reimport, \
+                patch.object(main.hub, "cellular_sms_lock", asyncio.Lock()), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast, \
+                patch.object(main, "_dispatch_push") as push:
+            result = await main.api_messages_reimport_cellular("3", {"confirm_id": "3"})
+        self.assertEqual(result, {"ok": True, "imported": 1, "retained": 1})
+        scanner.discover.assert_called_once_with([inst])
+        reimport.assert_called_once_with("3", discovered)
+        broadcast.assert_awaited_once()
+        push.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

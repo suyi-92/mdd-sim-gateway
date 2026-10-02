@@ -9,12 +9,14 @@ import Esim from './views/Esim.jsx'
 import Keepalive from './views/Keepalive.jsx'
 import { deviceTitle } from './deviceNames.js'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage, physicallyPresentDevices } from './views/UnifiedPages.jsx'
+import ContactsPage from './views/Contacts.jsx'
 import { useI18n } from './i18n.jsx'
 import { formatPhoneNumberDisplay } from './phoneNumberDisplay.js'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
-  ['messages', 'Messages', '✉'], ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
+  ['messages', 'Messages', '✉'], ['contacts', 'Contacts', '☏'],
+  ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
   ['egress', 'Network exits', '⇄'],
   ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
@@ -129,6 +131,25 @@ export default function App() {
   }, [selectedDeviceId, deviceTab])
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'auto')
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
+  // Unread messages across every line, for the badge on Messages. The page itself keeps the
+  // per-conversation counts; this is refreshed when a message arrives and when one is read.
+  const [unreadTotal, setUnreadTotal] = useState(0)
+  const [unreadLines, setUnreadLines] = useState({})
+  const unreadRequest = useRef(0)
+  const loadUnread = useCallback(async () => {
+    const request = ++unreadRequest.current
+    try {
+      const summary = await api.unreadTotal()
+      const lines = await Promise.all((summary.lines || []).map(async id => {
+        try { return [id, Number((await api.unreadMessages(id)).total) || 0] }
+        catch { return [id, 0] }
+      }))
+      if (request === unreadRequest.current) {
+        setUnreadTotal(Number(summary.total) || 0)
+        setUnreadLines(Object.fromEntries(lines))
+      }
+    } catch {}
+  }, [])
   const [authState, setAuthState] = useState(null)
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
   const namedHardware = useRef({ devices: [], cards: [] })
@@ -238,6 +259,8 @@ export default function App() {
     window.addEventListener('online', resume)
     return () => { document.removeEventListener('visibilitychange', resume); window.removeEventListener('online', resume) }
   }, [refresh, authState?.authenticated])
+  const [originRefused, setOriginRefused] = useState(false)
+  useEffect(()=>{ if(authState?.authenticated) loadUnread() },[authState?.authenticated,loadUnread])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
     if (msg.type === 'instance_updated') { onInstanceSaved(msg.line); refresh() }
@@ -258,21 +281,22 @@ export default function App() {
       showToast({card_removed:t('SIM removed — line stopped'),reader_lost:t('Reader unplugged — line stopped'),reader_added:`${t('Card reader connected')}${name?`: ${name}`:''}`,reader_removed:`${t('Card reader disconnected')}${name?`: ${name}`:''}`}[msg.event])
     }
     if(['device','hardware','capability','cellular','engine'].includes(msg.type)) refresh()
+    if(msg.type==='sms') loadUnread()
     wsEvents.current.handlers.forEach(h=>h(msg))
     if(msg.type==='sms'&&msg.message?.direction==='in'&&!msg.updated)showToast(t('SMS from {peer}',{peer:formatPhoneNumberDisplay(msg.message.peer)}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:formatPhoneNumberDisplay(msg.call.peer)}))
-  },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth,onInstanceSaved])
+  },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth,onInstanceSaved,loadUnread])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>
   if (!authState.authenticated) return <AuthScreen configured={authState.configured} accountUsername={authState.username} t={t} onDone={result=>{setCsrf(result.csrf);setAuthState(s=>({...s,configured:true,authenticated:true,csrf:result.csrf}))}} />
   const sel=instances.find(i=>String(i.id)===String(selected))
   const callSel=instances.find(i=>String(i.id)===String(callSelected))
   const presentDeviceCount=physicallyPresentDevices(devices).length
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,onInstanceSaved,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,setCallSelected,refresh,onInstanceSaved,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta,refreshUnread:loadUnread,unreadLines}
   const pages={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common} pageVisible={view === 'devices'}/>,
     messages:<Messages {...common} pageVisible={view === 'messages'}/>, esim:<Esim {...common} pageVisible={view === 'esim'}/>, keepalive:<Keepalive {...common}/>,
-    egress:<EgressPage {...common}/>,
+    egress:<EgressPage {...common}/>, contacts:<ContactsPage showToast={showToast}/>,
     notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }
   const mountedViews = visitedViews.includes(view) ? visitedViews : [...visitedViews, view]
@@ -285,12 +309,12 @@ export default function App() {
       onCallChange={trackGlobalCall} />
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
-      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}</button>)}</nav>
+      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}{key==='messages'&&unreadTotal>0&&<span className="u-nav-count" aria-label={t('{count} unread',{count:unreadTotal})}>{unreadTotal>99?'99+':unreadTotal}</span>}</button>)}</nav>
       <div className="u-sidebar-foot"><div className="u-theme">{[['auto','◐'],['light','☀'],['dark','☾']].map(([k,x])=><button key={k} className={theme===k?'active':''} onClick={()=>setTheme(k)} title={t(k)}>{x}</button>)}</div><small>{discovering&&!presentDeviceCount?t('Detecting devices…'):`${presentDeviceCount} ${t(presentDeviceCount === 1 ? 'device' : 'devices')}`}</small><a className="u-feedback-link" href={issueUrl} target="_blank" rel="noreferrer"><span>◉</span>{t('Issues and suggestions')}<b>↗</b></a><div className="u-project-meta"><span className="u-version">{systemMeta.version ? `v${systemMeta.version}` : '—'}</span><span className="u-repo-actions">{systemMeta.repository_url&&<a href={systemMeta.repository_url} target="_blank" rel="noreferrer" aria-label="GitHub" title="GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.29-1.69-1.29-1.69-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.4-1.27.74-1.56-2.57-.29-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.16 1.18a10.9 10.9 0 0 1 5.75 0c2.19-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg></a>}</span></div><button className="btn btn-ghost" onClick={async()=>{try{await api.authLogout()}finally{setCsrf('');setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))}}}>{t('Sign out')}</button></div>
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className={`u-live${loadErrors.devices ? " is-stale" : ""}`} role="status" title={lastDeviceUpdate ? t('Last device update: {time}', { time: new Date(lastDeviceUpdate).toLocaleTimeString() }) : undefined}><span className="u-dot" /><span className="u-live-label">{initialLoading?t('Loading…'):loadErrors.devices?t('Device list is out of date; retrying'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</span></div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}><div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className={`u-live${loadErrors.devices ? " is-stale" : ""}`} role="status" title={lastDeviceUpdate ? t('Last device update: {time}', { time: new Date(lastDeviceUpdate).toLocaleTimeString() }) : undefined}><span className="u-dot" /><span className="u-live-label">{initialLoading?t('Loading…'):loadErrors.devices?t('Device list is out of date; retrying'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</span></div></header><div className={`u-content${communicationView ? ' u-content-communication' : ''}`}>{originRefused&&<div className="u-update-banner rollback" role="alert"><b>{t('Live updates and the softphone are off: the gateway does not recognise the address this page was opened from.')}</b><span>{t('A reverse proxy in front of the gateway must keep the Host header (nginx: proxy_set_header Host $http_host;), or be listed under Settings → Security → Trusted reverse proxies and send X-Forwarded-Host.')}</span></div>}<div className="u-note u-compliance-note" role="note">{t('Responsible use notice')}</div><div className={`u-persistent-call-page${view === 'calls' ? '' : ' is-hidden'}`} aria-hidden={view !== 'calls'}><Softphone {...common} selected={callSel} setSelected={setCallSelected} pageVisible={view === 'calls'} globalCallLineId={globalCallLineId} /></div>
       {mountedViews.filter(page => page !== 'calls').map(page => (
         <div key={page} className={page === 'messages' ? 'u-persistent-call-page' : undefined}
           hidden={page !== view} aria-hidden={page !== view}

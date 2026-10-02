@@ -136,7 +136,8 @@ class SoftphoneProvisioningTests(unittest.TestCase):
                 patch.object(main.cfg, "ice_advertise_address", return_value="192.168.101.50"):
             result = main.api_softphone("2", request)
         self.assertEqual(result["media_host"], "192.168.101.50")
-        self.assertEqual(result["ws_port"], 8109)
+        self.assertEqual(result["ws_path"], "/api/instances/2/softphone/ws")
+        self.assertNotIn("ws_port", result)
 
 
 if __name__ == "__main__":

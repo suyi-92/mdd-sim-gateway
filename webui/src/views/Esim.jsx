@@ -664,6 +664,47 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
   useEffect(() => { setReadFeedback('') }, [reader, selectedCard?.iccid])
   const imeiDefault = meta.imei || matchedInst?.imei || ''
   const dual = ses.length > 1
+
+  // The 409 guard is authoritative about which line holds the reader; the local
+  // lineRunning view can be stale (e.g. right after a profile switch auto-started a
+  // line). On 409 offer to stop the blocking line, wait for the engine to actually
+  // exit, then retry once.
+  const waitLineStopped = async (id, timeoutMs = 30000) => {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const snapshot = await api.instances()
+      const inst = (snapshot.instances || []).find((x) => String(x.id) === String(id))
+      if (!inst || !isLineRunning(inst)) return
+      if (Date.now() > deadline) {
+        throw new Error(t('Line {id} did not stop in time', { id }))
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+  }
+  const withEngineGuardRetry = async (fn, alreadyStoppedId) => {
+    const owner = session.current
+    const sameCard = () => owner === session.current && owner.mounted
+    try {
+      return await fn()
+    } catch (e) {
+      const d = e?.data?.detail
+      if (!sameCard()) throw e
+      if (!(e?.status === 409 && d && typeof d === 'object'
+            && d.code === 'engine_running' && d.instance_id)) {
+        throw e
+      }
+      if (String(alreadyStoppedId || '') !== String(d.instance_id)) {
+        const ok = confirm(t('Line {id} is running on this reader and blocks this eUICC operation. Stop the line and continue?', { id: d.instance_id }))
+        if (!ok) throw e
+        await api.stop(d.instance_id)
+      }
+      await waitLineStopped(d.instance_id)
+      // A 409 did not accept a card operation. Never submit its retry to a new
+      // physical card/session after waiting for the old line to stop.
+      if (!sameCard()) throw new Error(t('The device or SIM changed. Refresh its state before trying again.'))
+      return fn()
+    }
+  }
   const profiles = useMemo(
     () => ses.flatMap((se) => se.profiles || []),
     [ses],
@@ -901,7 +942,10 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
         await api.stop(matchedInst.id)
       }
       if (owner !== session.current) return
-      const res = await api.esimEnable(p.iccid, target)
+      const res = await withEngineGuardRetry(
+        () => api.esimEnable(p.iccid, target),
+        lineRunning && matchedInst ? matchedInst.id : '',
+      )
       if (!current()) return
       // The confirmed WebSocket event normally updates this as soon as lpac succeeds. Keep
       // the response path as a fallback for a reconnecting browser.
@@ -1117,7 +1161,7 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
     setBusyOp(label)
     setErr('')
     try {
-      await fn()
+      await withEngineGuardRetry(fn)
       if (!current()) return
       showToast?.(t('{action} OK', { action: t(label) }))
       await loadAll()

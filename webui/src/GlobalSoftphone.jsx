@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from './api.js'
-import { Softphone as Phone } from './softphone.js'
+import { Softphone as Phone, microphoneMessage, RELAY_UNAVAILABLE, RELAY_UNREACHABLE } from './softphone.js'
 import CallSurface from './CallSurface.jsx'
 import { useLiveSubtitles } from './LiveSubtitles.jsx'
 import { useI18n } from './i18n.jsx'
+import { useContactNames } from './contactNames.js'
 
 // Keep incoming-call registration independent of the page the administrator happens to be
 // viewing. The Calls page owns its selected line (it needs the same Phone for outbound calls),
@@ -98,18 +99,31 @@ export default function GlobalSoftphone({
           } else if (type === 'ended' || type === 'failed') {
             if (callRef.current?.id !== id) return
             finishCall(id, data?.cause)
+          } else if (type === 'mediafallback') {
+            // Answered without a microphone: the caller is audible, the user is not. Say so
+            // on the overlay for the whole call, not just in a toast that scrolls away.
+            setCall((current) => current?.id === id ? { ...current, listenOnly: true } : current)
+            showToast?.(t(microphoneMessage(data)))
+          } else if (type === 'mediafail') {
+            // Last resort: not even a silent track could be built, so the call really died.
+            showToast?.(t(microphoneMessage(data)))
           } else if (type === 'audioblocked') {
             showToast?.(t('Browser blocked call audio. Click the page once and try again.'))
+          } else if (type === 'relayunavailable') {
+            showToast?.(t(RELAY_UNAVAILABLE))
+          } else if (type === 'relayunreachable') {
+            showToast?.(t(RELAY_UNREACHABLE))
           }
         }
-        phone = new Phone(onEvent, null)
+        phone = new Phone(onEvent, null, () => api.softphone(id))
+        if (!phone.start(prov, prov.host || location.hostname)) return
         phones.current.set(id, phone)
-        phone.start(prov, prov.host || location.hostname)
       }).catch(() => {})
     }
   }, [lineKey, excludedId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => () => {
+    wanted.current = new Set()
     clearTimeout(clearTimer.current)
     for (const phone of phones.current.values()) phone.stop()
     phones.current.clear()
@@ -128,6 +142,9 @@ export default function GlobalSoftphone({
       }
     }
   }, [call, excludedId, lineKey])
+  // Asked for before the hook can early-return, and with the number it is ringing from: a
+  // caller who is in the address book should be named on the very first frame of the overlay.
+  const callerName = useContactNames(call?.number ? [call.number] : [], call?.id)[call?.number] || ''
 
   useEffect(() => {
     if (call?.state !== 'active' || !call.startedAt) { setDuration(0); return }
@@ -166,7 +183,7 @@ export default function GlobalSoftphone({
     phone?.sendDTMF(tone)
     setDtmfSeq((value) => (value + tone).slice(-32))
   }
-  const surface = <CallSurface call={call} line={call.line} duration={clock} muted={muted}
+  const surface = <CallSurface call={call} callerName={callerName} line={call.line} duration={clock} muted={muted}
     keypad={keypad} dtmfSeq={dtmfSeq} embedded={embedded}
     subtitles={subtitles} onToggleSubtitles={subtitles.toggle}
     onAnswer={answer} onDecline={decline} onHangup={hangup} onToggleMute={toggleMute}

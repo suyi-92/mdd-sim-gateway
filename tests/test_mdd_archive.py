@@ -81,6 +81,31 @@ class SQLiteSafetyTests(unittest.TestCase):
 
 
 class ArchiveRoundTripTests(unittest.TestCase):
+    def test_mms_attachments_round_trip_with_database_but_temporary_uploads_do_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "source"
+            (data / "mms/message-1").mkdir(parents=True)
+            (data / "mms/message-1/image.jpg").write_bytes(b"fictional-picture")
+            for name in ("mms-staging", "uploads"):
+                (data / name).mkdir()
+                (data / name / "draft").write_bytes(b"transient")
+            connection = sqlite3.connect(data / "state.db")
+            connection.execute("CREATE TABLE attachments(path TEXT)")
+            connection.execute("INSERT INTO attachments VALUES ('mms/message-1/image.jpg')")
+            connection.commit()
+            connection.close()
+            archive = root / "backup.tar.gz"
+            mdd_archive.create_backup(data, archive, version="1.13.1-vmware.1",
+                                      source_commit=COMMIT, created_at=CREATED_AT)
+            destination = root / "restore"
+            mdd_archive.safe_extract(archive, destination)
+            with sqlite3.connect(destination / "data/state.db") as connection:
+                relative = connection.execute("SELECT path FROM attachments").fetchone()[0]
+            self.assertEqual((destination / "data" / relative).read_bytes(), b"fictional-picture")
+            self.assertFalse((destination / "data/mms-staging").exists())
+            self.assertFalse((destination / "data/uploads").exists())
+
     def test_create_and_extract_round_trip_excludes_runtime_caches(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

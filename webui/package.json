@@ -1,11 +1,11 @@
 {
   "name": "mdd-sim-gateway-webui",
   "private": true,
-  "version": "1.9.4-vmware.52",
+  "version": "1.13.1-vmware.1",
   "type": "module",
   "scripts": {
     "test:polling": "node --test tests/pollRequest.test.js",
-    "prebuild": "test -d tests && node --test tests/*.test.js",
+    "prebuild": "test -d tests && node --test tests/*.test.js tests/*.test.mjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"

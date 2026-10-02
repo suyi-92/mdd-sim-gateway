@@ -160,6 +160,7 @@ class CountryTestHttpPath(unittest.TestCase):
             "config_revision": egress.country_exit_revision(proxy, "gb"),
         }}}
         with patch.object(main.cfg, "get_settings", return_value={"proxy": proxy}), \
+                patch.object(main.auth, "configured", return_value=True), \
                 patch.object(main.auth, "session", return_value={"csrf": "fixture-csrf"}), \
                 patch.object(main, "_write_audit_record"), \
                 patch.object(egress, "publish"), \
@@ -167,7 +168,7 @@ class CountryTestHttpPath(unittest.TestCase):
                 patch.object(egress, "finish_test") as finish, \
                 patch.object(egress, "status", return_value=state), \
                 patch.object(egress, "test_udp_proxy", return_value=42):
-            response = ApiClient().post("/api/egress/gb/test", content=b"{}", headers={
+            response = ApiClient(cookie="fixture-session").post("/api/egress/gb/test", content=b"{}", headers={
                 "Content-Type": "application/json", "X-MDD-CSRF-Token": "fixture-csrf"})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["latency_ms"], 42)

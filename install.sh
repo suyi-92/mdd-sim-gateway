@@ -30,6 +30,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # shellcheck source=scripts/docker-local.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/scripts/docker-local.sh"
 docker() { docker_local "$@"; }
+# shellcheck source=scripts/mdd_mms_ports.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/scripts/mdd_mms_ports.sh"
 
 usage() {
   cat <<'EOF'
@@ -745,6 +747,14 @@ engine_module_contract() {
   python3 "$source/tools/engine-modules.py" "$source/engine/asterisk-keep-modules.txt" "$@"
 }
 
+verify_control_imports() {
+  local python=$1
+  "$python" -c 'import PIL.Image, pi_heif, websockets' >/dev/null 2>&1 || {
+    warn "Control dependencies do not import (Pillow/pi-heif/websockets); activation refused"
+    return 1
+  }
+}
+
 verify_prepared_build() {
   local source=$1 root=$2 expected_sha=$3 expected_version runtime_fp base_fp image modules_contract
   [[ -f "$root/READY" && -f "$root/webui/index.html" && -x "$root/venv/bin/python" && \
@@ -767,6 +777,7 @@ verify_prepared_build() {
     warn "build verification failed: Control venv console scripts or dependencies are invalid"
     return 1
   }
+  verify_control_imports "$root/venv/bin/python" || return 1
   [[ -f "$root/venv/bin/lpac" && ! -L "$root/venv/bin/lpac" ]] || return 1
   python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
     "$(docker image inspect "$image" --format '{{.Id}}')" \
@@ -835,6 +846,7 @@ prepare_build() {
   python3 -m venv --clear "$temp/venv"
   "$temp/venv/bin/pip" install --disable-pip-version-check --no-cache-dir -r "$source_dir/control/requirements.txt"
   "$temp/venv/bin/pip" check
+  verify_control_imports "$temp/venv/bin/python" || die "Control image-conversion dependencies are unusable"
   build_lpac "$temp/venv/bin/lpac"
 
   info "building WebUI in fixed Node container $NODE_BUILD_IMAGE"
@@ -1186,6 +1198,7 @@ case "$action" in
     network_guard_armed=0
     trap - EXIT HUP INT TERM
     install_modemmanager_dropin
+    ensure_mms_at_port_rule
     install_source_checkout
     write_managed_state
     ensure_singbox

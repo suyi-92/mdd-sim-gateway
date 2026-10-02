@@ -51,7 +51,8 @@ const json = (response, value, status = 200) => {
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost')
   if (url.pathname.startsWith('/api/')) {
-    if (request.method !== 'GET') writes.push([request.method, url.pathname])
+    // Contact resolution uses POST for a bounded number batch but does not mutate data.
+    if (request.method !== 'GET' && url.pathname !== '/api/contacts/resolve') writes.push([request.method, url.pathname])
     const values = {
       '/api/auth/status': { configured: true, authenticated: true, csrf: 'fixture-only' },
       '/api/instances': { instances }, '/api/cards': { cards },

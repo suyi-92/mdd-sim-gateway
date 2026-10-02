@@ -19,9 +19,11 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from copy import deepcopy
+from urllib.parse import unquote, urlsplit
 
 from . import config as cfg
 
@@ -113,23 +115,64 @@ def _recv_exact(stream: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _dns_name(value: str) -> bytes:
+    labels = value.rstrip(".").encode("idna").split(b".")
+    if not labels or any(not label or len(label) > 63 for label in labels):
+        raise EgressError("invalid ePDG DNS name")
+    return b"".join(bytes([len(label)]) + label for label in labels) + b"\x00"
+
+
+def _dns_ipv4_answer(message: bytes, transaction: bytes) -> str:
+    if len(message) < 12 or message[:2] != transaction or not (message[2] & 0x80) \
+            or message[3] & 0x0f:
+        raise EgressError("ePDG DNS response was invalid")
+    questions, answers = struct.unpack("!HH", message[4:8])
+
+    def skip_name(offset):
+        while offset < len(message):
+            length = message[offset]
+            if length & 0xc0 == 0xc0:
+                return offset + 2
+            offset += 1
+            if length == 0:
+                return offset
+            offset += length
+        raise EgressError("ePDG DNS response was truncated")
+
+    offset = 12
+    for _ in range(questions):
+        offset = skip_name(offset) + 4
+    for _ in range(answers):
+        offset = skip_name(offset)
+        if offset + 10 > len(message):
+            break
+        record_type, record_class, _ttl, length = struct.unpack(
+            "!HHIH", message[offset:offset + 10])
+        offset += 10
+        value = message[offset:offset + length]
+        if record_type == 1 and record_class == 1 and length == 4:
+            return socket.inet_ntoa(value)
+        offset += length
+    raise EgressError("ePDG DNS response had no IPv4 address")
+
+
 def _udp_probe_once(host: str, port: int, probe: tuple, timeout: float,
-                    username: str = "", password: str = "") -> int:
+                    username: str = "", password: str = "") -> int | str:
     """One complete SOCKS5 UDP ASSOCIATE carrying `probe`, returning the round trip in ms.
 
     `probe` is (kind, target_host, target_port): "dns" sends an A query, "stun" a Binding
     Request. The target may be a name — the relay resolves it, which is also what a real
     exit has to do.
     """
-    kind, target_host, target_port = probe
+    kind, target_host, target_port, *parameters = probe
     if kind == "stun":
         transaction = os.urandom(12)
         payload = struct.pack("!HH", 0x0001, 0) + b"\x21\x12\xa4\x42" + transaction
     else:
         transaction = os.urandom(2)
-        # A cloudflare.com A query with recursion desired.
+        query_name = parameters[0] if parameters else "cloudflare.com"
         payload = transaction + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" \
-            + b"\x0acloudflare\x03com\x00\x00\x01\x00\x01"
+            + _dns_name(query_name) + b"\x00\x01\x00\x01"
 
     started = time.monotonic()
     with socket.create_connection((host, int(port)), timeout=timeout) as stream:
@@ -191,7 +234,27 @@ def _udp_probe_once(host: str, port: int, probe: tuple, timeout: float,
                 raise EgressError("STUN response did not match the test request")
         elif len(answer) < 4 or answer[0:2] != transaction or not (answer[2] & 0x80):
             raise EgressError("UDP DNS response did not match the test request")
+        if kind == "resolve":
+            return _dns_ipv4_answer(answer, transaction)
     return max(1, round((time.monotonic() - started) * 1000))
+
+
+def resolve_ipv4_via_socks(proxy_url: str, name: str, timeout: float = 8.0) -> str:
+    """Resolve an ePDG through a public resolver reached from the selected country exit."""
+    parsed = urlsplit(proxy_url)
+    if parsed.scheme != "socks5" or not parsed.hostname or parsed.port is None:
+        raise EgressError("invalid internal SOCKS endpoint")
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    failures = []
+    for resolver in udp_probe_targets():
+        try:
+            return str(_udp_probe_once(parsed.hostname, parsed.port,
+                                      ("resolve", resolver, 53, name), timeout,
+                                      username, password))
+        except (EgressError, OSError, ValueError, struct.error) as exc:
+            failures.append(str(exc))
+    raise EgressError("ePDG DNS resolution failed through country exit: " + "; ".join(failures))
 
 
 def test_udp_proxy(host: str, port: int, timeout: float = 24.0,
@@ -308,6 +371,11 @@ def _config_error(summary: str, completed) -> str:
 
 def _orchestrator_module():
     path = Path(__file__).resolve().parents[2] / "host" / "mdd_orchestrator.py"
+    # The loaded module imports host.modem_probe, so make its package root importable
+    # when Control was launched with control/ as its working directory.
+    package_root = str(path.parent.parent)
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
     spec = importlib.util.spec_from_file_location("mdd_proxy_test_orchestrator", path)
     if not spec or not spec.loader:
         raise EgressError("proxy protocol support is unavailable")

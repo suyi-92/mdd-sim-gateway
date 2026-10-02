@@ -7,6 +7,7 @@ idle process is replaced; a crash is restarted separately from the Engine contai
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,28 @@ def request_restart(reason, rundir=RUNDIR):
     ticket = {"request_id": uuid.uuid4().hex, "reason_code": reason, "ts": time.time()}
     atomic_json(rundir / "asterisk.request.json", ticket)
     return ticket["request_id"]
+
+
+def record_exit(logdir, code):
+    """Keep the manager's bounded container-exit evidence alongside richer stability logs."""
+    path = logdir / "asterisk" / "supervisor.jsonl"
+    rec = {"ts": int(time.time()), "event": "asterisk_exited",
+           "rc": code if code >= 0 else 128 - code,
+           "disposition": "signal" if code < 0 else "exit"}
+    if code < 0:
+        rec["signal"] = -code
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        with (path.parent / "supervisor.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            lines = path.read_text().splitlines()[-499:] if path.exists() else []
+            lines.append(json.dumps(rec, sort_keys=True))
+            temporary = path.with_suffix(".jsonl.tmp")
+            temporary.write_text("\n".join(lines) + "\n")
+            temporary.replace(path)
+    except OSError:
+        # Diagnostic storage failure must not stop recovery of the call service.
+        pass
 
 
 def cli(command):
@@ -192,6 +215,7 @@ class Supervisor:
 
     def exited(self):
         code = self.child.returncode
+        record_exit(self.logs, code)
         self.event("asterisk_exited", signal_code=-code if code < 0 else 0,
                    exit_code=code if code >= 0 else 128 - code,
                    reason_code="manual" if self.stopping or self.restart_pending else "process_exit")
