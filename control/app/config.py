@@ -43,6 +43,10 @@ class LineLimitError(ValueError):
     pass
 
 
+class PortAllocationError(ValueError):
+    pass
+
+
 def validate_sim_line_limit(value) -> int:
     """Return one integer line limit inside the supported operator-configurable range."""
     if isinstance(value, bool):
@@ -694,7 +698,19 @@ def alloc_ports_auto(data: dict, exclude_iid: str | None = None) -> dict:
             break
         if _block_free(block, reserved):
             return block
-    raise ValueError("no free port block available for a new line")
+    # Preserve the historical choices (and every saved block), then fill the large
+    # gaps between their RTP pools. The old 2000-port stride only fits 28 blocks,
+    # despite the supported 32-line limit. Keep checking all service/RTP conflicts,
+    # including legacy 60-port pools and actual TCP/UDP listeners.
+    for index in range((MAX_USER_PORT - PORT_BASE["rtp_start"]) // LEGACY_RTP_SPAN + 1):
+        block = _alloc_ports(index)
+        block["rtp_start"] = PORT_BASE["rtp_start"] + index * LEGACY_RTP_SPAN
+        block["rtp_end"] = block["rtp_start"] + DEFAULT_RTP_SPAN - 1
+        if max(_block_ports(block)) > MAX_USER_PORT:
+            break
+        if _block_free(block, reserved):
+            return block
+    raise PortAllocationError("no free port block available for a new line")
 
 
 def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None) -> dict:

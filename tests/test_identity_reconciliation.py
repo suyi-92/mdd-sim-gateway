@@ -59,6 +59,44 @@ class BridgeFreshnessTests(unittest.TestCase):
 
 
 class CardRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_port_or_line_limit_failure_retries_then_creates_a_line(self):
+        from control.app.sim import CardInfo
+        name = 'fixture-reader'
+        good = CardInfo(name, 0, True, iccid='fixture', imsi='001010000000001', mcc='001', mnc='01')
+        for error, code in ((main.cfg.PortAllocationError, 'ports_unavailable'),
+                            (main.cfg.LineLimitError, 'line_limit')):
+            with self.subTest(code=code), \
+                    patch.object(main.hub, 'cards', {}), \
+                    patch.object(main.hub, 'reader_locks', {}), \
+                    patch.object(main.hub, 'lpa_busy', {}), \
+                    patch.object(main.hub, 'broadcast', new=AsyncMock()), \
+                    patch.object(main.usbreader, 'port_for_index', return_value=None), \
+                    patch.object(main, '_find_running_by_reader', return_value=None), \
+                    patch.object(main, '_modem_identity_for_reader', return_value=None), \
+                    patch.object(main.sim, 'read_card_bounded', return_value=good), \
+                    patch.object(main, '_match_instance_by_iccid', return_value=None), \
+                    patch.object(main.cfg, 'card_auto_create_suppressed', return_value=False), \
+                    patch.object(main.cfg, 'upsert_instance', side_effect=[error(), error(), {'id': '1'}]), \
+                    patch.object(main, '_next_instance_id', return_value='1'), \
+                    patch.object(main.egress, 'publish'), \
+                    patch.object(main, '_auto_start_hotplugged_line', new=AsyncMock()):
+                for attempt in (1, 2):
+                    await main._on_card_insert(name, 0, verify=True)
+                    row = main.hub.cards[name]
+                    self.assertEqual(row['provisioning_error'], code)
+                    self.assertEqual(row['identity_state'], 'pending')
+                    self.assertEqual(row['identity_attempts'], attempt)
+                    self.assertEqual(row['iccid'], good.iccid)
+                    self.assertEqual(row['imsi'], good.imsi)
+                    self.assertIsNone(row['matched'])
+                    self.assertGreater(row['identity_retry_at'], main.time.monotonic())
+                await main._on_card_insert(name, 0, verify=True)
+                row = main.hub.cards[name]
+                self.assertEqual(row['identity_state'], 'confirmed')
+                self.assertEqual(row['matched'], '1')
+                self.assertNotIn('provisioning_error', row)
+                self.assertEqual(row['identity_attempts'], 0)
+
     async def test_failed_first_read_retries_without_repeated_usb_reset(self):
         from control.app.sim import CardInfo
         name = 'fixture-reader'

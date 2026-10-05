@@ -580,10 +580,14 @@ def _ensure_card_draft(info: dict) -> dict | None:
                     "webrtc": {"enable": True}},
             "debug": {"asterisk": False, "charon": False},
         }, unique_name=True)
-    except cfg.LineLimitError:
-        log.warning("SIM line limit reached; ignoring newly detected SIM %s",
-                    iccid[-4:])
+    except (cfg.LineLimitError, cfg.PortAllocationError) as exc:
+        code = "line_limit" if isinstance(exc, cfg.LineLimitError) else "ports_unavailable"
+        info["provisioning_error"] = code
+        _identity_pending(info, code)
+        log.warning("automatic SIM line creation deferred reason=%s", code)
         return None
+    info.pop("provisioning_error", None)
+    info["identity_attempts"] = 0
     egress.publish()
     return inst
 
@@ -1059,7 +1063,6 @@ async def _on_card_insert_locked(
                 else:
                     _identity_pending(info, "subscription_unreadable")
                 return
-            info["identity_attempts"] = 0
         except sim.CardProbeTimeout:
             _identity_failed(info, "read_timeout")
             return
@@ -1116,6 +1119,9 @@ async def _on_card_insert_locked(
                 info["matched"] = inst["id"]
     if hub.cards.get(name) is not info:
         return
+    if info.get("matched"):
+        info.pop("provisioning_error", None)
+        info["identity_attempts"] = 0
     hub.cards[name] = info
     log.info("card inserted reader=%s (%s) identity=%s matched=%s", idx, name,
              "available" if info["iccid"] else "unknown", info["matched"])
@@ -5795,6 +5801,15 @@ async def _unified_devices() -> list[dict]:
                                          if item.get("hardware_id") == device_id
                                          and item.get("present")
                                          and (not bridge_current or item.get("iccid") == identity["iccid"])), {})
+        if device_present and not inst:
+            provision_error = card_info.get("provisioning_error")
+            if provision_error in {"ports_unavailable", "line_limit"}:
+                vowifi.update(actual="error", available=False, reason=(
+                    "SIM detected, but no free ports are available to create its line; retrying automatically"
+                    if provision_error == "ports_unavailable" else
+                    "SIM detected, but the saved line limit has been reached; remove an unused line or raise the limit"))
+            elif card_info.get("iccid") and card_info.get("imsi"):
+                vowifi.update(available=False, reason="Configure the inserted SIM before enabling VoWiFi")
         # Keep physical SIM state independent from the optional VoWiFi PC/SC
         # bridge.  A connected cellular modem can have a readable SIM even when
         # every virtual reader slot is empty or VoWiFi is disabled.

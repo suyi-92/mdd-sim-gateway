@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -7,6 +8,48 @@ from control.app import config
 
 
 class PortAllocationTests(unittest.TestCase):
+    def test_all_32_lines_can_be_allocated_without_overlaps(self):
+        data = {"instances": {}}
+        with patch.object(config, "_host_port_free", return_value=True):
+            for index in range(config.MAX_SIM_LINE_LIMIT):
+                block = config.alloc_ports_auto(data)
+                ports = config._block_ports(block)
+                self.assertFalse(ports & config._reserved_ports(data))
+                self.assertLessEqual(max(ports), 65535)
+                data["instances"][str(index)] = {"ports": block}
+        self.assertEqual(len(data["instances"]), 32)
+
+    def test_28_legacy_blocks_are_preserved_and_four_new_lines_fit(self):
+        data = {"instances": {str(i): {"ports": {
+            k: v for k, v in config._alloc_ports(i).items() if k != "rtp_span"}}
+            for i in range(28)}}
+        saved = deepcopy(data["instances"])
+        with patch.object(config, "_host_port_free", return_value=True):
+            for i in range(28, 32):
+                block = config.alloc_ports_auto(data)
+                self.assertFalse(config._block_ports(block) & config._reserved_ports(data))
+                self.assertLessEqual(max(config._block_ports(block)), 65535)
+                data["instances"][str(i)] = {"ports": block}
+        self.assertEqual({k: data["instances"][k] for k in saved}, saved)
+
+    def test_fallback_checks_live_service_and_rtp_conflicts(self):
+        data = {"instances": {str(i): {"ports": config._alloc_ports(i)} for i in range(28)}}
+        with patch.object(config, "_host_port_free", return_value=True):
+            first = config.alloc_ports_auto(data)
+        for conflict in (first["sip_udp"], first["webrtc"], first["rtp_start"] + 11):
+            with self.subTest(conflict=conflict), patch.object(
+                    config, "_host_port_free", side_effect=lambda port, **kw: port != conflict):
+                chosen = config.alloc_ports_auto(data)
+                self.assertNotIn(conflict, config._block_ports(chosen))
+
+    def test_real_exhaustion_is_typed_and_does_not_modify_saved_lines(self):
+        data = {"instances": {"1": {"ports": config._alloc_ports(0)}}}
+        saved = deepcopy(data)
+        with patch.object(config, "_host_port_free", return_value=False):
+            with self.assertRaises(config.PortAllocationError):
+                config.alloc_ports_auto(data)
+        self.assertEqual(data, saved)
+
     def test_new_blocks_use_the_compact_rtp_span(self):
         block = config._alloc_ports(0)
         self.assertEqual(block["rtp_span"], config.DEFAULT_RTP_SPAN)

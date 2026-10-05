@@ -426,6 +426,38 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["default_name"], "3T Electronics SCR Prime reader")
         self.assertEqual(device["hardware_name"], raw_name)
 
+    async def test_readable_card_without_line_reports_provisioning_failure(self):
+        card = {"name": "SCR fixture", "index": 0, "reader_port": "1-1",
+                "present": True, "hardware_kind": "reader", "iccid": "fixture",
+                "imsi": "001010000000001", "identity_state": "pending"}
+        with patch.object(main, "_device_sources", return_value=({}, {}, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main.device_state, "native_reader_devices", return_value={"reader-test": card}), \
+                patch.object(main.device_state, "migrate_reader_records", return_value=[]), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main, "_hardware_imei_for_card", return_value=("", "reader-test", "reader")), \
+                patch.object(main.cfg, "get_settings", return_value={}), \
+                patch.object(main.cfg, "list_instances", return_value=[]), \
+                patch.object(main, "_carrier_description", return_value={}), \
+                patch.object(main.egress, "status", return_value={}), \
+                patch.object(main.egress, "line_country", return_value=""), \
+                patch.object(main.egress, "country_for_mcc", return_value=""):
+            for code, text in (("ports_unavailable", "no free ports"),
+                               ("line_limit", "saved line limit")):
+                card["provisioning_error"] = code
+                device = (await main._unified_devices())[0]
+                self.assertTrue(device["sim"]["present"])
+                self.assertIsNone(device["instance_id"])
+                capability = device["capabilities"]["vowifi"]
+                self.assertEqual(capability["actual"], "error")
+                self.assertFalse(capability["available"])
+                self.assertIn(text, capability["reason"])
+            card.pop("provisioning_error")
+            device = (await main._unified_devices())[0]
+            self.assertEqual(device["capabilities"]["vowifi"]["reason"],
+                             "Configure the inserted SIM before enabling VoWiFi")
+
     async def test_manual_native_reader_provision_does_not_require_imei_or_smsc(self):
         card = main.sim.CardInfo(
             reader="Reader", reader_index=0, reader_port="1-1", present=True,
