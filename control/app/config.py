@@ -25,8 +25,7 @@ DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
 _lock = threading.RLock()
 
-# Operator-controlled product boundary. The Web UI exposes the configured value, while this
-# source-level range prevents a typo or malformed client from creating an unbounded workload.
+# Operator-controlled concurrent Engine limit. Saved SIM records do not consume capacity.
 MIN_SIM_LINE_LIMIT = 1
 DEFAULT_SIM_LINE_LIMIT = 13
 MAX_SIM_LINE_LIMIT = 32
@@ -686,12 +685,13 @@ def _block_free(block: dict, reserved: set[int]) -> bool:
     return True
 
 
-def alloc_ports_auto(data: dict, exclude_iid: str | None = None) -> dict:
+def alloc_ports_auto(data: dict, exclude_iid: str | None = None,
+                     *, reserved_ports: set[int] | None = None) -> dict:
     """Automatic port allocation: scan index blocks from 0 upward and take the first whose
     whole port block collides with neither another instance nor a live host listener. This
     is the default behaviour. Starting at 0 (not next_index) means re-provisioning a line
     back to Auto reclaims the lowest free block instead of drifting ever upward."""
-    reserved = _reserved_ports(data, exclude_iid)
+    reserved = _reserved_ports(data, exclude_iid) | (reserved_ports or set())
     for index in range(0, 500):                    # generous bound; ~500 lines is absurd
         block = _alloc_ports(index)
         if max(_block_ports(block)) > MAX_USER_PORT:
@@ -713,7 +713,9 @@ def alloc_ports_auto(data: dict, exclude_iid: str | None = None) -> dict:
     raise PortAllocationError("no free port block available for a new line")
 
 
-def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None) -> dict:
+def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None,
+                        *, reserved_ports: set[int] | None = None,
+                        check_host: bool = True) -> dict:
     """Manual port selection: the user picks the SIP UDP port; the rest of the block is
     derived from it at the same offsets as the nominal layout, so one number configures
     the whole line. Validates range and checks the whole derived block for conflicts.
@@ -729,7 +731,7 @@ def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None
     block["rtp_span"] = DEFAULT_RTP_SPAN
     if max(_block_ports(block)) > MAX_USER_PORT:
         raise ValueError(f"port {sip_udp} is too high — its RTP range would exceed {MAX_USER_PORT}")
-    reserved = _reserved_ports(data, exclude_iid)
+    reserved = _reserved_ports(data, exclude_iid) | (reserved_ports or set())
     clash = _block_ports(block) & reserved
     if clash:
         if sip_udp in clash or block["sip_tls"] in clash:
@@ -740,6 +742,8 @@ def ports_from_sip_base(data: dict, sip_udp: int, exclude_iid: str | None = None
         raise ValueError(f"port {sip_udp} overlaps another line's port range "
                          f"(conflict at {min(clash)}). Try a port at least 10 away, or "
                          f"use Automatic.")
+    if not check_host:
+        return block
     for port, name in ((block["sip_udp"], "SIP/UDP"), (block["sip_tls"], "SIP/TLS"),
                        (block["webrtc"], "WebRTC"), (block["ami"], "control")):
         if not _host_port_free(port):
@@ -820,23 +824,30 @@ def upsert_instance(inst: dict, unique_name: bool = False, *,
 def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
                             clear_modem_readers: bool = False) -> dict:
     data = load()
-    iid = str(inst["id"])
+    # Automatic discovery chooses identity and id under the same lock as insertion.
+    # Concurrent readers must not select the same free id and overwrite another SIM.
+    iid = str(inst.get("id") or "")
+    if not iid:
+        iccid = str(inst.get("iccid") or "")
+        existing_card = next((x for x in data["instances"].values()
+                              if iccid and x.get("iccid") == iccid), None)
+        if existing_card:
+            return existing_card
+        candidate = 1
+        while str(candidate) in data["instances"]:
+            candidate += 1
+        iid = str(candidate)
+        inst = {**inst, "id": iid}
     # Runtime-only fields sometimes ride along on the instance object (the API returns
     # instances with a computed `status` and `has_pin`); never persist them to config.
     inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
     existing = data["instances"].get(iid, {})
-    limit = sim_line_limit(data["settings"])
-    if not existing and len(data["instances"]) >= limit:
-        raise LineLimitError(
-            f"MDD Sim Gateway is configured for at most {limit} SIM lines")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:
         inst["index"] = existing["index"]
-    # Port block: keep an existing/explicit block; otherwise auto-allocate a conflict-free
-    # one (checks other instances AND live host listeners, stepping forward on collision).
-    if "ports" not in inst:
-        inst["ports"] = existing.get("ports") or alloc_ports_auto(data, exclude_iid=iid)
+    # Saved ports are only a last-used preference, never a reservation. New records
+    # need no ports; the Engine lifecycle allocates after checking runtime capacity.
     # Treat an empty/missing ami_secret the same: a WebUI save that carries a blank
     # secret must never overwrite the real one (control would then log in to the
     # engine's Asterisk with the wrong credential forever).
@@ -905,24 +916,25 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False, *,
     return merged
 
 
-def line_allowed(iid: str) -> bool:
-    """Whether a saved line is inside the operator's deterministic configured set.
+def line_allowed(iid: str, active_ids: set[str], settings: dict | None = None) -> bool:
+    """Admit a new Engine, or replace an existing one without consuming another slot.
 
-    Lowering the limit never deletes records. Existing UI order (`index`) wins and ids break ties
-    deterministically, while every engine-start path refuses records after the configured limit.
+    Lowering the limit never interrupts a running line. Its next replacement can
+    retain that slot, but no additional line starts until capacity is available.
+    Callers must hold the Engine admission lock while checking and reserving.
     """
-    def order(item: dict):
-        try:
-            index = int(item.get("index"))
-        except (TypeError, ValueError):
-            index = 1 << 30
-        return index, str(item.get("id") or "")
+    return str(iid) in active_ids or len(active_ids) < sim_line_limit(settings)
 
-    data = load()
-    limit = sim_line_limit(data["settings"])
-    allowed = {str(item.get("id")) for item in
-               sorted(data["instances"].values(), key=order)[:limit]}
-    return str(iid) in allowed
+
+def update_instance_ports(iid: str, block: dict) -> None:
+    """Persist a last-used preference without recreating a concurrently deleted SIM."""
+    with _lock:
+        data = load()
+        inst = data["instances"].get(str(iid))
+        if inst is None:
+            raise ValueError("SIM line no longer exists")
+        inst["ports"] = dict(block)
+        save(data)
 
 
 def clear_pin(iid: str) -> bool:

@@ -31,6 +31,82 @@ from . import config as cfg, egress, sysinfo
 
 log = logging.getLogger("mdd.engine")
 
+# A saved SIM owns neither an Engine slot nor host ports. Admission is serialized
+# across worker threads, while slow egress/PCSC/Docker work remains per-line so an
+# unrelated stop is never queued behind every pending start.
+_resource_lock = threading.RLock()
+_line_locks: dict[str, threading.RLock] = {}
+_starting: dict[str, dict | None] = {}
+
+
+def _line_lock(iid: str):
+    with _resource_lock:
+        return _line_locks.setdefault(str(iid), threading.RLock())
+
+
+def _runtime_resources(client, exclude_iid: str = "") -> tuple[set[str], set[int]]:
+    """Docker is authoritative after Control restarts; failed inspection fails closed.
+
+    Include Created/restarting/paused containers and in-flight starts. An exited
+    container holds no published ports. Saved blocks of inactive SIMs are ignored.
+    Only inspect containers; never remove one to manufacture capacity.
+    """
+    active = set(_starting)
+    reserved: set[int] = set()
+    saved = {str(x["id"]): x for x in cfg.list_instances()}
+    prefix = container_name("")
+    for container in client.containers.list(all=True, filters={"name": prefix}):
+        if not container.name.startswith(prefix) or not _owned(container):
+            continue
+        if container.status in {"exited", "dead"}:
+            continue
+        iid = container.name[len(prefix):]
+        active.add(iid)
+        if iid == exclude_iid:
+            continue
+        block = (saved.get(iid) or {}).get("ports")
+        if block:
+            reserved.update(cfg._block_ports(block))
+        # Saved settings can change before a restart retires the old generation.
+        # Always include its actual published ports as well as the saved block.
+        bindings = (container.attrs.get("HostConfig") or {}).get("PortBindings") or {}
+        for values in bindings.values():
+            for binding in values or []:
+                value = str(binding.get("HostPort") or "")
+                if value:
+                    reserved.add(int(value))
+    for iid, block in _starting.items():
+        if iid != exclude_iid and block:
+            reserved.update(cfg._block_ports(block))
+    return active, reserved
+
+
+def suggest_ports() -> dict:
+    with _resource_lock:
+        _, reserved = _runtime_resources(_client())
+        return cfg.alloc_ports_auto({"instances": {}}, reserved_ports=reserved)
+
+
+def _allocate_start_ports(inst: dict, client) -> dict:
+    iid = str(inst["id"])
+    with _resource_lock:
+        _, reserved = _runtime_resources(client, exclude_iid=iid)
+        try:
+            if inst.get("port_mode") == "manual":
+                block = cfg.ports_from_sip_base(
+                    {"instances": {}}, int(inst.get("sip_port") or 0), reserved_ports=reserved)
+            else:
+                block = inst.get("ports")
+                if (not block or max(cfg._block_ports(block)) > cfg.MAX_USER_PORT
+                        or not cfg._block_free(block, reserved)):
+                    block = cfg.alloc_ports_auto({"instances": {}}, reserved_ports=reserved)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise cfg.PortAllocationError("No free port block is available for this line") from exc
+        # Reserve before releasing the admission lock. Docker has not bound them yet.
+        _starting[iid] = block
+        cfg.update_instance_ports(iid, block)
+        return {**inst, "ports": block}
+
 # Bounded so a line that rebuilds every two minutes cannot fill a Pi's SD card. Only the
 # recent tail is diagnostically useful.
 DIAGNOSTIC_RECORDS = 200
@@ -422,6 +498,23 @@ def _retire_container(container, *, settle_pcsc: bool = False) -> bool:
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
     """(Re)create and start the engine container for an instance."""
     iid = str(inst["id"])
+    with _line_lock(iid):
+        with _resource_lock:
+            active, _ = _runtime_resources(_client())
+            # Read the current setting after waiting for admission, not a stale
+            # settings object captured by a queued caller.
+            if not cfg.line_allowed(iid, active):
+                raise cfg.LineLimitError("The simultaneous running line limit has been reached")
+            _starting[iid] = None
+        try:
+            return _start_reserved(inst, settings, dev_mounts, reason)
+        finally:
+            with _resource_lock:
+                _starting.pop(iid, None)
+
+
+def _start_reserved(inst: dict, settings: dict, dev_mounts: bool, reason: str):
+    iid = str(inst["id"])
     # Fail closed before creating the container when country routing is enabled. The host-side
     # orchestrator confirms that this carrier's outer ePDG address is routed through the selected
     # country TUN; inner IMS/SIP/RTP then stays inside the resulting IPsec tunnel.
@@ -445,9 +538,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         # Clash Fake-IP on the host. Pin this one container to
         # the real address the orchestrator just routed through the selected country exit.
         extra_hosts[epdg_host] = sorted(set(addresses))[0]
-    cfg.write_instance_json(inst, settings)
     base, host_base = _instance_paths(iid)
-    ports = inst.get("ports", {})
     client = _client()
     # Retire any existing generation before reusing its host PC/SC reader.  Do not force-delete
     # the normal replacement path: a second config save can arrive while the first generation is
@@ -462,6 +553,9 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     except docker.errors.NotFound:
         pass
 
+    inst = _allocate_start_ports(inst, client)
+    ports = inst["ports"]
+    cfg.write_instance_json(inst, settings)
     _clear_runtime_state(base)
 
     volumes = {
@@ -572,6 +666,11 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
 
 
 def stop(iid: str, expected_container_id: str | None = None):
+    with _line_lock(str(iid)):
+        return _stop_locked(iid, expected_container_id)
+
+
+def _stop_locked(iid: str, expected_container_id: str | None = None):
     try:
         c = _client().containers.get(container_name(iid))
         if not _owned(c):

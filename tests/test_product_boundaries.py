@@ -22,27 +22,23 @@ class ProductBoundaryTests(unittest.TestCase):
         )
         return temp, paths
 
-    def test_default_thirteenth_line_is_allowed_but_fourteenth_is_refused(self):
+    def test_saved_cards_are_not_limited_and_do_not_allocate_ports(self):
         temp, paths = self.temp_config()
-        with temp, paths:
+        with temp, paths, patch.object(config, "alloc_ports_auto", side_effect=AssertionError("save must not allocate")):
             self.assertEqual(config.sim_line_limit(), 13)
-            for iid in range(1, config.DEFAULT_SIM_LINE_LIMIT + 1):
-                config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
-            with self.assertRaises(config.LineLimitError):
-                config.upsert_instance({"id": "14", "name": "SIM 14"})
-            edited = config.upsert_instance({"id": "13", "name": "kept"})
-            self.assertEqual(edited["name"], "kept")
+            for iid in range(1, 65):
+                saved = config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
+                self.assertNotIn("ports", saved)
+            self.assertEqual(len(config.list_instances()), 64)
+            config.update_settings({"max_sim_lines": 1})
+            config.upsert_instance({"id": "65", "name": "another saved SIM"})
+            self.assertEqual(len(config.list_instances()), 65)
 
-    def test_operator_limit_is_validated_and_enforced(self):
+    def test_operator_running_limit_is_validated(self):
         temp, paths = self.temp_config()
         with temp, paths:
             saved = config.update_settings({"max_sim_lines": "3"})
             self.assertEqual(saved["max_sim_lines"], 3)
-            for iid in range(1, 4):
-                config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
-            with self.assertRaisesRegex(config.LineLimitError, "at most 3"):
-                config.upsert_instance({"id": "4", "name": "SIM 4"})
-
             for value in (0, 33, True, "", "1.5"):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     config.validate_sim_line_limit(value)
@@ -148,15 +144,11 @@ class ProductBoundaryTests(unittest.TestCase):
             self.assertNotIn("activation_reminder", channel["events"])
             self.assertNotIn("software_update", channel["events"])
 
-    def test_only_lines_within_the_configured_limit_are_startable(self):
-        temp, paths = self.temp_config()
-        with temp, paths:
-            config.save({"instances": {
-                str(iid): {"id": str(iid), "index": iid}
-                for iid in range(1, 6)
-            }, "settings": {"max_sim_lines": 4}})
-            self.assertTrue(config.line_allowed("4"))
-            self.assertFalse(config.line_allowed("5"))
+    def test_capacity_depends_on_active_set_not_saved_order(self):
+        self.assertTrue(config.line_allowed("99", {"1", "2"}, {"max_sim_lines": 3}))
+        self.assertFalse(config.line_allowed("99", {"1", "2", "3"}, {"max_sim_lines": 3}))
+        self.assertTrue(config.line_allowed("3", {"1", "2", "3"}, {"max_sim_lines": 1}))
+
 
 
 if __name__ == "__main__":

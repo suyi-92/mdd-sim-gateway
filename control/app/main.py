@@ -544,7 +544,7 @@ def _ensure_card_draft(info: dict) -> dict | None:
     """Persist a safe, stopped line draft as soon as a new SIM identity is readable.
 
     A draft makes hotplug the normal creation path while deliberately avoiding engine startup
-    until mandatory identity fields (notably IMEI on a native reader) are available.
+    until the current SIM subscription and required modem identity are available.
     """
     iccid = str(info.get("iccid") or "").strip()
     if not iccid:
@@ -554,38 +554,30 @@ def _ensure_card_draft(info: dict) -> dict | None:
         return existing
     identity = _modem_identity_for_reader(info.get("name")) or {}
     mcc, mnc = str(info.get("mcc") or ""), str(info.get("mnc") or "")
-    try:
-        inst = cfg.upsert_instance({
-            "id": _next_instance_id(),
-            "name": cfg.default_instance_name(mcc, mnc, iccid),
-            "provisioning_state": "draft",
-            "iccid": iccid,
-            "imsi": str(info.get("imsi") or ""),
-            "mcc": mcc,
-            "mnc": mnc,
-            **_carrier_identity_update(info),
-            "imei": identity.get("imei") or "",
-            "reader": f"imsi:{info['imsi']}" if info.get("imsi") else "",
-            "reader_index": int(info.get("index") or 0),
-            "reader_port": str(info.get("reader_port") or ""),
-            "smsc": str(info.get("smsc") or ""),
-            "proxy_country": "",
-            "enabled": False,
-            "apn": "ims",
-            "idr_mode": "apn",
-            "cp_mode": "auto",
-            "sip": {**cfg.carrier_sip_defaults(
-                        mcc, mnc, iccid, _carrier_identity(info)),
-                    "listen_addr": "0.0.0.0", "transport": "udp", "external": [],
-                    "webrtc": {"enable": True}},
-            "debug": {"asterisk": False, "charon": False},
-        }, unique_name=True)
-    except (cfg.LineLimitError, cfg.PortAllocationError) as exc:
-        code = "line_limit" if isinstance(exc, cfg.LineLimitError) else "ports_unavailable"
-        info["provisioning_error"] = code
-        _identity_pending(info, code)
-        log.warning("automatic SIM line creation deferred reason=%s", code)
-        return None
+    inst = cfg.upsert_instance({
+        "name": cfg.default_instance_name(mcc, mnc, iccid),
+        "provisioning_state": "draft",
+        "iccid": iccid,
+        "imsi": str(info.get("imsi") or ""),
+        "mcc": mcc,
+        "mnc": mnc,
+        **_carrier_identity_update(info),
+        "imei": identity.get("imei") or "",
+        "reader": f"imsi:{info['imsi']}" if info.get("imsi") else "",
+        "reader_index": int(info.get("index") or 0),
+        "reader_port": str(info.get("reader_port") or ""),
+        "smsc": str(info.get("smsc") or ""),
+        "proxy_country": "",
+        "enabled": False,
+        "apn": "ims",
+        "idr_mode": "apn",
+        "cp_mode": "auto",
+        "sip": {**cfg.carrier_sip_defaults(
+                    mcc, mnc, iccid, _carrier_identity(info)),
+                "listen_addr": "0.0.0.0", "transport": "udp", "external": [],
+                "webrtc": {"enable": True}},
+        "debug": {"asterisk": False, "charon": False},
+    }, unique_name=True)
     info.pop("provisioning_error", None)
     info["identity_attempts"] = 0
     egress.publish()
@@ -806,19 +798,16 @@ CARD_PROBE_HARD_TIMEOUT_SECONDS = float(
 CARD_ICCID_HARD_TIMEOUT_SECONDS = float(
     os.environ.get("MDD_CARD_ICCID_HARD_TIMEOUT", "20"))
 DEVICE_RESCAN_CONTROL_TIMEOUT_SECONDS = max(180.0, CARD_PROBE_HARD_TIMEOUT_SECONDS * 3)
+START_WAIT_REASONS = {
+    "line_limit": "Waiting for a free running line slot; saved SIM records are not limited.",
+    "ports_unavailable": "Waiting for free host ports before starting this line.",
+    "egress_unavailable": "Waiting for the selected country exit before retrying.",
+}
 
 
 def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
                           reason: str = "manual"):
     """Translate fail-closed egress errors into an actionable API response."""
-    if not cfg.line_allowed(str(inst.get("id") or "")):
-        limit = cfg.sim_line_limit()
-        raise HTTPException(409, {
-            "code": "line_limit",
-            "message": (f"MDD Sim Gateway is configured for at most "
-                        f"{limit} SIM lines. Delete an existing line or raise the limit "
-                        "before starting this one."),
-        })
     try:
         # A modem-backed line must be rebound from the bridge's current ICCID metadata on
         # EVERY start, including health-policy rebuilds. Merely finding the old generated
@@ -833,7 +822,22 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
         # A restart begins a new healthy stretch; the old one says nothing about the exit
         # this container will end up using.
         hub.ok_since.pop(str(inst.get("id") or ""), None)
-        return engine.start(inst, settings, dev_mounts=dev_mounts, reason=reason)
+        result = engine.start(inst, settings, dev_mounts=dev_mounts, reason=reason)
+        hub.hotplug_pending.pop(str(inst["id"]), None)
+        return result
+    except (cfg.LineLimitError, cfg.PortAllocationError) as exc:
+        code = "line_limit" if isinstance(exc, cfg.LineLimitError) else "ports_unavailable"
+        iid = str(inst["id"])
+        message = START_WAIT_REASONS[code]
+        hub.hotplug_pending[iid] = {
+            "epoch": hub.hotplug_epochs.get(iid, 0), "iccid": inst.get("iccid"),
+            "retry_at": time.monotonic() + 60, "reason_code": code,
+        }
+        hub.status_cache[iid] = {
+            "state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
+            "reason_code": code, "reason": message, "detail": {},
+        }
+        raise HTTPException(409, {"code": code, "message": message}) from exc
     except egress.EgressError as exc:
         raise HTTPException(503, {"code": "egress_unavailable", "message": str(exc)})
 
@@ -3121,8 +3125,9 @@ def apply_health(iid, inst, st, container_id: str | None = None):
                     or pending.get("epoch") != hub.hotplug_epochs.get(str(iid), 0)):
                 hub.hotplug_pending.pop(str(iid), None)
             else:
-                st = {**st, "reason_code": "egress_unavailable",
-                      "reason": "Waiting for the selected country exit before retrying.",
+                code = pending.get("reason_code", "egress_unavailable")
+                st = {**st, "reason_code": code,
+                      "reason": START_WAIT_REASONS.get(code, START_WAIT_REASONS["egress_unavailable"]),
                       "automatic_retry_in": max(0, int(pending["retry_at"] - now))}
                 if now >= pending["retry_at"] and iid not in hub.hotplug_starts:
                     pending["retry_at"] = now + 60
@@ -3262,16 +3267,6 @@ async def lifespan(app: FastAPI):
     hub.event_loop = asyncio.get_running_loop()
     store.init()
     await asyncio.to_thread(esim_download_operations.interrupt_running)
-    # A lowered operator limit may leave more saved or running lines than currently allowed.
-    # Keep every saved record, but stop excess engines before background recovery begins.
-    for saved_line in cfg.list_instances():
-        iid = str(saved_line.get("id") or "")
-        if iid and not cfg.line_allowed(iid):
-            try:
-                await asyncio.to_thread(engine.stop, iid)
-                log.warning("stopped line %s because it exceeds the SIM line limit", iid)
-            except Exception as exc:  # noqa: BLE001 - startup must continue to surface status
-                log.error("could not stop over-limit line %s: %s", iid, exc)
     # Legacy history used a free-form line name. Map only unique, non-numeric current names;
     # numeric ids are reusable and therefore unsafe to guess across deleted/recreated lines.
     aliases: dict[str, list[str]] = {}
@@ -4999,7 +4994,7 @@ def api_ports_suggest():
     (conflict-checked against other lines + live host listeners). Lets the manual-port UI
     show a sensible default and the auto option show what it will use."""
     try:
-        block = cfg.alloc_ports_auto(cfg.load())
+        block = engine.suggest_ports()
         return {"auto_sip_udp": block["sip_udp"], "auto_sip_tls": block["sip_tls"],
                 "min": cfg.MIN_USER_PORT, "max": cfg.MAX_USER_PORT}
     except Exception as e:  # noqa
@@ -5338,7 +5333,7 @@ async def api_provision(body: dict):
         raise HTTPException(422, "imei_unavailable: configure a 15-digit IMEI in "
                                  "Device > Hardware before provisioning this SIM.")
     inst = {
-        "id": str(body.get("id") or (len(cfg.list_instances()) + 1)),
+        "id": str(body.get("id") or ""),
         "name": body.get("name") or f"{c.mcc}-{c.mnc}",
         "provisioning_state": "ready",
         "imsi": c.imsi, "mcc": c.mcc, "mnc": c.mnc, "iccid": c.iccid,
@@ -5387,28 +5382,17 @@ async def api_provision(body: dict):
         inst["swu_reader"] = slot(1).get("name") or str(slot(1).get("index", idx))
         inst["ami_reader"] = slot(2).get("name") or str(slot(2).get("index", idx))
         inst["reader_index"] = int(slot(1).get("index", idx))
-    # Port mapping: 'manual' pins the SIP UDP port the user chose (the rest of the block
-    # derives from it, validated for range + host/instance conflicts). 'auto' (default)
-    # allocates a conflict-free block now — and when re-provisioning an existing line it
-    # RE-allocates (so switching an already-provisioned line back to Auto actually moves it
-    # off a manual port), stepping past anything in use.
-    iid = str(inst["id"])
-    if body.get("port_mode") == "manual":
+    # Save the requested policy, without reserving ports for an inactive record.
+    inst["port_mode"] = "manual" if body.get("port_mode") == "manual" else "auto"
+    if inst["port_mode"] == "manual":
         try:
-            inst["ports"] = cfg.ports_from_sip_base(cfg.load(), int(body.get("sip_port", 0)),
-                                                    exclude_iid=iid)
-        except (ValueError, TypeError) as e:
-            raise HTTPException(422, f"port_error: {e}")
+            inst["sip_port"] = int(body.get("sip_port", 0))
+            cfg.ports_from_sip_base({"instances": {}}, inst["sip_port"], check_host=False)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, f"port_error: {exc}") from exc
     else:
-        try:
-            inst["ports"] = cfg.alloc_ports_auto(cfg.load(), exclude_iid=iid)
-        except ValueError as e:
-            raise HTTPException(422, f"port_error: {e}")
-    try:
-        inst = cfg.upsert_instance(inst)
-    except cfg.LineLimitError as exc:
-        raise HTTPException(409, {
-            "code": "line_limit", "message": str(exc)}) from exc
+        inst.update(ports={}, sip_port=None)
+    inst = cfg.upsert_instance(inst)
     hub._msisdn_tries.pop(str(inst["id"]), None)
     hub.reset_health(inst["id"], "user_requested")
     # engine.start force-removes any existing container; retire AMI first so a cached
@@ -5602,6 +5586,8 @@ def _vowifi_capability(desired: bool, observed: dict, running: bool,
         actual = "starting"
     elif not bridge:
         actual = "starting"
+    elif (line_status or {}).get("reason_code") in {"line_limit", "ports_unavailable"}:
+        actual, error = "degraded", line_status["reason"]
     elif not running:
         actual, error = "degraded", "VoWiFi is enabled but no configured line is running"
     else:
@@ -5802,13 +5788,7 @@ async def _unified_devices() -> list[dict]:
                                          and item.get("present")
                                          and (not bridge_current or item.get("iccid") == identity["iccid"])), {})
         if device_present and not inst:
-            provision_error = card_info.get("provisioning_error")
-            if provision_error in {"ports_unavailable", "line_limit"}:
-                vowifi.update(actual="error", available=False, reason=(
-                    "SIM detected, but no free ports are available to create its line; retrying automatically"
-                    if provision_error == "ports_unavailable" else
-                    "SIM detected, but the saved line limit has been reached; remove an unused line or raise the limit"))
-            elif card_info.get("iccid") and card_info.get("imsi"):
+            if card_info.get("iccid") and card_info.get("imsi"):
                 vowifi.update(available=False, reason="Configure the inserted SIM before enabling VoWiFi")
         # Keep physical SIM state independent from the optional VoWiFi PC/SC
         # bridge.  A connected cellular modem can have a readable SIM even when
@@ -8837,10 +8817,10 @@ def api_softphone(iid: str, request: Request):
     # a Clash/Mihomo 198.18.0.0/15 adapter from becoming the SDP default media destination.
     media_host = cfg.ice_advertise_address(cfg.get_settings())
     return {
-        "enabled": bool(wr.get("enable", True)),
+        "enabled": bool(wr.get("enable", True) and ports and engine.is_running(iid)),
         "username": wr.get("username", "webrtc"),
         "password": wr.get("password", ""),
-        "ws_port": ports.get("webrtc", 8089),
+        "ws_port": ports.get("webrtc"),
         "host": host,
         "media_host": media_host,
         "realm": cfg.ims_realm(inst["mcc"], inst["mnc"]),

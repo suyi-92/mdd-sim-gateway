@@ -116,8 +116,9 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine, "_clear_runtime_state", lambda base: None), \
                 patch.object(engine, "_host_pcsclite_library", return_value=host_library), \
                 patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {})
+            engine._start_reserved(inst, {}, False, "test")
 
         self.assertEqual(captured["volumes"][host_library], {
             "bind": "/usr/lib64/libpcsclite.so.1", "mode": "ro"})
@@ -144,8 +145,9 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
                 patch.object(engine, "_clear_runtime_state", lambda base: None), \
                 patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {"debug": {"ami": True}})
+            engine._start_reserved(inst, {"debug": {"ami": True}}, False, "test")
 
         bindings = captured["ports"]
         self.assertEqual(bindings["5038/tcp"], ("127.0.0.1", 5038))
@@ -178,8 +180,9 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
                 patch.object(engine, "_clear_runtime_state", lambda base: None), \
                 patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {})
+            engine._start_reserved(inst, {}, False, "test")
 
         bindings = captured["ports"]
         self.assertNotIn("5038/tcp", bindings)
@@ -211,8 +214,9 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
                 patch.object(engine, "_clear_runtime_state", lambda base: None), \
                 patch.object(engine.egress, "ensure_line", return_value=routed), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {"proxy": {"enabled": True}})
+            engine._start_reserved(inst, {"proxy": {"enabled": True}}, False, "test")
 
         self.assertEqual(captured["extra_hosts"][epdg], "31.94.76.1")
         self.assertEqual(captured["extra_hosts"]["host.docker.internal"], "host-gateway")
@@ -250,9 +254,10 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
                 patch.object(engine, "_clear_runtime_state", lambda base: None), \
                 patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
             with self.assertRaisesRegex(RuntimeError, "already in use"):
-                engine.start(inst, {})
+                engine._start_reserved(inst, {}, False, "test")
 
         self.assertEqual(removed, [True])
 
@@ -297,10 +302,11 @@ class EnginePathTests(unittest.TestCase):
                              return_value="/usr/lib/libpcsclite.so.1"), \
                 patch.object(engine, "capture_diagnostics"), \
                 patch.object(engine.egress, "ensure_line", lambda i, s: None), \
+                patch.object(engine, "_allocate_start_ports", side_effect=lambda inst, client: inst), \
                 patch.object(engine.cfg, "write_instance_json", lambda i, s: None), \
                 patch.object(engine.time, "sleep",
                              side_effect=lambda seconds: order.append(("settle", seconds))):
-            engine.start(inst, {})
+            engine._start_reserved(inst, {}, False, "test")
 
         self.assertEqual(order, [
             ("stop", engine.ENGINE_STOP_TIMEOUT_SECONDS),

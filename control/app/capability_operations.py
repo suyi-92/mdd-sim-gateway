@@ -24,7 +24,7 @@ ERROR_CODES = {
     "busy", "interrupted", "invalid_request", "not_found", "pin_required",
     "pin_invalid", "no_card", "card_mismatch", "card_unreadable",
     "recovery_cancelled", "transition_timeout", "device_unavailable",
-    "resume_failed", "egress_unavailable", "failed",
+    "resume_failed", "egress_unavailable", "line_limit", "ports_unavailable", "failed",
 }
 
 

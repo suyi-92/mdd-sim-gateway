@@ -64,6 +64,8 @@ def native_vowifi_capability(desired: bool, running: bool, line_status: dict | N
     """Map a native reader's engine state without inventing a cellular/bridge dependency."""
     if not desired:
         return {"desired": False, "actual": "stopping" if running else "off", "reason": ""}
+    if (line_status or {}).get("reason_code") in {"line_limit", "ports_unavailable"}:
+        return {"desired": True, "actual": "degraded", "reason": line_status["reason"]}
     if not running:
         return {"desired": True, "actual": "degraded",
                 "reason": "VoWiFi is configured but the line is not running"}

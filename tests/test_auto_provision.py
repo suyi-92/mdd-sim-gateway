@@ -426,7 +426,7 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["default_name"], "3T Electronics SCR Prime reader")
         self.assertEqual(device["hardware_name"], raw_name)
 
-    async def test_readable_card_without_line_reports_provisioning_failure(self):
+    async def test_readable_card_without_line_does_not_claim_no_sim(self):
         card = {"name": "SCR fixture", "index": 0, "reader_port": "1-1",
                 "present": True, "hardware_kind": "reader", "iccid": "fixture",
                 "imsi": "001010000000001", "identity_state": "pending"}
@@ -443,17 +443,6 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.egress, "status", return_value={}), \
                 patch.object(main.egress, "line_country", return_value=""), \
                 patch.object(main.egress, "country_for_mcc", return_value=""):
-            for code, text in (("ports_unavailable", "no free ports"),
-                               ("line_limit", "saved line limit")):
-                card["provisioning_error"] = code
-                device = (await main._unified_devices())[0]
-                self.assertTrue(device["sim"]["present"])
-                self.assertIsNone(device["instance_id"])
-                capability = device["capabilities"]["vowifi"]
-                self.assertEqual(capability["actual"], "error")
-                self.assertFalse(capability["available"])
-                self.assertIn(text, capability["reason"])
-            card.pop("provisioning_error")
             device = (await main._unified_devices())[0]
             self.assertEqual(device["capabilities"]["vowifi"]["reason"],
                              "Configure the inserted SIM before enabling VoWiFi")
@@ -479,7 +468,7 @@ class HardwareIdentityApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "load", return_value={"instances": {}}), \
                 patch.object(main.cfg, "alloc_ports_auto", return_value={"sip": 5060}), \
                 patch.object(main.cfg, "upsert_instance",
-                             side_effect=lambda value: value) as upsert, \
+                             side_effect=lambda value: {**value, "id": value.get("id") or "1"}) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.hub, "reset_health"), \

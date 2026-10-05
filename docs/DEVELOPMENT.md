@@ -15,7 +15,9 @@
 - SCR Prime 自动路径只能应用 `03_scr_prime_reader.patch`；
 - Engine 的 PC/SC socket 与客户端库必须成对来自宿主：容器只读挂载经过包路径、root 权限和
   x86_64 ELF 验证的 `libpcsclite1` 文件，不能依赖跨版本私有 IPC；
-- `max_sim_lines` 默认 13、范围 1–32，并由所有入口共用。
+- `max_sim_lines` 仅限制同时运行的 VoWiFi Engine，默认 13、范围 1–32，所有启动入口共用；
+  保存 SIM 数量不受此上限限制，新记录不预占端口。降低上限保留现有运行线路；端口和名额
+  以 Docker 及进行中的启动为准，容器移除后可复用，不能按保存顺序拒绝后录入的卡。
 
 ## 开发前检查
 
