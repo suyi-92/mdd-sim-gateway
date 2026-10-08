@@ -601,6 +601,7 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
   const [readFeedback, setReadFeedback] = useState('')
   const [renameStatus, setRenameStatus] = useState(null)
   const renameBusy = useRef(false)
+  const nicknameRequest = useRef(null)
   const [busyOp, setBusyOp] = useState('')
   const [profileSwitch, setProfileSwitch] = useState(null) // { iccid, phase }
   const viewOwner = useRef(null)
@@ -700,6 +701,13 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
   }, [])
 
   useEffect(() => {
+    const retainedNickname = canRetainEsimView(
+      nicknameRequest.current, reader, selectedCard, devices)
+    if (nicknameRequest.current && !retainedNickname) {
+      nicknameRequest.current = null
+      renameBusy.current = false
+      setBusyOp('')
+    }
     setLoading(false)
     if (!retainedView) {
       setBusyOp('')
@@ -713,8 +721,10 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
     setLoaded(false)
     setCachedAt(0)
     setErr('')
-    setRenameTarget(null)
-    setRenameStatus(null)
+    if (!retainedNickname) {
+      setRenameTarget(null)
+      setRenameStatus(null)
+    }
     setCachePending(true)
   }, [identityKey, selectedDevice?.hardware_generation])
 
@@ -1139,7 +1149,20 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
   const saveNickname = async (nick) => {
     if (!renameTarget || renameBusy.current || busyOp || switchActive || loading) return
     const owner = session.current
-    const current = () => owner === session.current && owner.mounted
+    // Channel recovery advances the reader generation, while the physical eUICC and
+    // inserted profile remain the same. Only this transaction may follow that recovery;
+    // another profile or USB generation must still fence off its result and line restart.
+    const request = {
+      reader, hardwareId: selectedCard?.hardware_id,
+      hardwareGeneration: selectedDevice?.hardware_generation,
+      profileIds: [selectedCard?.iccid],
+    }
+    nicknameRequest.current = request
+    const sameCard = () => nicknameRequest.current === request && viewNow.current.reader === reader
+      && (request.hardwareId && request.hardwareGeneration
+        ? canRetainEsimView(request, reader, viewNow.current.card, viewNow.current.devices)
+        : owner === session.current)
+    const current = () => sameCard() && owner.mounted && session.current.mounted
     renameBusy.current = true
     const { se, profile, runningLine } = renameTarget
     const target = seTarget(reader, se)
@@ -1164,7 +1187,7 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
         await api.stop(runningId)
         stopped = true
       }
-      if (owner !== session.current) return
+      if (!sameCard()) return
       feedback(t('Saving…'))
       const result = await api.esimNickname(profile.iccid, nick, target)
       renamed = true
@@ -1174,7 +1197,7 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
       }
       // The nickname API updates the gateway cache. A fresh exclusive read is unnecessary,
       // and would fail once the original line owns the reader again.
-      if (current()) setSes(list => list.map(item => item.id !== se.id ? item : {
+      if (current()) setSes(list => list.map(item => item.id !== se.id || item.eid !== se.eid ? item : {
         ...item, profiles: (item.profiles || []).map(p => p.iccid !== profile.iccid ? p
           : { ...p, profileNickname: result.nickname ?? nick }),
       }))
@@ -1184,24 +1207,33 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
     } finally {
       // Once stopped for this transaction, the original line still needs its matching
       // recovery even if its page disappeared. A real card replacement remains a fence.
-      if (stopped && readerReady && owner === session.current) {
-        feedback(t('Restarting the original line…'))
-        try {
-          await api.start(runningId)
-          if (!await waitForEsimLine(api, runningId)) {
-            resumeFailure = t('Line {id} did not become ready within 90 seconds. Check its SIM and registration status in Devices.', { id: runningId })
+      if (stopped && readerReady && sameCard()) {
+        if (!viewNow.current.card?.iccid || viewNow.current.card.iccid !== request.profileIds[0]
+            || ['pending', 'reading', 'failed'].includes(viewNow.current.card.identity_state)) {
+          resumeFailure = t('The original SIM identity is not confirmed. Keep the line stopped and check its status in Devices.')
+        } else {
+          feedback(t('Restarting the original line…'))
+          try {
+            await api.start(runningId)
+            if (!await waitForEsimLine(api, runningId)) {
+              resumeFailure = t('Line {id} did not become ready within 90 seconds. Check its SIM and registration status in Devices.', { id: runningId })
+            }
           }
+          catch (e) { resumeFailure = t('Line {id} could not restart: {error}', { id: runningId, error: e.message }) }
         }
-        catch (e) { resumeFailure = t('Line {id} could not restart: {error}', { id: runningId, error: e.message }) }
       }
-      if (!current()) { renameBusy.current = false; return }
-      const message = [renamed ? t(renameTarget.local ? 'Local note saved.' : 'Profile renamed.') : failure, resumeFailure].filter(Boolean).join(' ')
-      feedback(message, [failure, resumeFailure].filter(Boolean).join(' '))
-      if (renamed) setRenameTarget(null)
-      showToast?.(message)
-      try { await refresh?.() } catch { /* The operation result stays in its profile row. */ }
-      if (current()) setBusyOp('')
-      renameBusy.current = false
+      if (current()) {
+        const message = [renamed ? t(renameTarget.local ? 'Local note saved.' : 'Profile renamed.') : failure, resumeFailure].filter(Boolean).join(' ')
+        feedback(message, [failure, resumeFailure].filter(Boolean).join(' '))
+        if (renamed) setRenameTarget(null)
+        showToast?.(message)
+        try { await refresh?.() } catch { /* The operation result stays in its profile row. */ }
+      }
+      if (nicknameRequest.current === request) {
+        if (current()) setBusyOp('')
+        nicknameRequest.current = null
+        renameBusy.current = false
+      }
     }
   }
 
