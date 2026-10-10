@@ -4508,9 +4508,33 @@ async def _reconcile_failed_profile_outcomes() -> None:
             await _esim_profile_operation_resolved(iccid)
 
 
+async def _esim_access_recovery_ready(task: dict, observed: dict) -> bool:
+    """Passive host waiting must not own the locks needed to turn flight mode off."""
+    if not task.get("bridge_request_id"):
+        return True
+    host = _esim_host_recovery(task, observed)
+    state = str(host.get("state") or "")
+    if state in {"failed", "cancelled"}:
+        await _update_esim_recovery(
+            str(task['id']), "failed", phase="card_access",
+            error_code=str(host.get("error_code") or "baseband_initialization_failed"))
+        return False
+    if (observed.get("desired") or {}).get("flight_mode") or state == "waiting_flight_mode":
+        if task.get("state") != "waiting_flight_mode":
+            await _update_esim_recovery(str(task['id']), "waiting_flight_mode", phase="card_access")
+        return False
+    if state != "ready" or time.time() - float(task.get("profile_checked_at") or 0) < 30:
+        if task.get("state") == "waiting_flight_mode":
+            await _update_esim_recovery(str(task['id']), "waiting_baseband", phase="card_access")
+        return False
+    return True
+
+
 async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> None:
     """Repair access once, then prove profile state before the ordinary recovery path."""
     if capability_lock.locked() or network_operations.busy():
+        return
+    if not await _esim_access_recovery_ready(task, observed):
         return
     reader, device_id = str(task.get("reader") or ""), str(task.get("device_id") or "")
     task_id, iccid = str(task['id']), str(task.get("iccid") or "")
@@ -4522,6 +4546,10 @@ async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> Non
                 or (not task.get("bridge_request_id")
                     and (not _bridge_card_evidence(identity) or identity.get("iccid") != iccid))):
             await _update_esim_recovery(task_id, "cancelled", phase="card_access", error_code="device_changed")
+            return
+        # Recheck after acquiring physical ownership: a newer host observation may
+        # have arrived while another eSIM operation held the switch lock.
+        if not await _esim_access_recovery_ready(task, current):
             return
         if any(hub.lpa_busy.get(name) for name in names):
             return
@@ -4539,21 +4567,8 @@ async def _recover_unconfirmed_profile_access(task: dict, observed: dict) -> Non
                     task_id, "waiting_baseband", phase="card_access",
                     bridge_request_id=request_id) or task
                 return
-            host = _esim_host_recovery(task, observed)
-            state = str(host.get("state") or "")
-            if state in {"failed", "cancelled"}:
-                await _update_esim_recovery(
-                    task_id, "failed", phase="card_access",
-                    error_code=str(host.get("error_code") or "baseband_initialization_failed"))
-                return
-            if (observed.get("desired") or {}).get("flight_mode") or state == "waiting_flight_mode":
-                if task.get("state") != "waiting_flight_mode":
-                    await _update_esim_recovery(task_id, "waiting_flight_mode", phase="card_access")
-                return
             if task.get("state") == "waiting_flight_mode":
                 await _update_esim_recovery(task_id, "waiting_baseband", phase="card_access")
-            if state != "ready" or time.time() - float(task.get("profile_checked_at") or 0) < 30:
-                return
             if not _bridge_card_evidence(identity) or identity.get("iccid") != iccid:
                 return
             checks = int(task.get("profile_checks") or 0) + 1
@@ -6734,20 +6749,22 @@ async def api_device_capabilities(device_id: str, body: dict, background: bool =
     if device.get("device_type") == "reader" \
             and ({"cellular_enabled", "flight_mode"} & set(body)):
         raise HTTPException(400, "a smart-card reader has no cellular radio")
+    busy_detail = {"code": "busy",
+                   "message": "Another device operation is running. Please wait."}
     if network_operations.busy() \
             or operations.device_rescan_status().get("state") in {"requested", "running"}:
-        raise HTTPException(409, "another device operation is running")
+        raise HTTPException(409, busy_detail)
     existing = capability_operation_store.latest(device_id)
     if existing.get("state") in capability_operations.ACTIVE_STATES:
         if existing.get("target") == capability_operations.CapabilityOperations._target(body):
             return {"accepted": True, "operation": existing}
-        raise HTTPException(409, "another device capability operation is running")
+        raise HTTPException(409, busy_detail)
     if capability_lock.locked():
-        raise HTTPException(409, "another device operation is running")
+        raise HTTPException(409, busy_detail)
     try:
         operation = capability_operation_store.begin(device_id, body)
-    except (capability_operations.OperationBusy, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from exc
+    except capability_operations.OperationBusy as exc:
+        raise HTTPException(409, busy_detail) from exc
     task = asyncio.create_task(
         _run_capability_operation(operation["operation_id"], device_id, dict(body)))
     capability_tasks.add(task)

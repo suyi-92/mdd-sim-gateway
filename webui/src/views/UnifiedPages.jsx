@@ -258,6 +258,11 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
       // pin_required / pin_invalid are recoverable right here: ask for the PIN and retry
       // the start with it (the device-level "enabled" intent was already persisted).
       const code = e.data?.detail?.code
+      if (code === 'busy' || ['another device operation is running',
+          'another device capability operation is running'].includes(e.message)) {
+        showToast?.(t('Another device operation is running. Please wait.'))
+        return
+      }
       if ((code === 'pin_required' || code === 'pin_invalid') && next && device.instance_id) {
         const tries = e.data.detail.tries ?? '?'
         const pin = window.prompt(code === 'pin_invalid'

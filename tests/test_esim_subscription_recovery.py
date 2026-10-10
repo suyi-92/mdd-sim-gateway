@@ -190,8 +190,12 @@ class FailedOutcomeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                                  bridge_request_id='request')
         obs = self.observed['devices']['modem-a']
         obs.update(desired={'flight_mode': False}, cellular_recovery={'state': 'ready', 'operation_id': 'old'})
-        with patch.object(lpa, 'profile_list', new=AsyncMock(return_value=[
-                {'iccid': 'target-card', 'profileState': 'enabled'}])) as listing:
+        async def read_owned(*_args, **_kwargs):
+            self.assertTrue(main.capability_lock.locked())
+            self.assertTrue(main.hub.esim_switch_lock('modem-a').locked())
+            self.assertTrue(main.hub.reader_lock('reader').locked())
+            return [{'iccid': 'target-card', 'profileState': 'enabled'}]
+        with patch.object(lpa, 'profile_list', new=AsyncMock(side_effect=read_owned)) as listing:
             await main._advance_esim_cellular_recovery(task)
             listing.assert_not_awaited()
             obs['cellular_recovery']['operation_id'] = 'request'
@@ -222,3 +226,50 @@ class FailedOutcomeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await main._advance_esim_cellular_recovery(task)
         self.assertEqual(self.store.latest('modem-a')['state'], 'failed')
         self.assertEqual(self.store.latest('modem-a')['error_code'], 'sim_power_cycle_failed')
+
+    async def test_passive_access_recovery_never_blocks_switches_behind_a_card_probe(self):
+        self.enterContext(patch.object(main, 'capability_lock', asyncio.Lock()))
+        obs = self.observed['devices']['modem-a']
+        cases = (
+            (True, 'waiting_flight_mode', 'request', 0, 'waiting_flight_mode'),
+            (False, 'waiting_identity', 'request', 0, 'waiting_baseband'),
+            (False, 'ready', 'old-request', 0, 'waiting_baseband'),
+            (False, 'ready', 'request', main.time.time(), 'waiting_baseband'),
+            (True, 'failed', 'request', 0, 'failed'),
+        )
+        with patch.object(lpa, 'profile_list', new=AsyncMock()) as listing, \
+                patch.object(main, '_esim_write_bridge_restart_request') as restart:
+            for flight, state, request_id, checked, expected in cases:
+                with self.subTest(flight=flight, state=state, request_id=request_id):
+                    task = self.store.schedule('modem-a', 'target-card', 'reader', 'generation-a')
+                    task = self.store.update(task['id'], 'waiting_baseband',
+                                             profile_confirmation_pending=True,
+                                             bridge_request_id='request', profile_checked_at=checked)
+                    obs.update(desired={'flight_mode': flight}, cellular_recovery={
+                        'state': state, 'operation_id': request_id,
+                        'error_code': 'sim_power_cycle_failed'})
+                    async with main.hub.reader_lock('reader'):
+                        worker = asyncio.create_task(main._advance_esim_cellular_recovery(task))
+                        try:
+                            await asyncio.sleep(0)
+                            self.assertFalse(main.capability_lock.locked(),
+                                             'passive host waiting must allow flight-mode changes')
+                            await asyncio.wait_for(worker, 1)
+                        finally:
+                            worker.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await worker
+                    self.assertEqual(self.store.latest('modem-a')['state'], expected)
+        listing.assert_not_awaited()
+        restart.assert_not_called()
+        main._esim_guard_engine.assert_not_called()
+
+    async def test_waiting_access_recovery_still_rejects_a_new_usb_generation(self):
+        task = self.store.schedule('modem-a', 'target-card', 'reader', 'generation-a')
+        task = self.store.update(task['id'], 'waiting_flight_mode',
+                                 profile_confirmation_pending=True, bridge_request_id='request')
+        self.observed['devices']['modem-a']['usb_generation'] = 'generation-b'
+        with patch.object(lpa, 'profile_list', new=AsyncMock()) as listing:
+            await main._advance_esim_cellular_recovery(task)
+        self.assertEqual(self.store.latest('modem-a')['state'], 'cancelled')
+        listing.assert_not_awaited()

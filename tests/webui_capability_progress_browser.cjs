@@ -11,6 +11,7 @@ let posts = 0
 let operation = {}
 let flightDesired = true
 let flightActual = 'on'
+let rejectBusy = ''
 
 const device = () => ({
   id: 'modem-fixture', device_type: 'modem', present: true, instance_id: '7',
@@ -30,6 +31,9 @@ const server = http.createServer((request, response) => {
   if (url.pathname.startsWith('/api/')) {
     if (request.method === 'PATCH' && url.pathname === '/api/devices/modem-fixture/capabilities') {
       posts += 1
+      if (rejectBusy) return json(response, { detail: rejectBusy === 'legacy'
+        ? 'another device operation is running'
+        : { code: 'busy', message: 'Another device operation is running. Please wait.' } }, 409)
       flightDesired = false; flightActual = 'stopping'
       operation = { operation_id: '0123456789abcdef01234567', state: 'running',
         phase: 'reconciling', target: { flight_mode: false }, updated_at: Date.now() / 1000 }
@@ -98,11 +102,29 @@ server.on('upgrade', (_request, socket) => socket.destroy())
     assert.equal(await restored.getAttribute('aria-checked'), 'false')
     assert.equal(posts, 1)
 
+    for (const rejection of ['structured', 'legacy']) {
+      rejectBusy = rejection
+      const before = posts
+      const response = page.waitForResponse(result => result.status() === 409
+        && result.url().includes('/capabilities'))
+      page.once('dialog', dialog => dialog.accept())
+      await restored.click()
+      await response
+      await page.getByText('其他设备操作尚未结束，请稍候。', { exact: true }).waitFor()
+      await page.waitForFunction(() => [...document.querySelectorAll('[role=switch]')]
+        .some(button => button.getAttribute('aria-label') === '飞行模式' && !button.disabled))
+      assert.equal(await restored.getAttribute('aria-checked'), 'false')
+      await page.waitForTimeout(1100)
+      assert.equal(posts, before + 1, 'A rejected busy request must not retry or change the saved target')
+      assert.equal(await page.getByText('another device operation is running', { exact: true }).count(), 0)
+      assert.equal(await page.getByText('能力切换失败', { exact: false }).count(), 0)
+    }
+
     for (const width of [1440, 900, 390]) {
       await page.setViewportSize({ width, height: 900 })
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
     }
-    console.log('PASS: capability request returns once, survives page navigation/reload, and starting service remains switchable')
+    console.log('PASS: capability progress survives navigation/reload; busy stays localized without changing intent or retrying; three widths fit')
   } finally {
     if (browser) await browser.close()
     server.close()
