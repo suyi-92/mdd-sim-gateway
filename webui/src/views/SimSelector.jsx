@@ -11,9 +11,9 @@ import { communicationLineDetails } from '../simLineDetails.js'
 // selected-line state so switching a messaging line cannot tear down an active phone session.
 //
 // Only lines whose physical reader is currently PRESENT are listed — a provisioned line
-// whose reader/card is unplugged is dropped from the dropdown (its config stays under SIM
+// whose reader/card is unplugged is dropped from the list (its config stays under SIM
 // Config and it reappears when the reader returns).
-export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false, showToast }) {
+export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line', showDetails = false, unreadLines = {}, showToast }) {
   const { t, language } = useI18n()
   const selectedHardware = useRef('')
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
@@ -73,7 +73,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
               ? 'Cellular network registered' : 'VoWiFi is off'
             : i.status?.presentation?.label || i.status?.label
           const st = statusLabel ? ` — ${t(statusLabel)}` : ''
-          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
+          return <option key={i.id} value={i.id}>{deviceTitle(physical, 0, t)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}{unreadLines[i.id] ? ` · ${t('{count} unread', {count: unreadLines[i.id]})}` : ''}</option>
         })}
       </select>
       {live.length === 1 && <span className="u-line-selector-tail">{t('only line')}</span>}

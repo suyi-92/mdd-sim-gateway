@@ -56,6 +56,16 @@ def _default_gateway_ipv4():
     return ""
 
 
+def _outside(address: str, excluded: str) -> bool:
+    """True unless ``address`` lies in the ``excluded`` network (empty excludes nothing)."""
+    if not excluded:
+        return True
+    try:
+        return ipaddress.ip_address(address) not in ipaddress.ip_network(excluded)
+    except ValueError:
+        return True
+
+
 def container_ipv4():
     """The container's own docker-bridge IPv4 (e.g. 172.17.0.3). MUST be the bridge address, never
     the VoWiFi tunnel inner IP: it is used as the IKE source (SWU_SOURCE) and as the local SIP
@@ -94,6 +104,15 @@ def container_ipv4():
         s.close()
 
 
+
+
+
+
+
+
+
+
+
 def imeisv_from_imei(imei, imeisv="", svn="00"):
     """Return a 16-digit IMEISV for the ePDG DEVICE_IDENTITY response.
 
@@ -130,6 +149,22 @@ def sanitize_user_agent(value):
     return " ".join(cleaned.split())[:MAX_USER_AGENT_LEN].strip()
 
 
+MAX_URI_PARAMS_LEN = 128
+_URI_PARAM = re.compile(r"[A-Za-z0-9._~+%:-]+(?:=[A-Za-z0-9._~+%:-]+)?")
+
+
+def sanitize_uri_params(value):
+    """Return ';'-separated SIP URI parameters for an outgoing call, or ''.
+
+    Mirrors control/app/config.sanitize_uri_params: the text is written into the dialplan's
+    Dial() argument, so only what a URI parameter is made of may pass -- no ',' '&' '$' '['
+    '(' or whitespace -- and a part that is not name or name=value is dropped.
+    """
+    parts = [part.strip() for part in str(value or "").split(";")]
+    kept = [part for part in parts if part and _URI_PARAM.fullmatch(part)]
+    return ";".join(kept)[:MAX_URI_PARAMS_LEN].rstrip(";")
+
+
 def build_context(cfg):
     mcc = str(cfg["mcc"])
     mnc = str(cfg["mnc"]).zfill(3)
@@ -152,6 +187,8 @@ def build_context(cfg):
         raise ValueError("AMI credential is missing from instance configuration")
     if webrtc.get("enable", True) and not webrtc_password:
         raise ValueError("WebRTC credential is missing from instance configuration")
+    local_addr = cfg.get("local_addr") or container_ipv4()
+    ws_addr = local_addr
     ike = cfg.get("ike", {}) or {}
     default_ike = ("aes256-sha256-prfsha256-modp2048,aes128-sha256-prfsha256-modp2048,"
                    "aes256-sha1-prfsha1-modp2048,aes128-sha1-prfsha1-modp2048,"
@@ -198,7 +235,7 @@ def build_context(cfg):
         # family or Asterisk cannot reach the P-CSCF over the tunnel: IPv6 P-CSCF (Telus, EE)
         # -> bind [::]:5060; IPv4 P-CSCF (Vodafone UK, cp_mode=v4) -> bind 0.0.0.0:5060.
         "pcscf_is_v6": (":" in pcscf),
-        "local_addr": cfg.get("local_addr") or container_ipv4(),
+        "local_addr": local_addr,
         "ike_proposals": ike.get("proposals", default_ike),
         "esp_proposals": ike.get("esp_proposals", default_esp),
         # P-Access-Network-Info: i-wlan-node-id should be the Wi-Fi AP BSSID (MAC). The
@@ -211,17 +248,22 @@ def build_context(cfg):
         "user_eq_phone": bool(sip.get("user_eq_phone", False)),
         "home_local_voice_codes": home_local_voice_codes,
         "home_phone_context": home_phone_context,
+        # Rendered by the manager only when switched on; a hand-authored file may still say
+        # invite_uri_params_enable: false to keep the text without using it.
+        "invite_uri_params": ("" if sip.get("invite_uri_params_enable") is False
+                              else sanitize_uri_params(sip.get("invite_uri_params"))),
         # SDP identity (s=/o= lines) — Asterisk defaults s=Asterisk which fingerprints it.
         "sdp_session": (sip.get("sdp_session") or "-"),
         "sdp_owner": (sip.get("sdp_owner") or "-"),
         "ami_user": cfg.get("ami_user", "vowifi"),
         "ami_secret": ami_secret,
         "manager_url": cfg.get("manager_url", ""),
-        "sip_listen": sip.get("listen_addr", "0.0.0.0"),
         "webrtc_enable": bool(webrtc.get("enable", True)),
         "webrtc_user": webrtc.get("username", "webrtc"),
         "webrtc_password": webrtc_password,
-        "webrtc_port": webrtc.get("port", 8089),
+        # Container-internal plain WS listener; must match control/app/softphone_ws.py.
+        "webrtc_ws_addr": ws_addr,
+        "webrtc_ws_port": 8088,
         "domain": cfg.get("domain", ""),
         # Host-reachable address to advertise to LOCAL SIP clients (Contact + SDP). The
         # container's own IP is not routable off the docker bridge, so in-dialog requests
@@ -243,9 +285,14 @@ def build_context(cfg):
         # The container's own RTP bind IP (docker-bridge private, e.g. 172.17.0.2). Used as the
         # LHS of rtp.conf [ice_host_candidates] to rewrite that unreachable host candidate to
         # the host LAN IP (advertise_addr) so a LAN WebRTC browser can reach our RTP.
-        "rtp_bind_addr": cfg.get("local_addr") or container_ipv4(),
+        "rtp_bind_addr": local_addr,
         "rtp_start": cfg.get("rtp_start", 10000),
         "rtp_end": cfg.get("rtp_end", 11000),
+        # Relay media mode: the browser leg's RTP binds to this line's media network address
+        # and is reached only through the relay. Empty in direct mode.
+        "media_relay": False,
+        "media_if": "",
+        "media_addr": "",
         "debug_asterisk": cfg.get("debug", {}).get("asterisk", False),
         "debug_charon": cfg.get("debug", {}).get("charon", False),
     }

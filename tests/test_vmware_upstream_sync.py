@@ -153,7 +153,7 @@ class LateMessageTransactionTests(TempStore):
             self.assertEqual(c.execute('SELECT COUNT(*) FROM sms_late_groups').fetchone()[0], 0)
         self.assertIsNone(store.merge_late_sms_segment('2', '888', 7, 2, 2, 'second', now=1300))
 
-    def test_late_event_updates_original_and_reconciles_without_another_notification(self):
+    def test_late_event_completes_original_and_sends_complete_notification_once(self):
         self.partial()
         payload = {'instance': '2', 'event': 'sms_in',
                    'args': ['888', base64.b64encode(b'second').decode(), '7', '2', '2']}
@@ -167,7 +167,10 @@ class LateMessageTransactionTests(TempStore):
         self.assertTrue(event['updated'])
         self.assertEqual(event['message']['body'], 'first second')
         harvest.assert_called_once_with('2', '888')
-        notify.assert_not_called()
+        notify.assert_called_once()
+        with patch.object(main, "_dispatch_push") as duplicate_notify:
+            asyncio.run(main.api_engine_event(payload))
+        duplicate_notify.assert_not_called()
 
 
 class EngineModuleContractTests(unittest.TestCase):

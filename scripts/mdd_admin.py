@@ -49,6 +49,7 @@ def preflight(data: Path, state: Path) -> dict:
             or not isinstance(value.get("username"), str)):
         raise ValueError("administrator account is invalid; no changes made")
     read_private(data / "sessions.json", optional=True)
+    read_private(data / "clients.json", optional=True)
     return value
 
 
@@ -101,8 +102,8 @@ def reset_admin(data: Path, state: Path, password: str, derive,
             if service("is-active", unit):
                 raise RuntimeError("administrator recovery could not stop management services")
         account = preflight(data, state)
-        for name in ("auth.json", "sessions.json"):
-            originals[name] = read_private(data / name, optional=name == "sessions.json")
+        for name in ("auth.json", "sessions.json", "clients.json"):
+            originals[name] = read_private(data / name, optional=name != "auth.json")
         backup = Path(tempfile.mkdtemp(prefix="admin-reset-", dir=state))
         for name, content in originals.items():
             if content is not None:
@@ -112,6 +113,7 @@ def reset_admin(data: Path, state: Path, password: str, derive,
                        changed_at=int(time.time()))
         changed = True
         atomic_write(data / "sessions.json", b'{"version":1,"sessions":{}}\n')
+        atomic_write(data / "clients.json", b'{"version":1,"clients":[],"next_id":1}\n')
         atomic_write(data / "auth.json", json.dumps(account).encode("utf-8"))
         for unit in UNITS:
             if active[unit]:

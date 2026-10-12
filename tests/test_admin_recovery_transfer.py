@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import zipfile
 
-from control.app import auth, backup_transfer, config, main
+from control.app import auth, backup_transfer, config, main, clients
 from scripts import mdd_admin, mdd_archive
 
 
@@ -42,7 +42,7 @@ class ApiClient:
                     result["body"].extend(message.get("body", b""))
                     if not message.get("more_body", False):
                         finished.set()
-            values = {"content-length": str(len(content)), **(headers or {})}
+            values = {"cookie": f"{auth.SESSION_COOKIE}=fixture-session", "content-length": str(len(content)), **(headers or {})}
             scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
                      "http_version": "1.1", "scheme": "https", "method": method,
                      "path": path, "raw_path": path.encode(), "query_string": b"",
@@ -77,6 +77,8 @@ class RecoveryFixture(unittest.TestCase):
             (auth, "AUTH_PATH", str(self.data / "auth.json")),
             (auth, "SESSIONS_PATH", str(self.data / "sessions.json")),
             (auth, "_sessions", {}), (auth, "_failures", {}),
+            (clients, "CLIENTS_PATH", str(self.data / "clients.json")),
+            (clients, "_clients", {}), (clients, "_by_digest", {}), (clients, "_next_id", 1),
         ):
             patcher = patch.object(target, name, value)
             patcher.start()
@@ -113,6 +115,7 @@ class AdministratorRecoveryTests(RecoveryFixture):
         super().setUp()
         auth.setup("fixture-old-password", "fixture-admin")
         self.old_token, _csrf = auth.login("fixture-admin", "fixture-old-password", "192.0.2.1")
+        _, self.client_token = clients.register("Fixture app")
         self.states = {unit: True for unit in mdd_admin.UNITS}
         self.calls = []
 
@@ -133,6 +136,10 @@ class AdministratorRecoveryTests(RecoveryFixture):
         self.reset(health=lambda: None)
         auth._load_sessions()
         self.assertIsNone(auth.session(self.old_token))
+        clients._load()
+        self.assertIsNone(clients.resolve(self.client_token))
+        backup = next(self.state.glob("admin-reset-*"))
+        self.assertTrue((backup / "clients.json").is_file())
         self.assertIsNone(auth.login("fixture-admin", "fixture-old-password", "192.0.2.1"))
         self.assertIsNotNone(auth.login("fixture-admin", "fixture-new-password", "192.0.2.1"))
         self.assertEqual(sentinel.read_text(), "max_sim_lines: 13\n")
@@ -142,7 +149,7 @@ class AdministratorRecoveryTests(RecoveryFixture):
         self.assertEqual(len(list(self.state.glob("admin-reset-*"))), 1)
 
     def test_health_failure_restores_original_authentication_and_sessions(self):
-        originals = {name: (self.data / name).read_bytes() for name in ("auth.json", "sessions.json")}
+        originals = {name: (self.data / name).read_bytes() for name in ("auth.json", "sessions.json", "clients.json")}
         with self.assertRaisesRegex(RuntimeError, "fixture health failure"):
             self.reset(health=lambda: (_ for _ in ()).throw(RuntimeError("fixture health failure")))
         for name, content in originals.items():
@@ -184,6 +191,8 @@ class AdministratorRecoveryTests(RecoveryFixture):
             self.reset(health=lambda: None)
         self.assertEqual((self.data / "auth.json").read_bytes(), original)
         self.assertFalse((self.data / "sessions.json").exists())
+        clients._load()
+        self.assertIsNotNone(clients.resolve(self.client_token))
         self.assertTrue(all(self.states.values()))
 
     def test_manager_validates_generation_before_invoking_recovery_without_password_arguments(self):
@@ -323,7 +332,7 @@ class TransferApiTests(RecoveryFixture):
     def test_authenticated_round_trip_requires_csrf_and_cleans_download_staging(self):
         self.archive()
         client = ApiClient()
-        with patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
+        with patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}), patch.object(auth, "configured", return_value=True):
             exported = client.get("/api/system/backups/fixture.tar.gz/export")
             self.assertEqual(exported.status_code, 200)
             self.assertEqual(exported.headers["cache-control"], "no-store")

@@ -25,6 +25,8 @@ This list covers the material dependencies intentionally used by MDD Sim Gateway
 | Twemoji Mozilla | Bundled color Emoji font used for country flags in proxy node names | Apache-2.0 (font tooling/code); Twemoji artwork CC-BY-4.0 | https://github.com/mozilla/twemoji-colr |
 | FastAPI | Control API framework | MIT | https://github.com/fastapi/fastapi |
 | phonenumberslite | Telephone numbering-plan validation and number-region display | Apache-2.0 | https://github.com/daviddrysdale/python-phonenumbers |
+| Pillow | Converting and shrinking MMS pictures on the gateway | MIT-CMU (binary wheels bundle libjpeg-turbo, libpng, libwebp, libavif and others under their own permissive licenses) | https://github.com/python-pillow/Pillow |
+| pi-heif | Reading HEIC/HEIF pictures for MMS conversion (the decode-only build of pillow-heif) | BSD-3-Clause (source); binary wheels bundle libheif and libde265 (LGPL-3.0), and no encoder | https://github.com/bigcat88/pillow_heif |
 | Android Open Source Project Carrier ID table | Offline MNO/MVNO identification data | Apache-2.0 | https://android.googlesource.com/platform/packages/providers/TelephonyProvider/ |
 
 Twemoji Mozilla is built by Mozilla from Twemoji artwork. The font project is Copyright

@@ -214,9 +214,9 @@ class RuntimeCapacityTests(unittest.TestCase):
 
     def test_live_host_conflict_reallocates_auto_but_manual_fails_closed(self):
         self.line(1, ports=config._alloc_ports(0))
-        with patch.object(config, '_host_port_free', side_effect=lambda port, **kw: port != 8089):
+        with patch.object(config, '_host_port_free', side_effect=lambda port, **kw: port != 5060):
             self.start(1)
-        self.assertNotEqual(config.get_instance('1')['ports']['webrtc'], 8089)
+        self.assertNotEqual(config.get_instance('1')['ports']['sip_udp'], 5060)
         self.line(2, port_mode='manual', sip_port=5060)
         with patch.object(config, '_host_port_free', return_value=False):
             with self.assertRaises(config.PortAllocationError):

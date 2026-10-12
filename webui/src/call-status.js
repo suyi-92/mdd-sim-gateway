@@ -26,6 +26,7 @@ export function ordinaryCallEndLabel(status, sipCause, synthesizedDecline = fals
   // The outbound dialplan maps every non-answer to a local 603. Until call_result arrives,
   // say only what is known instead of briefly accusing the carrier of rejecting the call.
   if (synthesizedDecline && sipCause === 'Rejected') return 'Call ended'
+  if (sipCause === 'User Denied Media Access') return 'Microphone unavailable'
   if (sipCause === 'Rejected') return 'Call declined'
   if (sipCause === 'Busy') return 'Busy'
   if (sipCause === 'Canceled' || sipCause === 'Canceled/Rejected') return 'Call cancelled'

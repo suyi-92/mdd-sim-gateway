@@ -297,16 +297,18 @@ class ClientEndpointTests(unittest.IsolatedAsyncioTestCase):
                             "headers": list(headers)},
                            AsyncMock(return_value={"type": "http.request", "body": body}))
 
-        call_next = AsyncMock(return_value=Response())
-        with patch.object(auth, "session", return_value=None):
-            response = await main.require_admin_session(request(b"{}"), call_next)
-            self.assertEqual(response.status_code, 401)
-        with patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
-            response = await main.require_admin_session(request(b"{}"), call_next)
-            self.assertEqual(response.status_code, 403)
-            response = await main.require_admin_session(
-                request(b"{}", [(b"x-mdd-csrf-token", b"fixture-csrf")]), call_next)
-            self.assertEqual(response.status_code, 200)
+        from tests.test_gate import _run, http
+        with patch.object(auth, "configured", return_value=True), \
+                patch.object(auth, "session", return_value=None):
+            response = await _run(http('/api/diagnostics/client-events', 'POST'))
+            self.assertEqual(response.status, 401)
+        with patch.object(auth, "configured", return_value=True), \
+                patch.object(auth, "session", return_value={"csrf": "fixture-csrf"}):
+            response = await _run(http('/api/diagnostics/client-events', 'POST'))
+            self.assertEqual(response.status, 403)
+            response = await _run(http('/api/diagnostics/client-events', 'POST',
+                headers=[('x-mdd-csrf-token', 'fixture-csrf')]))
+            self.assertEqual(response.status, 200)
         item = {"scope": "devices", "outcome": "timeout", "status_code": 0,
                 "elapsed_ms": 15000, "client_epoch": 1000, "sequence": 1}
         with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", directory):

@@ -85,7 +85,9 @@ export default function CallSurface({
 
       <div className="u-call-identity">
         <div className="u-call-avatar" aria-hidden="true">☎</div>
-        <div className="u-call-number mono">{call.number ? formatPhoneNumberDisplay(call.number) : t('Unknown')}</div>
+        <div className="u-call-number">{call.contactName || (call.number ? formatPhoneNumberDisplay(call.number) : t('Unknown'))}</div>
+        {call.contactName && <small className="mono">{formatPhoneNumberDisplay(call.number)}</small>}
+        {call.listenOnly && state !== 'ended' && <p className="u-note">{t('Listen only · the other side cannot hear you')}</p>}
         <div className="u-call-line">{line || t('VoWiFi line')}</div>
         {state === 'active' && <div className="u-call-duration mono">{duration}</div>}
       </div>

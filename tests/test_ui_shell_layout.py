@@ -168,7 +168,7 @@ class PageRhythmTests(unittest.TestCase):
 
     def test_calls_messages_keepalive_and_logs_have_narrow_layout_contracts(self):
         self.assertIn('className="u-call-layout"', SOFTPHONE)
-        self.assertIn('className="u-messages-layout"', MESSAGES)
+        self.assertIn('u-messages-layout u-messages-split', MESSAGES)
         self.assertIn('className="u-keepalive-grid"', KEEPALIVE)
         self.assertIn('className="u-log-toolbar"', LOGS)
         self.assertIn("@media(max-width:760px)", CSS)

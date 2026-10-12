@@ -161,7 +161,8 @@ _active: dict[str, asyncio.subprocess.Process] = {}
 def lpac_bin() -> str:
     settings = cfg.get_settings()
     path = (settings.get("esim") or {}).get("lpac_bin") or ""
-    if path:
+    default_path = os.path.join(cfg.DATA_DIR, "lpac", "lpac")
+    if path and (path != default_path or os.path.isfile(path)):
         return path
     return cfg.default_lpac_bin()
 

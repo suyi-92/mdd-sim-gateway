@@ -161,6 +161,7 @@ class CountryTestHttpPath(unittest.TestCase):
         }}}
         with patch.object(main.cfg, "get_settings", return_value={"proxy": proxy}), \
                 patch.object(main.auth, "session", return_value={"csrf": "fixture-csrf"}), \
+                patch.object(main.auth, "configured", return_value=True), \
                 patch.object(main, "_write_audit_record"), \
                 patch.object(egress, "publish"), \
                 patch.object(egress, "request_test", return_value=("fixture-token", 1000)), \

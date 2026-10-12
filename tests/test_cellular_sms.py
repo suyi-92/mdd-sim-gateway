@@ -51,6 +51,9 @@ class MemoryTracker:
         self.calls.append(("bind", reservation_id, daemon_epoch, modem_path, sms_path))
         return self.bound
 
+    def imported_cellular_message_is_preserved(self, *args):
+        return True
+
     def cancel_local_modem_sms(self, reservation_id):
         self.calls.append(("cancel", reservation_id))
 
@@ -245,7 +248,7 @@ class CellularSmsTests(unittest.TestCase):
         rows = scanner.discover(LINE)
         self.assertEqual([row["body"] for row in rows], ["part one and part two"])
 
-    def test_stale_incomplete_inbound_sms_is_deleted_after_one_day(self):
+    def test_stale_incomplete_inbound_sms_is_only_deleted_by_policy_after_one_day(self):
         detail = [{
             "content": {"number": "+44123", "text": "--"},
             "properties": {"pdu-type": "deliver", "state": "receiving",
@@ -259,6 +262,9 @@ class CellularSmsTests(unittest.TestCase):
             wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS)
 
         self.assertEqual(scanner.discover(LINE), [])
+        record = scanner.discover(LINE, include_local_cleanup=True)[0]
+        self.assertTrue(record["_stale_only"])
+        self.assertTrue(scanner.delete_preserved(record))
         self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
 
     def test_recent_incomplete_sms_is_preserved_for_assembly(self):
@@ -297,20 +303,20 @@ class CellularSmsTests(unittest.TestCase):
         self.assertTrue(scanner.delete_preserved(record))
         self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
 
-    def test_mms_wap_push_notification_is_deleted_instead_of_imported(self):
+    def test_mms_wap_push_notification_is_returned_for_durable_mms_ingest(self):
         calls = []
         runner = sms_runner([wap_push_sms()], calls=calls)
         scanner = cellular_sms.Scanner(runner)
 
-        self.assertEqual(scanner.discover(LINE), [])
-        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertEqual(len(scanner.discover(LINE)), 1)
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
 
     def test_mms_wap_push_notification_is_kept_when_dropping_is_disabled(self):
         calls = []
         runner = sms_runner([wap_push_sms()], calls=calls)
         scanner = cellular_sms.Scanner(runner, drop_mms_wap_push=False)
 
-        self.assertEqual(scanner.discover(LINE), [])
+        self.assertEqual(len(scanner.discover(LINE)), 1)
         self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
 
     def test_only_the_wap_push_mime_marker_authorizes_a_delete(self):
@@ -321,8 +327,8 @@ class CellularSmsTests(unittest.TestCase):
                            "timestamp": "2026-09-12T09:00:00+08:00"},
         }]
         calls = []
-        scanner = cellular_sms.Scanner(sms_runner(detail, calls=calls))
-        self.assertEqual(scanner.discover(LINE), [])
+        scanner = cellular_sms.Scanner(sms_runner(detail, calls=calls), detail_ttl=0)
+        self.assertEqual(len(scanner.discover(LINE)), 1)
 
         # Neither is a readable message that happens to carry the marker in its payload.
         detail[0]["content"] = {"number": "+44123", "text": "hello",
@@ -332,15 +338,15 @@ class CellularSmsTests(unittest.TestCase):
         self.assertEqual([row["body"] for row in rows], ["hello"])
         self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
 
-    def test_undeletable_wap_push_stops_retrying_after_its_attempt_budget(self):
+    def test_readonly_discovery_never_deletes_an_undeletable_wap_push(self):
         calls = []
         runner = sms_runner([wap_push_sms()], calls=calls, delete_returncode=1)
         scanner = cellular_sms.Scanner(runner)
         for _ in range(6):
-            self.assertEqual(scanner.discover(LINE), [])
+            self.assertEqual(len(scanner.discover(LINE)), 1)
 
         attempts = calls.count(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"))
-        self.assertEqual(attempts, cellular_sms._WAP_PUSH_DELETE_ATTEMPTS)
+        self.assertEqual(attempts, 0)
 
     def test_sms_binary_payload_decoding_tolerates_mmcli_renderings(self):
         self.assertEqual(cellular_sms._sms_data("23 06 24"), b"\x23\x06\x24")

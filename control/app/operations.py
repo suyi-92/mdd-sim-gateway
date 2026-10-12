@@ -17,6 +17,7 @@ import docker
 import yaml
 
 from . import config as cfg
+from . import store
 
 
 _SECRET_KEYS = re.compile(
@@ -160,6 +161,12 @@ def redact_jsonl(text: str) -> str:
 
 
 CALL_EVENTS = ("call_out", "call_result", "ussd")
+# The dialplan's closed vocabulary for which side ended a call ([hangup-by]).
+HANGUP_BY = ("carrier", "local", "gateway")
+# Asterisk's own log lines at WARNING/ERROR, e.g. "[Sep 21 22:06:43] WARNING[2987][C-00000009]".
+_ASTERISK_PROBLEM = re.compile(r"\b(?:WARNING|ERROR)\[\d+\]")
+_SIP_USERINFO = re.compile(r"\b(sips?|tel):[^\s@;<>\"',]+@", re.I)
+_TEL_URI = re.compile(r"\btel:[^\s;<>\"',]+", re.I)
 CALL_EVENT_SCAN_LINES = 20_000
 SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
 # Leave space for ZIP metadata, the manifest and compression overhead. The final archive is
@@ -273,6 +280,9 @@ def call_event_evidence(text: str) -> str:
         peer_at = 1 if (event == "call_result" and args and args[0] in ("in", "out")) else 0
         if peer_at < len(args) and not any(ch in args[peer_at] for ch in "*#"):
             args[peer_at] = "<number>"
+        if event == "call_result" and peer_at == 1 and len(args) > 4 \
+                and args[4] not in HANGUP_BY:
+            args[4] = "<unknown>"
         if event == "ussd" and len(args) > 1:
             # That a reply arrived, and how big it was, answers the question. Its text can
             # carry account details and answers nothing.
@@ -282,6 +292,25 @@ def call_event_evidence(text: str) -> str:
             safe["ts"] = int(record["ts"])
         out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True))
     return "\n".join(out)
+
+
+def asterisk_problem_lines(text: str) -> str:
+    """Asterisk's WARNING/ERROR lines, with every SIP/tel identity taken out.
+
+    The whole `messages` log cannot ship: its NOTICE lines name the subscriber's IMS public
+    identity on every registration. But an answered call that drops at once leaves its only
+    explanation here — a rejected SDP answer, a failed bridge, a media error — and without it
+    a report reading ANSWER/16 cannot be told apart from the carrier simply hanging up. So keep
+    the problem lines and drop the identity: the user part of any SIP/tel URI is replaced
+    before the generic redactor (long digit runs, hex blobs, key material) runs over the rest.
+    """
+    out = []
+    for line in text.splitlines():
+        if not _ASTERISK_PROBLEM.search(line):
+            continue
+        line = _SIP_USERINFO.sub(lambda m: f"{m.group(1)}:<user>@", line)
+        out.append(_TEL_URI.sub("tel:<number>", line))
+    return redact_log("\n".join(out)) if out else ""
 
 
 SERVICE_RESTART_SCOPES = ("control", "services", "host")
@@ -324,15 +353,16 @@ def _read_json(path: Path) -> dict:
 
 
 def request_service_restart(scope: str) -> dict:
-    """Publish a service-restart request for the root orchestrator to carry out.
+    """Publish a service-restart request for the active deployment executor to carry out.
 
-    The control plane can restart neither itself nor the host: it is unprivileged, and in two
-    of the three scopes it is one of the processes being restarted. So it only states the
-    intent, exactly as it does for self-updates, and the orchestrator detaches whatever would
-    otherwise kill the process running it.
+    The request file keeps the API contract identical between the Pi host orchestrator and the
+    container executor. Both detach the operation that eventually stops this process.
     """
     if scope not in SERVICE_RESTART_SCOPES:
         return {"ok": False, "error_code": "restart.error.invalid_scope"}
+    # A container may restart the project containers through the already-mounted Docker
+    # socket, but rebooting the NAS remains a host administration action. Do not emulate it
+    # with a privileged helper container or a host namespace escape.
     request_path, status_path = _service_restart_paths()
     with _SERVICE_RESTART_LOCK:
         current = service_restart_status()
@@ -350,6 +380,99 @@ def request_service_restart(scope: str) -> dict:
             **request, "state": "requested", "updated_at": now})
         _write_private_json(request_path, request)
         return {"ok": True, **request, "state": "requested", "updated_at": now}
+
+
+def perform_container_service_restart(scope: str, client=None) -> dict:
+    """Consume a restart request and restart only named, ownership-checked MDD containers."""
+    request_path, status_path = _service_restart_paths()
+    request = _read_json(request_path)
+    if str(request.get("scope") or "") != scope or scope not in {"control", "services"}:
+        result = {"state": "failed", "scope": scope,
+                  "error_code": "restart.error.invalid_scope", "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        return result
+    try:
+        request_path.unlink()
+    except OSError:
+        pass
+    running = {"state": "running", "scope": scope, "executor": "container",
+               "updated_at": int(time.time())}
+    _write_private_json(status_path, running)
+    own_client = client is None
+    docker_client = client
+    names = {
+        "control": os.environ.get("MDD_CONTROL_CONTAINER", "mdd-sim-gateway-control"),
+        "hardware": os.environ.get("MDD_HARDWARE_CONTAINER", "mdd-sim-gateway-hardware"),
+        "egress": os.environ.get("MDD_EGRESS_CONTAINER", "mdd-sim-gateway-egress"),
+    }
+    order = ["control"] if scope == "control" else ["egress", "hardware", "control"]
+    try:
+        if docker_client is None:
+            docker_client = docker.from_env()
+        containers = []
+        for component in order:
+            container = docker_client.containers.get(names[component])
+            labels = (container.attrs.get("Config") or {}).get("Labels") or {}
+            if (labels.get("io.mdd-sim-gateway.managed") != "true"
+                    or labels.get("io.mdd-sim-gateway.component") != component):
+                raise RuntimeError(f"refusing to restart unowned {component} container")
+            containers.append((component, container))
+        control_container = next(container for component, container in containers
+                                 if component == "control")
+        for component, container in containers:
+            if component == "control":
+                continue
+            if component == "hardware":
+                marker = Path(cfg.DATA_DIR) / "orchestrator" / "pcsc-maintenance"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(int(time.time())), encoding="ascii")
+            container.restart(timeout=30)
+        # Docker cancels a synchronous restart when its caller lives in the target container:
+        # the daemon stops Control (and therefore the HTTP client driving the request) before
+        # it reaches the start half. A short-lived sibling performs the final restart instead.
+        target_name = json.dumps(names["control"])
+        helper = (
+            "import time,docker\n"
+            "time.sleep(1)\n"
+            "client=docker.from_env()\n"
+            f"target=client.containers.get({target_name})\n"
+            "labels=(target.attrs.get('Config') or {}).get('Labels') or {}\n"
+            "assert labels.get('io.mdd-sim-gateway.managed') == 'true'\n"
+            "assert labels.get('io.mdd-sim-gateway.component') == 'control'\n"
+            "target.restart(timeout=30)\n")
+        docker_client.containers.run(
+            # docker-py shell-splits a string command before sending it to the daemon.
+            # Keep the complete Python program as the one argument consumed by ``-c``.
+            control_container.image.id, command=[helper], entrypoint=["python", "-c"],
+            detach=True, auto_remove=True, network_mode="none",
+            healthcheck={"test": ["NONE"]},
+            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+            labels={"io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": "restart-helper"},
+            name=f"mdd-sim-gateway-restart-{time.time_ns()}")
+        return running
+    except Exception as exc:  # noqa: Docker exposes several backend-specific exception types
+        result = {**running, "state": "failed", "error_code": "restart.error.failed",
+                  "error": str(exc)[:400], "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        return result
+    finally:
+        if own_client and docker_client is not None:
+            try:
+                docker_client.close()
+            except Exception:  # noqa
+                pass
+
+
+def settle_container_service_restart() -> dict:
+    """This Control process coming back proves its container restart completed."""
+    _request_path, status_path = _service_restart_paths()
+    status = _read_json(status_path)
+    if (status.get("state") == "running" and status.get("executor") == "container"
+            and status.get("scope") in {"control", "services"}):
+        status = {**status, "state": "success", "updated_at": int(time.time())}
+        _write_private_json(status_path, status)
+    return status
 
 
 def service_restart_status() -> dict:
@@ -667,9 +790,29 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
         except OSError:
             continue
 
+    # Asterisk's `messages` is filtered the way events are, never exported whole (see
+    # asterisk_problem_lines); `full` stays out entirely.
+    for path in sorted(base.glob("*/logs/asterisk/messages")):
+        try:
+            tail = deque(maxlen=CALL_EVENT_SCAN_LINES)
+            raw_line_count = 0
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    raw_line_count += 1
+                    tail.append(line.rstrip("\r\n"))
+            source = list(tail)
+            eligible = asterisk_problem_lines("\n".join(source)).splitlines()
+            selected = eligible[-log_lines:]
+            if selected:
+                add_candidate(path, f"logs/{path.parents[2].name}-asterisk-problems.log",
+                              source, eligible, selected, "\n".join(selected), 30,
+                              raw_line_count)
+        except OSError:
+            continue
+
     # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
     stability_names = [f"stability-{component}{suffix}.jsonl"
-                       for component in ("ike", "control")
+                       for component in ("ike", "control", "asterisk")
                        for suffix in ("", *(f".{n}" for n in range(1, 7)))]
     stability_paths = [path for name in stability_names for path in base.glob(f"*/logs/{name}")]
     stability_paths.extend(path for name in stability_names if "-control" in name

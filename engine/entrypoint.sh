@@ -18,9 +18,69 @@ export MDD_ENGINE_SESSION
 MDD_ENGINE_SESSION=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 
 export MDD_RUNDIR="${MDD_RUNDIR:-/run/mdd-sim-gateway}"
-mkdir -p "$MDD_RUNDIR" /logs /etc/asterisk
+# /logs is bind-mounted from the host and survives both a container restart and a rebuild, so
+# Asterisk's own logs live there (astlogdir in asterisk.conf). Until this existed, every
+# investigation into "the engine restarted on its own" had to work from `docker logs` alone,
+# which loses everything the moment the manager recreates the container.
+export MDD_AST_LOGDIR="${MDD_AST_LOGDIR:-/logs/asterisk}"
+mkdir -p "$MDD_RUNDIR" /logs "$MDD_AST_LOGDIR" /etc/asterisk
 
 log() { echo "[entrypoint] $*"; }
+
+# One machine-readable line per supervised lifecycle transition (Asterisk exit, swu_ike exit,
+# backoff reset). The manager reads this to tell a docker-restart-policy bounce apart from a
+# rebuild it performed itself; `docker logs` cannot express that difference.
+supervisor_record() {
+    python3 - "$@" <<'PY' 2>/dev/null || true
+import json, os, sys, time
+rec = {"ts": int(time.time()), "event": sys.argv[1]}
+for pair in sys.argv[2:]:
+    key, _, value = pair.partition("=")
+    if not key:
+        continue
+    try:
+        rec[key] = int(value)
+    except ValueError:
+        rec[key] = value
+path = os.path.join(os.environ.get("MDD_AST_LOGDIR", "/logs/asterisk"), "supervisor.jsonl")
+try:
+    # Bounded: this file must never be the reason a 15G SD card fills up.
+    lines = []
+    if os.path.exists(path):
+        with open(path) as handle:
+            lines = handle.read().splitlines()[-499:]
+    lines.append(json.dumps(rec, sort_keys=True))
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+except OSError:
+    pass
+PY
+}
+
+# Keep the persisted Asterisk logs bounded. At the shipped verbosity these grow ~12 KB/day, so
+# the cap is never reached in practice; it exists so a debug session left switched on cannot
+# fill the card.
+AST_LOG_MAX_BYTES="${MDD_AST_LOG_MAX_BYTES:-8388608}"
+AST_LOG_KEEP="${MDD_AST_LOG_KEEP:-3}"
+
+rotate_asterisk_logs() {
+    for name in full messages; do
+        path="$MDD_AST_LOGDIR/$name"
+        [ -f "$path" ] || continue
+        size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+        [ "$size" -lt "$AST_LOG_MAX_BYTES" ] && continue
+        mv -f "$path" "$path.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || continue
+        # Ask the running Asterisk to reopen its files; harmless if it is not up yet.
+        asterisk -rx "logger reload" >/dev/null 2>&1 || true
+    done
+    # shellcheck disable=SC2012
+    ls -1t "$MDD_AST_LOGDIR"/full.* "$MDD_AST_LOGDIR"/messages.* 2>/dev/null \
+        | tail -n +$((AST_LOG_KEEP * 2 + 1)) | while read -r old; do rm -f "$old"; done
+}
+
+rotate_asterisk_logs
 
 # --- 1. Render configs from /config/instance.json --------------------------------
 log "rendering configs..."
@@ -78,10 +138,18 @@ rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
 # complete segments into persistent /logs/ike storage. This keeps it separate from Asterisk's
 # console (docker logs); the manager surfaces IKE and Asterisk as two separate views.
 # The supervisor's own status lines still go to the container stdout via log().
+# A run that carried traffic for this long counts as a successful connection, so the next
+# teardown starts from the short delay again. Without the reset the delay only ever doubled
+# (4 -> 8 -> ... -> 60) for the life of the process; that stayed invisible only because the
+# container itself was being restarted after nearly every teardown, which re-seeded it to 4.
+# Once Asterisk stops taking the container down with it, an unreset backoff would leave a
+# healthy line waiting a full minute to re-establish.
+SWU_STABLE_SECONDS="${SWU_STABLE_SECONDS:-120}"
 (
   backoff=4
   while true; do
     log "swu_ike starting"
+    started=$(date +%s)
     python3 -u /usr/local/bin/swu_ike.py \
         -m "${USIM_READER_INDEX:-0}" \
         -s "$SWU_SOURCE" \
@@ -100,7 +168,16 @@ rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
       log "swu_ike stopped after a terminal carrier rejection; waiting for manager or operator action"
       while true; do sleep 3600; done
     fi
+    ran=$(( $(date +%s) - started ))
+    if [ "$ran" -ge "$SWU_STABLE_SECONDS" ]; then
+      if [ "$backoff" -ne 4 ]; then
+        log "swu_ike had been up ${ran}s; resetting reconnect delay ${backoff}s -> 4s"
+        supervisor_record swu_backoff_reset "ran_seconds=$ran" "previous_backoff=$backoff"
+      fi
+      backoff=4
+    fi
     log "swu_ike exited (rc=$rc); reconnecting in ${backoff}s"
+    supervisor_record swu_ike_exited "rc=$rc" "ran_seconds=$ran" "backoff_seconds=$backoff"
     sleep "$backoff"; backoff=$((backoff*2)); [ "$backoff" -gt 60 ] && backoff=60
   done
 ) &

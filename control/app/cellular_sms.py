@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import hashlib
 import json
+import os
 import math
 import re
 import subprocess
@@ -32,6 +33,46 @@ _LOCAL_SMS_TTL = 3600.0
 _LOCAL_SMS_LIMIT = 512
 _local_sms_paths: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 _local_sms_lock = threading.RLock()
+
+
+# What to do with an SMS object once its message is safely in the database.
+#   delete     remove it at once: modem/SIM storage is small (tens of slots) and a full store
+#              stops all further delivery, while the database already holds the message.
+#   when_full  leave objects in place, deleting the oldest imported ones only when the storage
+#              is nearly full.
+#   keep       never delete; the operator manages modem storage.
+STORAGE_POLICIES = ("delete", "when_full", "keep")
+STORAGE_POLICY_ENV = "MDD_CELLULAR_SMS_STORAGE"
+STORAGE_LIMIT_ENV = "MDD_CELLULAR_SMS_STORAGE_LIMIT"
+# Slots kept free under when_full, so the parts of a long text still have room to arrive.
+_STORAGE_HEADROOM = 3
+# Assumed capacity when the modem does not answer AT+CPMS? (ModemManager without --debug).
+_DEFAULT_STORAGE_LIMIT = 20
+_CAPACITY_TTL = 600.0
+# The gateway's own object is removed once ModemManager reports it sent. One that never gets
+# there -- its send timed out, or the process exited mid-send -- is removed after this long,
+# which is far beyond any submit still in progress.
+_OWN_OBJECT_GRACE = 600.0
+# Give up after a few failures so an object that can never be deleted (a read-only storage, a
+# revoked permission) does not put an mmcli call into every five-second poll forever.
+_DELETE_ATTEMPTS = 3
+
+
+def storage_policy(settings: dict | None = None, environ=os.environ) -> str:
+    """The configured policy: settings.cellular_sms_storage, else the environment, else delete."""
+    for value in ((settings or {}).get("cellular_sms_storage"), environ.get(STORAGE_POLICY_ENV)):
+        text = str(value or "").strip().lower().replace("-", "_")
+        if text in STORAGE_POLICIES:
+            return text
+    return "delete"
+
+
+def storage_limit(environ=os.environ) -> int:
+    try:
+        value = int(str(environ.get(STORAGE_LIMIT_ENV) or "").strip())
+    except ValueError:
+        return _DEFAULT_STORAGE_LIMIT
+    return value if value > _STORAGE_HEADROOM else _DEFAULT_STORAGE_LIMIT
 
 
 def _run_json(args: list[str], runner=subprocess.run) -> dict:
@@ -501,14 +542,51 @@ def send(instances: list[dict], instance_id, recipient: str, text: str,
                      reservation_id=reservation_id)
 
 
+_ISO_ZONE_RE = re.compile(r"(?:Z|([+-])(\d{2})(?::?(\d{2}))?)$")
+
+
 def _timestamp(value) -> int:
+    """Epoch seconds of a ModemManager timestamp, independent of the host's time zone.
+
+    ModemManager writes the SMSC's zone as "+10" (hours only), which datetime.fromisoformat
+    rejects before Python 3.11, and a value without any zone would silently be read in the
+    host's local zone. The zone is normalised to "+HH:MM" first, and a value that still has
+    none is refused (0, so the receipt time is used) rather than guessed.
+    """
     raw = str(value or "").strip()
-    if not raw:
+    match = _ISO_ZONE_RE.search(raw)
+    if not raw or not match:
         return 0
+    if match.group(0) == "Z":
+        normalised = raw[:match.start()] + "+00:00"
+    else:
+        normalised = (raw[:match.start()] + f"{match.group(1)}{match.group(2)}:"
+                      f"{match.group(3) or '00'}")
     try:
-        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+        parsed = datetime.fromisoformat(normalised)
     except (ValueError, OverflowError):
         return 0
+    return int(parsed.timestamp()) if parsed.tzinfo is not None else 0
+
+
+_CPMS_RE = re.compile(r'"(\w+)"\s*,\s*(\d+)\s*,\s*(\d+)')
+
+
+def _storage_capacity(modem_path: str, runner) -> tuple[str, int, int] | None:
+    """(storage, used, total) of the modem's read/delete SMS storage, or None if unreadable.
+
+    ModemManager exposes no capacity, so this asks the modem (AT+CPMS?). The command channel
+    exists only while ModemManager runs with --debug; without it the caller falls back to a
+    configured object count.
+    """
+    result, problem = _invoke(["-m", modem_path, "--command=AT+CPMS?"], runner, 10)
+    if problem or getattr(result, "returncode", 1):
+        return None
+    match = _CPMS_RE.search(getattr(result, "stdout", "") or "")
+    if not match:
+        return None
+    total = int(match.group(3))
+    return (match.group(1).lower(), int(match.group(2)), total) if total > 0 else None
 
 
 class Scanner:
@@ -522,7 +600,7 @@ class Scanner:
     def __init__(self, runner=subprocess.run, *, topology_ttl: float = 60.0,
                  detail_ttl: float = 60.0, clock=time.monotonic, wall_clock=time.time,
                  local_sms_tracker=None, epoch_getter=_modemmanager_epoch,
-                 drop_mms_wap_push: bool = True):
+                 drop_mms_wap_push: bool = False, environ=os.environ):
         self.runner = runner
         self.topology_ttl = topology_ttl
         self.detail_ttl = detail_ttl
@@ -530,7 +608,10 @@ class Scanner:
         self.wall_clock = wall_clock
         self.local_sms_tracker = local_sms_tracker
         self.epoch_getter = epoch_getter
-        self.drop_mms_wap_push = drop_mms_wap_push
+        self.drop_mms_wap_push = False  # binary notifications now enter the MMS store
+        self.environ = environ
+        self._live_counts = {}
+        self._capacity = {}
         self._daemon_epoch = ""
         self._topology_expires = 0.0
         self._topology: list[tuple[str, str]] = []
@@ -539,17 +620,28 @@ class Scanner:
         self._wap_push_attempts: dict[tuple[str, str], int] = {}
         self._cleanup_retries: dict[tuple[str, str], tuple[int, float]] = {}
 
-    def _consume_mms_wap_push(self, key: tuple[str, str], modem_path: str,
-                              sms_path: str) -> None:
-        """Delete one recognised MMS notification so modem/SIM storage cannot fill up."""
-        attempts = self._wap_push_attempts.get(key, 0)
-        if attempts >= _WAP_PUSH_DELETE_ATTEMPTS:
-            return
-        self._wap_push_attempts[key] = attempts + 1
-        result, problem = _invoke(
-            ["-m", modem_path, f"--messaging-delete-sms={sms_path}"], self.runner, 10)
-        if problem is None and not result.returncode:
-            self._wap_push_attempts.pop(key, None)
+    def _read(self, sms_path: str) -> dict | None:
+        """One SMS object's detail in the scanner's own terms; None when it cannot be read."""
+        doc = _run_json(["-s", sms_path], self.runner)
+        sms = doc.get("sms")
+        if not isinstance(sms, dict):
+            return None
+        content, props = sms.get("content") or {}, sms.get("properties") or {}
+        timestamp = str(props.get("timestamp") or "")
+        return {
+            "peer": str(content.get("number") or ""),
+            "body": _sms_text(content.get("text")),
+            "content": content,
+            "state": str(props.get("state") or "").lower(),
+            "pdu_type": str(props.get("pdu-type") or "").lower(),
+            "storage": str(props.get("storage") or "").lower(),
+            "ts": _timestamp(timestamp),
+            "timestamp_raw": timestamp,
+            "signature": hashlib.sha256("\0".join((
+                str(content.get("number") or ""), str(content.get("text") or ""),
+                str(content.get("data") or ""), str(props.get("pdu-type") or ""),
+                timestamp)).encode("utf-8", "surrogatepass")).hexdigest(),
+        }
 
     def _delete_preserved_sms(self, modem_path: str, sms_path: str,
                               daemon_epoch: str) -> bool:
@@ -580,15 +672,56 @@ class Scanner:
         self._cleanup_retries[key] = (attempts, now + delay)
         return False
 
-    def delete_preserved(self, record: dict) -> bool:
-        """Remove a scanner record after the caller proves its database copy is durable."""
-        if not isinstance(record, dict):
+    def _preserved(self, record: dict) -> bool:
+        tracker = self.local_sms_tracker
+        if tracker is None:
             return False
-        return self._delete_preserved_sms(
-            str(record.get("_modem_path") or ""),
-            str(record.get("_sms_path") or ""),
-            str(record.get("_daemon_epoch") or ""),
-        )
+        if record.get("_stale_only"):
+            return True  # explicitly bounded, unassembled inbound fragment retention
+        if record.get("_local_only"):
+            return tracker.local_modem_sms_is_preserved(
+                record["instance"], record.get("_modem_iccid") or "",
+                record.get("_daemon_epoch") or "", record.get("_modem_path") or "",
+                record.get("_sms_path") or "", _content_hash(record["peer"], record["body"]))
+        if record.get("data"):
+            return tracker.cellular_binary_is_preserved(record["instance"], record["peer"], record["data"])
+        return tracker.imported_cellular_message_is_preserved(
+            record["fingerprint"], record["instance"], record["direction"], record["peer"],
+            record["body"], record["ts"], "cellular")
+
+    def delete_preserved(self, record: dict) -> bool:
+        """Recheck generation, actual SIM, object content and durable row before deletion."""
+        if not isinstance(record, dict) or not record.get("_signature"):
+            return False
+        modem_path, sms_path = record.get("_modem_path"), record.get("_sms_path")
+        epoch = record.get("_daemon_epoch")
+        if not epoch or not modem_path or not sms_path:
+            return False
+        with _local_sms_lock:
+            try:
+                if self.epoch_getter() != epoch:
+                    return False
+                modem = _run_json(["-m", modem_path], self.runner).get("modem") or {}
+                sim_path = str((modem.get("generic") or {}).get("sim") or "")
+                if not SIM_PATH_RE.fullmatch(sim_path):
+                    return False
+                props = ((_run_json(["-i", sim_path], self.runner).get("sim") or {}).get("properties") or {})
+                iccid, imsi = _normalize_iccid(props.get("iccid")), _normalize_imsi(props.get("imsi"))
+                if iccid:
+                    if iccid != record.get("_modem_iccid"):
+                        return False
+                elif not imsi or imsi != record.get("_modem_imsi"):
+                    return False
+                current = self._read(sms_path)
+                if not current or current["signature"] != record["_signature"]:
+                    return False
+                if record.get("_stale_only") and current["state"] != "receiving":
+                    return False
+                if not self._preserved(record):
+                    return False
+                return self._delete_preserved_sms(modem_path, sms_path, epoch)
+            except Exception:
+                return False
 
     def _refresh_topology(self, now: float) -> None:
         topology = []
@@ -624,6 +757,7 @@ class Scanner:
             self._wap_push_attempts.clear()
             self._cleanup_retries.clear()
             self._daemon_epoch = daemon_epoch
+            self._topology_expires = 0.0
         if now >= self._topology_expires:
             self._refresh_topology(now)
         by_iccid = {_normalize_iccid(item.get("iccid")): str(item.get("id")) for item in instances
@@ -658,6 +792,7 @@ class Scanner:
                 listing_complete = (isinstance(raw_paths, list)
                                      and all(SMS_PATH_RE.fullmatch(str(path))
                                              for path in raw_paths))
+            self._live_counts[modem_path] = len(paths) if listing_complete else None
             for sms_path in paths:
                 sms_path = str(sms_path)
                 if not SMS_PATH_RE.match(sms_path):
@@ -689,26 +824,23 @@ class Scanner:
                     state = str(props.get("state") or "").lower()
                     pdu_type = str(props.get("pdu-type") or "").lower()
                     timestamp = str(props.get("timestamp") or "")
-                    if state == "receiving":
-                        # ModemManager is still collecting the parts of a multi-part SMS.
-                        # Import once the assembled text is final; a partial body would be
-                        # stored now and the complete one imported again as a second message.
-                        # A day-old inbound fragment can no longer complete usefully and may
-                        # otherwise hold the modem's last storage slot forever.
+                    data = _sms_data(content.get("data")) if not text.strip() else b""
+                    if state in ("receiving", "sending"):
                         self._details.pop(key, None)
                         received_at = _timestamp(timestamp)
-                        if (pdu_type == "deliver" and self.local_sms_tracker is not None
+                        if (include_local_cleanup and state == "receiving" and pdu_type == "deliver"
                                 and daemon_epoch and received_at
                                 and self.wall_clock() - received_at >= STALE_RECEIVING_SECONDS):
-                            self._delete_preserved_sms(modem_path, sms_path, daemon_epoch)
+                            detail = self._read(sms_path)
+                            if detail:
+                                found.append({"instance": iid, "_stale_only": True,
+                                              "_modem_path": modem_path, "_sms_path": sms_path,
+                                              "_daemon_epoch": daemon_epoch, "_modem_iccid": iccid,
+                                              "_modem_imsi": modem_imsi,
+                                              "_signature": detail["signature"], "ts": received_at})
                         continue
-                    if not text.strip():
+                    if not text.strip() and (not data or pdu_type == "submit"):
                         self._details.pop(key, None)
-                        # A carrier MMS notification has no displayable form here and the
-                        # gateway never retrieves MMS, so nothing will ever consume it. Left
-                        # in place it occupies modem/SIM SMS storage indefinitely.
-                        if self.drop_mms_wap_push and _is_mms_wap_push(content):
-                            self._consume_mms_wap_push(key, modem_path, sms_path)
                         continue
                     direction = "out" if pdu_type == "submit" else "in"
                     signature_parts = [iccid, sms_path, direction, peer, text, timestamp]
@@ -721,8 +853,15 @@ class Scanner:
                     signature = "\0".join(signature_parts)
                     record = {
                         "fingerprint": hashlib.sha256(signature.encode()).hexdigest(),
+                        "legacy_fingerprint": hashlib.sha256("\0".join(signature_parts[:6]).encode()).hexdigest(),
                         "direction": direction, "peer": peer, "body": text,
-                        "ts": _timestamp(timestamp), "transport": "cellular",
+                        "ts": _timestamp(timestamp), "transport": "cellular", "data": data,
+                        "storage": str(props.get("storage") or "").lower(),
+                        "_modem_iccid": iccid, "_modem_imsi": modem_imsi,
+                        "_signature": hashlib.sha256("\0".join((peer,
+                            str(content.get("text") or ""), str(content.get("data") or ""),
+                            str(props.get("pdu-type") or ""), timestamp)).encode(
+                                "utf-8", "surrogatepass")).hexdigest(),
                     }
                     if self.local_sms_tracker is not None and daemon_epoch:
                         record.update({
@@ -769,6 +908,48 @@ class Scanner:
         for key in list(self._local_sms_keys):
             if key not in live_local_keys:
                 self._local_sms_keys.pop(key, None)
+        return found
+
+    def poll(self, instances: list[dict], ingest=None, *, policy: str = "delete") -> list:
+        """Import first; storage policy never substitutes for durable ownership evidence."""
+        records = self.discover(instances, include_local_cleanup=ingest is not None)
+        if ingest is None:
+            return [r for r in records if not r.get("_local_only") and not r.get("_stale_only")]
+        policy = policy if policy in STORAGE_POLICIES else "keep"
+        found, candidates = [], {}
+        for record in records:
+            try:
+                preserved = self._preserved(record)
+                if not preserved and not record.get("_local_only") and not record.get("_stale_only"):
+                    stored = ingest(record)
+                    if stored:
+                        found.append(stored)
+                if policy != "keep" and self._preserved(record):
+                    if policy == "delete":
+                        self.delete_preserved(record)
+                    else:
+                        candidates.setdefault(record.get("_modem_path"), []).append(record)
+            except Exception:
+                continue
+        for modem, retained in candidates.items():
+            if not modem or self._live_counts.get(modem) is None:
+                continue
+            now = self.clock()
+            cached = self._capacity.get(modem)
+            capacity = cached[1] if cached and now < cached[0] else _storage_capacity(modem, self.runner)
+            self._capacity[modem] = (now + _CAPACITY_TTL, capacity)
+            if capacity:
+                storage, used, total = capacity
+                retained = [r for r in retained if r.get("storage", "") in ("", storage)]
+            else:
+                used, total = self._live_counts[modem], storage_limit(self.environ)
+            excess = max(0, used - total + _STORAGE_HEADROOM)
+            for record in sorted(retained, key=lambda r: r.get("ts", 0)):
+                if excess <= 0:
+                    break
+                if self.delete_preserved(record):
+                    excess -= 1
+                    self._capacity.pop(modem, None)
         return found
 
 

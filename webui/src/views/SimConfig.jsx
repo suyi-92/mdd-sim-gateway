@@ -6,7 +6,7 @@ import { useI18n } from '../i18n.jsx'
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '', proxy_country: '',
   reader_index: 0, reader_port: '', msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
-  sip: { listen_addr: '0.0.0.0', webrtc: { enable: true } },
+  sip: { webrtc: { enable: true } },
   debug: { asterisk: false, charon: false },
 })
 
@@ -199,6 +199,7 @@ export default function SimConfig({ instances, selected, refresh, onInstanceSave
       // (they are computed per-request, not config — never persist them).
       delete body.status; delete body.has_pin
       delete body.number_country; delete body.applied
+      delete body.proxy_country_effective; delete body.sip_carrier_defaults
       // Never send an empty PIN — the stored PIN (tied to this IMSI) must survive edits to
       // unrelated fields. `pin` state is only set when the user re-enters/verifies a PIN
       // here; only then do we forward it to update the saved credential.
@@ -449,11 +450,36 @@ export default function SimConfig({ instances, selected, refresh, onInstanceSave
               {t('Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.')}
             </div>
           </Field>
-          <label style={{ marginTop: 8 }}>
-            <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!form.sip.user_eq_phone}
-              onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
-            {t('Add ;user=phone to telephone-number SIP requests')}
-          </label>
+          {/* The endpoint-wide switch is superseded by the call-only parameters below. It stays
+              visible only on a line where someone turned it on by hand, so it can be turned off;
+              a carrier default (O2) keeps working without being shown twice. */}
+          {form.sip.user_eq_phone === true && !(form.sip_carrier_defaults || {}).user_eq_phone &&
+            <label style={{ marginTop: 8 }}>
+              <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked
+                onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
+              {t('Add ;user=phone to every SIP request, SMS included (older setting; the call-only option below replaces it)')}
+            </label>}
+          {(() => {
+            // A setting the line leaves unset follows the carrier profile, so show that value.
+            const carrier = form.sip_carrier_defaults || {}
+            const enabled = form.sip.invite_uri_params_enable ?? !!carrier.invite_uri_params_enable
+            return <>
+              <label style={{ marginTop: 8 }}>
+                <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={enabled}
+                  onChange={(e) => updSip({ invite_uri_params_enable: e.target.checked })} />
+                {t('Add parameters to the request URI of outgoing calls')}
+              </label>
+              {enabled && <Field label={t('Request URI parameters')}>
+                <input className="mono" maxLength={128}
+                  value={form.sip.invite_uri_params ?? carrier.invite_uri_params ?? ''}
+                  onChange={(e) => updSip({ invite_uri_params: e.target.value })}
+                  placeholder="user=phone" />
+                <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+                  {t('Outgoing calls only; SMS is not affected. Separate several parameters with ;.')}
+                </div>
+              </Field>}
+            </>
+          })()}
         </details>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>

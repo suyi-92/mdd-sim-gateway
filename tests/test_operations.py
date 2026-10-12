@@ -255,6 +255,64 @@ class OperationsTests(unittest.TestCase):
         self.assertIn("#225#", captured)              # the code itself still diagnosable
         self.assertNotIn("sms_in", captured)          # message events are not call evidence
 
+    def test_support_bundle_keeps_the_hangup_side_but_nothing_else_in_its_slot(self):
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+447700900123", "ANSWER", "16", "carrier"]},
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+447700900123", "ANSWER", "16", "+447700900999"]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = [json.loads(l) for l in
+                            archive.read("logs/sim1-call-events.jsonl").decode().splitlines()]
+        self.assertEqual(captured[0]["args"], ["out", "<number>", "ANSWER", "16", "carrier"])
+        # The slot is a closed vocabulary; anything else is not let through as evidence.
+        self.assertEqual(captured[1]["args"][4], "<unknown>")
+
+    def test_support_bundle_carries_asterisk_problems_without_the_identity(self):
+        """An answered call that drops at once is explained only by Asterisk's own warnings.
+
+        `messages` also names the IMS public identity on every registration, so only the
+        WARNING/ERROR lines are taken, and every SIP/tel user part is removed from them.
+        """
+        messages = "\n".join([
+            "[Sep 21 22:05:00] NOTICE[100] res_pjsip_outbound_registration.c: Registered "
+            "'sip:234870000000001@ims.mnc087.mcc234.3gppnetwork.org'",
+            "[Sep 21 22:06:43] WARNING[2987][C-00000009] res_pjsip_sdp_rtp.c: No joint "
+            "capabilities for 'audio' from <sip:+447700900123@ims.example;user=phone>",
+            "[Sep 21 22:06:43] ERROR[2987][C-00000009] app_stack.c:390 return_exec: "
+            "Return without Gosub: stack is unallocated",
+            "[Sep 21 22:06:44] WARNING[2988] chan_pjsip.c: peer tel:+447700900456",
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs", "asterisk")
+            logs.mkdir(parents=True)
+            logs.joinpath("messages").write_text(messages + "\n")
+            logs.joinpath("full").write_text("[Sep 21] WARNING[1] full-log-must-stay-out\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                names = archive.namelist()
+                captured = archive.read("logs/sim1-asterisk-problems.log").decode()
+                manifest = json.loads(archive.read("manifest.json"))
+
+        self.assertIn("No joint capabilities", captured)          # the evidence itself
+        self.assertIn("[C-00000009]", captured)                   # still tied to its call
+        self.assertIn("Return without Gosub", captured)
+        self.assertNotIn("Registered", captured)                  # NOTICE lines stay out
+        self.assertNotIn("234870000000001", captured)
+        self.assertNotIn("447700900123", captured)
+        self.assertNotIn("447700900456", captured)
+        self.assertIn("sip:<user>@ims.example", captured)
+        self.assertIn("tel:<number>", captured)
+        self.assertNotIn("full-log-must-stay-out", "".join(names) + captured)
+        self.assertEqual(manifest["files"]["logs/sim1-asterisk-problems.log"]
+                         ["filtered_lines"], 1)
+
     def test_support_bundle_carries_the_host_view_the_control_plane_cannot_observe(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
             orchestrator = Path(temp, "orchestrator")
@@ -693,6 +751,81 @@ class ServiceRestartTests(unittest.TestCase):
 
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
+
+    def test_a_container_restart_that_never_completes_is_reported_failed(self):
+        self.root.mkdir(parents=True)
+        (self.root / "service-restart-status.json").write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container",
+            "updated_at": int(time.time()) - 300}))
+        status = operations.service_restart_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "restart.error.failed")
+
+
+    def test_container_service_restart_checks_ownership_and_orders_base_services_first(self):
+        restarted = []
+
+        class Container:
+            def __init__(self, component):
+                self.attrs = {"Config": {"Labels": {
+                    "io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": component}}}
+                self.component = component
+                self.image = Mock(id=f"sha256:{component}")
+            def restart(self, timeout):
+                self.assert_timeout = timeout
+                restarted.append(self.component)
+
+        containers = {name: Container(component) for component, name in {
+            "control": "mdd-sim-gateway-control",
+            "hardware": "mdd-sim-gateway-hardware",
+            "egress": "mdd-sim-gateway-egress"}.items()}
+        client = Mock()
+        client.containers.get.side_effect = containers.__getitem__
+        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
+            operations.request_service_restart("services")
+            result = operations.perform_container_service_restart("services", client)
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(restarted, ["egress", "hardware"])
+        client.containers.run.assert_called_once()
+        helper = client.containers.run.call_args
+        self.assertEqual(helper.args[0], "sha256:control")
+        self.assertEqual(helper.kwargs["network_mode"], "none")
+        self.assertEqual(helper.kwargs["healthcheck"], {"test": ["NONE"]})
+        self.assertEqual(len(helper.kwargs["command"]), 1)
+        self.assertIn("mdd-sim-gateway-control", helper.kwargs["command"][0])
+        self.assertIn("target.restart(timeout=30)", helper.kwargs["command"][0])
+        self.assertTrue((self.root / "pcsc-maintenance").is_file())
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_container_restart_refuses_a_foreign_named_container(self):
+        foreign = Mock()
+        foreign.attrs = {"Config": {"Labels": {}}}
+        client = Mock()
+        client.containers.get.return_value = foreign
+        operations.request_service_restart("control")
+        result = operations.perform_container_service_restart("control", client)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("unowned", result["error"])
+        foreign.restart.assert_not_called()
+
+    def test_container_restart_reports_an_unavailable_docker_daemon(self):
+        operations.request_service_restart("control")
+        with patch.object(operations.docker, "from_env",
+                          side_effect=RuntimeError("daemon unavailable")):
+            result = operations.perform_container_service_restart("control")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_code"], "restart.error.failed")
+        self.assertIn("daemon unavailable", result["error"])
+
+    def test_returning_control_process_settles_container_restart(self):
+        status_path = self.root / "service-restart-status.json"
+        self.root.mkdir(parents=True)
+        status_path.write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container"}))
+        status = operations.settle_container_service_restart()
+        self.assertEqual(status["state"], "success")
 
 
 class DeviceRescanOperationTests(unittest.TestCase):

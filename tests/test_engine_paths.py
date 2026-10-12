@@ -8,7 +8,17 @@ import unittest
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
+
+
+def _docker_errors():
+    """Mirror docker-py's hierarchy: ImageNotFound is a subclass of NotFound there, so a
+    stub that makes them unrelated would hide a handler catching the wrong one."""
+    not_found = type("NotFound", (Exception,), {})
+    return SimpleNamespace(
+        NotFound=not_found,
+        ImageNotFound=type("ImageNotFound", (not_found,), {}),
+    )
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +66,7 @@ class EnginePathTests(unittest.TestCase):
     def engine_module():
         fake_docker = SimpleNamespace(
             from_env=lambda: None,
-            errors=SimpleNamespace(NotFound=type("NotFound", (Exception,), {})),
+            errors=_docker_errors(),
         )
         with patch.dict(sys.modules, {"docker": fake_docker}):
             sys.modules.pop("control.app.engine", None)
@@ -154,7 +164,8 @@ class EnginePathTests(unittest.TestCase):
         self.assertEqual(captured["volumes"]["/etc/localtime"],
                          {"bind": "/etc/localtime", "mode": "ro"})
         # Only authenticated WebRTC and RTP stay reachable; standalone SIP is not published.
-        for exposed in ("8089/tcp", "10000/udp"):
+        self.assertNotIn("8089/tcp", bindings)
+        for exposed in ("10000/udp",):
             self.assertNotIsInstance(bindings[exposed], tuple)
         self.assertNotIn("5060/udp", bindings)
         self.assertNotIn("5061/tcp", bindings)

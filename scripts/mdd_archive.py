@@ -146,7 +146,7 @@ def read_manifest(path: Path) -> dict:
             value = json.load(stream)
     except (OSError, ValueError) as exc:
         raise ArchiveError("backup manifest is missing or invalid") from exc
-    if not isinstance(value, dict) or set(value) != MANIFEST_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (MANIFEST_FIELDS, MANIFEST_FIELDS | {"mms"}):
         raise ArchiveError("backup manifest fields are invalid")
     if value.get("format") != 1 or value.get("kind") != "mdd-sim-gateway-data":
         raise ArchiveError("unsupported backup manifest")
@@ -172,6 +172,49 @@ def _tar_info(name: str, metadata: os.stat_result, *, directory: bool) -> tarfil
     return item
 
 
+def mms_inventory(root: Path) -> dict:
+    """Inventory every referenced MMS part; distinguish existing gaps from archive loss."""
+    files, missing = {}, set()
+    for database, metadata in _data_entries(root):
+        if not stat.S_ISREG(metadata.st_mode) or not database.name.endswith(DATABASE_SUFFIXES):
+            continue
+        connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
+        try:
+            has_parts = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mms_parts'").fetchone()
+            rows = connection.execute("SELECT message_id,path,size FROM mms_parts WHERE path!=''").fetchall() if has_parts else []
+        finally:
+            connection.close()
+        for mid, name, size in rows:
+            if not isinstance(name, str) or Path(name).name != name or name in ("", ".", "..") or "\\" in name:
+                raise ArchiveError("unsafe MMS attachment reference")
+            media = database.with_suffix(".mms") if "-before-v" in database.name else database.parent / "mms"
+            relative = (media / str(int(mid)) / name).relative_to(root).as_posix()
+            path = root / relative
+            if not path.exists():
+                missing.add(relative)
+                continue
+            if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+                raise ArchiveError("unsafe MMS attachment type")
+            if path.stat().st_size != int(size or 0):
+                raise ArchiveError("MMS attachment size disagrees with database")
+            digest = hashlib.sha256()
+            with path.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            files[relative] = {'size': int(size or 0), 'sha256': digest.hexdigest()}
+    return {'files': files, 'missing_parts': sorted(missing)}
+
+
+def verify_mms_inventory(root: Path, expected: dict | None) -> None:
+    observed = mms_inventory(root)
+    if expected is None:
+        # Legacy backups did not describe known missing parts; do not invent exceptions.
+        if observed['missing_parts']:
+            raise ArchiveError('legacy backup contains missing MMS attachments')
+    elif observed != expected:
+        raise ArchiveError('MMS database references or attachment digests do not match backup')
+
+
 def create_backup(data_root: Path, archive_path: Path, *, version: str,
                   source_commit: str, created_at: str) -> list[str]:
     """Create a root-owned portable archive from a quiesced data directory."""
@@ -182,8 +225,10 @@ def create_backup(data_root: Path, archive_path: Path, *, version: str,
         raise ArchiveError("the data root is not a directory")
     checked = sqlite_check_tree(data_root)
     payload = _manifest(version=version, source_commit=source_commit, created_at=created_at)
+    payload["mms"] = mms_inventory(data_root)
     manifest = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
     root_metadata = data_root.stat()
+    packed_mms = set()
 
     with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
         manifest_info = tarfile.TarInfo("manifest.json")
@@ -214,6 +259,8 @@ def create_backup(data_root: Path, archive_path: Path, *, version: str,
                 item.size = current.st_size
                 with os.fdopen(descriptor, "rb", closefd=False) as stream:
                     archive.addfile(item, stream)
+                if relative in payload["mms"]["files"]:
+                    packed_mms.add(relative)
                 after = os.fstat(descriptor)
                 # Windows may refresh the sub-second timestamp representation after a file read.
                 # Linux is the supported runtime and provides the exact nanosecond comparison.
@@ -222,6 +269,9 @@ def create_backup(data_root: Path, archive_path: Path, *, version: str,
                     raise ArchiveError(f"data file changed while backing up: {relative}")
             finally:
                 os.close(descriptor)
+    if packed_mms != set(payload["mms"]["files"]):
+        raise ArchiveError("referenced MMS attachment was omitted from archive")
+    verify_mms_inventory(data_root, payload["mms"])
     os.chmod(archive_path, 0o600)
     return checked
 
@@ -270,7 +320,7 @@ def safe_extract(archive_path: Path, destination: Path, *, max_bytes: int | None
         data_member = next(member for member in members if member.name.rstrip("/") == "data")
         if not manifest_member.isfile() or not data_member.isdir():
             raise ArchiveError("backup manifest/data has an invalid type")
-        if manifest_member.size > 16384:
+        if manifest_member.size > 16 * 1024 * 1024:
             raise ArchiveError("backup manifest exceeds the size limit")
         directory_modes: list[tuple[Path, int]] = []
         for member in members:
@@ -295,6 +345,7 @@ def safe_extract(archive_path: Path, destination: Path, *, max_bytes: int | None
             os.chmod(target, mode)
     manifest = read_manifest(destination / "manifest.json")
     sqlite_check_tree(destination / "data")
+    verify_mms_inventory(destination / "data", manifest.get("mms"))
     return manifest
 
 

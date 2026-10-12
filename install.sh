@@ -767,6 +767,7 @@ verify_prepared_build() {
     warn "build verification failed: Control venv console scripts or dependencies are invalid"
     return 1
   }
+  "$root/venv/bin/python" "$source/tools/check-mms-codecs.py" || return 1
   [[ -f "$root/venv/bin/lpac" && ! -L "$root/venv/bin/lpac" ]] || return 1
   python3 - "$root/manifest.json" "$expected_sha" "$expected_version" "$image" "$runtime_fp" "$base_fp" \
     "$(docker image inspect "$image" --format '{{.Id}}')" \
@@ -835,6 +836,7 @@ prepare_build() {
   python3 -m venv --clear "$temp/venv"
   "$temp/venv/bin/pip" install --disable-pip-version-check --no-cache-dir -r "$source_dir/control/requirements.txt"
   "$temp/venv/bin/pip" check
+  "$temp/venv/bin/python" "$source_dir/tools/check-mms-codecs.py"
   build_lpac "$temp/venv/bin/lpac"
 
   info "building WebUI in fixed Node container $NODE_BUILD_IMAGE"
@@ -902,6 +904,8 @@ PY
   rm -rf -- "$build_root"
   mv "$temp" "$build_root"
   relocate_venv "$build_root/venv" "$temp/venv" "$build_root/venv"
+  "$build_root/venv/bin/pip" check || die "relocated Control dependencies failed"
+  "$build_root/venv/bin/python" "$source_dir/tools/check-mms-codecs.py" || die "relocated MMS codecs failed"
   touch "$build_root/READY"
   if ! verify_prepared_build "$source_dir" "$build_root" "$sha"; then
     rm -f "$build_root/READY"
@@ -932,6 +936,10 @@ activate_build() {
   sha=${sha:-$(git -C "$source_dir" rev-parse HEAD)}
   build_root=${build_root:-$cache_dir/builds/$sha}
   verify_prepared_build "$source_dir" "$build_root" "$sha" || die "build is incomplete or does not match source $sha: $build_root"
+  # Older managers cannot restore host rule changes after a failed health gate.
+  if [[ -f "$state_dir/active-commit" && ${MDD_UPDATE_MANAGER_ABI:-0} != 2 ]]; then
+    die "MMS host-rule activation requires the current managed update transaction; use latest bootstrap update"
+  fi
   local image="mdd-sim-gateway/engine:$sha" lan_ip
   docker image inspect "$image" >/dev/null || die "verified Engine image is missing: $image"
   docker tag "$image" "$ENGINE_STABLE_IMAGE"
@@ -994,6 +1002,7 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+  python3 "$source_dir/scripts/mdd_udev.py" apply
   install -m 0755 "$source_dir/scripts/mddctl" /usr/local/sbin/mddctl
   systemctl daemon-reload
   systemctl enable mdd-sim-gateway-control.service mdd-sim-gateway-orchestrator.service >/dev/null
@@ -1195,6 +1204,19 @@ case "$action" in
     cellular_gate
     build_root="$cache_dir/builds/$sha"
     prepare_build
+    initial_rule_backup="$state_dir/udev-backups/pre-install-$$.json"
+    python3 "$source_dir/scripts/mdd_udev.py" snapshot --backup "$initial_rule_backup"
+    initial_rule_rollback() {
+      local code=$?
+      trap - EXIT HUP INT TERM
+      python3 "$source_dir/scripts/mdd_udev.py" restore --backup "$initial_rule_backup" || \
+        warn "secondary AT-port rule rollback failed; recovery material: $initial_rule_backup"
+      exit "$code"
+    }
+    trap initial_rule_rollback EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     activate_build
     configure_firewall_rules
     if ((no_start == 0)); then
@@ -1208,6 +1230,7 @@ case "$action" in
     else
       info "services installed but not started (--no-start)"
     fi
+    trap - EXIT HUP INT TERM
     info "installation complete; manage this VM with mddctl"
     ;;
 esac

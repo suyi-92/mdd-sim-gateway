@@ -828,6 +828,8 @@ cmd_update() {
   UPDATE_WORKTREE=""
   UPDATE_SNAPSHOT=""
   UPDATE_PREVIOUS_IMAGE=""
+  UPDATE_RULE_BACKUP=""
+  UPDATE_RULE_HELPER=""
   UPDATE_WORKTREE_ACTIVE=0
   UPDATE_TRANSACTION_ARMED=0
   if ((dry_run)); then info "update preflight passed for $old; no fetch or build performed"; return; fi
@@ -858,6 +860,12 @@ cmd_update() {
       if ! (stop_runtime) >/dev/null 2>&1; then
         warn "rollback could not fully stop the failed generation; continuing bounded recovery"
       fi
+      if [[ -n "$UPDATE_RULE_BACKUP" ]]; then
+        if ! python3 "$UPDATE_RULE_HELPER" restore --backup "$UPDATE_RULE_BACKUP"; then
+          warn "secondary AT-port rule rollback failed"
+          rollback_failed=1
+        fi
+      fi
       current_status=$(managed_checkout_status_kind 2>/dev/null || printf invalid)
       current_branch=$(git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || true)
       current_remote=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)
@@ -876,7 +884,7 @@ cmd_update() {
         rollback_failed=1
       fi
       if ((rollback_failed == 0)); then
-        if ! bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" \
+        if ! env MDD_UPDATE_MANAGER_ABI=2 bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" \
             --build-root "$UPDATE_OLD_BUILD" --sha "$UPDATE_OLD"; then
           warn "rollback could not reactivate the previous venv and WebUI"
           rollback_failed=1
@@ -942,6 +950,11 @@ cmd_update() {
   (cd "$worktree" && "$build/venv/bin/python" -m unittest discover -s tests -p 'test_*.py')
   (driver_reprobe_native)
 
+  UPDATE_RULE_HELPER="$CACHE_DIR/update/mms-rules-$new.py"
+  UPDATE_RULE_BACKUP="$STATE_DIR/udev-backups/pre-update-$old-$new-$$.json"
+  install -m 0600 "$worktree/scripts/mdd_udev.py" "$UPDATE_RULE_HELPER"
+  python3 "$UPDATE_RULE_HELPER" snapshot --backup "$UPDATE_RULE_BACKUP"
+
   snapshot="$BACKUP_DIR/pre-update-$old-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
   UPDATE_SNAPSHOT=$snapshot
   remember_run_state
@@ -952,7 +965,7 @@ cmd_update() {
   docker image inspect "$ENGINE_STABLE_IMAGE" >/dev/null 2>&1 && docker tag "$ENGINE_STABLE_IMAGE" "$previous_image"
 
   git -C "$INSTALL_DIR" merge --ff-only "origin/$BRANCH"
-  bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$build" --sha "$new"
+  env MDD_UPDATE_MANAGER_ABI=2 bash "$INSTALL_DIR/install.sh" activate --source "$INSTALL_DIR" --build-root "$build" --sha "$new"
   start_runtime
   health_check
   printf '%s\n' "$old" > "$STATE_DIR/previous-commit"
@@ -980,6 +993,7 @@ cmd_uninstall() {
   fi
   if [[ -f "$STATE_DIR/scr-prime-driver.json" ]]; then driver_restore_internal; fi
   stop_runtime
+  python3 "$INSTALL_DIR/scripts/mdd_udev.py" remove
   systemctl disable "$CONTROL_UNIT" "$ORCHESTRATOR_UNIT" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$CONTROL_UNIT" "/etc/systemd/system/$ORCHESTRATOR_UNIT"
   rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf

@@ -59,7 +59,11 @@ class UpdateRollbackTransactionTests(unittest.TestCase):
             run(["git", "clone", "--quiet", "--bare", str(fixture.repo), str(remote)])
             run(["git", "clone", "--quiet", str(remote), str(producer)])
             (producer / "tracked.txt").write_text("new generation\n", encoding="utf-8")
-            run(["git", "add", "tracked.txt"], cwd=producer)
+            (producer / "scripts").mkdir(exist_ok=True)
+            # Exercise manager rollback with a side-effect-free helper; real rule mutations
+            # are covered separately against temporary rules and command runners.
+            (producer / "scripts/mdd_udev.py").write_text("import pathlib,sys\nif 'snapshot' in sys.argv: pathlib.Path(sys.argv[-1]).parent.mkdir(parents=True,exist_ok=True); pathlib.Path(sys.argv[-1]).write_text('{}')\n")
+            run(["git", "add", "tracked.txt", "scripts/mdd_udev.py"], cwd=producer)
             run(["git", "commit", "-m", "new generation"], cwd=producer)
             run(["git", "push", "origin", "vmware"], cwd=producer)
             new = run(["git", "rev-parse", "HEAD"], cwd=producer).stdout.strip()
@@ -116,6 +120,14 @@ docker() {{
   if [[ "$1" == image && "$2" == ls ]]; then return 0; fi
   if [[ "$1" == image && "$2" == rm ]]; then return 0; fi
   return 92
+}}
+env() {{
+  if [[ "${{1:-}}" == MDD_UPDATE_MANAGER_ABI=2 && "${{2:-}}" == bash ]]; then
+    shift 2
+    MDD_UPDATE_MANAGER_ABI=2 bash "$@"
+  else
+    command env "$@"
+  fi
 }}
 bash() {{
   if [[ "$1" == -n ]]; then return 0; fi

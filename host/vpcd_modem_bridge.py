@@ -3,7 +3,8 @@
 
 Each VPCD slot is mapped to one ISO 7816 logical channel.  The modem has one
 physical AT port, so all AT commands are serialized while the selected-file
-state remains isolated by the UICC logical channels.
+state remains isolated by the UICC logical channels.  A card that grants fewer
+channels than slots has slots share a channel (see ChannelArbiter).
 """
 
 import argparse
@@ -51,10 +52,21 @@ CHANNEL_SETTLE_SECONDS = 0.5
 # already proved a card is evidence that its physical SIM generation changed or became
 # unusable; the current logical channels must then be retired instead of serving stale state.
 IDENTITY_LOSS_LIMIT = 3
+# Some UICCs expose a single supplementary logical channel (a China Unicom USIM answered the
+# second MANAGE CHANNEL OPEN with 6A81). Slots then share a channel, which is only safe if a
+# slot finds the card where it left it: each slot's SELECTs are replayed when the channel
+# changes hands, and a slot owed a GET RESPONSE keeps the channel until it asks for it.
+PENDING_RESPONSE_HOLD_SECONDS = 2.0
+MAX_SELECT_HISTORY = 16
+SELECT_MF = bytes.fromhex("00A40004023F00")
 
 
 class ModemError(RuntimeError):
     pass
+
+
+class ChannelCapacityError(ModemError):
+    """Only a verified 6A81 MANAGE CHANNEL reply permits channel sharing."""
 
 
 def decode_bcd_iccid(data):
@@ -71,38 +83,57 @@ def decode_bcd_iccid(data):
     return value if value.startswith("89") and 18 <= len(value) <= 20 else ""
 
 
-def logical_channel_metadata(channels, requested=3, status="ready", error=""):
-    """Return stable, UI-safe resource metadata for one physical UICC."""
+def logical_channel_metadata(channels, requested=3, status="ready", error="",
+                             slot_channels=None):
+    """Return stable, UI-safe resource metadata for one physical UICC.
+
+    `slot_channels` maps every served slot to its channel; it repeats a channel when the
+    card had fewer channels than slots and the slots share one.
+    """
     values = [int(channel) for channel in channels]
+    served = [int(channel) for channel in (values if slot_channels is None else slot_channels)]
     return {
         "channel_capacity": LOGICAL_CHANNEL_CAPACITY,
         "channel_requested": int(requested),
         "channel_allocated": len(values),
         "channel_status": str(status),
         "channel_error": str(error),
+        "channel_shared": len(set(served)) < len(served),
+        "slots_served": len(served),
         "logical_channels": [
             {"slot": slot, "channel": channel, "role": LOGICAL_CHANNEL_ROLES[slot]}
-            for slot, channel in enumerate(values)
+            for slot, channel in enumerate(served)
         ],
     }
 
 
 def allocate_logical_channels(card, count):
-    """Allocate unique UICC channels and clean up partial allocations on failure."""
+    """Allocate up to `count` unique UICC channels; at least one is required.
+
+    A card that runs out of channels part way is served with what it granted (see
+    slot_channel_map) rather than refused outright. Nothing is left open on failure.
+    """
     channels = []
     try:
         for _slot in range(int(count)):
-            channel = card.open_channel()
-            for attempt in range(2, CHANNEL_OPEN_ATTEMPTS + 1):
-                if channel not in channels:
-                    break
-                print("[bridge] MANAGE CHANNEL OPEN returned channel %d again; settling the "
-                      "AT port and retrying (attempt %d/%d)" %
-                      (channel, attempt, CHANNEL_OPEN_ATTEMPTS), flush=True)
-                card.settle()
+            try:
                 channel = card.open_channel()
-            if channel in channels:
-                raise ModemError("duplicate logical channel allocated: %d" % channel)
+                for attempt in range(2, CHANNEL_OPEN_ATTEMPTS + 1):
+                    if channel not in channels:
+                        break
+                    print("[bridge] MANAGE CHANNEL OPEN returned channel %d again; settling "
+                          "the AT port and retrying (attempt %d/%d)" %
+                          (channel, attempt, CHANNEL_OPEN_ATTEMPTS), flush=True)
+                    card.settle()
+                    channel = card.open_channel()
+                if channel in channels:
+                    raise ModemError("duplicate logical channel allocated: %d" % channel)
+            except ChannelCapacityError as exc:
+                if not channels:
+                    raise
+                print("[bridge] SIM granted %d of %d logical channels (%s); slots will share"
+                      % (len(channels), int(count), exc), flush=True)
+                break
             channels.append(channel)
         return channels
     except Exception as exc:
@@ -127,6 +158,142 @@ def allocate_logical_channels_with_recovery(card, count):
         raise ModemError(
             "SIM logical channel allocation failed without closing unowned channels: %s"
             % error) from error
+def slot_channel_map(channels, slots):
+    """Assign every slot a channel, sharing when the card granted fewer than `slots`.
+
+    With two channels the IMS slot keeps one to itself: Asterisk abandons an AKA request
+    after a fixed timeout, while PIN checks and the SWu handshake are not that sensitive
+    and do not run at the same moment as an IMS registration challenge.
+    """
+    channels = list(channels)
+    if len(channels) >= slots:
+        return channels[:slots]
+    if len(channels) == 1:
+        return channels * slots
+    # Two channels, three slots: pin and swu share, ims ("ims" is the last role) is alone.
+    return [channels[0]] * (slots - 1) + [channels[1]]
+
+
+def _is_select(apdu):
+    return len(apdu) >= 4 and apdu[1] == 0xA4
+
+
+def _is_absolute_select(apdu):
+    """True when a SELECT fixes the whole file context by itself, independent of history."""
+    p1 = apdu[2]
+    if p1 in (0x04, 0x08):  # by DF name (AID), by path from MF
+        return True
+    if p1 == 0x00:
+        data = apdu[5:5 + apdu[4]] if len(apdu) > 5 else b""
+        return data in (b"", b"\x3F\x00")
+    return False
+
+
+def _select_succeeded(response):
+    return len(response) >= 2 and (response[-2:] == b"\x90\x00" or
+                                   response[-2] in (0x91, 0x61, 0x9F, 0x62, 0x63))
+
+
+class ChannelArbiter:
+    """Serialize the slots mapped to one UICC logical channel.
+
+    A slot that is alone on its channel pays nothing: the owner never changes, so no SELECT
+    is replayed. The selected-file history is still kept, so the same object serves both
+    the one-channel-per-slot and the shared layouts.
+    """
+
+    def __init__(self, card, channel):
+        self.card = card
+        self.channel = channel
+        self.cond = threading.Condition()
+        self.owner = None
+        self.pending = None
+        self.pending_deadline = 0.0
+        self.selects = {}
+        self.overflowed = set()
+
+    def _restore(self, slot):
+        if slot in self.overflowed:
+            raise ModemError("shared channel SELECT history cannot be restored")
+        history = self.selects.get(slot) or [SELECT_MF]
+        for apdu in history:
+            command = apdu
+            response = self.card.transmit(command, self.channel)
+            for _ in range(8):
+                if len(response) < 2:
+                    raise ModemError("short shared channel SELECT response")
+                sw1, sw2 = response[-2:]
+                if sw1 in (0x61, 0x9F):
+                    command = bytes((0, 0xC0, 0, 0, sw2))
+                    response = self.card.transmit(command, self.channel)
+                elif sw1 == 0x6C:
+                    if len(command) == 5 or len(command) == 6 + command[4]:
+                        command = command[:-1] + bytes((sw2,))
+                    elif command[4] and len(command) == 5 + command[4]:
+                        command += bytes((sw2,))
+                    else:
+                        raise ModemError("unsupported shared SELECT length correction")
+                    response = self.card.transmit(command, self.channel)
+                else:
+                    break
+            if not _select_succeeded(response) or response[-2] in (0x61, 0x9F):
+                raise ModemError("shared channel SELECT restore failed")
+
+    def _claim(self, slot):
+        """Wait out another slot's owed GET RESPONSE, then make `slot` the owner."""
+        while self.pending not in (None, slot):
+            remaining = self.pending_deadline - time.monotonic()
+            if remaining <= 0:
+                self.overflowed.add(self.pending)
+                self.pending = None
+                break
+            self.cond.wait(remaining)
+        if slot in self.overflowed:
+            raise ModemError("shared channel state expired or overflowed")
+        if self.owner is not None and self.owner != slot:
+            self._restore(slot)
+        self.owner = slot
+
+    def _record(self, slot, apdu, response):
+        if not _is_select(apdu) or not _select_succeeded(response):
+            return
+        if _is_absolute_select(apdu):
+            self.selects[slot] = [apdu]
+            self.overflowed.discard(slot)
+            return
+        history = self.selects.setdefault(slot, [])
+        history.append(apdu)
+        if len(history) > MAX_SELECT_HISTORY:
+            self.overflowed.add(slot)
+            raise ModemError("shared channel SELECT history exceeded safe limit")
+
+    def transmit(self, slot, apdu):
+        with self.cond:
+            self._claim(slot)
+            response = self.card.transmit(apdu, self.channel)
+            if self.card.closes_logical_channel(apdu, self.channel):
+                # ModemCard.transmit put the channel back on MF for the next client.
+                self.selects[slot] = [SELECT_MF]
+            else:
+                self._record(slot, apdu, response)
+            if len(response) >= 2 and response[-2] in (0x61, 0x9F, 0x6C):
+                self.pending = slot
+                self.pending_deadline = time.monotonic() + PENDING_RESPONSE_HOLD_SECONDS
+            elif self.pending == slot:
+                self.pending = None
+            self.cond.notify_all()
+            return response
+
+    def reset(self, slot):
+        with self.cond:
+            self._claim(slot)
+            if self.pending == slot:
+                self.pending = None
+            self.selects[slot] = [SELECT_MF]
+            try:
+                self.card.reset_channel(self.channel)
+            finally:
+                self.cond.notify_all()
 
 
 class ATSerial(serial.Serial if serial else object):
@@ -167,9 +334,15 @@ class ModemCard:
         self.ser = ATSerial(
             port, baud, timeout=0.25, write_timeout=2, exclusive=True
         )
-        self._drain()
-        self._at("ATE0")
-        self._at("AT+CMEE=2")
+        try:
+            self._drain()
+            self._at("ATE0")
+            self._at("AT+CMEE=2")
+        except Exception:
+            # A port that is not an AT port (the modem probe tries several) must not stay
+            # locked until garbage collection gets to it.
+            self.close()
+            raise
 
     def _drain(self):
         deadline = time.monotonic() + 0.5
@@ -191,7 +364,6 @@ class ModemCard:
         with self.lock:
             self.ser.reset_input_buffer()
             self.ser.write((command + "\r").encode("ascii"))
-            self.ser.flush()
             buf = bytearray()
             deadline = time.monotonic() + self.timeout
             while time.monotonic() < deadline:
@@ -317,6 +489,8 @@ class ModemCard:
 
     def open_channel(self):
         response = self.csim(bytes.fromhex("0070000001"))
+        if response == bytes.fromhex("6A81"):
+            raise ChannelCapacityError("MANAGE CHANNEL capacity exhausted (6A81)")
         if len(response) != 3 or response[-2:] != b"\x90\x00":
             raise ModemError("MANAGE CHANNEL OPEN failed: %s" % response.hex())
         channel = response[0]
@@ -466,7 +640,8 @@ def recv_exact(sock, size, stopping=None):
     return bytes(chunks)
 
 
-def serve_slot(card, host, port, slot, channel, atr, debug, stopping=None):
+def serve_slot(arbiter, host, port, slot, atr, debug, stopping=None):
+    channel = arbiter.channel
     managed_stop = stopping is not None
     stopping = stopping or threading.Event()
     delay = SLOT_RETRY_SECONDS
@@ -498,14 +673,14 @@ def serve_slot(card, host, port, slot, channel, atr, debug, stopping=None):
                     if control == 0x04:
                         sock.sendall(struct.pack(">H", len(atr)) + atr)
                     elif control in (0x01, 0x02):
-                        card.reset_channel(channel)
+                        arbiter.reset(slot)
                     if debug:
                         print(
                             "[bridge] slot %d control 0x%02X" % (slot, control),
                             flush=True,
                         )
                     continue
-                response = card.transmit(payload, channel)
+                response = arbiter.transmit(slot, payload)
                 sock.sendall(struct.pack(">H", len(response)) + response)
         except ModemError:
             # A failed close/reopen leaves the slot unusable. Exiting this worker makes the
@@ -663,23 +838,27 @@ def main():
         print("[bridge] %s" % exc, flush=True)
         card.close()
         raise
-    static_metadata.update(logical_channel_metadata(channels, args.slots, "ready"))
+    slot_channels = slot_channel_map(channels, args.slots)
+    static_metadata.update(logical_channel_metadata(channels, args.slots, "ready",
+                                                    slot_channels=slot_channels))
     write_metadata(args.metadata_file, {**static_metadata, **identity,
                                         "updated_at": int(time.time())})
     print("[bridge] allocated logical channels %r" % channels, flush=True)
+    if len(set(slot_channels)) < len(slot_channels):
+        print("[bridge] slot channel map %r (shared)" % slot_channels, flush=True)
 
     atr = bytes.fromhex(args.atr)
     stopping = threading.Event()
+    arbiters = {channel: ChannelArbiter(card, channel) for channel in channels}
     threads = []
-    for slot, channel in enumerate(channels):
+    for slot, channel in enumerate(slot_channels):
         thread = threading.Thread(
             target=serve_slot,
             args=(
-                card,
+                arbiters[channel],
                 args.host,
                 args.base_port + slot,
                 slot,
-                channel,
                 atr,
                 args.debug,
                 stopping,

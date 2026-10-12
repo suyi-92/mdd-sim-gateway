@@ -28,6 +28,7 @@ import time
 import docker
 
 from . import config as cfg, egress, sysinfo
+from .egress_contract import ENGINE_LABEL
 
 log = logging.getLogger("mdd.engine")
 
@@ -114,6 +115,10 @@ LIFECYCLE_RECORDS = 500
 LIFECYCLE_EVENTS = {
     "recovery_scheduled", "recovery_blocked", "recovery_started", "recovery_failed",
     "recovery_succeeded", "recovery_cancelled", "vowifi_disabled",
+    # Docker's restart policy restarted the engine without the manager asking it to, i.e. the
+    # engine process died on its own. reason_code carries how it left (engine_exit /
+    # engine_signal / unknown) as reported by the entrypoint supervisor.
+    "engine_restarted",
     # A start/reprovision refused by the PIN/identity preflight before the engine ran.
     # reason_code carries the closed code (no_card / pin_required / pin_invalid /
     # card_mismatch / card_unreadable); the ICCID itself never enters this public record.
@@ -243,6 +248,18 @@ def container_name(iid: str) -> str:
     return f"mdd-sim-gateway-engine-{iid}"
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 def _instance_paths(iid: str):
     base = os.path.join(DATA_DIR, "instances", str(iid))
     os.makedirs(os.path.join(base, "run"), exist_ok=True)
@@ -261,7 +278,8 @@ def _clear_runtime_state(base: str):
     """
     run_dir = os.path.join(base, "run")
     for name in ("swu_status.json", "pcscf", "pcscf.applied", "pin_status.json",
-                 "usim_status.json", "engine.env", "swu.ctl"):
+                 "usim_status.json", "engine.env", "swu.ctl", "media.json", "media.nft",
+                 "media.iptables"):
         try:
             os.unlink(os.path.join(run_dir, name))
         except FileNotFoundError:
@@ -608,9 +626,9 @@ def _start_reserved(inst: dict, settings: dict, dev_mounts: bool, reason: str):
         volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
         volumes[os.path.join(eng, "templates")] = {"bind": "/opt/mdd-sim-gateway/templates", "mode": "ro"}
 
-    # Expose only the authenticated browser softphone transport. Standalone
-    # SIP UDP/TCP/TLS listeners are not published to the host.
-    port_bindings = {f"{8089}/tcp": ports.get("webrtc", 8089)}
+    # SIP signalling uses the authenticated same-origin WebSocket proxy.
+    # No SIP or WebSocket listener is published to the host.
+    port_bindings = {}
     # AMI grants system/command/originate. The manager dials the container bridge directly, so a
     # host mapping is unnecessary in normal operation and costs another docker-proxy. Keep the
     # loopback-only mapping as an explicit diagnostic option.
@@ -737,9 +755,36 @@ def container_runtime(iid: str) -> dict:
                 if network.get("IPAddress"):
                     ip = network["IPAddress"]
                     break
-        return {"running": running, "ip": ip, "container_id": getattr(c, "id", None)}
+        return {"running": running, "ip": ip, "container_id": getattr(c, "id", None),
+                "restart_count": int(c.attrs.get("RestartCount") or 0),
+                "started_at": (c.attrs.get("State") or {}).get("StartedAt", "")}
     except docker.errors.NotFound:
         return {"running": False, "ip": None, "container_id": None}
+
+
+
+
+
+def last_engine_exit(iid: str) -> dict:
+    """Read the native supervisor evidence; retain the historical upstream fallback."""
+    base, _ = _instance_paths(iid)
+    for relative in ("stability-asterisk.jsonl", "asterisk/supervisor.jsonl"):
+        path = os.path.join(base, "logs", relative)
+        try:
+            for line in reversed(_tail_lines(path, 40)):
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict) or record.get("event") != "asterisk_exited":
+                    continue
+                if "signal_code" in record:
+                    record = {**record, "disposition": "signal" if record["signal_code"] else "exit",
+                              "signal": record["signal_code"], "rc": record.get("exit_code", 0)}
+                return record
+        except OSError:
+            continue
+    return {}
 
 
 def container_ip(iid: str) -> str | None:
