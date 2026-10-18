@@ -851,7 +851,10 @@ function EsimView({ cards, devices = [], instances, refresh, subscribe, showToas
       try {
         const result = await boundedRead(signal => api.esimChipCached(reader, undefined, signal))
         if (cancelled || owner !== session.current || !owner.mounted) return
-        if (result.generation != null && result.generation !== selectedCard?.generation) return
+        // This is a profile-scoped cache merge.  A reader generation can advance during
+        // bridge recovery or a service restart while the physical card remains inserted;
+        // discard only mismatched profiles in mergeNotificationSnapshot, rather than
+        // dropping the whole snapshot and leaving an old operation warning on screen.
         setSes(list => mergeNotificationSnapshot(list, result))
       } catch { /* Keep the last outcome until a successful, same-card snapshot arrives. */ }
       finally {
