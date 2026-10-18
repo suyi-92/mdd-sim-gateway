@@ -1091,6 +1091,54 @@ class Orchestrator:
         self._bridge_restarts[request_id] = value
         return value
 
+    @staticmethod
+    def _qmi_port_for_assignment(assignment: dict) -> str:
+        """Find the QMI control node belonging to one USB modem, without guessing a port."""
+        usb_path = str(assignment.get("usb_path") or "").strip()
+        if not re.fullmatch(r"[0-9-]+(?:\.[0-9]+)?", usb_path):
+            return ""
+        for node in sorted(Path("/sys/class/usbmisc").glob("cdc-wdm*")):
+            try:
+                resolved = str(node.resolve())
+            except OSError:
+                continue
+            if f"/{usb_path}/" in resolved:
+                return f"/dev/{node.name}"
+        return ""
+
+    def _uim_power_cycle(self, assignment: dict) -> tuple[bool, str]:
+        """Reset only the modem's UIM slot, using QMI card evidence rather than CFUN."""
+        port = self._qmi_port_for_assignment(assignment)
+        if not port:
+            return False, "qmi_device_unavailable"
+        base = ["timeout", "25s", "qmicli", "--device-open-proxy", "-d", port]
+        try:
+            status = run([*base, "--uim-get-card-status"])
+        except (OSError, subprocess.SubprocessError):
+            return False, "uim_status_failed"
+        text = status.stdout or ""
+        slot_match = re.search(r"Primary GW:\s+slot\s+'([1-8])'", text)
+        if not slot_match:
+            slot_match = re.search(r"Logical slot:\s+([1-8])", text)
+        if status.returncode or not slot_match:
+            return False, "uim_slot_unconfirmed"
+        slot = slot_match.group(1)
+        off = None
+        on = None
+        try:
+            off = run([*base, f"--uim-sim-power-off={slot}"])
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            # The bridge must never be left without a powered card after a failed off call.
+            try:
+                on = run([*base, f"--uim-sim-power-on={slot}"])
+            except (OSError, subprocess.SubprocessError):
+                on = None
+        if off is None or off.returncode or on is None or on.returncode:
+            return False, "uim_power_cycle_failed"
+        return True, ""
+
     def process_bridge_restart_requests(self):
         """Consume scoped requests and stop only the selected modem bridge.
 
@@ -1110,11 +1158,13 @@ class Orchestrator:
             device_id = str(request.get("device_id") or "")
             expected_iccid_sha256 = str(request.get("expected_iccid_sha256") or "")
             cellular_refresh = request.get("cellular_refresh", True)
+            uim_reset = request.get("uim_reset", False)
             if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id)
                     or request_id != path.stem
                     or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", device_id)
                     or not re.fullmatch(r"[0-9a-f]{64}", expected_iccid_sha256)
-                    or not isinstance(cellular_refresh, bool)):
+                    or not isinstance(cellular_refresh, bool)
+                    or not isinstance(uim_reset, bool)):
                 if request_id and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id):
                     self._bridge_restart_status(
                         {"request_id": request_id, "device_id": device_id}, "failed",
@@ -1135,6 +1185,7 @@ class Orchestrator:
                 "device_id": device_id,
                 "expected_iccid_sha256": expected_iccid_sha256,
                 "cellular_refresh": cellular_refresh,
+                "uim_reset": uim_reset,
                 "requested_at": requested_at,
                 "started_at": time.time(),
                 "usb_generation": generation,
@@ -1155,6 +1206,14 @@ class Orchestrator:
             self._stop_bridge_process(proc)
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
+            if uim_reset:
+                self._bridge_restart_status(request, "resetting_uim")
+                ok, error = self._uim_power_cycle(assignment)
+                if not ok:
+                    self._bridge_restart_status(request, "failed", error=error)
+                    self.log(f"eSIM UIM reset failed for device {device_id}: {error}")
+                    continue
+                self.log(f"eSIM UIM reset completed for device {device_id}")
             if cellular_refresh:
                 now = time.time()
                 self._set_cellular_recovery(

@@ -13,7 +13,7 @@
   <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
 
-## 本轮新增：1.13.2-vmware.1
+## 本轮新增：1.13.2-vmware.2
 
 消息页新增 MMS 收发、附件暂存与转换、通讯录及已读水位；客户端可使用可撤销 bearer 令牌。
 MMS 需要线路的运营商 APN/MMSC 与受支持蜂窝链路，VoWiFi 收到通知不等于附件已下载。

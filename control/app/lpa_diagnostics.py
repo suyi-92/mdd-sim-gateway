@@ -31,6 +31,7 @@ PROFILE_REASONS = {
     "profile not in enabled state": ("profile_not_enabled", 2),
     "disallowed by policy": ("policy_disallowed", 3),
     "wrong profile reenabling": ("wrong_profile_reenabling", 4),
+    "cat busy": ("cat_busy", 5),
     "internal error, maybe illegal iccid/aid coding": ("internal_error", None),
 }
 REASON_MESSAGES = {
@@ -39,6 +40,7 @@ REASON_MESSAGES = {
     "profile_not_enabled": "The card reports that this profile is not enabled.",
     "policy_disallowed": "The card's profile policy does not allow this operation.",
     "wrong_profile_reenabling": "The card rejected re-enabling this profile.",
+    "cat_busy": "The eSIM card interface is busy. It will be reset and the switch retried.",
     "internal_error": "The eSIM helper could not encode, exchange or parse the card command. No card result was confirmed.",
 }
 PCSC_CODES = {

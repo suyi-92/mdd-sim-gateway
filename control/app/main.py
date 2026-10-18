@@ -4402,6 +4402,15 @@ async def _esim_enable_verified(name, iccid, *, aid=None, **kwargs):
         }) from error
 
 
+def _esim_cat_busy_http_error(error: BaseException) -> bool:
+    """Recognize the card-confirmed CAT busy result that can be repaired by UIM reset."""
+    if not isinstance(error, HTTPException) or not isinstance(error.detail, dict):
+        return False
+    diagnostic = error.detail.get("diagnostic") or {}
+    return (diagnostic.get("step") == "es10c_enable_profile"
+            and diagnostic.get("card_result") == 5)
+
+
 def _esim_guard_engine(name: str):
     """Refuse LPA while a VoWiFi engine holds the card (lpac needs exclusive PC/SC).
 
@@ -4774,6 +4783,7 @@ async def _esim_restore_profile_switch(previous: dict[str, dict]):
 
 def _esim_write_bridge_restart_request(
     hardware_id: str, iccid: str, *, cellular_refresh: bool = True,
+    uim_reset: bool = False,
 ) -> tuple[str, str]:
     request_id = f"esim-{int(time.time() * 1000)}-{random.randrange(1_000_000):06d}"
     root = os.path.join(cfg.DATA_DIR, "orchestrator")
@@ -4788,6 +4798,7 @@ def _esim_write_bridge_restart_request(
                    "usb_generation": str(((device_state.status().get("devices") or {}).get(
                        hardware_id) or {}).get("usb_generation") or ""),
                    "cellular_refresh": bool(cellular_refresh),
+                   "uim_reset": bool(uim_reset),
                    "requested_at": time.time()}, handle)
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
@@ -4800,10 +4811,11 @@ async def _esim_restart_modem_bridge(
     timeout: float = ESIM_BRIDGE_RESTART_TIMEOUT,
     *,
     cellular_refresh: bool = True,
+    uim_reset: bool = False,
 ) -> dict:
     request_id, status_path = await asyncio.to_thread(
         _esim_write_bridge_restart_request, hardware_id, iccid,
-        cellular_refresh=cellular_refresh)
+        cellular_refresh=cellular_refresh, uim_reset=uim_reset)
     deadline = time.monotonic() + timeout
     last_state = "requested"
     while time.monotonic() < deadline:
@@ -11557,10 +11569,29 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             await _update_esim_recovery(
                 recovery_task_id, None, se_id=str(se.get("id") or ""),
                 se_aid=str(se.get("aid") or ""))
-            await _esim_run(
-                name, idx, _esim_enable_verified(
-                    name, iccid, aid=se.get("aid"), process_notifications=False),
-                keep_busy=True, profile_iccid=iccid)
+            async def enable_profile():
+                return await _esim_run(
+                    name, idx, _esim_enable_verified(
+                        name, iccid, aid=se.get("aid"), process_notifications=False),
+                    keep_busy=True, profile_iccid=iccid)
+
+            try:
+                await enable_profile()
+            except HTTPException as exc:
+                if not _esim_cat_busy_http_error(exc):
+                    raise
+                active_iccid = str((hub.cards.get(name) or {}).get("iccid") or "")
+                if not active_iccid or active_iccid == iccid:
+                    raise
+                # ES10c result 5 means the eUICC CAT session is busy.  On this modem the
+                # baseband leaves that session pending while flight mode is active; reset
+                # only the verified UIM slot, keep RF disabled, rebuild the bridge, and retry
+                # the same profile exactly once.
+                log.warning("eSIM profile enable hit CAT busy; resetting the verified UIM slot")
+                await _esim_restart_modem_bridge(
+                    hardware_id, active_iccid, cellular_refresh=False, uim_reset=True)
+                await _esim_wait_for_confirmed_card(name)
+                await enable_profile()
             lpa_succeeded = True
             await _update_esim_recovery(
                 recovery_task_id, "profile_enabled", phase="profile_enabled")

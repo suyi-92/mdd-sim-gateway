@@ -17,6 +17,7 @@ class DiagnosticTests(unittest.TestCase):
             ('es10c_disable_profile', 'profile not in enabled state', 2),
             ('es10c_enable_profile', 'iccid or aid not found', 1),
             ('es10c_enable_profile', 'wrong profile reenabling', 4),
+            ('es10c_enable_profile', 'cat busy', 5),
         ]:
             with self.subTest(step=step, reason=reason):
                 error = lpa.LpaError(step, detail=reason, stage='profile enable')

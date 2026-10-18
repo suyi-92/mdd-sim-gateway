@@ -13,6 +13,46 @@ from host.mdd_orchestrator import Orchestrator
 
 
 class BridgeRestartHandshakeTests(unittest.TestCase):
+    def test_uim_power_cycle_attempts_power_on_when_power_off_raises(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp))
+            status = SimpleNamespace(returncode=0, stdout="Primary GW: slot '1'")
+            powered_on = SimpleNamespace(returncode=0, stdout="")
+            with patch.object(app, "_qmi_port_for_assignment", return_value="/dev/cdc-wdm0"), \
+                    patch.object(mdd_orchestrator, "run",
+                                 side_effect=[status, OSError("qmicli unavailable"), powered_on]) as run:
+                result = app._uim_power_cycle({"usb_path": "1-2"})
+
+        self.assertEqual(result, (False, "uim_power_cycle_failed"))
+        self.assertEqual([call.args[0][-1] for call in run.call_args_list], [
+            "--uim-get-card-status", "--uim-sim-power-off=1", "--uim-sim-power-on=1"])
+
+    def test_cat_busy_restart_resets_only_the_verified_uim_slot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root)
+            old = Mock()
+            old.poll.return_value = None
+            app.bridges = {"modem-1": old}
+            mdd_orchestrator.atomic_json(
+                app.bridge_restart_request_dir / "cat-busy.json", {
+                    "request_id": "cat-busy",
+                    "device_id": "modem-1",
+                    "expected_iccid_sha256": hashlib.sha256(b"profile-old").hexdigest(),
+                    "cellular_refresh": False,
+                    "uim_reset": True,
+                    "requested_at": 100,
+                })
+            with patch.object(app, "_uim_power_cycle", return_value=(True, "")) as reset:
+                app.process_bridge_restart_requests()
+
+            reset.assert_called_once_with({})
+            old.terminate.assert_called_once()
+            status = mdd_orchestrator.read_json(
+                app.bridge_restart_status_dir / "cat-busy.json")
+            self.assertEqual(status["state"], "resetting_uim")
+            self.assertTrue(status["uim_reset"])
+
     def test_restart_completes_only_for_new_pid_ready_channels_and_target_iccid(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -753,6 +793,51 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         command.assert_awaited_once_with(
             "profile", "enable", "profile-target", "1",
             reader_name="VoWiFi Modem modem-1 00 00", aid="fixture-aid", timeout=90)
+
+    async def test_modem_cat_busy_resets_uim_and_retries_once(self):
+        cat_busy = main.HTTPException(400, {
+            "code": "esim_operation_failed",
+            "diagnostic": {"step": "es10c_enable_profile", "card_result": 5},
+        })
+        recovery = {
+            "card": {"iccid": "profile-target"}, "readers": ["reader"],
+            "instance_id": "2", "bridge": {"state": "channels_ready"},
+        }
+        target = {"id": "2", "iccid": "profile-target", "enabled": False,
+                  "provisioning_state": "ready"}
+        with patch.object(main, "_esim_resolve_reader", return_value=("reader", 0)), \
+                patch.object(main, "_esim_switch_identity",
+                             return_value=("modem-1", "modem-1")), \
+                patch.object(main, "_esim_prepare_profile_switch",
+                             new=AsyncMock(return_value={})), \
+                patch.object(main, "_esim_modem_reader_names", return_value=["reader"]), \
+                patch.object(main, "_esim_prewarm_target_egress", return_value=True), \
+                patch.object(main, "_esim_profile_event", new=AsyncMock()), \
+                patch.object(main, "_esim_resolve_se_owned",
+                             new=AsyncMock(return_value={"id": "se", "aid": "a"})), \
+                patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
+                patch.object(main, "_esim_run", new=AsyncMock(
+                    side_effect=[cat_busy, None])) as run, \
+                patch.object(main, "_esim_restart_modem_bridge",
+                             new=AsyncMock(return_value={"state": "channels_ready"})) as restart, \
+                patch.object(main, "_esim_wait_for_confirmed_card", new=AsyncMock()), \
+                patch.object(main, "_esim_recover_profile_switch",
+                             new=AsyncMock(return_value=recovery)), \
+                patch.object(main, "_match_instance_by_iccid", return_value=target), \
+                patch.object(main, "_esim_cache_update_profile"), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "identity_state": "confirmed",
+                                "iccid": "profile-old"},
+                }), \
+                patch.object(main.egress, "publish"), \
+                patch.object(main, "_update_esim_recovery", new=AsyncMock()), \
+                patch.object(main.cfg, "upsert_instance", side_effect=lambda value, **_: value):
+            result = await main.api_esim_enable("profile-target", {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.await_count, 2)
+        restart.assert_awaited_once_with(
+            "modem-1", "profile-old", cellular_refresh=False, uim_reset=True)
 
     async def test_native_reader_lpa_failure_restores_the_old_line(self):
         previous = {"7": {"enabled": True, "running": False}}
