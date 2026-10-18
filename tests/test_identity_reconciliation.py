@@ -179,6 +179,25 @@ class CardRetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CachedProfileEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_old_enable_failure_is_resolved_by_read_watermark(self):
+        failure = {
+            'state': 'failed', 'updated_at': 100,
+            'error': {'diagnostic': {'step': 'es10c_enable_profile', 'status_word': '9000'}},
+        }
+        cached = {'ts': 200, 'ses': [{
+            'id': 'one', 'eid': 'fixture-euicc',
+            'profiles': [{'iccid': 'target', 'profileState': 'disabled',
+                          'operation_status': failure}],
+        }]}
+        with patch.object(main, '_esim_resolve_reader', return_value=('reader', 0)), \
+                patch.object(main, '_current_reader_iccid', return_value='target'), \
+                patch.object(main, '_esim_cache_for_iccid', return_value=cached):
+            result = await main.api_esim_chip_cached(reader='reader')
+        profile = result['ses'][0]['profiles'][0]
+        self.assertEqual(profile['operation_status']['state'], 'resolved')
+        self.assertEqual(profile['operation_status']['resolution'], 'profile_disabled_verified')
+        self.assertEqual(cached['ses'][0]['profiles'][0]['operation_status']['state'], 'failed')
+
     async def test_current_card_calibrates_only_its_unique_se(self):
         cached = {'ses': [
             {'id': 'one', 'eid': 'fixture-euicc', 'profiles': [

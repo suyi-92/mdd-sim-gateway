@@ -11307,13 +11307,24 @@ async def api_esim_chip_cached(reader_index: int = 0, reader: str | None = None)
     matches = [se for se in ses if any(p.get("iccid") == iccid
                                      for p in se.get("profiles") or [])]
     unique = len(matches) == 1 and bool(matches[0].get("eid"))
+    cache_read_at = float(entry.get("ts") or 0)
     cached_ses = []
     for se in ses:
         confirmed = unique and se is matches[0]
-        profiles = [{**p, "cachedProfileState": p.get("profileState"),
-                     "profileState": ("enabled" if p.get("iccid") == iccid else "disabled")
-                     if confirmed else "unknown"}
-                    for p in se.get("profiles") or []]
+        profiles = []
+        for p in se.get("profiles") or []:
+            profile = {**p, "cachedProfileState": p.get("profileState"),
+                       "profileState": ("enabled" if p.get("iccid") == iccid else "disabled")
+                       if confirmed else "unknown"}
+            operation = p.get("operation_status")
+            if (cache_read_at > 0 and isinstance(operation, dict)
+                    and float(operation.get("updated_at") or 0) <= cache_read_at):
+                # Caches written by older releases may still carry a failed enable after a
+                # later read proved the profile state. Normalize only the returned snapshot;
+                # the stored diagnostic remains untouched for audit and future migration.
+                profile["operation_status"] = _esim_resolve_enable_operation(
+                    operation, p.get("profileState"), cache_read_at)
+            profiles.append(profile)
         cached_ses.append({**se, "notifications": [], "notifications_loaded": False, "profiles": profiles,
                            "active_state_verified": confirmed})
     return {"ok": True, "cached": True, "reader": name, "reader_index": idx,
