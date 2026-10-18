@@ -59,6 +59,8 @@ ESIM_CARD_REFRESH_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_CARD_REFRESH_ATTEMPTS", "12"))
 ESIM_CARD_REFRESH_INTERVAL = float(
     os.environ.get("MDD_ESIM_CARD_REFRESH_INTERVAL", "0.75"))
+ESIM_CARD_CONFIRM_WAIT_SECONDS = float(
+    os.environ.get("MDD_ESIM_CARD_CONFIRM_WAIT", "45"))
 ESIM_LINE_RECOVERY_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_LINE_RECOVERY_ATTEMPTS", "3"))
 ESIM_LINE_RECOVERY_RETRY_DELAY = float(
@@ -4291,6 +4293,30 @@ def _esim_require_confirmed_card(name: str) -> None:
         "state": str(info.get("identity_state") or "unknown"),
         "reason": str(info.get("identity_reason") or "card_not_present"),
     })
+
+
+async def _esim_wait_for_confirmed_card(name: str, timeout: float | None = None) -> None:
+    """Let the card monitor finish a transient post-LPA verification before switching.
+
+    EnableProfile can produce a REFRESH/remove-insert edge.  The monitor then needs one or
+    more bounded retries to prove the same card again; rejecting the next user click during
+    that window makes a safe, recoverable switch look permanently broken.  Do not acquire a
+    reader lock here: the monitor owns that lock while draining its probe.  The final LPA
+    reservation still rechecks the identity while holding the lock.
+    """
+    wait = max(0.0, float(ESIM_CARD_CONFIRM_WAIT_SECONDS if timeout is None else timeout))
+    deadline = time.monotonic() + wait
+    while True:
+        info = hub.cards.get(name) or {}
+        if info.get("present") and info.get("identity_state") == "confirmed":
+            return
+        state = str(info.get("identity_state") or "unknown")
+        if state not in {"pending", "reading"}:
+            _esim_require_confirmed_card(name)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _esim_require_confirmed_card(name)
+        await asyncio.sleep(min(ESIM_CARD_REFRESH_INTERVAL, remaining, 0.5))
 
 
 async def _esim_reserve_lpa_busy(name: str, hardware_id: str,
@@ -11459,6 +11485,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
         if not hardware_id:
             previous = await _esim_prepare_reader_profile_switch(name)
             try:
+                await _esim_wait_for_confirmed_card(name)
                 se = await _esim_resolve_se_owned(
                     name, idx, body.get("se_id") or body.get("seId"),
                     body.get("aid"), require=True, switch_locked=True,
@@ -11518,6 +11545,7 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
         try:
             # Drain any card probe before reserving the readers.  Reserving first would make
             # an in-flight probe publish reader_changed and let EnableProfile race the card.
+            await _esim_wait_for_confirmed_card(name)
             await _esim_reserve_lpa_busy(name, hardware_id, busy_readers)
             await _esim_profile_event(name, iccid, "switching")
             if _esim_vowifi_requested(hardware_id):

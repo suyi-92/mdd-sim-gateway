@@ -655,6 +655,32 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 0, expect_iccid="profile-new", attempts=3)
         self.assertEqual(result.iccid, "profile-old")
 
+    async def test_switch_waiter_releases_a_transient_card_verification(self):
+        cards = {"reader": {"present": True, "identity_state": "pending"}}
+
+        async def confirm():
+            await asyncio.sleep(0)
+            cards["reader"]["identity_state"] = "confirmed"
+
+        with patch.object(main.hub, "cards", cards), \
+                patch.object(main, "ESIM_CARD_REFRESH_INTERVAL", 0):
+            task = asyncio.create_task(confirm())
+            await main._esim_wait_for_confirmed_card("reader", timeout=1)
+            await task
+
+        self.assertEqual(cards["reader"]["identity_state"], "confirmed")
+
+    async def test_switch_waiter_keeps_the_fail_closed_timeout(self):
+        cards = {"reader": {"present": True, "identity_state": "pending",
+                             "identity_reason": "reader_busy"}}
+        with patch.object(main.hub, "cards", cards), \
+                patch.object(main, "ESIM_CARD_REFRESH_INTERVAL", 0):
+            with self.assertRaises(main.HTTPException) as caught:
+                await main._esim_wait_for_confirmed_card("reader", timeout=0)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.detail["code"], "card_identity_unconfirmed")
+
     async def test_native_reader_switch_disables_the_old_profiles_line(self):
         lines = {"7": {"id": "7", "enabled": True}}
 
@@ -739,6 +765,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                              new=AsyncMock(return_value=previous)), \
                 patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock(side_effect=error)), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "identity_state": "confirmed"},
+                }), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:
             with self.assertRaises(main.HTTPException):
@@ -760,6 +789,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_resolve_se_owned", new=AsyncMock(return_value={"id": "se", "aid": "a"})), \
                 patch.object(main, "_esim_enable_verified", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock(side_effect=error)), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "identity_state": "confirmed"},
+                }), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:
             with self.assertRaises(main.HTTPException):
