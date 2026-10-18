@@ -227,6 +227,17 @@ def _normalize_imsi(value) -> str:
     return re.sub(r"\D", "", str(value or ""))
 
 
+def _card_key(iccid: str, imsi: str) -> str:
+    """Opaque identity for the card currently attached to a physical modem."""
+    value = _normalize_iccid(iccid)
+    kind = "iccid"
+    if not value:
+        value = _normalize_imsi(imsi)
+        kind = "imsi"
+    return (hashlib.sha256(f"{kind}:{value}".encode("ascii", "ignore")).hexdigest()
+            if value else "")
+
+
 def _boot_id() -> str:
     try:
         with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
@@ -619,6 +630,9 @@ class Scanner:
         self._local_sms_keys: OrderedDict[tuple[str, str, str], None] = OrderedDict()
         self._wap_push_attempts: dict[tuple[str, str], int] = {}
         self._cleanup_retries: dict[tuple[str, str], tuple[int, float]] = {}
+        # Used only for the one-time post-upgrade baseline. Existing objects are retained for
+        # explicit cleanup, never silently attributed to a newly selected SIM.
+        self._started_wall = float(self.wall_clock())
 
     def _read(self, sms_path: str) -> dict | None:
         """One SMS object's detail in the scanner's own terms; None when it cannot be read."""
@@ -772,6 +786,30 @@ class Scanner:
         found = []
         live_keys = set()
         live_local_keys = set()
+        fences = {}
+        begin_fence = getattr(self.local_sms_tracker, "begin_cellular_sms_fence", None)
+        for modem_path, modem_iccid, modem_imsi in self._topology:
+            if not callable(begin_fence):
+                continue
+            if modem_iccid:
+                fence_iid = by_iccid.get(modem_iccid)
+            else:
+                fence_iid = by_imsi.get(modem_imsi) if modem_imsi else None
+            card_key = _card_key(modem_iccid, modem_imsi)
+            if not fence_iid or not card_key:
+                continue
+            try:
+                fence = begin_fence(modem_path, card_key, fence_iid,
+                                    now=int(self.wall_clock()))
+            except Exception:
+                fence = None
+            if isinstance(fence, dict):
+                fences[modem_path] = {**fence, "card_key": card_key, "instance": fence_iid}
+                if fence.get("baseline"):
+                    fences[modem_path]["baseline_cutoff"] = self._started_wall - 120
+        claim_object = getattr(self.local_sms_tracker, "claim_cellular_sms_object", None)
+        quarantine_object = getattr(self.local_sms_tracker, "quarantine_cellular_sms_object", None)
+        repair_stale = getattr(self.local_sms_tracker, "repair_stale_cellular_message", None)
         for modem_path, modem_iccid, modem_imsi in self._topology:
             if modem_iccid:
                 iid = by_iccid.get(modem_iccid)
@@ -869,6 +907,40 @@ class Scanner:
                             "_daemon_epoch": daemon_epoch,
                         })
                     self._details[key] = (now + self.detail_ttl, record)
+                fence = fences.get(modem_path)
+                if fence and callable(claim_object):
+                    try:
+                        ownership = claim_object(
+                            modem_path, sms_path, fence["card_key"], iid,
+                            record.get("_signature") or "", now=int(self.wall_clock()))
+                    except Exception:
+                        ownership = None
+                    if isinstance(ownership, dict):
+                        status = ownership.get("status")
+                        stale = status == "stale"
+                        baseline_old = bool(
+                            fence.get("baseline") and status == "new" and
+                            (not int(record.get("ts") or 0) or
+                             int(record.get("ts") or 0) < fence.get("baseline_cutoff", 0)))
+                        if stale or baseline_old:
+                            if baseline_old and callable(quarantine_object):
+                                try:
+                                    quarantine_object(modem_path, sms_path)
+                                except Exception:
+                                    pass
+                            if callable(repair_stale) and record.get("body", "").strip():
+                                try:
+                                    repaired = repair_stale(
+                                        iid, ownership.get("previous_instance", ""),
+                                        record.get("peer", ""), record.get("body", ""),
+                                        int(record.get("ts") or 0))
+                                    if repaired:
+                                        # Keep the journal free of senders and message text.
+                                        log.info("removed %d stale cellular SMS row(s) on line %s",
+                                                 repaired, iid)
+                                except Exception:
+                                    pass
+                            continue
                 if record["direction"] == "out" and self.local_sms_tracker is not None:
                     if not daemon_epoch:
                         # Without a daemon generation we cannot distinguish a locally-created

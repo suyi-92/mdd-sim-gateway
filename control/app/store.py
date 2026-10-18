@@ -871,9 +871,45 @@ def _migration_completed_ts(c) -> None:
         pass
 
 
+def _migration_cellular_sms_fence(c) -> None:
+    """Keep ModemManager SMS objects tied to the card that created them.
+
+    ModemManager keeps the SMS store on a physical modem when its SIM changes.  The object
+    path therefore is not evidence that the current SIM received the text.  These two small
+    ledgers let the scanner reject an unchanged object after a card transition while still
+    accepting a new object that reuses the same numeric path.
+    """
+    _script(c, """
+        CREATE TABLE IF NOT EXISTS cellular_sms_modems (
+            modem_path TEXT PRIMARY KEY,
+            card_key TEXT NOT NULL,
+            instance TEXT NOT NULL DEFAULT '',
+            updated_ts INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cellular_sms_objects (
+            modem_path TEXT NOT NULL,
+            sms_path TEXT NOT NULL,
+            card_key TEXT NOT NULL,
+            instance TEXT NOT NULL DEFAULT '',
+            signature TEXT NOT NULL,
+            first_seen_ts INTEGER NOT NULL,
+            last_seen_ts INTEGER NOT NULL,
+            quarantined INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(modem_path, sms_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cellular_sms_objects_card
+            ON cellular_sms_objects(card_key, instance);
+    """)
+    try:
+        c.execute("ALTER TABLE cellular_sms_objects ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+
 _MIGRATIONS = (_migration_message_identity, _migration_modem_object_on_message, _migration_mms,
                _migration_identity_scope, lambda c: _migration_filed_mms_pushes(c),
-               _migration_read_baseline, _migration_completed_ts)
+               _migration_read_baseline, _migration_completed_ts,
+               _migration_cellular_sms_fence)
 
 
 def _sweep_binary_messages(c) -> int:
@@ -901,6 +937,132 @@ def _sweep_binary_messages(c) -> int:
         c.execute("DELETE FROM messages WHERE id=?", (row["id"],))
         moved += 1
     return moved
+
+
+def begin_cellular_sms_fence(modem_path: str, card_key: str, instance: str,
+                             now: int | None = None) -> dict:
+    """Record the card currently attached to one physical ModemManager modem.
+
+    ``baseline`` is true only for the first observation of a line that already has cellular
+    history.  On an upgrade, the modem may still contain objects imported by the old scanner;
+    those objects are registered as a baseline and are not presented as new messages.
+    """
+    modem_path, card_key, instance = str(modem_path), str(card_key), str(instance)
+    stamp = int(now if now is not None else time.time())
+    with _lock, _conn() as c:
+        row = c.execute("SELECT card_key,instance FROM cellular_sms_modems "
+                        "WHERE modem_path=?", (modem_path,)).fetchone()
+        if row is None:
+            baseline = bool(c.execute(
+                "SELECT 1 FROM messages WHERE instance=? AND direction='in' "
+                "AND transport='cellular' LIMIT 1", (instance,)).fetchone())
+            c.execute("INSERT INTO cellular_sms_modems "
+                      "(modem_path,card_key,instance,updated_ts) VALUES(?,?,?,?)",
+                      (modem_path, card_key, instance, stamp))
+            return {"baseline": baseline, "changed": True, "previous_card": "",
+                    "previous_instance": ""}
+        previous_card, previous_instance = str(row["card_key"]), str(row["instance"] or "")
+        changed = previous_card != card_key
+        if changed or previous_instance != instance:
+            c.execute("UPDATE cellular_sms_modems SET card_key=?,instance=?,updated_ts=? "
+                      "WHERE modem_path=?", (card_key, instance, stamp, modem_path))
+        return {"baseline": False, "changed": changed,
+                "previous_card": previous_card if changed else "",
+                "previous_instance": previous_instance if changed else ""}
+
+
+def claim_cellular_sms_object(modem_path: str, sms_path: str, card_key: str,
+                              instance: str, signature: str,
+                              now: int | None = None) -> dict:
+    """Return whether an SMS object belongs to the current card generation.
+
+    A same-path object with identical content after a card change is the old card's retained
+    message.  A changed signature is a newly-created object whose numeric path was reused and
+    is allowed to become owned by the current card.
+    """
+    modem_path, sms_path = str(modem_path), str(sms_path)
+    card_key, instance, signature = str(card_key), str(instance), str(signature)
+    stamp = int(now if now is not None else time.time())
+    with _lock, _conn() as c:
+        row = c.execute("SELECT card_key,instance,signature,quarantined FROM cellular_sms_objects "
+                        "WHERE modem_path=? AND sms_path=?", (modem_path, sms_path)).fetchone()
+        if row is None:
+            c.execute("INSERT INTO cellular_sms_objects "
+                      "(modem_path,sms_path,card_key,instance,signature,first_seen_ts,last_seen_ts,"
+                      "quarantined) VALUES(?,?,?,?,?,?,?,0)",
+                      (modem_path, sms_path, card_key, instance, signature, stamp, stamp))
+            return {"status": "new", "previous_instance": ""}
+        previous_card, previous_instance, previous_signature, quarantined = (
+            str(row["card_key"]), str(row["instance"] or ""), str(row["signature"]),
+            bool(row["quarantined"]))
+        if previous_card == card_key and previous_signature == signature and quarantined:
+            return {"status": "stale", "previous_instance": previous_instance}
+        if previous_card != card_key and previous_signature == signature:
+            return {"status": "stale", "previous_instance": previous_instance}
+        status = "known" if previous_card == card_key and previous_signature == signature else "new"
+        c.execute("UPDATE cellular_sms_objects SET card_key=?,instance=?,signature=?,last_seen_ts=?,"
+                  "quarantined=0 "
+                  "WHERE modem_path=? AND sms_path=?",
+                  (card_key, instance, signature, stamp, modem_path, sms_path))
+        return {"status": status, "previous_instance": previous_instance}
+
+
+def quarantine_cellular_sms_object(modem_path: str, sms_path: str) -> bool:
+    """Persist that an unchanged object was present before the current card was observed."""
+    with _lock, _conn() as c:
+        return c.execute("UPDATE cellular_sms_objects SET quarantined=1 "
+                         "WHERE modem_path=? AND sms_path=?",
+                         (str(modem_path), str(sms_path))).rowcount == 1
+
+
+def repair_stale_cellular_message(instance: str, previous_instance: str, peer: str,
+                                  body: str, ts: int) -> int:
+    """Remove or move a row proven to belong to an older card on the same modem.
+
+    If the old line already has the exact row, the newly misassigned copy is deleted while its
+    identity ledger is retained.  Otherwise it is moved to the old line when that owner is
+    known.  With no owner evidence, only an exact duplicate on another line is removed; an
+    unrelated message is left untouched.
+    """
+    iid, previous = str(instance), str(previous_instance or "")
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT id FROM messages WHERE instance=? AND direction='in' "
+            "AND transport='cellular' AND peer=? AND body=? AND ts=? ORDER BY id",
+            (iid, str(peer), str(body), int(ts))).fetchall()
+        if not rows:
+            return 0
+        if previous == iid:
+            previous = ""
+        if not previous:
+            candidates = c.execute(
+                "SELECT DISTINCT instance FROM messages WHERE instance<>? "
+                "AND direction='in' AND transport='cellular' AND peer=? AND body=? AND ts=?",
+                (iid, str(peer), str(body), int(ts))).fetchall()
+            if len(candidates) == 1:
+                previous = str(candidates[0]["instance"])
+        target_exists = bool(previous and c.execute(
+            "SELECT 1 FROM messages WHERE instance=? AND direction='in' "
+            "AND transport='cellular' AND peer=? AND body=? AND ts=? LIMIT 1",
+            (previous, str(peer), str(body), int(ts))).fetchone())
+        changed = 0
+        for row in rows:
+            mid = int(row["id"])
+            if previous and not target_exists:
+                c.execute("UPDATE messages SET instance=? WHERE id=?", (previous, mid))
+                c.execute("DELETE FROM message_identities WHERE message_id=?", (mid,))
+                _record_identity(c, previous, mid, "in", peer, body, int(ts), "cellular")
+                c.execute("UPDATE message_imports SET instance=? WHERE message_id=?",
+                          (previous, mid))
+            else:
+                # Keep the identity/import tombstone so this modem object cannot resurrect the
+                # row after the operator clears it or after another ModemManager restart.
+                c.execute("UPDATE message_imports SET message_id=NULL WHERE message_id=?", (mid,))
+                c.execute("DELETE FROM mms_parts WHERE message_id=?", (mid,))
+                c.execute("DELETE FROM mms WHERE message_id=?", (mid,))
+                c.execute("DELETE FROM messages WHERE id=?", (mid,))
+            changed += 1
+        return changed
 
 
 def add_binary_sms(instance: str, peer: str, ts: int | None = None, *,

@@ -170,6 +170,54 @@ class DiscoverTests(DurableStoreCase):
         mm.add(7, sms_object())
         self.assertEqual(cellular_sms.discover(LINE, runner=mm), [])
 
+    def test_retained_object_is_not_reassigned_after_card_switch(self):
+        mm = FakeModemManager("card-a")
+        path = mm.add(7, sms_object(text="from card a"))
+        now = [100.0]
+        s = scanner(mm, topology_ttl=0, detail_ttl=0,
+                    clock=lambda: now[0], wall_clock=lambda: now[0])
+        first = s.discover([
+            {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
+        ])
+        self.assertEqual([(r["instance"], r["body"]) for r in first],
+                         [("a", "from card a")])
+
+        mm.iccid = "card-b"
+        now[0] += 1
+        self.assertEqual(s.discover([
+            {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
+        ]), [])
+
+        # A new SMS that reuses the numeric object path is accepted because its content
+        # signature changed, even though the modem's card identity changed too.
+        mm.objects[path] = sms_object(text="from card b", timestamp="2026-09-12T09:01:00+08:00")
+        now[0] += 1
+        rows = s.discover([
+            {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
+        ])
+        self.assertEqual([(r["instance"], r["body"]) for r in rows],
+                         [("b", "from card b")])
+
+    def test_first_scan_after_upgrade_baselines_old_objects_and_repairs_duplicate(self):
+        mm = FakeModemManager("card-b")
+        mm.add(7, sms_object(text="old card text"))
+        old_ts = 1789174800
+        store.add_message("b", "in", "+447700900123", "old card text",
+                          transport="cellular", ts=old_ts)
+        store.add_message("a", "in", "+447700900123", "old card text",
+                          transport="cellular", ts=old_ts)
+        now = [1_800_000_100.0]
+        s = scanner(mm, topology_ttl=0, detail_ttl=0,
+                    clock=lambda: now[0], wall_clock=lambda: now[0])
+        self.assertEqual(s.discover([
+            {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
+        ]), [])
+        self.assertEqual(s.discover([
+            {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
+        ]), [])
+        self.assertEqual(len(store.list_messages("a", "+447700900123")), 1)
+        self.assertEqual(store.list_messages("b", "+447700900123"), [])
+
     def test_scanner_caches_topology_and_details_but_keeps_listing_live(self):
         mm = FakeModemManager()
         path = mm.add(7, sms_object())
