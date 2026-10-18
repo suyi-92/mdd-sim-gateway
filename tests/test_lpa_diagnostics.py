@@ -138,7 +138,7 @@ class ProfileResultTests(unittest.IsolatedAsyncioTestCase):
     def status(self):
         return main._esim_cache_load()['fixture-euicc']['ses'][0]['profiles'][0]['operation_status']
 
-    async def test_failed_write_survives_reread_and_only_successful_write_clears_it(self):
+    async def test_failed_write_is_resolved_by_a_fresh_disabled_profile_read(self):
         read_timestamp = main._esim_cache_load()['fixture-euicc']['ts']
         async def fail():
             raise lpa.LpaError('es10c_enable_profile', detail='disallowed by policy', stage='profile enable')
@@ -148,7 +148,8 @@ class ProfileResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main._esim_cache_load()['fixture-euicc']['ts'], read_timestamp,
                          'a failed write must not make an old profile list look freshly read')
         main._esim_cache_store(self.profiles, '')
-        self.assertEqual(self.status()['state'], 'failed')
+        self.assertEqual(self.status()['state'], 'resolved')
+        self.assertEqual(self.status()['resolution'], 'profile_disabled_verified')
         self.assertEqual(self.status()['error'], caught.exception.detail)
         await main._esim_run('reader', 0, AsyncMock(return_value={})(), profile_iccid='fixture-card')
         self.assertEqual(self.status()['state'], 'success')

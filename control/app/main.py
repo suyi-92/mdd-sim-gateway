@@ -11026,8 +11026,11 @@ def _esim_cache_store(ses: list, imei: str):
                 profile["recovery_status"] = recovery
             operation = previous_operation.get((str(se.get("id") or ""), profile.get("iccid")))
             if operation:
-                # A successful read is not proof that the last write succeeded.
-                profile["operation_status"] = operation
+                # A fresh profile list is the card's authoritative outcome for an earlier
+                # uncertain enable.  Keep the original diagnostic for audit, but stop
+                # presenting it as a current error once the card confirms either state.
+                profile["operation_status"] = _esim_resolve_enable_operation(
+                    operation, profile.get("profileState"), checked_at)
     # Profiles/chip metadata remain useful while a line owns the reader, but the pending
     # notification list is transient: automatic delivery can remove it moments after this
     # snapshot. Persisting it made an already-sent installation result reappear after every
@@ -11130,20 +11133,46 @@ async def _esim_profile_operation_result(iccid: str, error: dict | None = None):
         log.warning("could not persist eSIM operation result error=%s", type(exc).__name__)
 
 
+def _esim_enable_operation_failed(status: dict | None) -> bool:
+    if not isinstance(status, dict) or status.get("state") != "failed":
+        return False
+    error = status.get("error") or {}
+    if not isinstance(error, dict):
+        return False
+    diagnostic = error.get("diagnostic") or {}
+    return (error.get("code") == "profile_enable_unconfirmed"
+            or (isinstance(diagnostic, dict)
+                and diagnostic.get("step") == "es10c_enable_profile"))
+
+
+def _esim_resolve_enable_operation(status: dict | None, profile_state, resolved_at: float | None = None):
+    """Retain an enable diagnostic while hiding it after a fresh card-state proof."""
+    if not _esim_enable_operation_failed(status):
+        return status
+    state = str(profile_state or "").lower()
+    if state not in {"enabled", "disabled"}:
+        return status
+    now = float(resolved_at or time.time())
+    return {
+        **status,
+        "state": "resolved",
+        "resolved_at": now,
+        "failed_at": status.get("updated_at"),
+        "resolution": "enabled_profile_verified" if state == "enabled"
+        else "profile_disabled_verified",
+        "updated_at": now,
+    }
+
+
 async def _esim_profile_operation_resolved(iccid: str):
-    """Keep the failed command for audit, but record a later verified card outcome."""
+    """Keep the failed command for audit, but record a later verified enabled outcome."""
     entry = await asyncio.to_thread(_esim_cache_for_iccid, iccid)
     for se in (entry or {}).get("ses") or []:
         for profile in se.get("profiles") or []:
             status = profile.get("operation_status") or {}
-            error = status.get("error") or {}
-            enable_error = (error.get("code") == "profile_enable_unconfirmed"
-                            or (error.get("diagnostic") or {}).get("step") == "es10c_enable_profile")
-            if profile.get("iccid") == iccid and status.get("state") == "failed" and enable_error:
+            if profile.get("iccid") == iccid and _esim_enable_operation_failed(status):
                 await asyncio.to_thread(_esim_cache_update_profile, iccid,
-                    operation_status={**status, "state": "resolved", "resolved_at": time.time(),
-                                      "failed_at": status.get("updated_at"),
-                                      "resolution": "enabled_profile_verified", "updated_at": time.time()})
+                    operation_status=_esim_resolve_enable_operation(status, "enabled"))
 
 
 @_esim_cache_transaction
