@@ -571,6 +571,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_cache_update_profile"), \
                 patch.object(main, "_esim_recover_profile_switch",
                              new=AsyncMock(side_effect=error)), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "identity_state": "confirmed"},
+                }), \
                 patch.object(main.egress, "publish"), \
                 patch.object(main, "_esim_restore_profile_switch",
                              new=AsyncMock()) as restore:
@@ -613,6 +616,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_cache_update_profile"), \
                 patch.object(main, "_esim_recover_profile_switch",
                              new=AsyncMock(return_value=recovery)), \
+                patch.object(main.hub, "cards", {
+                    "reader": {"present": True, "identity_state": "confirmed"},
+                }), \
                 patch.object(main.asyncio, "create_task", side_effect=capture):
             result = await main.api_esim_enable("profile-target", {})
 
@@ -681,7 +687,9 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                             return_value={"7": {"enabled": True, "running": False}})), \
                         patch.object(main, "_esim_guard_engine"), \
                         patch.object(main, "_match_instance_by_iccid", return_value=None), \
-                        patch.object(main.hub, "cards", {}), \
+                        patch.object(main.hub, "cards", {
+                            "reader": {"present": True, "identity_state": "confirmed"},
+                        }), \
                         patch.object(main.hub, "lpa_busy", {}), \
                         patch.object(main.lpa, "run_lpac", new=AsyncMock(
                             return_value=SimpleNamespace(data={}))) as command, \

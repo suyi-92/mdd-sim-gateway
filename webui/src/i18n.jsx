@@ -481,6 +481,8 @@ const zh = {
   'Profile enabled; rebuilding the modem SIM bridge…': '配置文件已启用，正在重建模块 SIM 桥接…',
   'SIM bridge ready; processing the eSIM notification…': 'SIM 桥接已就绪，正在处理 eSIM 通知…',
   'Processing the eSIM notification…': '正在处理 eSIM 通知…',
+  'Flight mode is on; turn it off to process the eSIM notification.': '飞行模式已开启，请关闭飞行模式后再处理 eSIM 通知。',
+  'Waiting for the modem to finish initialization before processing the eSIM notification.': '正在等待蜂窝模块完成初始化，之后再处理 eSIM 通知。',
   'The reader was busy. eSIM notification pending; click Load, then Process all to retry.': '读卡器暂时占用，eSIM 通知待处理；请点击“读取”，再点击“全部处理”重试。',
   'eSIM notification pending; click Load, then Process all to retry.': 'eSIM 通知待处理；请点击“读取”，再点击“全部处理”重试。',
   'The reader remained busy; the eSIM notification is still pending.': '读卡器持续被占用，eSIM 通知仍待处理。',

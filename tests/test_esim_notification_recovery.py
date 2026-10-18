@@ -87,6 +87,38 @@ class NotificationCacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lpa_reservation_drains_an_inflight_card_probe(self):
+        name = 'VoWiFi Modem modem-a 00 00'
+        sibling = 'VoWiFi Modem modem-a 00 01'
+        cards = {
+            name: {'present': True, 'identity_state': 'confirmed'},
+            sibling: {'present': True, 'identity_state': 'confirmed'},
+        }
+        with patch.object(main.hub, 'cards', cards), \
+                patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'reader_locks', {}):
+            lock = main.hub.reader_lock(name)
+            await lock.acquire()
+            task = asyncio.create_task(
+                main._esim_reserve_lpa_busy(name, 'modem-a', [name, sibling]))
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertEqual(main.hub.lpa_busy, {})
+            lock.release()
+            self.assertEqual(await task, [name, sibling])
+            self.assertEqual(main.hub.lpa_busy, {name: True, sibling: True})
+
+    async def test_lpa_reservation_rejects_unconfirmed_identity_without_writing(self):
+        name = 'VoWiFi Modem modem-a 00 00'
+        with patch.object(main.hub, 'cards', {
+                name: {'present': True, 'identity_state': 'reading'}
+        }), patch.object(main.hub, 'lpa_busy', {}), \
+                patch.object(main.hub, 'reader_locks', {}):
+            with self.assertRaises(main.HTTPException) as caught:
+                await main._esim_reserve_lpa_busy(name, 'modem-a', [name])
+        self.assertEqual(caught.exception.detail['code'], 'card_identity_unconfirmed')
+        self.assertEqual(main.hub.lpa_busy, {})
+
     async def test_enable_rebuild_notify_verify_in_that_order_before_line_start(self):
         name = 'VoWiFi Modem modem-a 00 00'
         order = []
@@ -135,7 +167,9 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.egress, 'publish'), \
                 patch.object(main.lpa, 'run_lpac', new=lpac), \
                 patch.object(main.lpa, 'auto_process_notifications', return_value=True), \
-                patch.object(main.hub, 'cards', {}), \
+                patch.object(main.hub, 'cards', {
+                    name: {'present': True, 'identity_state': 'confirmed'},
+                }), \
                 patch.object(main.hub, 'lpa_busy', {}), \
                 patch.object(main.hub, 'reader_locks', {}), \
                 patch.object(main.hub, 'broadcast', new=AsyncMock()):
@@ -146,6 +180,32 @@ class SwitchOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, [('profile', 'enable'), 'bridge', 'reader_ready', ('notification', 'process'), 'verify'])
         self.assertEqual(result['notification_status']['state'], 'processed')
         self.assertEqual(result['recovery_skipped'], 'vowifi_disabled')
+
+    async def test_flight_mode_defers_notification_without_waiting_for_lpac_timeout(self):
+        name = 'VoWiFi Modem modem-a 00 00'
+        target = {'id': 'line-1', 'iccid': 'fixture-card', 'enabled': False}
+        bridge = {'state': 'channels_ready', 'request_id': 'request',
+                  'cellular_recovery': {'state': 'waiting_flight_mode'}}
+        deferred = AsyncMock(side_effect=lambda status: status)
+        notify = AsyncMock()
+        with patch.object(main, '_esim_restart_modem_bridge', new=AsyncMock(return_value=bridge)), \
+                patch.object(main, '_esim_refresh_modem_readers', new=AsyncMock(
+                    return_value=({'present': True, 'iccid': 'fixture-card'}, [name]))), \
+                patch.object(main, '_match_instance_by_iccid', return_value=target), \
+                patch.object(main, '_refresh_instance_reader_binding', return_value=target), \
+                patch.object(main, '_esim_vowifi_requested', return_value=False), \
+                patch.object(main.cfg, 'upsert_instance', side_effect=lambda value: value), \
+                patch.object(main.egress, 'publish'), \
+                patch.object(main.hub, 'cards', {name: {'present': True}}), \
+                patch.object(main, '_update_esim_recovery', new=AsyncMock()):
+            result = await main._esim_recover_profile_switch(
+                name, 'modem-a', 'fixture-card', after_bridge=notify,
+                recovery_task_id='task', on_notification_deferred=deferred)
+
+        notify.assert_not_awaited()
+        deferred.assert_awaited_once()
+        self.assertEqual(deferred.await_args.args[0]['reason_code'], 'flight_mode')
+        self.assertEqual(result['notification_status']['state'], 'pending')
 
 
 class VerifiedHandoffTests(unittest.IsolatedAsyncioTestCase):

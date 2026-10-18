@@ -74,6 +74,12 @@ function isNonEuiccError(msg) {
 
 function notificationFeedback(status, t) {
   if (['pending', 'processing'].includes(status?.state)) {
+    if (status.reason_code === 'flight_mode') {
+      return t('Flight mode is on; turn it off to process the eSIM notification.')
+    }
+    if (status.reason_code === 'baseband_initialization') {
+      return t('Waiting for the modem to finish initialization before processing the eSIM notification.')
+    }
     return t('Processing the eSIM notification…')
   }
   if (status?.state === 'failed') {

@@ -4251,14 +4251,17 @@ def _esim_resolve_se(
 
 
 async def _esim_resolve_se_owned(name, idx, se_id=None, aid=None, *, require=False,
-                                 switch_locked=False):
+                                 switch_locked=False, require_card_identity=False):
     if not switch_locked:
         async with hub.esim_switch_lock(_esim_switch_identity(name)[0]):
             return await _esim_resolve_se_owned(
-                name, idx, se_id, aid, require=require, switch_locked=True)
+                name, idx, se_id, aid, require=require, switch_locked=True,
+                require_card_identity=require_card_identity)
     async with hub.reader_lock(name):
         hardware_id = device_state.vpcd_modem_hardware_id(name)
         names = _esim_modem_reader_names(name, hardware_id) if hardware_id else [name]
+        if require_card_identity:
+            _esim_require_confirmed_card(name)
         for reader in names:
             await asyncio.to_thread(_esim_guard_engine, reader)
         # A cancelled HTTP request must not release ownership while the thread is using PC/SC.
@@ -4269,6 +4272,71 @@ async def _esim_resolve_se_owned(name, idx, se_id=None, aid=None, *, require=Fal
         except asyncio.CancelledError:
             await worker
             raise
+
+
+def _esim_require_confirmed_card(name: str) -> None:
+    """Refuse an LPA transaction until the card monitor has a stable identity.
+
+    A profile switch can trigger a REFRESH/remove-insert edge while a normal card probe is
+    still draining.  Sending EnableProfile in that window makes the probe report
+    ``reader_changed`` and leaves lpac's result ambiguous.  The monitor's confirmed row is
+    the only safe admission proof; it contains no card identifier in the public error.
+    """
+    info = hub.cards.get(name) or {}
+    if info.get("present") and info.get("identity_state") == "confirmed":
+        return
+    raise HTTPException(409, {
+        "code": "card_identity_unconfirmed",
+        "message": "The card reader is still being verified. Wait for the card status to become ready and retry.",
+        "state": str(info.get("identity_state") or "unknown"),
+        "reason": str(info.get("identity_reason") or "card_not_present"),
+    })
+
+
+async def _esim_reserve_lpa_busy(name: str, hardware_id: str,
+                                 readers: list[str] | None = None,
+                                 *, guard_engine: bool = False) -> list[str]:
+    """Drain card probes and atomically reserve the physical eUICC's readers for LPA.
+
+    Locks are acquired before checking identity, so a probe that was already in progress is
+    allowed to finish.  The reservation is written while those locks are still held; no new
+    probe can slip between the stability check and ``lpa_busy`` publication.
+    """
+    names = list(readers or _esim_modem_reader_names(name, hardware_id))
+    ordered = sorted(set(names))
+    locks = []
+    seen_locks = set()
+    for reader in ordered:
+        lock = hub.reader_lock(reader)
+        if id(lock) not in seen_locks:
+            seen_locks.add(id(lock))
+            locks.append(lock)
+    acquired = []
+    try:
+        for lock in locks:
+            await lock.acquire()
+            acquired.append(lock)
+        _esim_require_confirmed_card(name)
+        for reader in names:
+            info = hub.cards.get(reader) or {}
+            if info.get("present") and info.get("identity_state") != "confirmed":
+                raise HTTPException(409, {
+                    "code": "card_identity_unconfirmed",
+                    "message": "A reader for this eSIM is still being verified. Retry after all card statuses are ready.",
+                    "state": str(info.get("identity_state") or "unknown"),
+                    "reason": str(info.get("identity_reason") or "card_not_ready"),
+                })
+            if guard_engine:
+                await asyncio.to_thread(_esim_guard_engine, reader)
+        for reader in names:
+            (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
+            hub.lpa_busy[reader] = True
+        return names
+    except BaseException:
+        raise
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
 
 
 async def _esim_enable_verified(name, iccid, *, aid=None, **kwargs):
@@ -4855,7 +4923,8 @@ async def _esim_wait_notification_reader(name: str, iccid: str) -> None:
 
 
 async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
-                                     *, after_bridge=None, recovery_task_id: str = "") -> dict:
+                                     *, after_bridge=None, recovery_task_id: str = "",
+                                     on_notification_deferred=None) -> dict:
     """Rebuild the modem bridge, publish the new line, and return before Engine startup.
 
     Country egress can need longer than one startup attempt to resolve and route a new ePDG.
@@ -4880,10 +4949,26 @@ async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str,
                    else "automatic_selection"),
             bridge_request_id=str(bridge.get("request_id") or ""),
             error_code=str(cellular_recovery.get("error_code") or ""))
-    if after_bridge:
+    host_state = str(cellular_recovery.get("state") or "")
+    defer_notification = bool(cellular_recovery) and host_state in {
+        "waiting_flight_mode", "waiting_baseband"}
+    if after_bridge and not defer_notification:
         async with hub.reader_lock(name):
             await _esim_wait_notification_reader(name, iccid)
-    notification_status = await after_bridge() if after_bridge else None
+    notification_status = None
+    if after_bridge and defer_notification:
+        reason = "flight_mode" if host_state == "waiting_flight_mode" else "baseband_initialization"
+        notification_status = {"state": "pending", "reason_code": reason,
+                               "attempts": 0, "stage": "notification_process",
+                               "elapsed_ms": 0}
+        if on_notification_deferred:
+            result = on_notification_deferred(notification_status)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is not None:
+                notification_status = result
+    elif after_bridge:
+        notification_status = await after_bridge()
     notifications_done_at = time.monotonic()
     info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
     refreshed_at = time.monotonic()
@@ -5225,7 +5310,8 @@ async def _resume_persisted_esim_bridge(task: dict) -> None:
                 recovery = await _esim_recover_profile_switch(
                     reader, device_id, iccid,
                     after_bridge=process_after_bridge,
-                    recovery_task_id=str(task.get("id") or ""))
+                    recovery_task_id=str(task.get("id") or ""),
+                    on_notification_deferred=report_notification)
                 if recovery.get("start_allowed", True):
                     asyncio.create_task(_esim_start_profile_line(
                         reader, device_id, iccid, str(recovery["instance_id"]),
@@ -11154,7 +11240,8 @@ def _esim_notification_status_callback(reader: str, iccid: str):
         reason = str(status.get("reason_code") or "")
         if reason not in {"reader_busy", "card_unavailable", "notification_timeout",
                           "reader_unavailable", "process_error", "network_transport",
-                          "remote_rejected", "interrupted", "unknown_error"}:
+                          "remote_rejected", "interrupted", "unknown_error",
+                          "flight_mode", "baseband_initialization"}:
             reason = ""
         value = {"state": state, "reason_code": reason,
                  "attempts": min(3, max(0, int(status.get("attempts") or 0))),
@@ -11334,7 +11421,8 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             try:
                 se = await _esim_resolve_se_owned(
                     name, idx, body.get("se_id") or body.get("seId"),
-                    body.get("aid"), require=True, switch_locked=True)
+                    body.get("aid"), require=True, switch_locked=True,
+                    require_card_identity=True)
                 await _esim_profile_event(name, iccid, "switching")
                 await _esim_run(
                     name, idx, _esim_enable_verified(
@@ -11384,19 +11472,20 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
                 error_code="profile_switch_prepare_failed")
             raise
         busy_readers = _esim_modem_reader_names(name, hardware_id)
-        for reader in busy_readers:
-            (hub.cards.get(reader) or {}).pop("esim_verified_bridge", None)
-            hub.lpa_busy[reader] = True
         lpa_succeeded = False
         notification_status = None
         report_notification = _esim_notification_status_callback(name, iccid)
         try:
+            # Drain any card probe before reserving the readers.  Reserving first would make
+            # an in-flight probe publish reader_changed and let EnableProfile race the card.
+            await _esim_reserve_lpa_busy(name, hardware_id, busy_readers)
             await _esim_profile_event(name, iccid, "switching")
             if _esim_vowifi_requested(hardware_id):
                 await asyncio.to_thread(_esim_prewarm_target_egress, iccid)
             se = await _esim_resolve_se_owned(
                 name, idx, body.get("se_id") or body.get("seId"),
-                body.get("aid"), require=True, switch_locked=True)
+                body.get("aid"), require=True, switch_locked=True,
+                require_card_identity=True)
             await _update_esim_recovery(
                 recovery_task_id, None, se_id=str(se.get("id") or ""),
                 se_aid=str(se.get("aid") or ""))
@@ -11429,7 +11518,8 @@ async def _enable_esim_profile(iccid: str, body: dict | None = None):
             try:
                 recovery = await _esim_recover_profile_switch(
                     name, hardware_id, iccid, after_bridge=process_after_bridge,
-                    recovery_task_id=recovery_task_id)
+                    recovery_task_id=recovery_task_id,
+                    on_notification_deferred=report_notification)
             except Exception as exc:  # noqa
                 deferred = await _defer_unreadable_subscription(recovery_task_id, exc)
                 if not deferred:

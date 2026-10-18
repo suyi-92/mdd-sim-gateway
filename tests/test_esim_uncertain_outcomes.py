@@ -59,6 +59,9 @@ class EnableOutcomeTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, '_esim_enable_verified', new=lambda *a, **k: object()), \
                 patch.object(main, '_esim_run', new=AsyncMock(side_effect=error)), \
                 patch.object(main, '_esim_profile_event', new=AsyncMock()), \
+                patch.object(main.hub, 'cards', {
+                    'reader': {'present': True, 'identity_state': 'confirmed'},
+                }), \
                 patch.object(main, '_publish_esim_recovery', new=AsyncMock()), \
                 patch.object(main, '_update_esim_recovery', new=updates), \
                 patch.object(main.esim_recoveries, 'active', return_value=[]), \
