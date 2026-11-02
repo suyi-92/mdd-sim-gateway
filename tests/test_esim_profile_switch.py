@@ -141,6 +141,31 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(patch.object(main.cfg, 'upsert_instance', side_effect=lambda value, **kw: value))
 
+    def test_bridge_request_binds_durable_cellular_recovery_to_usb_generation(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(main.cfg, "DATA_DIR", temp), \
+                patch.object(main.device_state, "status", return_value={
+                    "devices": {"modem-1": {"usb_generation": "generation-a"}}}):
+            request_id, _status_path = main._esim_write_bridge_restart_request(
+                "modem-1", "profile-target")
+            request = mdd_orchestrator.read_json(
+                Path(temp) / "orchestrator" / "bridge-restart-requests" / f"{request_id}.json")
+        self.assertTrue(request["cellular_refresh"])
+        self.assertEqual(request["usb_generation"], "generation-a")
+        self.assertEqual(request["expected_iccid_sha256"],
+                         hashlib.sha256(b"profile-target").hexdigest())
+        self.assertNotIn("profile-target", str(request))
+
+    async def test_failed_host_convergence_never_enables_or_starts_line(self):
+        with patch.object(main, "_esim_restart_modem_bridge", new=AsyncMock(
+                side_effect=main.HTTPException(503, "identity mismatch"))), \
+                patch.object(main.cfg, "upsert_instance") as enable, \
+                patch.object(main, "api_instance_start", new=AsyncMock()) as start:
+            with self.assertRaises(main.HTTPException):
+                await main._esim_recover_profile_switch("reader", "modem-1", "profile-target")
+        enable.assert_not_called()
+        start.assert_not_awaited()
+
     def test_modem_reader_list_ignores_the_driver_spare_slot(self):
         readers = [
             "VoWiFi Modem modem-1 00 00",

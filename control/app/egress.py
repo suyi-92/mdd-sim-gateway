@@ -755,13 +755,81 @@ def _ensure_socks_exit(country, proxy, timeout):
     raise EgressError(f"{country.upper()} exit unavailable: {reason}")
 
 
-def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:
+def exit_probe_context(inst: dict, settings: dict) -> dict | None:
+    """Bind a probe to the current automatic country exit and saved assignment.
+
+    Both native TUN exits and container exits have a SOCKS diagnostic listener. The
+    native listener must stay on loopback and its applied revision must match settings;
+    an old listener or carrier DNS failure alone is never evidence against a new node.
+    """
+    proxy = settings.get("proxy") or {}
+    country = line_country(inst)
+    if not proxy.get("enabled") or not country:
+        return None
+    state = status()
+    selected = (state.get("exits") or {}).get(country) or {}
+    configured = (proxy.get("exits") or {}).get(country) or {}
+    if (not configured.get("enabled") or selected.get("ready") is not True
+            or selected.get("mode") != "subscription"
+            or selected.get("selection") == "manual" or not selected.get("node")
+            or len(selected.get("candidates") or []) < 2
+            or selected["node"] not in selected["candidates"]):
+        return None
+    selected_transport = transport()
+    assignment_revision = country_exit_revision(proxy, country)
+    if selected_transport == "socks5":
+        if (not current_status(state, proxy, time.time())
+                or selected.get("transport") != "socks5"):
+            return None
+    else:
+        stamp = state.get("updated_at")
+        # Native reconciliation can spend time resolving several ePDGs. Allow its normal
+        # bounded polling window, while rejecting missing, future or stale snapshots.
+        if (state.get("enabled") is not True or type(stamp) not in (int, float)
+                or not -5 <= time.time() - stamp <= 60
+                or selected.get("config_revision") != assignment_revision
+                or selected.get("proxy_host") != "127.0.0.1"):
+            return None
+    try:
+        socks_endpoint(selected)
+    except ValueError:
+        return None
+    return {"country": country, "transport": selected_transport,
+            "config_revision": country_connection_revision(proxy, country),
+            "assignment_revision": assignment_revision,
+            "config_fingerprint": state.get("config_fingerprint", ""),
+            "candidates": list(selected["candidates"]),
+            **{key: selected.get(key) for key in
+               ("node", "node_tag", "proxy_host", "proxy_port")}}
+
+
+def probe_current_exit(inst: dict, settings: dict) -> dict | None:
+    """Prove independent DNS/STUN reachability after a failed Engine start.
+
+    Reuse the normal interleaved probe and its bounded cold-start confirmation. Never
+    expose raw probe exceptions or charge a result to a replaced selector/configuration.
+    """
+    context = exit_probe_context(inst, settings)
+    if context is None:
+        return None
+    try:
+        test_udp_proxy(context["proxy_host"], context["proxy_port"], timeout=8.0)
+        reachable = True
+    except EgressError:
+        reachable = False
+    if exit_probe_context(inst, cfg.get_settings()) != context:
+        return None
+    return {"context": context, "reachable": reachable}
+
+
+def request_reselect(inst: dict, reason: str, stable_for: float = 0.0,
+                     *, probe_context: dict | None = None) -> str:
     """Ask the host to move this SIM's country exit to a different node.
 
-    Raised when the control plane gives up on a line. A line that cannot register is the only
-    reliable evidence that an exit is unusable for VoWiFi: the ePDG tunnel can be established
-    over a path on which SIP then goes unanswered, so no latency probe would catch it. The
-    orchestrator owns sing-box and performs the change; this only records the request.
+    Registration failures can reveal an unusable path even when a latency test passes.
+    A failed recovery start can also provide independent DNS/STUN evidence against the
+    current exit. The orchestrator owns sing-box and performs the change; this records
+    the request, binding verified startup probes to their exact node and assignment.
 
     ``stable_for`` is how long the line was healthy before it broke. Past a threshold the exit
     has demonstrably carried IMS, so the failure belongs to something else — a carrier-side
@@ -774,6 +842,12 @@ def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:
         return ""
     country = line_country(inst)
     current = (status().get("exits") or {}).get(country) or {}
+    if probe_context is not None:
+        if exit_probe_context(inst, cfg.get_settings()) != probe_context:
+            return ""
+        # The host must consume this exact observation, even if selection changes after
+        # publication. It can discard a stale request without cooling down a new node.
+        current = probe_context
     # A locked exit is a deliberate operator choice — including while it is failing — and a
     # country routed direct has no node to move. A "preferred" pin still allows the move: the
     # host applies the preference when it picks the replacement. The orchestrator enforces
@@ -789,6 +863,9 @@ def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:
                           # can put it in a cooldown instead of picking it again immediately.
                           "node": str(current.get("node") or ""),
                           "line": str(inst.get("id") or "")}
+    if probe_context is not None:
+        countries[country].update(expected_node=probe_context["node"],
+                                  config_revision=probe_context["assignment_revision"])
     _atomic_json(_RESELECT, {"version": 1, "countries": countries})
     return country
 

@@ -41,6 +41,9 @@ class DeviceMigrationTests(unittest.TestCase):
                                                          "base_port": 35963}}})
         self._write(self.app.device_status_path,
                     {"devices": {"2c7c-0125-1-1.2": {"present": False}}})
+        user_hardware_path = self.app.root / "devices-hardware.json"
+        self._write(user_hardware_path, {"devices": {
+            "2c7c-0125-1-1.2": {"device_type": "modem", "display_name": "Desk modem"}}})
         self._identity("2c7c-0125-1-1.2")
         self._identity("2c7c-0125-1-1.4")
 
@@ -55,6 +58,11 @@ class DeviceMigrationTests(unittest.TestCase):
         self.assertEqual(moved["usb_path"], "1-1.4")
         status = json.loads(self.app.device_status_path.read_text())["devices"]
         self.assertEqual(status, {})
+        records = json.loads(user_hardware_path.read_text())["devices"]
+        self.assertEqual(set(records), {"2c7c-0125-1-1.4"})
+        self.assertEqual(records["2c7c-0125-1-1.4"]["display_name"], "Desk modem")
+        self.assertEqual(records["2c7c-0125-1-1.4"]["device_type"], "modem")
+        self.assertEqual(records["2c7c-0125-1-1.4"]["stable_path"], "1-1.4")
 
     def test_same_model_requires_matching_hardware_imei(self):
         devices = {"2c7c-0125-1-1.2": {"vowifi_enabled": True}}

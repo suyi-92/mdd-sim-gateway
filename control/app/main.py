@@ -2956,7 +2956,8 @@ def _local_card_fault(iid: str, inst: dict) -> str:
     return ""
 
 
-def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> str:
+def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float,
+                       *, failed_probe: dict | None = None) -> str:
     """Attribute one line freeze and act on it: hold, move the exit, back off, or stop.
 
     Runs on the freeze path only, so reading the tunnel's own evidence here costs nothing in
@@ -2964,6 +2965,9 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
     captured separately and must not be on this decision's critical path.
     """
     iid = str(iid)
+    if failed_probe is not None and egress.exit_probe_context(
+            inst, cfg.get_settings()) != failed_probe:
+        return failover.HOLD
     local = _local_card_fault(iid, inst)
     if local:
         log.warning("line %s froze (%s): %s — a local binding fault, not evidence against "
@@ -2971,6 +2975,10 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         return failover.HOLD
     country = egress.line_country(inst)
     exits = (egress.status().get("exits") or {}).get(country) or {}
+    if failed_probe is not None and any(
+            exits.get(key) != failed_probe.get(key) for key in
+            ("node", "node_tag", "proxy_host", "proxy_port", "candidates")):
+        return failover.HOLD
     if (not cfg.get_settings().get("proxy", {}).get("enabled", False)
             or exits.get("mode") != "subscription"):
         # Direct, single-node and disabled routes have no pool to walk, so a ledger for them
@@ -2989,19 +2997,23 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
     pinned = exits.get("selection") == "manual"
     peer_registered = _peer_line_registered(iid, country)
     swu, retransmits = "", None
-    try:
-        swu = (engine.read_run_json(iid, "swu_status.json") or {}).get("state") or ""
-    except Exception as exc:  # noqa
-        log.debug("cannot read tunnel evidence for line %s: %r", iid, exc)
-    try:
-        evidence = engine.ike_evidence(iid) or {}
-        if evidence.get("available", True) and evidence.get("retransmits") is not None:
-            retransmits = int(evidence["retransmits"])
-    except Exception as exc:
-        log.debug("cannot read IKE evidence for line %s: %r", iid, exc)
-    verdict = failover.classify(swu, retransmits, stable_for,
-                                egress.RESELECT_MIN_STABLE_SECONDS,
-                                reason_code=st.get("reason_code") or "unknown")
+    if failed_probe is None:
+        try:
+            swu = (engine.read_run_json(iid, "swu_status.json") or {}).get("state") or ""
+        except Exception as exc:  # noqa
+            log.debug("cannot read tunnel evidence for line %s: %r", iid, exc)
+        try:
+            evidence = engine.ike_evidence(iid) or {}
+            if evidence.get("available", True) and evidence.get("retransmits") is not None:
+                retransmits = int(evidence["retransmits"])
+        except Exception as exc:
+            log.debug("cannot read IKE evidence for line %s: %r", iid, exc)
+    # Current end-to-end UDP failure outweighs historical uptime and stale CONNECTED
+    # files from a removed engine. The ordinary freeze path keeps its conservative policy.
+    verdict = (failover.BLAMES_EXIT if failed_probe is not None else
+               failover.classify(swu, retransmits, stable_for,
+                                 egress.RESELECT_MIN_STABLE_SECONDS,
+                                 reason_code=st.get("reason_code") or "unknown"))
     revision = egress.country_connection_revision(cfg.get_settings().get("proxy") or {}, country)
     previous = hub.exit_ledgers.get(iid) or {}
     if previous.get("config_revision") != revision:
@@ -3019,8 +3031,11 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
              len(ledger.get("tried") or []), len(candidates), peer_registered)
     if action == failover.SWITCH:
         try:
+            reselect_options = {"stable_for": stable_for}
+            if failed_probe is not None:
+                reselect_options.update(stable_for=0.0, probe_context=failed_probe)
             egress.request_reselect(inst, f"health-freeze:{st['reason_code']}",
-                                    stable_for=stable_for)
+                                    **reselect_options)
         except Exception as exc:  # noqa
             log.warning("exit reselect request failed for line %s: %s", iid, exc)
     elif verdict == failover.BLAMES_EXIT and not peer_registered and country:
@@ -3052,6 +3067,35 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
             notify_push.dispatch, cfg.get_settings(), notify_push.EV_LINE_UNRECOVERABLE,
             inst, node or country.upper(), text))
     return action
+
+
+async def _judge_failed_start_exit(iid: str, inst: dict) -> str:
+    """Revisit exit attribution when recovery cannot even start a replacement engine."""
+    country = egress.line_country(inst)
+    if _peer_line_registered(str(iid), country):
+        return failover.HOLD
+    health = hub.health_for(iid)
+    evidence = await asyncio.to_thread(egress.probe_current_exit, inst, cfg.get_settings())
+    current_inst = cfg.get_instance(str(iid))
+    if (evidence is None or hub.health.get(str(iid)) is not health or not current_inst
+            or not _line_auto_start_allowed(current_inst)[0]
+            or _peer_line_registered(str(iid), country)):
+        return failover.HOLD
+    context = evidence["context"]
+    if egress.exit_probe_context(current_inst, cfg.get_settings()) != context:
+        return failover.HOLD
+    if evidence["reachable"]:
+        ledger = hub.exit_ledgers.get(str(iid)) or {}
+        if (ledger.get("node") == context["node"]
+                and ledger.get("config_revision") == context["config_revision"]
+                and ledger.get("strikes")):
+            ledger["strikes"] = 0
+            _save_exit_ledgers()
+        return failover.HOLD
+    log.warning("line %s failed startup and its current country exit failed the UDP probe; "
+                "re-evaluating automatic exit selection", iid)
+    return _judge_exit_failure(str(iid), current_inst, {"reason_code": "egress_unavailable"},
+                               0.0, failed_probe=context)
 
 
 def _host_alert_state_path() -> str:
@@ -3581,6 +3625,23 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
         h["next_retry_at"] = time.monotonic() + delay
         h["frozen_reason"] = str(getattr(exc, "detail", exc))
         code = _recovery_failure_code(exc)
+        retry_delay = delay
+        if code == "egress_unavailable":
+            try:
+                action = await _judge_failed_start_exit(str(iid), inst)
+                # A user stop/disable while the probe ran owns the current health state.
+                if hub.health.get(str(iid)) is not h:
+                    return
+                if action == failover.BACK_OFF:
+                    retry_delay = int(failover.EXHAUSTED_RETRY_SECONDS)
+                elif action == failover.GIVE_UP:
+                    retry_delay = None
+                h["next_retry_at"] = (time.monotonic() + retry_delay
+                                      if retry_delay is not None else None)
+            except Exception as probe_exc:
+                # Missing diagnostic evidence must not cancel ordinary recovery.
+                log.warning("exit probe judgement failed for line %s: %s",
+                            iid, type(probe_exc).__name__)
         detail = getattr(exc, "detail", None)
         source_matches = None
         if code == "hardware_imei_required" and isinstance(detail, dict):
@@ -3591,7 +3652,7 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
         h["last_blocked_reason"] = None
         _record_lifecycle(
             iid, "recovery_failed", code, retry_count=h.get("retry_count"),
-            delay_seconds=delay, card_present=True, imei_valid=False
+            delay_seconds=retry_delay, card_present=True, imei_valid=False
             if code == "hardware_imei_required" else None,
             imei_source_matches=source_matches)
 

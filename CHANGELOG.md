@@ -2,6 +2,18 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.14.0-vmware.1] - 2026-11-02
+
+### Fixed
+- ModemManager 身份查询设定子进程硬超时，恢复失败保留目标事务与脱敏阶段，继续禁止通用 reset。
+- 自动恢复启动遇到出口不可用时，以当前国家出口的独立 DNS/STUN 证据重新归因；保留手动锁定、已注册同国线路、配置代次与用户停止保护。
+- 模块逻辑通道持续访问失败触发有界桥接退役；支持 4–19 号扩展通道，持久重建预算不覆盖旧终态，不重放 APDU。
+- WebUI 锁定 Vite 6.4.5，额度查询表单按局部容器宽度收敛，并提示无序列号设备的端口命名关系。
+
+### Changed
+- 普通合并上游 1.14.0，设备改名、移动布局与 eSIM 身份握手保留已有更严格实现；同步记录区分正式版本与未发布 develop 增量。
+- 继续保留原生部署、运行容量、短信对象隔离、飞行模式延期及受管更新回滚；不恢复容器 Hardware、Release 更新或通用硬件 reset。
+
 ## [1.9.4-vmware.1] - 2026-09-14
 
 ### Added
@@ -45,6 +57,29 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 - 明确独立仓库的合并、提交推送和快照前置流程，退役 Release/CI 部署入口继续保持删除。
 
 ## [Unreleased]
+
+## [1.14.0] - 2026-10-15
+
+The automatic update channels remain on v1.13.2 pending real-device acceptance.
+
+### Added
+
+- Devices can have a custom display name in Hardware settings, so identical readers and modems
+  are easier to tell apart. The original hardware name remains visible, and clearing the custom
+  name restores the default. For devices without a serial number, names follow USB ports.
+
+### Fixed
+
+- eSIM profile-switch recovery now verifies ModemManager's live SIM identity when the
+  replacement bridge uses the cellular backend. Stale identities trigger one host-side,
+  target-modem reset and bridge rebuild, not a shared service restart. Direct-serial
+  bridges remain independent of ModemManager; failed convergence keeps the line stopped.
+  Full-container Hardware uses the same verification handshake and preserves other PC/SC
+  bridges while the reset target temporarily re-enumerates.
+
+- WebUI mobile layout responsiveness: keep wide tabular views scrollable and stack dense grids on small screens. Keepalive table and absent SIM cards preserve column structure via horizontal scrolling without clipping, detail drawer and SIM configuration forms fold into single-column layouts on mobile, and allowance query fields stack cleanly.
+
+- Updated source-map-js to 1.2.2 to address the reported denial-of-service advisory.
 
 ## [1.13.2] - 2026-10-05
 

@@ -595,9 +595,9 @@ function HardwarePanel({ device, refreshDevices, refresh, showToast }) {
     </div>
     <div className="u-hardware-action u-hardware-name">
       <div className="u-hardware-action-copy"><h4>{t('Device name')}</h4>
-        <p>{t('This name is used everywhere this physical device appears. Clear it to restore the automatic name.')}</p>
+        <p>{t('This name is used everywhere this physical device appears. Clear it to restore the automatic name.')} {t('Names may follow USB ports for devices without serial numbers; swapping identical readers can swap their names.')}</p>
       </div>
-      <input maxLength={80} value={name} onChange={event => setName(event.target.value)}
+      <input aria-label={t('Device name')} maxLength={80} value={name} onChange={event => setName(event.target.value)}
         placeholder={defaultDeviceName(device, 0, t)} />
       <button className="btn btn-primary" disabled={!!saving} onClick={saveName}>{t('Save')}</button>
     </div>

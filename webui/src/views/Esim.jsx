@@ -115,9 +115,16 @@ function recoveryFeedback(status, t) {
       ? t('The eSIM is readable, but LTE/EPS service was rejected (cause 7: EPS services not allowed).')
       : t('The eSIM is readable, but cellular service was rejected by the network.')
   }
-  if (status.state === 'failed') return t('The eSIM profile is enabled, but cellular recovery failed: {code}', {
-    code: status.error_code || t('unknown error'),
-  })
+  if (status.state === 'failed') {
+    const messages = {
+      modemmanager_timeout: 'The eSIM profile is enabled, but cellular recovery is incomplete because the modem query timed out.',
+      modemmanager_unavailable: 'The eSIM profile is enabled, but cellular recovery is incomplete because the modem service is temporarily unavailable.',
+    }
+    if (Object.hasOwn(messages, status.error_code)) return t(messages[status.error_code])
+    return t('The eSIM profile is enabled, but cellular recovery failed: {code}', {
+      code: status.error_code || t('unknown error'),
+    })
+  }
   if (status.state === 'waiting_flight_mode') return t('Profile enabled; cellular initialization will continue when flight mode is turned off.')
   if (status.state === 'registering') return t('Profile enabled; applying automatic network selection and waiting for registration…')
   return t('Profile enabled; completing SIM and baseband initialization…')

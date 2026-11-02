@@ -31,8 +31,10 @@ from pathlib import Path
 
 try:
     from host import modem_probe
+    from host.vpcd_modem_bridge import BridgeRecoveryBudget, SIM_ACCESS_CLEANUP_EXIT, SIM_ACCESS_RECOVERY_EXIT
 except ImportError:  # run as host/mdd_orchestrator.py, with host/ itself on the path
     import modem_probe
+    from vpcd_modem_bridge import BridgeRecoveryBudget, SIM_ACCESS_CLEANUP_EXIT, SIM_ACCESS_RECOVERY_EXIT
 
 try:
     import serial
@@ -160,10 +162,11 @@ def append_jsonl(path: Path, record: dict, limit: int = 500):
         pass
 
 
-def run(args, *, check=False, capture=True):
+def run(args, *, check=False, capture=True, timeout=None):
     return subprocess.run(args, check=check, text=True,
                           stdout=subprocess.PIPE if capture else None,
-                          stderr=subprocess.PIPE if capture else None)
+                          stderr=subprocess.PIPE if capture else None,
+                          **({"timeout": timeout} if timeout is not None else {}))
 
 
 def slug(value: str) -> str:
@@ -403,6 +406,7 @@ MODEM_MAY_PROVIDE_DEFAULT_ROUTE = os.environ.get(
 # an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
 # ModemManager has decided not to manage this hardware, not that it is still working on it.
 MM_CLAIM_GRACE_SECONDS = float(os.environ.get("MDD_MM_CLAIM_GRACE", "180"))
+MODEMMANAGER_QUERY_TIMEOUT_SECONDS = 10.0
 # Fast sampling helps an explicit radio/data request converge, but a rejected or
 # permanently unavailable network must not keep full reconciles running each second.
 CAPABILITY_POLL_BUDGET_SECONDS = 180.0
@@ -816,6 +820,8 @@ class Orchestrator:
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
         self.cellular_recovery_path = self.root / "esim-cellular-recovery.json"
         self.bridge_recovery_path = self.root / "bridge-recovery.json"
+        self.sim_access_recovery = BridgeRecoveryBudget(
+            self.root / "sim-access-recovery-budget.json")
         self.network_rejection_path = self.root / "network-rejections.json"
         self.exit_test_request_dir = self.root / "exit-test-requests"
         self.backup_operation_request_path = self.root / "backup-operation-request.json"
@@ -1139,6 +1145,37 @@ class Orchestrator:
             return False, "uim_power_cycle_failed"
         return True, ""
 
+    def _restore_bridge_exit_evidence(self, modem: dict) -> bool:
+        """Recover a child's durable failure if the supervisor died before recording it."""
+        device_id = str(modem.get("id") or "")
+        metadata = read_json(self.data / "modems" / f"{device_id}.json")
+        generation = str(modem.get("usb_generation") or "")
+        if (not generation or metadata.get("hardware_id") != device_id
+                or metadata.get("usb_generation") != generation):
+            return True
+        error = metadata.get("channel_error_code")
+        if error == "sim_access_cleanup_incomplete":
+            if (self._bridge_terminal.get(device_id) or {}).get("error_code") != error:
+                self._bridge_terminal[device_id] = {
+                    "state": "failed", "error_code": error, "usb_generation": generation,
+                    "updated_at": time.time(), "attempts": 0,
+                }
+                # If this fails, the caller cannot spawn; the child's metadata survives.
+                self._persist_bridge_terminal()
+            return False
+        if (error == "sim_access_runtime_failed"
+                and device_id not in self.sim_access_recovery.records):
+            self.sim_access_recovery.record_exit(device_id, SIM_ACCESS_RECOVERY_EXIT)
+        return True
+
+    def _acknowledge_bridge_cleanup_retry(self, device_id: str) -> None:
+        """An explicit device rescan may retry this stopped child's unclosed sessions."""
+        path = self.data / "modems" / f"{device_id}.json"
+        metadata = read_json(path)
+        if metadata.get("channel_error_code") == "sim_access_cleanup_incomplete":
+            atomic_json(path, {**metadata, "channel_error_code": "operator_retry_acknowledged",
+                               "channel_cleanup_pending": False, "channel_status": "stopped"})
+
     def process_bridge_restart_requests(self):
         """Consume scoped requests and stop only the selected modem bridge.
 
@@ -1180,6 +1217,16 @@ class Orchestrator:
             if expected_generation and expected_generation != generation:
                 self._bridge_restart_status(request, "failed", error="device generation changed")
                 continue
+            if device_id not in self.bridges and not self._restore_bridge_exit_evidence(
+                    {**assignment, "id": device_id}):
+                self._bridge_restart_status(request, "failed", error="sim_access_cleanup_incomplete")
+                continue
+            terminal = self._bridge_terminal.get(device_id) or {}
+            if (terminal.get("error_code") == "sim_access_cleanup_incomplete"
+                    and terminal.get("usb_generation") == generation):
+                self._bridge_restart_status(
+                    request, "failed", error="sim_access_cleanup_incomplete")
+                continue
             request = {
                 "request_id": request_id,
                 "device_id": device_id,
@@ -1204,6 +1251,11 @@ class Orchestrator:
                 self._bridge_terminal.pop(device_id, None)
                 self._persist_bridge_terminal()
             self._stop_bridge_process(proc)
+            if proc and getattr(proc, "returncode", None) == SIM_ACCESS_CLEANUP_EXIT:
+                self._record_bridge_exit(device_id, proc, 0.0)
+                self._bridge_restart_status(
+                    request, "failed", error="sim_access_cleanup_incomplete")
+                continue
             self._bridge_restart_status(request, "stopped")
             self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
             if uim_reset:
@@ -1285,7 +1337,24 @@ class Orchestrator:
                     device_id, "waiting_modemmanager", phase="baseband_initialization")
                 continue
 
-            snapshot = self.modem_snapshot(modem)
+            if device_id not in self.bridges and not self._restore_bridge_exit_evidence(modem):
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_initialization",
+                    error_code="sim_access_cleanup_incomplete")
+                continue
+            try:
+                snapshot = self.modem_snapshot(modem)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_identity",
+                    error_code=("modemmanager_timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                                else "modemmanager_unavailable"))
+                continue
+            if snapshot.get("query_error_code"):
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_identity",
+                    error_code=snapshot["query_error_code"])
+                continue
             actual = str(snapshot.get("sim_iccid") or "")
             expected = str(recovery.get("expected_iccid_sha256") or "")
             if (actual and hashlib.sha256(actual.encode()).hexdigest() == expected
@@ -1317,7 +1386,15 @@ class Orchestrator:
                 self._set_cellular_recovery(
                     device_id, "waiting_modemmanager", phase="baseband_initialization")
                 continue
-            detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
+            try:
+                detail = run(["mmcli", "-m", obj, "--output-keyvalue"],
+                             timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_initialization",
+                    error_code=("modemmanager_timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                                else "modemmanager_unavailable"))
+                continue
             port = self._kv(detail.stdout or "", "modem.generic.primary-port")
             slot = self._kv(detail.stdout or "", "modem.generic.primary-sim-slot")
             if (detail.returncode or not re.fullmatch(r"cdc-wdm[0-9]+", port)
@@ -1329,6 +1406,11 @@ class Orchestrator:
             # Stop only this bridge before the UIM session changes.  Do not use generic
             # Modem.Reset/CFUN reboot: 2c7c:0125 does not establish an EC25 command contract.
             self.stop_bridge(device_id)
+            if (self._bridge_terminal.get(device_id) or {}).get("error_code") == "sim_access_cleanup_incomplete":
+                self._set_cellular_recovery(
+                    device_id, "failed", phase="baseband_initialization",
+                    error_code="sim_access_cleanup_incomplete")
+                continue
             attempts = int(recovery.get("attempts") or 0) + 1
             self._set_cellular_recovery(
                 device_id, "resetting_sim", phase="baseband_initialization",
@@ -1470,8 +1552,16 @@ class Orchestrator:
             publish("failed", error_code="rescan.error.device_not_present")
             return None
         if scope == "all":
+            for retry_device in assignments:
+                self._acknowledge_bridge_cleanup_retry(retry_device)
+            if self._bridge_terminal:
+                self._bridge_terminal.clear()
+                self._persist_bridge_terminal()
             self.stop_bridges()
         elif device_type == "modem":
+            self._acknowledge_bridge_cleanup_retry(device_id)
+            if self._bridge_terminal.pop(device_id, None) is not None:
+                self._persist_bridge_terminal()
             self.stop_bridge(device_id)
         # A rediscovery must never republish identity or registration sampled from the
         # previous physical card generation while the fresh probes are still running.
@@ -1480,17 +1570,12 @@ class Orchestrator:
         if scope == "all":
             for value in maps:
                 value.clear()
-            if self._bridge_terminal:
-                self._bridge_terminal.clear()
-                self._persist_bridge_terminal()
             self._claim_evidence = {}
             self._unclaimed_since.clear()
             self.modem_profiles_swept = False
         elif device_type == "modem":
             for value in maps:
                 value.pop(device_id, None)
-            if self._bridge_terminal.pop(device_id, None) is not None:
-                self._persist_bridge_terminal()
             target_tty = str((assignments.get(device_id) or {}).get("tty") or "")
             if target_tty:
                 self._unclaimed_since.pop(target_tty, None)
@@ -1712,6 +1797,8 @@ class Orchestrator:
             bridge_failure = self._bridge_failures.get(device_id)
             bridge_terminal = self._bridge_terminal.get(device_id)
             bridge_alive = bool(bridge and bridge.poll() is None)
+            sim_access_error = (self.sim_access_recovery.error(device_id)
+                                if not bridge_alive else "")
             # A process that was just respawned over a recorded failure has not proven
             # anything yet: reporting it as a running bridge is what made a crash loop
             # read as healthy. It counts once it has outlived the settle window.
@@ -1781,7 +1868,11 @@ class Orchestrator:
                 "error": (error or ("device is not connected" if not present else "")
                           or " ".join(part for part in (
                               degraded,
-                              (("SIM access recovery reached a terminal failure through both "
+                              sim_access_error,
+                              ("SIM bridge channel cleanup did not finish; re-detect this device before retrying."
+                               if (bridge_terminal or {}).get("error_code")
+                               == "sim_access_cleanup_incomplete" else
+                               ("SIM access recovery reached a terminal failure through both "
                                 "ModemManager and direct serial.")
                                if (bridge_terminal or {}).get("error_code")
                                == "sim_access_failed_both_paths" else
@@ -1873,6 +1964,8 @@ class Orchestrator:
         """Release one modem AT bridge without disrupting any other device."""
         proc = self.bridges.get(device_id)
         self._stop_bridge_process(proc)
+        if proc and getattr(proc, "returncode", None) == SIM_ACCESS_CLEANUP_EXIT:
+            self._record_bridge_exit(device_id, proc, self._bridge_started.get(device_id, 0.0))
         self.bridges.pop(device_id, None)
         self.bridge_ports.pop(device_id, None)
 
@@ -1985,6 +2078,17 @@ class Orchestrator:
         self._bridge_failures[hwid] = {"count": count, "at": time.time(), "reason": reason,
                                        "returncode": proc.returncode,
                                        "uptime": round(uptime, 1), "backend": backend}
+        if proc.returncode == SIM_ACCESS_CLEANUP_EXIT:
+            assignment = (read_json(self.hw_state_path).get("assignments") or {}).get(hwid) or {}
+            self._bridge_terminal[hwid] = {
+                "state": "failed", "error_code": "sim_access_cleanup_incomplete",
+                "backend": backend, "attempts": count, "updated_at": time.time(),
+                "usb_generation": str(assignment.get("usb_generation") or ""),
+            }
+            self._persist_bridge_terminal()
+            self.log("SIM bridge cleanup incomplete; automatic rebuild blocked")
+            return
+        self.sim_access_recovery.record_exit(hwid, proc.returncode, uptime)
         lowered = reason.casefold()
         sim_access_failed = ("logical channel allocation failed" in lowered and
                              ("phonefailure" in lowered or "phone failure" in lowered))
@@ -2022,6 +2126,8 @@ class Orchestrator:
                  + (f": {reason}" if reason else ""))
 
     def _bridge_retry_due(self, hwid: str) -> bool:
+        if time.time() < self.sim_access_recovery.retry_at(hwid):
+            return False
         if hwid in self._bridge_terminal:
             return False
         failure = self._bridge_failures.get(hwid)
@@ -2193,6 +2299,7 @@ class Orchestrator:
                 # Modems whose bridge gave up on ModemManager and drives the tty itself.
                 "degraded_to_direct_serial": dict(self._degraded),
                 "bridge_failures": dict(self._bridge_failures),
+                "sim_access_recovery": self.sim_access_recovery.snapshot(),
             },
             "discovered_modems": discovered,
             "assignments": assignments,
@@ -2212,18 +2319,36 @@ class Orchestrator:
         })
 
     @staticmethod
-    def modemmanager_modem_for_tty(tty: str) -> str:
-        """Return the ModemManager object owning a tty, supporting multiple modules."""
-        listing = run(["mmcli", "-L"])
-        if listing.returncode:
+    def modemmanager_modem_for_tty(tty: str, *, timeout=None) -> str:
+        """Return the modem owning this exact tty within one bounded query window."""
+        if not tty:
             return ""
-        objects = re.findall(r"(/org/freedesktop/ModemManager1/Modem/\d+)", listing.stdout)
-        basename = Path(tty).name
-        for obj in objects:
-            detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
-            if detail.returncode == 0 and re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(basename)}(?![A-Za-z0-9_.-])",
-                                                   detail.stdout):
-                return obj
+        deadline = time.monotonic() + (
+            MODEMMANAGER_QUERY_TIMEOUT_SECONDS if timeout is None else timeout)
+
+        def query(args):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(args, timeout)
+            return run(args, timeout=remaining)
+
+        try:
+            listing = query(["mmcli", "-L"])
+            if listing.returncode:
+                return ""
+            objects = re.findall(r"(/org/freedesktop/ModemManager1/Modem/\d+)", listing.stdout)
+            basename = Path(tty).name
+            for obj in objects:
+                detail = query(["mmcli", "-m", obj, "--output-keyvalue"])
+                if detail.returncode == 0 and re.search(
+                        rf"(?<![A-Za-z0-9_.-]){re.escape(basename)}(?![A-Za-z0-9_.-])",
+                        detail.stdout):
+                    return obj
+        except (OSError, subprocess.SubprocessError):
+            if timeout is not None:
+                raise
+            # Discovery/status is observational: one stalled MM query must not tear down
+            # the supervisor and every other modem bridge. Recovery asks for strict errors.
         return ""
 
     @staticmethod
@@ -2426,12 +2551,24 @@ class Orchestrator:
             if key in current}
 
     def modem_snapshot(self, modem: dict) -> dict:
-        obj = self.modemmanager_modem_for_tty(modem.get("tty") or "")
+        try:
+            return self._modem_snapshot(modem)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"available": False, "registration": "unknown", "data_active": False,
+                    "sim_present": False, "sim_iccid": "", "msisdn": "",
+                    "observed_at": time.time(),
+                    "query_error_code": ("modemmanager_timeout"
+                        if isinstance(exc, subprocess.TimeoutExpired)
+                        else "modemmanager_unavailable")}
+
+    def _modem_snapshot(self, modem: dict) -> dict:
+        obj = self.modemmanager_modem_for_tty(
+            modem.get("tty") or "", timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
         if not obj:
             return {"available": False, "registration": "unknown", "data_active": False,
                     "sim_present": False, "sim_iccid": "", "msisdn": "",
                     "observed_at": time.time()}
-        detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
+        detail = run(["mmcli", "-m", obj, "--output-keyvalue"], timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
         if detail.returncode:
             return {"available": False, "registration": "unknown", "data_active": False,
                     "sim_present": False, "sim_iccid": "", "msisdn": "",
@@ -2461,7 +2598,7 @@ class Orchestrator:
         if failed_reason == "sim-missing":
             sim_present = False
         if sim_present:
-            sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"])
+            sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"], timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
             if sim_detail.returncode == 0:
                 sim_iccid = self.normalize_iccid(
                     self._kv(sim_detail.stdout or "", "sim.properties.iccid"))
@@ -2521,7 +2658,7 @@ class Orchestrator:
         }
         bearer_paths = re.findall(r"modem\.generic\.bearers\.value\[\d+\]\s*:\s*(\S+)", text)
         for bearer in bearer_paths:
-            info = run(["mmcli", "-b", bearer, "--output-keyvalue"])
+            info = run(["mmcli", "-b", bearer, "--output-keyvalue"], timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
             if info.returncode:
                 continue
             body = info.stdout or ""
@@ -3034,6 +3171,8 @@ class Orchestrator:
                 # sim-missing, retaining the old registered snapshot invents a card that is
                 # no longer present and keeps the UI bound to a dead object path.
                 self.cellular_states[device_id] = snapshot
+                if snapshot.get("query_error_code"):
+                    continue
                 observed = snapshot.get("radio_enabled") if snapshot.get("available") else None
                 if observed is not None:
                     self.radio_states[device_id] = bool(observed)
@@ -3687,6 +3826,35 @@ class Orchestrator:
                 self.reselect_retries.pop(country, None)
                 handled_changed = True
                 continue
+            if pending and ("expected_node" in request or "config_revision" in request):
+                expected_node = request.get("expected_node")
+                revision = request.get("config_revision")
+                if (not isinstance(expected_node, str) or not expected_node
+                        or not isinstance(revision, str) or not revision
+                        or revision != state.get("config_revision")):
+                    self.handled_reselect[country] = requested_at
+                    self.reselect_retries.pop(country, None)
+                    handled_changed = True
+                    continue
+                # build_proxy_config leaves node blank until selected nodes are sampled.
+                # Read the live selector here; a saved last-node value is not fresh proof.
+                try:
+                    url = f"http://{CLASH_API}/proxies/{urllib.parse.quote(f'exit-{country}', safe='')}"
+                    with urllib.request.urlopen(url, timeout=1.5) as response:
+                        selected = str((json.load(response) or {}).get("now") or "")
+                except (OSError, ValueError, TypeError):
+                    continue
+                if not selected:
+                    continue
+                members = state.get("_member_names") or {}
+                if selected not in members:
+                    continue
+                current_node = members[selected]
+                if current_node != expected_node:
+                    self.handled_reselect[country] = requested_at
+                    self.reselect_retries.pop(country, None)
+                    handled_changed = True
+                    continue
             # Both entry points rank synchronously and every unreachable member costs seconds,
             # so a failed ranking must never be retried on the very next reconcile cycle. The
             # zero key stands for initial selection: it has no request to abandon, so it keeps
@@ -4477,15 +4645,26 @@ class Orchestrator:
         unclaimed = []
         for modem in modems:
             if modem["id"] in self.bridges: continue
+            if not self._restore_bridge_exit_evidence(modem):
+                continue
             if not self._bridge_retry_due(modem["id"]):
                 continue
             bridge = self.repo / "host" / "vpcd_modem_bridge.py"
             metadata = self.data / "modems" / f"{modem['id']}.json"
             command = [sys.executable, str(bridge), "--modem", modem["tty"], "--slots", str(slots),
                        "--base-port", str(assignments[modem["id"]]["base_port"]),
-                       "--metadata-file", str(metadata), "--hardware-id", modem["id"]]
+                       "--metadata-file", str(metadata), "--hardware-id", modem["id"],
+                       "--usb-generation", str(modem.get("usb_generation") or "")]
             if through_modemmanager:
-                mm_modem = self.modemmanager_modem_for_tty(modem["tty"])
+                try:
+                    mm_modem = self.modemmanager_modem_for_tty(
+                        modem["tty"], timeout=MODEMMANAGER_QUERY_TIMEOUT_SECONDS)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    # A timed-out observation does not prove MM released this AT port.
+                    # Keep healthy peers running and never turn uncertainty into a direct
+                    # serial takeover or spend a watchdog replacement attempt.
+                    self.log(f"SIM bridge deferred: modem ownership query {type(exc).__name__}")
+                    continue
                 refused = self.mm_refusal_logged(modem)
                 if mm_modem:
                     self._unclaimed_since.pop(modem["tty"], None)
@@ -4509,6 +4688,8 @@ class Orchestrator:
                         "bridged over the serial port directly. Cellular data and flight mode "
                         "are unavailable until ModemManager claims it.")
             if not self.dry_run:
+                if not self.sim_access_recovery.reserve_attempt(modem["id"]):
+                    continue
                 # Output goes to a file, not the journal: stderr is what names the
                 # exception when a bridge dies, stdout is the activity trail the support
                 # bundle carries, and a pipe nobody drains would block a healthy bridge.

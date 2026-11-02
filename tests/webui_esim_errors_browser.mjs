@@ -32,18 +32,18 @@ const server = await createServer({ root, configFile: false, plugins: [{
 }], server: { host: '127.0.0.1', port: 0 } })
 await server.listen()
 let browser
-const output = '/tmp/mdd-card-errors-browser'
+const output = process.env.MDD_ESIM_ERRORS_UI_OUTPUT || '/tmp/mdd-card-errors-browser'
 fs.mkdirSync(output, { recursive: true })
 try {
   browser = await chromium.launch({ headless: true })
   for (const width of [1440, 900, 390]) {
     const page = await browser.newPage({ viewport: { width, height: 1000 } })
-    await page.addInitScript(() => localStorage.setItem('mdd-language', 'zh'))
+    await page.addInitScript(() => { if (!localStorage.getItem('mdd-language')) localStorage.setItem('mdd-language', 'zh') })
     const errors = []; page.on('pageerror', e => errors.push(e.message))
-    let operation = null, method = '', attempts = 0
+    let operation = null, recovery = null, method = '', attempts = 0
     const payload = () => ({ ok: true, cached: true, ts: 100, ses: [{
       id: 'default', eid: 'fixture-euicc', profiles: [
-        { iccid: 'card-active', profileNickname: 'Active profile', profileState: 'enabled' },
+        { iccid: 'card-active', profileNickname: 'Active profile', profileState: 'enabled', recovery_status: recovery },
         { iccid: 'card-target', profileNickname: 'Target profile', profileState: 'disabled', operation_status: operation },
       ],
     }] })
@@ -51,7 +51,7 @@ try {
       const url = new URL(route.request().url())
       if (url.pathname === '/api/esim/status') return route.fulfill({ json: { available: true } })
       if (url.pathname === '/api/esim/download/operation') return route.fulfill({ json: { operation: null } })
-      if (url.pathname === '/api/esim/chip/cached' || url.pathname === '/api/esim/chip') return route.fulfill({ json: payload() })
+      if (['/api/esim/chip/cached', '/api/esim/chip', '/api/esim/chip/read'].includes(url.pathname)) return route.fulfill({ json: payload() })
       if (url.pathname.startsWith('/api/esim/profiles/')) {
         attempts++; method = route.request().method()
         const detail = { code: 'esim_operation_failed',
@@ -97,9 +97,40 @@ try {
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
     assert.deepEqual(errors, [])
     await page.screenshot({ path: path.join(output, `${width}.png`), fullPage: true })
+    for (const language of ['zh', 'en']) {
+      await page.evaluate(value => localStorage.setItem('mdd-language', value), language)
+      for (const [code, zh, en] of [
+        ['modemmanager_timeout', 'eSIM 配置文件已启用，但模块查询超时，蜂窝恢复尚未完成。',
+          'The eSIM profile is enabled, but cellular recovery is incomplete because the modem query timed out.'],
+        ['modemmanager_unavailable', 'eSIM 配置文件已启用，但模块服务暂不可用，蜂窝恢复尚未完成。',
+          'The eSIM profile is enabled, but cellular recovery is incomplete because the modem service is temporarily unavailable.'],
+      ]) {
+        recovery = { id: 'fixture-recovery', state: 'failed', phase: 'baseband_identity', error_code: code }
+        await page.reload()
+        const activeRow = page.getByText('Active profile', { exact: true }).locator('..').locator('..').locator('..')
+        const status = activeRow.getByRole('status')
+        await status.filter({ hasText: language === 'zh' ? zh : en }).waitFor()
+        assert.equal(await status.getAttribute('title'), language === 'zh' ? zh : en)
+        assert.equal((await status.innerText()).includes(code), false, 'machine codes must have readable feedback')
+        const disable = activeRow.getByRole('button', { name: language === 'zh' ? '禁用' : 'Disable', exact: true })
+        const before = await disable.boundingBox(), rowBefore = await activeRow.boundingBox()
+        const load = page.getByRole('button', { name: language === 'zh' ? '读取' : 'Load', exact: true })
+        await load.click()
+        await page.waitForFunction(button => !button.disabled, await load.elementHandle())
+        await status.filter({ hasText: language === 'zh' ? zh : en }).waitFor()
+        const after = await disable.boundingBox(), rowAfter = await activeRow.boundingBox()
+        assert.ok(Math.abs((before.x - rowBefore.x) - (after.x - rowAfter.x)) < 1
+          && Math.abs((before.y - rowBefore.y) - (after.y - rowAfter.y)) < 1,
+          `refreshing recovery feedback must not move profile controls (${code}, ${language}, ${width}px)`)
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
+        assert.equal(attempts, 2, 'recovery feedback must not replay profile writes')
+        await activeRow.screenshot({ path: path.join(output, `${code}-${language}-${width}.png`) })
+      }
+    }
+    assert.deepEqual(errors, [])
     await page.close()
   }
-  console.log('eSIM error persistence and fixed row feedback passed at 1440/900/390px')
+  console.log('eSIM error persistence, readable modem timeout/service feedback in zh/en, fixed rows and no write replay passed at 1440/900/390px')
 } finally {
   await browser?.close()
   await server.close()

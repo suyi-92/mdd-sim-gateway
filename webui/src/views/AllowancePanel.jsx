@@ -129,7 +129,7 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
   const compact = mode === 'messages'
   if (loading) return <div className="card" role="status" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading')}…</div>
   if (loadError) return <div className="card u-error" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading failed')}</div>
-  return <div className="card" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>
+  return <div className="card u-allowance-panel" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>
     <div className="u-allowance-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <div style={{ flex: 1, minWidth: 180 }}><b>{t('Balance and allowance')}</b>
         <div style={{ color: 'var(--text-mute)', fontSize: 11 }}>{t('Updated')}: {updated}{value.source === 'sms' ? ` · ${t('Carrier SMS')}` : ''}</div></div>
