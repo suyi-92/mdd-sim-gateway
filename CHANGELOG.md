@@ -2,6 +2,14 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.14.0-vmware.2] - 2026-11-11
+
+### Fixed
+- 所有 ModemManager 蜂窝设备的短信在确认完整入库后回收模块或 SIM 副本，退役升级遗留的 `keep` 策略，避免短信存储耗尽。
+- 换卡隔离的旧对象核对原线路历史或完成原始存档后清理；状态报告、空正文及其他完整对象也先存档，不改写网页历史归属。
+- 保留未完成拼接及保存失败的对象；按实际 SIM、ModemManager 代次和内容复核清理，防止路径复用误删。
+- 增加换卡往返及模块、PC/SC 读卡器间移动同一卡的历史恢复回归；VoWiFi 接收继续直接写入本地数据库。
+
 ## [1.14.0-vmware.1] - 2026-11-02
 
 ### Fixed

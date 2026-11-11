@@ -44,6 +44,7 @@ class FakeModemManager:
         self.calls = []
         self.next_id = 100
         self.send_hook = None
+        self.owner = ":1.55"
 
     def path(self, n):
         return f"/org/freedesktop/ModemManager1/SMS/{n}"
@@ -53,12 +54,15 @@ class FakeModemManager:
         return self.path(n)
 
     def deletes(self):
-        return [c[3].split("=", 1)[1] for c in self.calls
-                if len(c) == 4 and c[3].startswith("--messaging-delete-sms=")]
+        return [c[8] for c in self.calls
+                if len(c) == 9 and c[:3] == ("busctl", "--system", "call")
+                and c[6:8] == ("Delete", "o")]
 
     def __call__(self, args, **kwargs):
         self.calls.append(tuple(args))
         assert isinstance(args, list) and "shell" not in kwargs
+        if args[:4] == ["busctl", "--system", "call", "org.freedesktop.DBus"]:
+            return Result(f's "{self.owner}"')
         if args == ["mmcli", "-L"]:
             return Result(MODEM)
         if args == ["mmcli", "-m", MODEM, "--output-json"]:
@@ -74,9 +78,9 @@ class FakeModemManager:
                 return Result(returncode=1, stderr="command not allowed")
             used, total = self.cpms
             return Result(f"response: '+CPMS: \"ME\",{used},{total},\"ME\",{used},{total}'")
-        if len(args) == 4 and args[:3] == ["mmcli", "-m", MODEM] and \
-                args[3].startswith("--messaging-delete-sms="):
-            path = args[3].split("=", 1)[1]
+        if args[:8] == ["busctl", "--system", "call", self.owner, MODEM,
+                       "org.freedesktop.ModemManager1.Modem.Messaging", "Delete", "o"]:
+            path = args[8]
             if not self.delete_ok or path not in self.objects:
                 return Result(returncode=1)
             del self.objects[path]
@@ -125,6 +129,7 @@ class MemoryTracker:
 def scanner(mm, **kwargs):
     kwargs.setdefault("epoch_getter", lambda: "epoch-1")
     kwargs.setdefault("local_sms_tracker", store)
+    kwargs.setdefault("cleanup_lock_path", str(Path(store.DATA_DIR) / "manager.lock"))
     return cellular_sms.Scanner(mm, **kwargs)
 
 
@@ -198,7 +203,7 @@ class DiscoverTests(DurableStoreCase):
         self.assertEqual([(r["instance"], r["body"]) for r in rows],
                          [("b", "from card b")])
 
-    def test_first_scan_after_upgrade_baselines_old_objects_and_repairs_duplicate(self):
+    def test_first_scan_after_upgrade_baselines_without_changing_either_history(self):
         mm = FakeModemManager("card-b")
         mm.add(7, sms_object(text="old card text"))
         old_ts = 1789174800
@@ -216,7 +221,7 @@ class DiscoverTests(DurableStoreCase):
             {"id": "a", "iccid": "card-a"}, {"id": "b", "iccid": "card-b"}
         ]), [])
         self.assertEqual(len(store.list_messages("a", "+447700900123")), 1)
-        self.assertEqual(store.list_messages("b", "+447700900123"), [])
+        self.assertEqual(len(store.list_messages("b", "+447700900123")), 1)
 
     def test_scanner_caches_topology_and_details_but_keeps_listing_live(self):
         mm = FakeModemManager()
@@ -265,11 +270,11 @@ class DiscoverTests(DurableStoreCase):
 
 
 class StoragePolicyTests(DurableStoreCase):
-    def test_policy_resolution_prefers_settings_then_environment(self):
+    def test_legacy_settings_and_environment_cannot_disable_cleanup(self):
         env = {cellular_sms.STORAGE_POLICY_ENV: "when-full"}
-        self.assertEqual(cellular_sms.storage_policy({}, env), "when_full")
+        self.assertEqual(cellular_sms.storage_policy({}, env), "delete")
         self.assertEqual(cellular_sms.storage_policy({"cellular_sms_storage": "keep"}, env),
-                         "keep")
+                         "delete")
         self.assertEqual(cellular_sms.storage_policy({"cellular_sms_storage": "bogus"}, {}),
                          "delete")
         self.assertEqual(cellular_sms.storage_limit({cellular_sms.STORAGE_LIMIT_ENV: "2"}),
@@ -373,10 +378,13 @@ class BinaryObjectTests(DurableStoreCase):
         self.assertTrue(ingest.records[0]["data"].startswith(b"\x23\x06\x24"))
         self.assertEqual(mm.deletes(), [path])
 
-    def test_object_with_neither_text_nor_payload_is_left_alone(self):
+    def test_complete_object_with_neither_text_nor_payload_is_archived_before_removal(self):
         mm = FakeModemManager()
-        mm.add(7, sms_object(text="--", data="--"))
+        path = mm.add(7, sms_object(text="--", data="--"))
         ingest = Ingest()
         self.assertEqual(scanner(mm).poll(LINE, ingest), [])
         self.assertEqual(ingest.records, [])
-        self.assertEqual(mm.deletes(), [])
+        self.assertEqual(mm.deletes(), [path])
+        with store._conn() as c:
+            saved = json.loads(c.execute("SELECT raw_json FROM modem_sms_archives").fetchone()[0])
+        self.assertEqual(saved["content"]["text"], "--")

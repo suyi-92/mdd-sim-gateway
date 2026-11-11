@@ -322,22 +322,37 @@ class MigrationSafetyTests(unittest.TestCase):
 
 
 class UpgradeStoragePolicyTests(unittest.TestCase):
-    def run_with(self, version, settings, env=None):
+    def run_with(self, settings, env=None):
         from control.app import main
         saved = []
         with patch.object(main.cfg, "get_settings", return_value=settings), \
                 patch.object(main.cfg, "update_settings", side_effect=saved.append), \
                 patch.dict("os.environ", env or {}, clear=False):
-            changed = main._keep_modem_storage_on_upgrade(version)
+            changed = main._ensure_modem_storage_cleanup()
         return changed, saved
 
-    def test_only_an_upgraded_installation_without_a_choice_gets_keep(self):
-        self.assertEqual(self.run_with(0, {}), (True, [{"cellular_sms_storage": "keep"}]))
-        self.assertEqual(self.run_with(None, {}), (False, []), "new installation")
-        self.assertEqual(self.run_with(4, {}), (False, []), "already on this version")
-        self.assertEqual(self.run_with(0, {"cellular_sms_storage": "delete"}), (False, []))
-        self.assertEqual(self.run_with(0, {}, {"MDD_CELLULAR_SMS_STORAGE": "delete"}),
-                         (False, []))
+    def test_legacy_retention_is_retired_without_touching_history(self):
+        for old in ({}, {"cellular_sms_storage": "keep"},
+                    {"cellular_sms_storage": "when_full"}):
+            with self.subTest(settings=old):
+                self.assertEqual(self.run_with(old),
+                                 (True, [{"cellular_sms_storage": "delete"}]))
+        self.assertEqual(self.run_with({"cellular_sms_storage": "delete"}), (False, []))
+        self.assertEqual(self.run_with({}, {"MDD_CELLULAR_SMS_STORAGE": "keep"}),
+                         (True, [{"cellular_sms_storage": "delete"}]))
+
+    def test_settings_save_cannot_restore_legacy_device_retention(self):
+        from control.app import main
+        previous = {"timezone": "UTC", "cellular_sms_storage": "delete"}
+        for old in ("keep", "when_full", None):
+            with self.subTest(legacy_policy=old), \
+                    patch.object(main.cfg, "get_settings", return_value=previous), \
+                    patch.object(main.cfg, "update_settings", return_value=previous) as update, \
+                    patch.object(main.egress, "publish"):
+                body = {} if old is None else {"cellular_sms_storage": old}
+                result = main.api_put_settings(body)
+                self.assertEqual(update.call_args.args[0]["cellular_sms_storage"], "delete")
+                self.assertEqual(result["cellular_sms_storage"], "delete")
 
     def test_schema_version_is_read_without_creating_the_database(self):
         with TempStore() as ctx:

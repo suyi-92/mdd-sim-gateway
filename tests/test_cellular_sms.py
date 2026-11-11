@@ -13,6 +13,8 @@ TEST_EPOCH = "a" * 64
 MODEM = "/org/freedesktop/ModemManager1/Modem/0"
 SIM = "/org/freedesktop/ModemManager1/SIM/0"
 SMS = "/org/freedesktop/ModemManager1/SMS/7"
+DELETE_SMS = ("busctl", "--system", "call", ":1.55", MODEM,
+              "org.freedesktop.ModemManager1.Modem.Messaging", "Delete", "o", SMS)
 LINE = [{"id": "3", "iccid": "card-a"}]
 
 
@@ -74,6 +76,8 @@ def sms_runner(detail: list, *, calls=None, delete_returncode: int = 0):
     def runner(args, **_kwargs):
         if calls is not None:
             calls.append(tuple(args))
+        if args[:4] == ["busctl", "--system", "call", "org.freedesktop.DBus"]:
+            return Result('s ":1.55"')
         if args == ["mmcli", "-L"]:
             return Result(MODEM)
         if args == ["mmcli", "-m", MODEM, "--output-json"]:
@@ -84,7 +88,7 @@ def sms_runner(detail: list, *, calls=None, delete_returncode: int = 0):
             return Result(json.dumps({"modem.messaging.sms": [SMS]}))
         if args == ["mmcli", "-s", SMS, "--output-json"]:
             return Result(json.dumps({"sms": detail[0]}))
-        if args == ["mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"]:
+        if tuple(args) == DELETE_SMS:
             return Result(returncode=delete_returncode)
         return Result(returncode=1)
     return runner
@@ -92,6 +96,9 @@ def sms_runner(detail: list, *, calls=None, delete_returncode: int = 0):
 
 class CellularSmsTests(unittest.TestCase):
     def setUp(self):
+        cleanup_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(cleanup_temp.cleanup)
+        self.cleanup_lock_path = str(Path(cleanup_temp.name) / "manager.lock")
         with cellular_sms._local_sms_lock:
             cellular_sms._local_sms_paths.clear()
 
@@ -161,8 +168,10 @@ class CellularSmsTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(calls.count(("mmcli", "-L")), 1)
-        self.assertEqual(calls.count(("mmcli", "-m", modem, "--output-json")), 1)
-        self.assertEqual(calls.count(("mmcli", "-i", sim, "--output-json")), 1)
+        # Enumeration/details are cached; identity is lightweight and confirmed before each
+        # pass so a card switch inside the topology TTL cannot borrow the old line.
+        self.assertEqual(calls.count(("mmcli", "-m", modem, "--output-json")), 3)
+        self.assertEqual(calls.count(("mmcli", "-i", sim, "--output-json")), 3)
         self.assertEqual(calls.count(("mmcli", "-s", sms, "--output-json")), 1)
         self.assertEqual(calls.count(
             ("mmcli", "-m", modem, "--messaging-list-sms", "--output-json")), 2)
@@ -248,7 +257,7 @@ class CellularSmsTests(unittest.TestCase):
         rows = scanner.discover(LINE)
         self.assertEqual([row["body"] for row in rows], ["part one and part two"])
 
-    def test_stale_incomplete_inbound_sms_is_only_deleted_by_policy_after_one_day(self):
+    def test_stale_incomplete_inbound_sms_is_preserved_without_a_complete_local_copy(self):
         detail = [{
             "content": {"number": "+44123", "text": "--"},
             "properties": {"pdu-type": "deliver", "state": "receiving",
@@ -262,10 +271,8 @@ class CellularSmsTests(unittest.TestCase):
             wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS)
 
         self.assertEqual(scanner.discover(LINE), [])
-        record = scanner.discover(LINE, include_local_cleanup=True)[0]
-        self.assertTrue(record["_stale_only"])
-        self.assertTrue(scanner.delete_preserved(record))
-        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertEqual(scanner.discover(LINE, include_local_cleanup=True), [])
+        self.assertNotIn(DELETE_SMS, calls)
 
     def test_recent_incomplete_sms_is_preserved_for_assembly(self):
         detail = [{
@@ -281,7 +288,7 @@ class CellularSmsTests(unittest.TestCase):
             wall_clock=lambda: received_at + cellular_sms.STALE_RECEIVING_SECONDS - 1)
 
         self.assertEqual(scanner.discover(LINE), [])
-        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertNotIn(DELETE_SMS, calls)
 
     def test_preserved_record_delete_requires_same_modemmanager_generation(self):
         detail = [{
@@ -293,15 +300,15 @@ class CellularSmsTests(unittest.TestCase):
         epoch = [TEST_EPOCH]
         scanner = cellular_sms.Scanner(
             sms_runner(detail, calls=calls), local_sms_tracker=MemoryTracker(),
-            epoch_getter=lambda: epoch[0])
+            epoch_getter=lambda: epoch[0], cleanup_lock_path=self.cleanup_lock_path)
         record = scanner.discover(LINE)[0]
         epoch[0] = "b" * 64
 
         self.assertFalse(scanner.delete_preserved(record))
-        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertNotIn(DELETE_SMS, calls)
         epoch[0] = TEST_EPOCH
         self.assertTrue(scanner.delete_preserved(record))
-        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertIn(DELETE_SMS, calls)
 
     def test_mms_wap_push_notification_is_returned_for_durable_mms_ingest(self):
         calls = []
@@ -309,7 +316,7 @@ class CellularSmsTests(unittest.TestCase):
         scanner = cellular_sms.Scanner(runner)
 
         self.assertEqual(len(scanner.discover(LINE)), 1)
-        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertNotIn(DELETE_SMS, calls)
 
     def test_mms_wap_push_notification_is_kept_when_dropping_is_disabled(self):
         calls = []
@@ -317,7 +324,7 @@ class CellularSmsTests(unittest.TestCase):
         scanner = cellular_sms.Scanner(runner, drop_mms_wap_push=False)
 
         self.assertEqual(len(scanner.discover(LINE)), 1)
-        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertNotIn(DELETE_SMS, calls)
 
     def test_only_the_wap_push_mime_marker_authorizes_a_delete(self):
         # An unreadable text alone is not enough: the object may still become importable.
@@ -336,7 +343,7 @@ class CellularSmsTests(unittest.TestCase):
         rows = scanner.discover(LINE)
 
         self.assertEqual([row["body"] for row in rows], ["hello"])
-        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+        self.assertNotIn(DELETE_SMS, calls)
 
     def test_readonly_discovery_never_deletes_an_undeletable_wap_push(self):
         calls = []
@@ -345,7 +352,7 @@ class CellularSmsTests(unittest.TestCase):
         for _ in range(6):
             self.assertEqual(len(scanner.discover(LINE)), 1)
 
-        attempts = calls.count(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"))
+        attempts = calls.count(DELETE_SMS)
         self.assertEqual(attempts, 0)
 
     def test_sms_binary_payload_decoding_tolerates_mmcli_renderings(self):

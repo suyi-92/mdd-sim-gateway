@@ -906,10 +906,34 @@ def _migration_cellular_sms_fence(c) -> None:
         pass
 
 
+def _migration_modem_sms_archives(c) -> None:
+    """Preserve complete opaque/old-card objects before freeing their physical storage."""
+    _script(c, """
+        CREATE TABLE IF NOT EXISTS modem_sms_archives (
+            archive_key TEXT PRIMARY KEY,
+            daemon_epoch TEXT NOT NULL,
+            modem_path TEXT NOT NULL,
+            sms_path TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            observed_card_key TEXT NOT NULL,
+            owner_instance TEXT NOT NULL DEFAULT '',
+            raw_json TEXT NOT NULL,
+            created_ts INTEGER NOT NULL
+        );
+    """)
+    columns = {row[1] for row in c.execute("PRAGMA table_info(cellular_sms_modems)")}
+    if "baseline_cutoff" not in columns:
+        c.execute("ALTER TABLE cellular_sms_modems "
+                  "ADD COLUMN baseline_cutoff INTEGER NOT NULL DEFAULT 0")
+        # Existing generations predate the persisted baseline. Use their already-recorded
+        # observation time once; never move this boundary forward on poll/restart.
+        c.execute("UPDATE cellular_sms_modems SET baseline_cutoff=MAX(1,updated_ts-120)")
+
+
 _MIGRATIONS = (_migration_message_identity, _migration_modem_object_on_message, _migration_mms,
                _migration_identity_scope, lambda c: _migration_filed_mms_pushes(c),
                _migration_read_baseline, _migration_completed_ts,
-               _migration_cellular_sms_fence)
+               _migration_cellular_sms_fence, _migration_modem_sms_archives)
 
 
 def _sweep_binary_messages(c) -> int:
@@ -940,40 +964,63 @@ def _sweep_binary_messages(c) -> int:
 
 
 def begin_cellular_sms_fence(modem_path: str, card_key: str, instance: str,
-                             now: int | None = None) -> dict:
+                             now: int | None = None, *, baseline_cutoff: int | None = None,
+                             object_paths: list[str] | None = None) -> dict:
     """Record the card currently attached to one physical ModemManager modem.
 
-    ``baseline`` is true only for the first observation of a line that already has cellular
-    history.  On an upgrade, the modem may still contain objects imported by the old scanner;
-    those objects are registered as a baseline and are not presented as new messages.
+    A line with existing cellular history gets a fixed initial cutoff, persisted with the
+    first modem observation. It keeps applying to previously unread objects after command/DB
+    failures and scanner restarts. Known objects are not quarantined again, and later polls
+    must never advance the cutoff. A true card transition durably quarantines its already
+    present object paths before changing the current card; later new paths remain
+    eligible for the new card. An unreadable/partial object cannot consume this boundary.
     """
     modem_path, card_key, instance = str(modem_path), str(card_key), str(instance)
     stamp = int(now if now is not None else time.time())
     with _lock, _conn() as c:
-        row = c.execute("SELECT card_key,instance FROM cellular_sms_modems "
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT card_key,instance,baseline_cutoff FROM cellular_sms_modems "
                         "WHERE modem_path=?", (modem_path,)).fetchone()
         if row is None:
             baseline = bool(c.execute(
                 "SELECT 1 FROM messages WHERE instance=? AND direction='in' "
                 "AND transport='cellular' LIMIT 1", (instance,)).fetchone())
+            cutoff = (max(1, int(baseline_cutoff if baseline_cutoff is not None else stamp - 120))
+                      if baseline else 0)
             c.execute("INSERT INTO cellular_sms_modems "
-                      "(modem_path,card_key,instance,updated_ts) VALUES(?,?,?,?)",
-                      (modem_path, card_key, instance, stamp))
-            return {"baseline": baseline, "changed": True, "previous_card": "",
+                      "(modem_path,card_key,instance,updated_ts,baseline_cutoff) VALUES(?,?,?,?,?)",
+                      (modem_path, card_key, instance, stamp, cutoff))
+            return {"baseline": bool(cutoff), "baseline_cutoff": cutoff,
+                    "changed": True, "previous_card": "",
                     "previous_instance": ""}
         previous_card, previous_instance = str(row["card_key"]), str(row["instance"] or "")
         changed = previous_card != card_key
+        cutoff = 0 if changed else int(row["baseline_cutoff"])
+        if changed:
+            prefix = "/org/freedesktop/ModemManager1/SMS/"
+            if (not isinstance(object_paths, list)
+                    or any(not isinstance(p, str) or not p.startswith(prefix)
+                           or not p[len(prefix):].isdigit() for p in object_paths)):
+                raise ValueError("card transition needs a complete SMS object snapshot")
+            c.executemany(
+                "INSERT INTO cellular_sms_objects "
+                "(modem_path,sms_path,card_key,instance,signature,first_seen_ts,last_seen_ts,quarantined) "
+                "VALUES(?,?,?,?,?,?,?,1) "
+                "ON CONFLICT(modem_path,sms_path) DO UPDATE SET signature='',quarantined=1,"
+                "last_seen_ts=excluded.last_seen_ts",
+                [(modem_path, p, previous_card, previous_instance, "", stamp, stamp)
+                 for p in object_paths])
         if changed or previous_instance != instance:
-            c.execute("UPDATE cellular_sms_modems SET card_key=?,instance=?,updated_ts=? "
-                      "WHERE modem_path=?", (card_key, instance, stamp, modem_path))
-        return {"baseline": False, "changed": changed,
+            c.execute("UPDATE cellular_sms_modems SET card_key=?,instance=?,updated_ts=?,baseline_cutoff=? "
+                      "WHERE modem_path=?", (card_key, instance, stamp, cutoff, modem_path))
+        return {"baseline": bool(cutoff), "baseline_cutoff": cutoff, "changed": changed,
                 "previous_card": previous_card if changed else "",
                 "previous_instance": previous_instance if changed else ""}
 
 
 def claim_cellular_sms_object(modem_path: str, sms_path: str, card_key: str,
                               instance: str, signature: str,
-                              now: int | None = None) -> dict:
+                              now: int | None = None, *, quarantine_new: bool = False) -> dict:
     """Return whether an SMS object belongs to the current card generation.
 
     A same-path object with identical content after a card change is the old card's retained
@@ -989,22 +1036,31 @@ def claim_cellular_sms_object(modem_path: str, sms_path: str, card_key: str,
         if row is None:
             c.execute("INSERT INTO cellular_sms_objects "
                       "(modem_path,sms_path,card_key,instance,signature,first_seen_ts,last_seen_ts,"
-                      "quarantined) VALUES(?,?,?,?,?,?,?,0)",
-                      (modem_path, sms_path, card_key, instance, signature, stamp, stamp))
-            return {"status": "new", "previous_instance": ""}
+                      "quarantined) VALUES(?,?,?,?,?,?,?,?)",
+                      (modem_path, sms_path, card_key, instance, signature, stamp, stamp,
+                       int(quarantine_new)))
+            return {"status": "stale" if quarantine_new else "new", "previous_instance": ""}
         previous_card, previous_instance, previous_signature, quarantined = (
             str(row["card_key"]), str(row["instance"] or ""), str(row["signature"]),
             bool(row["quarantined"]))
+        if quarantined and not previous_signature:
+            # This path was already present at a card transition but could not be read yet.
+            # Bind its first readable signature without pretending the current SIM owns it.
+            c.execute("UPDATE cellular_sms_objects SET signature=?,last_seen_ts=? "
+                      "WHERE modem_path=? AND sms_path=?",
+                      (signature, stamp, modem_path, sms_path))
+            return {"status": "stale", "previous_instance": previous_instance}
         if previous_card == card_key and previous_signature == signature and quarantined:
             return {"status": "stale", "previous_instance": previous_instance}
         if previous_card != card_key and previous_signature == signature:
             return {"status": "stale", "previous_instance": previous_instance}
         status = "known" if previous_card == card_key and previous_signature == signature else "new"
+        quarantine = bool(quarantine_new and status == "new")
         c.execute("UPDATE cellular_sms_objects SET card_key=?,instance=?,signature=?,last_seen_ts=?,"
-                  "quarantined=0 "
+                  "quarantined=? "
                   "WHERE modem_path=? AND sms_path=?",
-                  (card_key, instance, signature, stamp, modem_path, sms_path))
-        return {"status": status, "previous_instance": previous_instance}
+                  (card_key, instance, signature, stamp, int(quarantine), modem_path, sms_path))
+        return {"status": "stale" if quarantine else status, "previous_instance": previous_instance}
 
 
 def quarantine_cellular_sms_object(modem_path: str, sms_path: str) -> bool:
@@ -1711,6 +1767,113 @@ def imported_cellular_message_is_preserved(fingerprint: str, instance: str,
         return claimed.rowcount == 1
 
 
+def cellular_import_is_tombstoned(fingerprint: str, instance: str) -> bool:
+    """Exact import identity whose visible history was cleared; never recreates a row."""
+    with _lock, _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM message_imports i LEFT JOIN messages m ON m.id=i.message_id "
+            "WHERE i.fingerprint=? AND i.instance=? AND m.id IS NULL LIMIT 1",
+            (str(fingerprint), str(instance))).fetchone() is not None
+
+
+def _cellular_archive_values(record: dict) -> tuple | None:
+    """Validate the exact complete object snapshot used by both archival and its proof."""
+    try:
+        raw = str(record.get("_raw_json") or "")
+        doc = json.loads(raw)
+        if not isinstance(doc, dict):
+            return None
+        props = doc.get("properties") or {}
+        if props.get("state") not in {"received", "sent", "stored", "failed"}:
+            return None
+        epoch, modem, sms, signature, card = (
+            str(record.get(k) or "") for k in
+            ("_daemon_epoch", "_modem_path", "_sms_path", "_signature", "_observed_card_key"))
+        if not all((epoch, modem, sms, signature, card)):
+            return None
+        owner = "" if record.get("_historical_only") else str(record.get("instance") or "")
+        values = epoch, modem, sms, signature, card, owner, raw
+        key = hashlib.sha256(json.dumps(values, ensure_ascii=True).encode("ascii")).hexdigest()
+        return (key, *values)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def archive_cellular_sms_object(record: dict) -> bool:
+    """Durably retain one complete raw SMS without inventing a current-line history row.
+
+    Unknown historical ownership is explicit. Raw modem data stays in the same private SQLite
+    database as normal messages and is included by the existing backup transaction.
+    """
+    values = _cellular_archive_values(record)
+    if values is None:
+        return False
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO modem_sms_archives "
+                  "(archive_key,daemon_epoch,modem_path,sms_path,signature,observed_card_key,"
+                  "owner_instance,raw_json,created_ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (*values, int(time.time())))
+    return True
+
+
+def cellular_sms_archive_is_preserved(record: dict) -> bool:
+    values = _cellular_archive_values(record)
+    if values is None:
+        return False
+    with _lock, _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM modem_sms_archives WHERE archive_key=? AND daemon_epoch=? "
+            "AND modem_path=? AND sms_path=? AND signature=? AND observed_card_key=? "
+            "AND owner_instance=? AND raw_json=?", values).fetchone() is not None
+
+
+def preserved_cellular_sms_owner(peer: str, body: str, ts: int, *,
+                                 direction: str = "in", data: bytes = b"",
+                                 daemon_epoch: str = "", modem_path: str = "",
+                                 sms_path: str = "") -> str | None:
+    """Find the unique durable historical owner of a retained old-card modem object.
+
+    This is a read-only cleanup proof, never a reason to attribute an old object to the
+    currently inserted SIM. Text needs an exact sender/body/network-time match AND its
+    original non-null import marker. Binary payloads need their exact durable raw row.
+    A locally-created submit with no network timestamp instead needs its exact daemon/path
+    reservation and final visible history row. Missing, deleted or ambiguous history fails
+    closed. No tombstone, history row or ownership ledger is changed here.
+    """
+    if (not isinstance(peer, str) or not isinstance(body, str)
+            or isinstance(ts, bool) or not isinstance(ts, int) or ts < 0
+            or direction not in {"in", "out"}):
+        return None
+    owners = set()
+    with _lock, _conn() as c:
+        if data:
+            if direction != "in" or ts <= 0:
+                return None
+            owners.update(str(r[0]) for r in c.execute(
+                "SELECT DISTINCT instance FROM binary_sms "
+                "WHERE transport='cellular' AND peer=? AND ts=? AND body_hex=?",
+                (peer, ts, bytes(data).hex())))
+        elif body.strip():
+            if ts > 0:
+                owners.update(str(r[0]) for r in c.execute(
+                    "SELECT DISTINCT m.instance FROM messages m "
+                    "JOIN message_imports i ON i.message_id=m.id AND i.instance=m.instance "
+                    "WHERE m.direction=? AND m.peer=? AND m.body=? "
+                    "AND COALESCE(m.sent_ts,m.ts)=? AND COALESCE(m.kind,'sms')='sms'",
+                    (direction, peer, body, ts)))
+            if direction == "out" and daemon_epoch and modem_path and sms_path:
+                digest = hashlib.sha256(f"{peer}\0{body}".encode("utf-8")).hexdigest()
+                owners.update(str(r[0]) for r in c.execute(
+                    "SELECT DISTINCT m.instance FROM local_modem_sms l "
+                    "JOIN messages m ON m.id=l.message_id AND m.instance=l.instance "
+                    "WHERE l.daemon_epoch=? AND l.modem_path=? AND l.sms_path=? "
+                    "AND l.content_hash=? AND l.cancelled=0 AND m.peer=? AND m.body=? "
+                    "AND m.direction='out' AND m.transport='cellular' "
+                    "AND m.status IN ('sent','delivered','unknown','failed')",
+                    (daemon_epoch, modem_path, sms_path, digest, peer, body)))
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
 def reimport_cellular_messages(instance: str, records: list[dict]) -> list[dict] | None:
     """Atomically restore retained modem SMS after the operator cleared this line's history.
 
@@ -2202,6 +2365,20 @@ def local_modem_sms_is_preserved(instance: str, iccid: str, daemon_epoch: str,
             (str(instance), str(iccid), str(daemon_epoch), str(modem_path),
              str(sms_path), content_hash),
         ).fetchone() is not None
+
+
+def local_modem_sms_history_is_missing(instance: str, iccid: str, daemon_epoch: str,
+                                      modem_path: str, sms_path: str, content_hash: str,
+                                      *, maximum_created_ts: int) -> bool:
+    """An exact local object whose visible row was cleared, for separate raw preservation."""
+    with _lock, _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM local_modem_sms l LEFT JOIN messages m ON m.id=l.message_id "
+            "WHERE l.instance=? AND l.iccid=? AND l.daemon_epoch=? AND l.modem_path=? "
+            "AND l.sms_path=? AND l.content_hash=? AND l.cancelled=0 AND m.id IS NULL "
+            "AND l.created_ts<=? LIMIT 1",
+            (str(instance), str(iccid), str(daemon_epoch), str(modem_path), str(sms_path),
+             str(content_hash), int(maximum_created_ts))).fetchone() is not None
 
 
 def is_local_modem_sms(daemon_epoch: str, iccid: str, modem_path: str, sms_path: str,

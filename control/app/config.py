@@ -126,10 +126,8 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
-        # What happens to an SMS object on the modem/SIM once its message is in the database:
-        # "delete" (default), "when_full" or "keep". Deliberately absent from these defaults:
-        # an unset key defers to MDD_CELLULAR_SMS_STORAGE, so a deployment can choose the
-        # policy from its service environment; a value saved here takes precedence.
+        # Device storage is a receive buffer; durable per-SIM history lives in SQLite.
+        "cellular_sms_storage": "delete",
         # Voicemail defaults. Off unless asked for: recording a caller is the operator's
         # decision. Per-line overrides live in the line's sip.* block, like ring_timeout.
         "vm_enabled": False,

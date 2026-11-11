@@ -2528,27 +2528,12 @@ def _join_sms_parts(bodies: list[str], seqs: list[int], total: int) -> str:
     return store.join_sms_parts(bodies, seqs, total)
 
 
-def _keep_modem_storage_on_upgrade(previous_schema: int | None) -> bool:
-    """Leave modem SMS storage alone on an installation upgraded from before the policy existed.
-
-    Deleting imported objects is the right default, but switching it on silently during an
-    upgrade would empty every modem the first time the scanner runs -- including texts the
-    operator deliberately kept on a SIM. An upgraded installation therefore gets "keep" written
-    into its settings, visibly, and the release notes explain how to opt in to "delete". A new
-    installation (no history database yet) and an explicit choice, in settings or in
-    MDD_CELLULAR_SMS_STORAGE, are left as they are. Runs before the schema migration, so a
-    crash in between cannot lose the distinction.
-    """
-    if previous_schema is None or previous_schema >= 1:
+def _ensure_modem_storage_cleanup() -> bool:
+    """Retire legacy retention choices; device copies follow durable per-SIM history."""
+    if cfg.get_settings().get("cellular_sms_storage") == "delete":
         return False
-    if os.environ.get(cellular_sms.STORAGE_POLICY_ENV, "").strip():
-        return False
-    if "cellular_sms_storage" in (cfg.get_settings() or {}):
-        return False
-    cfg.update_settings({"cellular_sms_storage": "keep"})
-    log.warning("upgraded installation: modem SMS storage policy set to 'keep'; set "
-                "settings.cellular_sms_storage to 'delete' to empty modem storage as "
-                "messages are imported")
+    cfg.update_settings({"cellular_sms_storage": "delete"})
+    log.info("modem SMS copies will be released after durable local preservation")
     return True
 
 
@@ -3150,9 +3135,8 @@ async def _publish_cellular_sms(discovered: list[dict], scanner: cellular_sms.Sc
                     _harvest_allowance_reply, rec["instance"], rec["peer"])
                 _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
                                rec["peer"], rec["body"])
-        # A failed delete is retried on later polls. Old markers whose visible history was
-        # cleared are deliberately not eligible until the explicit re-import path restores
-        # an exact row, so automatic storage maintenance cannot undo the operator's choice.
+        # Visible imports need their exact durable row. The regular scanner separately
+        # archives opaque, historical and cleared-history copies without resurrecting them.
         preserved = await asyncio.to_thread(
             store.imported_cellular_message_is_preserved,
             item["fingerprint"], item["instance"], item["direction"],
@@ -3182,8 +3166,8 @@ async def cellular_sms_poller():
     while True:
         try:
             async with hub.cellular_sms_lock:
-                # One config read serves both the line list and the scanner's policy, so the
-                # operator's choice takes effect without restarting the control plane.
+                # Reload the saved SIM bindings; legacy retention choices cannot disable
+                # release of device copies after durable preservation.
                 conf = await asyncio.to_thread(cfg.load)
                 settings = conf.get("settings") or {}
                 stored = await asyncio.to_thread(
@@ -3858,7 +3842,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     hub.event_loop = asyncio.get_running_loop()
-    _keep_modem_storage_on_upgrade(store.schema_version())
+    _ensure_modem_storage_cleanup()
     store.set_subscriber_resolver(_line_subscriber)
     store.init()
     await asyncio.to_thread(esim_download_operations.interrupt_running)
@@ -7835,6 +7819,8 @@ def api_put_settings(body: dict):
             for key, value in body.items()}
     # Ignore the legacy field from older cached clients. Product identity is fixed.
     body.pop("system_name", None)
+    # Cached clients and legacy retention settings cannot fill the device's receive buffer.
+    body["cellular_sms_storage"] = "delete"
     if "max_sim_lines" in body:
         try:
             body["max_sim_lines"] = cfg.validate_sim_line_limit(body["max_sim_lines"])

@@ -8,11 +8,14 @@ to the saved SIM line by ICCID.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import math
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -59,11 +62,11 @@ _DELETE_ATTEMPTS = 3
 
 
 def storage_policy(settings: dict | None = None, environ=os.environ) -> str:
-    """The configured policy: settings.cellular_sms_storage, else the environment, else delete."""
-    for value in ((settings or {}).get("cellular_sms_storage"), environ.get(STORAGE_POLICY_ENV)):
-        text = str(value or "").strip().lower().replace("-", "_")
-        if text in STORAGE_POLICIES:
-            return text
+    """Every installation releases modem copies after durable local preservation.
+
+    Legacy keep/when_full settings and environment overrides must not silently disable the
+    storage-maintenance rule. Explicit Scanner.poll modes remain useful to read-only callers.
+    """
     return "delete"
 
 
@@ -257,6 +260,12 @@ def _modemmanager_epoch(runner=subprocess.run, boot_id_reader=_boot_id) -> str:
     boot_id = boot_id_reader()
     if not boot_id:
         return ""
+    owner = _modemmanager_owner(runner)
+    return hashlib.sha256(f"{boot_id}\0{owner}".encode("ascii")).hexdigest() if owner else ""
+
+
+def _modemmanager_owner(runner=subprocess.run) -> str:
+    """The unique D-Bus destination, so a delete cannot reach a replacement daemon."""
     try:
         result = runner([
             "busctl", "--system", "call", "org.freedesktop.DBus",
@@ -270,7 +279,7 @@ def _modemmanager_epoch(runner=subprocess.run, boot_id_reader=_boot_id) -> str:
     match = DBUS_OWNER_RE.fullmatch(str(getattr(result, "stdout", "") or "").strip())
     if not match:
         return ""
-    return hashlib.sha256(f"{boot_id}\0{match.group(1)}".encode("ascii")).hexdigest()
+    return match.group(1)
 
 
 def _remember_local_sms(modem_path: str, iccid: str, sms_path: str,
@@ -600,6 +609,33 @@ def _storage_capacity(modem_path: str, runner) -> tuple[str, int, int] | None:
     return (match.group(1).lower(), int(match.group(2)), total) if total > 0 else None
 
 
+@contextmanager
+def _sms_cleanup_transaction_guard(lock_path: str):
+    """Keep device deletion outside mddctl's exclusive update/rollback transaction.
+
+    New Control may already be accepting events while an update health check can still
+    restore the old database snapshot. Its freshly committed archive is not rollback-safe
+    until the manager releases this same lock. Ingestion/archival may continue meanwhile.
+    """
+    descriptor = None
+    permitted = False
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                             | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+        info = os.fstat(descriptor)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid():
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            permitted = True
+    except OSError:
+        # Lock contention and any inability to prove the shared lock defer only cleanup.
+        pass
+    try:
+        yield permitted
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 class Scanner:
     """Incrementally inspect ModemManager without rereading stable objects every five seconds.
 
@@ -611,7 +647,8 @@ class Scanner:
     def __init__(self, runner=subprocess.run, *, topology_ttl: float = 60.0,
                  detail_ttl: float = 60.0, clock=time.monotonic, wall_clock=time.time,
                  local_sms_tracker=None, epoch_getter=_modemmanager_epoch,
-                 drop_mms_wap_push: bool = False, environ=os.environ):
+                 drop_mms_wap_push: bool = False, environ=os.environ,
+                 cleanup_lock_path: str = "/run/lock/mdd-sim-gateway.lock"):
         self.runner = runner
         self.topology_ttl = topology_ttl
         self.detail_ttl = detail_ttl
@@ -621,9 +658,11 @@ class Scanner:
         self.epoch_getter = epoch_getter
         self.drop_mms_wap_push = False  # binary notifications now enter the MMS store
         self.environ = environ
+        self.cleanup_lock_path = cleanup_lock_path
         self._live_counts = {}
         self._capacity = {}
         self._daemon_epoch = ""
+        self._daemon_owner = ""
         self._topology_expires = 0.0
         self._topology: list[tuple[str, str]] = []
         self._details: dict[tuple[str, str], tuple[float, dict]] = {}
@@ -651,6 +690,7 @@ class Scanner:
             "storage": str(props.get("storage") or "").lower(),
             "ts": _timestamp(timestamp),
             "timestamp_raw": timestamp,
+            "raw_json": json.dumps(sms, sort_keys=True, ensure_ascii=True, separators=(",", ":")),
             "signature": hashlib.sha256("\0".join((
                 str(content.get("number") or ""), str(content.get("text") or ""),
                 str(content.get("data") or ""), str(props.get("pdu-type") or ""),
@@ -658,10 +698,11 @@ class Scanner:
         }
 
     def _delete_preserved_sms(self, modem_path: str, sms_path: str,
-                              daemon_epoch: str) -> bool:
+                              daemon_epoch: str, daemon_owner: str) -> bool:
         """Delete one exact object only while it still belongs to this MM generation."""
         if (not MODEM_PATH_RE.fullmatch(str(modem_path))
-                or not SMS_PATH_RE.fullmatch(str(sms_path)) or not daemon_epoch):
+                or not SMS_PATH_RE.fullmatch(str(sms_path)) or not daemon_epoch
+                or not re.fullmatch(r":\d+\.\d+", str(daemon_owner))):
             return False
         key = (str(modem_path), str(sms_path))
         now = self.clock()
@@ -669,13 +710,17 @@ class Scanner:
         if now < retry_at:
             return False
         try:
-            if self.epoch_getter() != daemon_epoch:
+            if (self.epoch_getter() != daemon_epoch
+                    or _modemmanager_owner(self.runner) != daemon_owner):
                 return False
         except Exception:
             return False
-        result, problem = _invoke(
-            ["-m", modem_path, f"--messaging-delete-sms={sms_path}"],
-            self.runner, 10)
+        # Address the unique owner, never the well-known name: if ModemManager exits after
+        # the checks, the request fails instead of deleting a reused path in the new daemon.
+        result, problem = _invoke_busctl([
+            daemon_owner, modem_path, "org.freedesktop.ModemManager1.Modem.Messaging",
+            "Delete", "o", sms_path,
+        ], self.runner, 10)
         if problem is None and result is not None and not result.returncode:
             self._cleanup_retries.pop(key, None)
             self._details.pop(key, None)
@@ -690,8 +735,16 @@ class Scanner:
         tracker = self.local_sms_tracker
         if tracker is None:
             return False
-        if record.get("_stale_only"):
-            return True  # explicitly bounded, unassembled inbound fragment retention
+        if record.get("_archive_only"):
+            return tracker.cellular_sms_archive_is_preserved(record)
+        if record.get("_historical_only"):
+            owner = tracker.preserved_cellular_sms_owner(
+                record["peer"], record["body"], record["ts"],
+                direction=record["direction"], data=record.get("data") or b"",
+                daemon_epoch=record.get("_daemon_epoch") or "",
+                modem_path=record.get("_modem_path") or "",
+                sms_path=record.get("_sms_path") or "")
+            return bool(owner) or tracker.cellular_sms_archive_is_preserved(record)
         if record.get("_local_only"):
             return tracker.local_modem_sms_is_preserved(
                 record["instance"], record.get("_modem_iccid") or "",
@@ -708,16 +761,26 @@ class Scanner:
         if not isinstance(record, dict) or not record.get("_signature"):
             return False
         modem_path, sms_path = record.get("_modem_path"), record.get("_sms_path")
-        epoch = record.get("_daemon_epoch")
-        if not epoch or not modem_path or not sms_path:
+        epoch, owner = record.get("_daemon_epoch"), record.get("_daemon_owner")
+        if not epoch or not owner or not modem_path or not sms_path:
             return False
-        with _local_sms_lock:
+        with _local_sms_lock, _sms_cleanup_transaction_guard(self.cleanup_lock_path) as permitted:
+            if not permitted:
+                return False
             try:
-                if self.epoch_getter() != epoch:
+                if (self.epoch_getter() != epoch
+                        or _modemmanager_owner(self.runner) != owner):
+                    return False
+                listing = _run_json(["-m", modem_path, "--messaging-list-sms"], self.runner)
+                paths = listing.get("modem.messaging.sms")
+                if (not isinstance(paths, list) or sms_path not in paths
+                        or any(not SMS_PATH_RE.fullmatch(str(p)) for p in paths)):
                     return False
                 modem = _run_json(["-m", modem_path], self.runner).get("modem") or {}
                 sim_path = str((modem.get("generic") or {}).get("sim") or "")
                 if not SIM_PATH_RE.fullmatch(sim_path):
+                    return False
+                if record.get("_sim_path") and sim_path != record["_sim_path"]:
                     return False
                 props = ((_run_json(["-i", sim_path], self.runner).get("sim") or {}).get("properties") or {})
                 iccid, imsi = _normalize_iccid(props.get("iccid")), _normalize_imsi(props.get("imsi"))
@@ -729,11 +792,19 @@ class Scanner:
                 current = self._read(sms_path)
                 if not current or current["signature"] != record["_signature"]:
                     return False
-                if record.get("_stale_only") and current["state"] != "receiving":
+                if ((record.get("_archive_only") or record.get("_historical_only"))
+                        and current["raw_json"] != record.get("_raw_json")):
+                    return False
+                # Partial inbound messages have no complete durable copy. A send still in
+                # progress must likewise finish before its object can be released.
+                if (current["state"] not in {"received", "sent", "stored", "failed"}
+                        or current["pdu_type"] == "deliver" and current["state"] != "received"
+                        or current["pdu_type"] == "submit" and current["state"] not in
+                        {"sent", "stored", "failed"}):
                     return False
                 if not self._preserved(record):
                     return False
-                return self._delete_preserved_sms(modem_path, sms_path, epoch)
+                return self._delete_preserved_sms(modem_path, sms_path, epoch, owner)
             except Exception:
                 return False
 
@@ -764,13 +835,16 @@ class Scanner:
         """Return displayable cellular SMS records. No message body or identity is logged."""
         now = self.clock()
         daemon_epoch = self.epoch_getter() if self.local_sms_tracker is not None else ""
-        if daemon_epoch != self._daemon_epoch:
+        daemon_owner = (_modemmanager_owner(self.runner)
+                        if self.local_sms_tracker is not None else "")
+        if daemon_epoch != self._daemon_epoch or daemon_owner != self._daemon_owner:
             # Object paths and their cached details belong to one ModemManager generation.
             self._details.clear()
             self._local_sms_keys.clear()
             self._wap_push_attempts.clear()
             self._cleanup_retries.clear()
             self._daemon_epoch = daemon_epoch
+            self._daemon_owner = daemon_owner
             self._topology_expires = 0.0
         if now >= self._topology_expires:
             self._refresh_topology(now)
@@ -786,36 +860,29 @@ class Scanner:
         found = []
         live_keys = set()
         live_local_keys = set()
-        fences = {}
         begin_fence = getattr(self.local_sms_tracker, "begin_cellular_sms_fence", None)
-        for modem_path, modem_iccid, modem_imsi in self._topology:
-            if not callable(begin_fence):
-                continue
-            if modem_iccid:
-                fence_iid = by_iccid.get(modem_iccid)
-            else:
-                fence_iid = by_imsi.get(modem_imsi) if modem_imsi else None
-            card_key = _card_key(modem_iccid, modem_imsi)
-            if not fence_iid or not card_key:
-                continue
-            try:
-                fence = begin_fence(modem_path, card_key, fence_iid,
-                                    now=int(self.wall_clock()))
-            except Exception:
-                fence = None
-            if isinstance(fence, dict):
-                fences[modem_path] = {**fence, "card_key": card_key, "instance": fence_iid}
-                if fence.get("baseline"):
-                    fences[modem_path]["baseline_cutoff"] = self._started_wall - 120
         claim_object = getattr(self.local_sms_tracker, "claim_cellular_sms_object", None)
-        quarantine_object = getattr(self.local_sms_tracker, "quarantine_cellular_sms_object", None)
-        repair_stale = getattr(self.local_sms_tracker, "repair_stale_cellular_message", None)
         for modem_path, modem_iccid, modem_imsi in self._topology:
             if modem_iccid:
                 iid = by_iccid.get(modem_iccid)
             else:
                 iid = by_imsi.get(modem_imsi) if modem_imsi else None
             if not iid:
+                continue
+            # Card switches can happen inside the topology TTL. Confirm the current identity
+            # before attributing any newly-listed object, not only later before deleting it.
+            current_modem = _run_json(["-m", modem_path], self.runner).get("modem") or {}
+            current_sim_path = str((current_modem.get("generic") or {}).get("sim") or "")
+            if not SIM_PATH_RE.fullmatch(current_sim_path):
+                self._topology_expires = 0.0
+                continue
+            current_props = ((_run_json(["-i", current_sim_path], self.runner).get("sim")
+                              or {}).get("properties") or {})
+            current_identity = (_normalize_iccid(current_props.get("iccid")),
+                                _normalize_imsi(current_props.get("imsi")))
+            if current_identity != (modem_iccid, modem_imsi):
+                self._topology_expires = 0.0
+                self._details = {k: v for k, v in self._details.items() if k[0] != modem_path}
                 continue
             iccid = instance_iccids.get(iid) or modem_iccid
             # Serialize the path snapshot with local object creation; otherwise the poller could
@@ -831,6 +898,23 @@ class Scanner:
                                      and all(SMS_PATH_RE.fullmatch(str(path))
                                              for path in raw_paths))
             self._live_counts[modem_path] = len(paths) if listing_complete else None
+            if not listing_complete:
+                continue
+            fence = None
+            if callable(begin_fence):
+                if not callable(claim_object):
+                    continue
+                try:
+                    fence = begin_fence(modem_path, _card_key(modem_iccid, modem_imsi), iid,
+                                        now=int(self.wall_clock()),
+                                        baseline_cutoff=int(self._started_wall - 120),
+                                        object_paths=list(paths))
+                except Exception:
+                    continue
+                if not isinstance(fence, dict) or not isinstance(fence.get("baseline"), bool):
+                    continue
+                fence = {**fence, "card_key": _card_key(modem_iccid, modem_imsi),
+                         "baseline_cutoff": fence.get("baseline_cutoff", 0)}
             for sms_path in paths:
                 sms_path = str(sms_path)
                 if not SMS_PATH_RE.match(sms_path):
@@ -865,19 +949,11 @@ class Scanner:
                     data = _sms_data(content.get("data")) if not text.strip() else b""
                     if state in ("receiving", "sending"):
                         self._details.pop(key, None)
-                        received_at = _timestamp(timestamp)
-                        if (include_local_cleanup and state == "receiving" and pdu_type == "deliver"
-                                and daemon_epoch and received_at
-                                and self.wall_clock() - received_at >= STALE_RECEIVING_SECONDS):
-                            detail = self._read(sms_path)
-                            if detail:
-                                found.append({"instance": iid, "_stale_only": True,
-                                              "_modem_path": modem_path, "_sms_path": sms_path,
-                                              "_daemon_epoch": daemon_epoch, "_modem_iccid": iccid,
-                                              "_modem_imsi": modem_imsi,
-                                              "_signature": detail["signature"], "ts": received_at})
                         continue
-                    if not text.strip() and (not data or pdu_type == "submit"):
+                    opaque = (pdu_type not in {"deliver", "submit"}
+                              or not text.strip() and (not data or pdu_type == "submit"))
+                    if opaque and (not include_local_cleanup or state not in
+                                   {"received", "sent", "stored", "failed"}):
                         self._details.pop(key, None)
                         continue
                     direction = "out" if pdu_type == "submit" else "in"
@@ -895,52 +971,49 @@ class Scanner:
                         "direction": direction, "peer": peer, "body": text,
                         "ts": _timestamp(timestamp), "transport": "cellular", "data": data,
                         "storage": str(props.get("storage") or "").lower(),
+                        "_raw_json": json.dumps(sms, sort_keys=True, ensure_ascii=True,
+                                                separators=(",", ":")),
+                        "_observed_card_key": _card_key(modem_iccid, modem_imsi),
                         "_modem_iccid": iccid, "_modem_imsi": modem_imsi,
                         "_signature": hashlib.sha256("\0".join((peer,
                             str(content.get("text") or ""), str(content.get("data") or ""),
                             str(props.get("pdu-type") or ""), timestamp)).encode(
                                 "utf-8", "surrogatepass")).hexdigest(),
                     }
+                    if opaque:
+                        record["_archive_only"] = True
                     if self.local_sms_tracker is not None and daemon_epoch:
                         record.update({
                             "_modem_path": modem_path, "_sms_path": sms_path,
-                            "_daemon_epoch": daemon_epoch,
+                            "_daemon_epoch": daemon_epoch, "_daemon_owner": daemon_owner,
+                            "_sim_path": current_sim_path,
                         })
                     self._details[key] = (now + self.detail_ttl, record)
-                fence = fences.get(modem_path)
+                if record.get("_archive_only") and not include_local_cleanup:
+                    continue
                 if fence and callable(claim_object):
                     try:
+                        baseline_old = bool(fence.get("baseline") and
+                            (not int(record.get("ts") or 0) or
+                             int(record.get("ts") or 0) < fence["baseline_cutoff"]))
                         ownership = claim_object(
                             modem_path, sms_path, fence["card_key"], iid,
-                            record.get("_signature") or "", now=int(self.wall_clock()))
+                            record.get("_signature") or "", now=int(self.wall_clock()),
+                            quarantine_new=baseline_old)
                     except Exception:
-                        ownership = None
-                    if isinstance(ownership, dict):
-                        status = ownership.get("status")
-                        stale = status == "stale"
-                        baseline_old = bool(
-                            fence.get("baseline") and status == "new" and
-                            (not int(record.get("ts") or 0) or
-                             int(record.get("ts") or 0) < fence.get("baseline_cutoff", 0)))
-                        if stale or baseline_old:
-                            if baseline_old and callable(quarantine_object):
-                                try:
-                                    quarantine_object(modem_path, sms_path)
-                                except Exception:
-                                    pass
-                            if callable(repair_stale) and record.get("body", "").strip():
-                                try:
-                                    repaired = repair_stale(
-                                        iid, ownership.get("previous_instance", ""),
-                                        record.get("peer", ""), record.get("body", ""),
-                                        int(record.get("ts") or 0))
-                                    if repaired:
-                                        # Keep the journal free of senders and message text.
-                                        log.info("removed %d stale cellular SMS row(s) on line %s",
-                                                 repaired, iid)
-                                except Exception:
-                                    pass
-                            continue
+                        continue
+                    if (not isinstance(ownership, dict)
+                            or ownership.get("status") not in {"new", "known", "stale"}):
+                        continue
+                    if (ownership["status"] == "stale"
+                            or baseline_old and ownership["status"] == "new"):
+                        if include_local_cleanup:
+                            # Old-card objects may be released only against their original
+                            # durable history. Never import them into the current line or
+                            # move/delete either line's history to manufacture that proof.
+                            found.append({**record, "instance": iid,
+                                          "_historical_only": True})
+                        continue
                 if record["direction"] == "out" and self.local_sms_tracker is not None:
                     if not daemon_epoch:
                         # Without a daemon generation we cannot distinguish a locally-created
@@ -986,16 +1059,39 @@ class Scanner:
         """Import first; storage policy never substitutes for durable ownership evidence."""
         records = self.discover(instances, include_local_cleanup=ingest is not None)
         if ingest is None:
-            return [r for r in records if not r.get("_local_only") and not r.get("_stale_only")]
+            return [r for r in records if not r.get("_local_only")
+                    and not r.get("_historical_only") and not r.get("_archive_only")]
         policy = policy if policy in STORAGE_POLICIES else "keep"
         found, candidates = [], {}
         for record in records:
             try:
                 preserved = self._preserved(record)
-                if not preserved and not record.get("_local_only") and not record.get("_stale_only"):
+                if not preserved and (record.get("_historical_only") or record.get("_archive_only")):
+                    self.local_sms_tracker.archive_cellular_sms_object(record)
+                elif not preserved and record.get("_local_only"):
+                    state = (json.loads(record["_raw_json"]).get("properties") or {}).get("state")
+                    cutoff = int(self.wall_clock())
+                    if state not in {"sent", "failed"}:
+                        cutoff -= int(_OWN_OBJECT_GRACE)
+                    if self.local_sms_tracker.local_modem_sms_history_is_missing(
+                            record["instance"], record.get("_modem_iccid") or "",
+                            record.get("_daemon_epoch") or "", record.get("_modem_path") or "",
+                            record.get("_sms_path") or "", _content_hash(record["peer"], record["body"]),
+                            maximum_created_ts=cutoff):
+                        record = {**record, "_archive_only": True}
+                        self.local_sms_tracker.archive_cellular_sms_object(record)
+                elif not preserved and not record.get("_local_only"):
                     stored = ingest(record)
                     if stored:
                         found.append(stored)
+                    elif (not self._preserved(record)
+                          and self.local_sms_tracker.cellular_import_is_tombstoned(
+                              record["fingerprint"], record["instance"])):
+                        # The operator cleared this exact visible message. Preserve its raw
+                        # device copy separately before cleanup, without resurrecting history.
+                        # An ingestion exception never reaches this branch.
+                        record = {**record, "_archive_only": True}
+                        self.local_sms_tracker.archive_cellular_sms_object(record)
                 if policy != "keep" and self._preserved(record):
                     if policy == "delete":
                         self.delete_preserved(record)
